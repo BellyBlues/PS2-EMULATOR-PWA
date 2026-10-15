@@ -27,7 +27,7 @@ static __fi u32 vu0DenormalizeMicroStatus(u32 nstatus)
 
 static __fi void vu0SetMicroFlags(u32* flags, u32 value)
 {
-#ifdef ARCH_X86
+#ifdef SIMD_SSE
 	_mm_store_si128(reinterpret_cast<__m128i*>(flags), _mm_set1_epi32(value));
 #elif defined(ARCH_ARM64)
 	vst1q_u32(flags, vdupq_n_u32(value));

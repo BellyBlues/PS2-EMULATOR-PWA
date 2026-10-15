@@ -7,7 +7,7 @@
 
 #include "common/Pcsx2Defs.h"
 
-#if defined(ARCH_X86)
+#if defined(SIMD_SSE)
 
 #ifdef _MSC_VER
 #include <intrin.h>

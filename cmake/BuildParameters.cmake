@@ -18,7 +18,7 @@ option(POSITION_INDEPENDENT_CODE "Generate position-independent code. It is reco
 #-------------------------------------------------------------------------------
 # Graphical option
 #-------------------------------------------------------------------------------
-if(NOT (WIN32 AND ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "ARM64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "aarch64")))
+if(NOT EMSCRIPTEN AND NOT (WIN32 AND ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "ARM64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "aarch64")))
 	if(NOT APPLE)
 		option(USE_OPENGL "Enable OpenGL GS renderer" ON)
 	endif()
@@ -28,7 +28,7 @@ endif()
 #-------------------------------------------------------------------------------
 # Path and lib option
 #-------------------------------------------------------------------------------
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
 	option(ENABLE_SETCAP "Enable networking capability for DEV9" OFF)
 	option(X11_API "Enable X11 support" ON)
 	option(WAYLAND_API "Enable Wayland support" ON)
@@ -80,7 +80,18 @@ mark_as_advanced(CMAKE_C_FLAGS_DEVEL CMAKE_CXX_FLAGS_DEVEL CMAKE_LINKER_FLAGS_DE
 #-------------------------------------------------------------------------------
 # Select the architecture
 #-------------------------------------------------------------------------------
-if("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "amd64" OR
+if(EMSCRIPTEN)
+	# WebAssembly has no recompilers (interpreters only, like ARM64). SIMD code
+	# takes the SSE4.1 paths, which Emscripten lowers to wasm SIMD128.
+	message(STATUS "Building for WebAssembly.")
+	set(ARCH_WASM TRUE)
+	add_compile_options("-msimd128" "-msse4.1" "-sSUPPORT_LONGJMP=wasm")
+	add_link_options("-sSUPPORT_LONGJMP=wasm")
+	# The core has ~210 MB of static data (fixed ring buffers etc.) before any allocation.
+	# Memory stays under 2 GB: vtlb tags handler entries with the sign bit of a uptr, so a
+	# wasm32 pointer above 2 GB would be read as a handler.
+	add_link_options("-sINITIAL_MEMORY=512MB" "-sALLOW_MEMORY_GROWTH=1" "-sMAXIMUM_MEMORY=2GB")
+elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "amd64" OR
    "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64" OR "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "x86_64")
 	# Multi-ISA only exists on x86.
 	option(DISABLE_ADVANCE_SIMD "Disable advance use of SIMD (SSE2+ & AVX)" OFF)

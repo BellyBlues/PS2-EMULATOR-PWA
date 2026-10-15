@@ -1027,6 +1027,30 @@ void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
 	s_fh = NULL;
 }
 
+#elif defined(__EMSCRIPTEN__)
+
+// Wasm cannot map the same memory at several addresses, so the repeats are plain
+// copies that do NOT mirror each other: a write past the first `size` bytes does
+// not show up at the start. Code that relies on wrapping through the mirrors
+// needs auditing (or explicit masking) on this platform; needs proper testing.
+void* GSAllocateWrappedMemory(size_t size, size_t repeat)
+{
+	void* ptr = _aligned_malloc(size * repeat, __pagesize);
+	if (!ptr)
+	{
+		Console.Error("Failed to allocate %zu bytes of GS memory.", size * repeat);
+		return nullptr;
+	}
+
+	std::memset(ptr, 0, size * repeat);
+	return ptr;
+}
+
+void GSFreeWrappedMemory(void* ptr, size_t size, size_t repeat)
+{
+	_aligned_free(ptr);
+}
+
 #else
 
 #include <sys/mman.h>

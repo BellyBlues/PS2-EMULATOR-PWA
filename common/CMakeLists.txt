@@ -169,6 +169,13 @@ elseif(APPLE)
 		"-framework Foundation"
 		"-framework IOKit"
 	)
+elseif(EMSCRIPTEN)
+	target_sources(common PRIVATE
+		Emscripten/EmHostSys.cpp
+		Emscripten/EmHTTPDownloader.cpp
+		Emscripten/EmMisc.cpp
+		Linux/LnxThreads.cpp
+	)
 else()
 	target_sources(common PRIVATE
 		Linux/LnxHostSys.cpp
@@ -201,7 +208,7 @@ if (USE_GCC AND CMAKE_INTERPROCEDURAL_OPTIMIZATION)
 	set_source_files_properties(FastJmp.cpp PROPERTIES COMPILE_FLAGS -fno-lto)
 endif()
 
-if(NOT WIN32)
+if(NOT WIN32 AND NOT EMSCRIPTEN)
 	# libcurl-based HTTPDownloader
 	target_sources(common PRIVATE
 		HTTPDownloaderCurl.cpp

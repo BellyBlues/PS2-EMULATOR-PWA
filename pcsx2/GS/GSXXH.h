@@ -5,6 +5,13 @@
 
 #include "MultiISA.h"
 
+#ifdef __wasm_simd128__
+// On wasm, xxhash.h includes <arm_neon.h> (Emscripten's NEON-on-SIMD128 header) from
+// inside extern "C", which breaks because that header pulls in C++ templates. Include
+// it here first so the later include does nothing.
+#include <arm_neon.h>
+#endif
+
 #ifndef XXH_versionNumber
 	#define XXH_STATIC_LINKING_ONLY 1
 	#define XXH_INLINE_ALL 1

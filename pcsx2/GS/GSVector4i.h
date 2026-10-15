@@ -834,7 +834,12 @@ public:
 
 	__forceinline GSVector4i sra64(s32 i) const
 	{
+#ifdef ARCH_WASM
+		// _mm_sra_epi64 is AVX-512 and has no Emscripten emulation; wasm has a native i64x2 shift.
+		return GSVector4i((__m128i)wasm_i64x2_shr((v128_t)m, static_cast<u32>(i)));
+#else
 		return GSVector4i(_mm_sra_epi64(m, _mm_cvtsi32_si128(i)));
+#endif
 	}
 
 #if _M_SSE >= 0x501

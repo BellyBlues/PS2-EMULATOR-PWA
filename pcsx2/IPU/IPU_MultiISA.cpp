@@ -1374,7 +1374,7 @@ __fi static bool mpeg2_slice()
 				//Cr bias	- 8 * 8
 				//Cb bias	- 8 * 8
 
-#if defined(ARCH_X86)
+#if defined(SIMD_SSE)
 				__m128i zeroreg = _mm_setzero_si128();
 
 				for (uint i = 0; i < (256+64+64) / 32; ++i)

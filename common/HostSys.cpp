@@ -40,6 +40,8 @@ static void MultiPause()
 	__asm__ __volatile__("isb");
 	__asm__ __volatile__("isb");
 	__asm__ __volatile__("isb");
+#elif defined(ARCH_WASM)
+	// Wasm has no spin-wait hint instruction.
 #else
 #error Unknown architecture.
 #endif

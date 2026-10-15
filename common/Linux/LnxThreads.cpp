@@ -22,6 +22,8 @@
 #include <sys/syscall.h>
 #define gettid() syscall(SYS_gettid)
 #endif
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten/threading.h>
 #else
 #include <pthread_np.h>
 #endif
@@ -342,6 +344,8 @@ void Threading::SetNameOfCurrentThread(const char* name)
 	// Extract of manpage: "The name can be up to 16 bytes long, and should be
 	//						null-terminated if it contains fewer bytes."
 	prctl(PR_SET_NAME, name, 0, 0, 0);
+#elif defined(__EMSCRIPTEN__)
+	emscripten_set_thread_name(pthread_self(), name);
 #elif defined(__unix__)
 	pthread_set_name_np(pthread_self(), name);
 #endif

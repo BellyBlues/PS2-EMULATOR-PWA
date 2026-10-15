@@ -25,10 +25,18 @@ static constexpr bool IsDebugBuild = false;
 
 #if defined(_M_ARM64) || defined(__aarch64__)
 	#define ARCH_ARM64
+#elif defined(__EMSCRIPTEN__)
+	#define ARCH_WASM
 #elif defined(_M_X86) || defined(__x86_64__) || defined(__i386__)
 	#define ARCH_X86
 #else
 	#error Unsupported Platform
+#endif
+
+// x86 and WebAssembly share the SSE intrinsic code paths; Emscripten lowers SSE4.1
+// intrinsics to wasm SIMD128. Use ARCH_X86 for anything else that is x86-specific.
+#if defined(ARCH_X86) || defined(ARCH_WASM)
+	#define SIMD_SSE
 #endif
 
 // Defines the memory page size for the target platform at compilation.

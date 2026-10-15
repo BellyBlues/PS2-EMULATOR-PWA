@@ -313,7 +313,7 @@ void resetNewVif(int idx)
 	nVif[idx].bSize = 0;
 	std::memset(nVif[idx].buffer, 0, sizeof(nVif[idx].buffer));
 
-	if (newVifDynaRec)
+	if constexpr (newVifDynaRec)
 		dVifReset(idx);
 }
 
@@ -355,7 +355,7 @@ _vifT int nVifUnpack(const u8* data)
 
 		if (!idx || !THREAD_VU1)
 		{
-			if (newVifDynaRec)
+			if constexpr (newVifDynaRec)
 				dVifUnpack<idx>(data, isFill);
 			else
 				_nVifUnpack(idx, data, vifRegs.mode, isFill);
@@ -484,7 +484,7 @@ __ri void _nVifUnpackLoop(const u8* data)
 	{
 		u8* dest = getVUptr(idx, vif.tag.addr);
 
-		if (doMode)
+		if (doMode || !newVifUnpackJIT)
 		{
 			//if (1) {
 			ft(dest, data);

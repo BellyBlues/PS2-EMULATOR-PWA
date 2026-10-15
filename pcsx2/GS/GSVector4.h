@@ -193,7 +193,7 @@ public:
 	__forceinline GSVector4 noopt()
 	{
 		// Note: Clang is currently the only compiler that attempts to optimize vector intrinsics, if that changes in the future the implementation should be updated
-#ifdef __clang__
+#if defined(__clang__) && !defined(ARCH_WASM)
 		__asm__("":"+x"(m)::);
 #endif
 		return *this;

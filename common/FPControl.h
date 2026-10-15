@@ -189,6 +189,82 @@ struct FPControlRegister
 
 	__fi constexpr bool operator==(const FPControlRegister& rhs) const { return bitmask == rhs.bitmask; }
 	__fi constexpr bool operator!=(const FPControlRegister& rhs) const { return bitmask != rhs.bitmask; }
+#elif defined(ARCH_WASM)
+	// Wasm has no FP control register: floats always round to nearest, keep denormals and
+	// never trap. This keeps whatever callers set in a per-thread value so it reads back,
+	// but arithmetic is unaffected. Code that relies on chop rounding or flush-to-zero
+	// (EE/VU float emulation) behaves differently here; needs proper testing.
+	u32 bitmask;
+
+	static constexpr u32 ROUNDING_CONTROL_SHIFT = 0;
+	static constexpr u32 ROUNDING_CONTROL_MASK = 3u;
+	static constexpr u32 ROUNDING_CONTROL_BITS = (ROUNDING_CONTROL_MASK << ROUNDING_CONTROL_SHIFT);
+	static constexpr u32 DENORMALS_ARE_ZERO_BIT = (1u << 2);
+	static constexpr u32 FLUSH_TO_ZERO_BIT = (1u << 3);
+	static constexpr u32 EXCEPTION_BIT = (1u << 4);
+
+	__fi static FPControlRegister& ThreadValue()
+	{
+		static thread_local FPControlRegister value = GetDefault();
+		return value;
+	}
+
+	__fi static FPControlRegister GetCurrent() { return ThreadValue(); }
+	__fi static void SetCurrent(FPControlRegister value) { ThreadValue() = value; }
+
+	__fi static constexpr FPControlRegister GetDefault()
+	{
+		// Nearest rounding, exceptions masked.
+		return FPControlRegister{0};
+	}
+
+	__fi constexpr FPControlRegister& EnableExceptions()
+	{
+		bitmask |= EXCEPTION_BIT;
+		return *this;
+	}
+
+	__fi constexpr FPControlRegister DisableExceptions()
+	{
+		bitmask &= ~EXCEPTION_BIT;
+		return *this;
+	}
+
+	__fi constexpr FPRoundMode GetRoundMode() const
+	{
+		return static_cast<FPRoundMode>((bitmask >> ROUNDING_CONTROL_SHIFT) & ROUNDING_CONTROL_MASK);
+	}
+
+	__fi constexpr FPControlRegister& SetRoundMode(FPRoundMode mode)
+	{
+		bitmask = (bitmask & ~ROUNDING_CONTROL_BITS) | ((static_cast<u32>(mode) & ROUNDING_CONTROL_MASK) << ROUNDING_CONTROL_SHIFT);
+		return *this;
+	}
+
+	__fi constexpr bool GetDenormalsAreZero() const { return ((bitmask & DENORMALS_ARE_ZERO_BIT) != 0); }
+
+	__fi constexpr FPControlRegister SetDenormalsAreZero(bool daz)
+	{
+		if (daz)
+			bitmask |= DENORMALS_ARE_ZERO_BIT;
+		else
+			bitmask &= ~DENORMALS_ARE_ZERO_BIT;
+		return *this;
+	}
+
+	__fi constexpr bool GetFlushToZero() const { return ((bitmask & FLUSH_TO_ZERO_BIT) != 0); }
+
+	__fi constexpr FPControlRegister SetFlushToZero(bool ftz)
+	{
+		if (ftz)
+			bitmask |= FLUSH_TO_ZERO_BIT;
+		else
+			bitmask &= ~FLUSH_TO_ZERO_BIT;
+		return *this;
+	}
+
+	__fi constexpr bool operator==(const FPControlRegister& rhs) const { return bitmask == rhs.bitmask; }
+	__fi constexpr bool operator!=(const FPControlRegister& rhs) const { return bitmask != rhs.bitmask; }
 #else
 #error Unknown architecture.
 #endif

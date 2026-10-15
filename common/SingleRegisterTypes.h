@@ -15,7 +15,7 @@
 
 #include <cstring>
 
-#if defined(ARCH_X86)
+#if defined(SIMD_SSE)
 
 // Can't stick them in structs because it breaks calling convention things, yay
 using r128 = __m128i;

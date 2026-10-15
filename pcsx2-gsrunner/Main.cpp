@@ -1112,6 +1112,38 @@ void GSRunner::StopPlatformMessagePump()
 	CocoaTools::StopMainThreadEventLoop();
 }
 
+#elif defined(__EMSCRIPTEN__)
+// No native windows in the browser. The runner works surfaceless; a web frontend
+// would hand the GS an OffscreenCanvas instead.
+static std::atomic<bool> s_shutdown_requested{false};
+
+bool GSRunner::CreatePlatformWindow()
+{
+	return true;
+}
+
+void GSRunner::DestroyPlatformWindow()
+{
+}
+
+std::optional<WindowInfo> GSRunner::GetPlatformWindowInfo()
+{
+	WindowInfo wi;
+	wi.type = WindowInfo::Type::Surfaceless;
+	return wi;
+}
+
+void GSRunner::PumpPlatformMessages(bool forever)
+{
+	while (forever && !s_shutdown_requested.load())
+		std::this_thread::sleep_for(std::chrono::milliseconds(16));
+}
+
+void GSRunner::StopPlatformMessagePump()
+{
+	s_shutdown_requested.store(true);
+}
+
 #elif defined(__linux__)
 static Display* s_display = nullptr;
 static Window s_window = None;

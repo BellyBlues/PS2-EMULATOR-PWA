@@ -2712,12 +2712,13 @@ void VMManager::InitializeCPUProviders()
 	vu1Thread.Open();
 #endif
 
-	VifUnpackSSE_Init();
+	if constexpr (newVifUnpackJIT)
+		VifUnpackSSE_Init();
 }
 
 void VMManager::ShutdownCPUProviders()
 {
-	if (newVifDynaRec)
+	if constexpr (newVifDynaRec)
 	{
 		dVifRelease(1);
 		dVifRelease(0);

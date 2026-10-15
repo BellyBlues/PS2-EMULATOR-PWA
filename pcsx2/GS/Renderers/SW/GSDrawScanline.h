@@ -22,8 +22,10 @@ class GSRasterizerData;
 
 class GSDrawScanline : public GSVirtualAlignedClass<32>
 {
+#ifndef ARCH_WASM
 	friend GSSetupPrimCodeGenerator;
 	friend GSDrawScanlineCodeGenerator;
+#endif
 
 public:
 	GSDrawScanline();
@@ -52,8 +54,10 @@ public:
 	void PrintStats();
 
 private:
+#ifndef ARCH_WASM
 	GSCodeGeneratorFunctionMap<GSSetupPrimCodeGenerator, u64, SetupPrimPtr> m_sp_map;
 	GSCodeGeneratorFunctionMap<GSDrawScanlineCodeGenerator, u64, DrawScanlinePtr> m_ds_map;
+#endif
 
 	static void CSetupPrim(const GSVertexSW* vertex, const u16* index, const GSVertexSW& dscan, GSScanlineLocalData& local);
 	static void CDrawScanline(int pixels, int left, int top, const GSVertexSW& scan, GSScanlineLocalData& local);

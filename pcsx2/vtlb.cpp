@@ -75,7 +75,12 @@ struct LoadstoreBackpatchInfo
 	bool is_fpr;
 };
 
+#ifdef ARCH_WASM
+// No fastmem on wasm (CHECK_FASTMEM is false), and a 4 GB area does not fit in wasm32.
+static constexpr size_t FASTMEM_AREA_SIZE = 0;
+#else
 static constexpr size_t FASTMEM_AREA_SIZE = 0x100000000ULL;
+#endif
 static constexpr u32 FASTMEM_PAGE_COUNT = FASTMEM_AREA_SIZE / VTLB_PAGE_SIZE;
 static constexpr u32 NO_FASTMEM_MAPPING = 0xFFFFFFFFu;
 

@@ -84,7 +84,7 @@ typedef GSVector2T<int> GSVector2i;
 class GSVector4;
 class GSVector4i;
 
-#if defined(ARCH_X86)
+#if defined(SIMD_SSE)
 #if _M_SSE >= 0x500
 
 class GSVector8;
@@ -112,7 +112,7 @@ class GSVector8i;
 
 __forceinline_odr GSVector4i::GSVector4i(const GSVector4& v, bool truncate)
 {
-#if defined(ARCH_X86)
+#if defined(SIMD_SSE)
 	m = truncate ? _mm_cvttps_epi32(v) : _mm_cvtps_epi32(v);
 #elif defined(ARCH_ARM64)
 	// GS thread uses default (nearest) rounding.
@@ -122,7 +122,7 @@ __forceinline_odr GSVector4i::GSVector4i(const GSVector4& v, bool truncate)
 
 __forceinline_odr GSVector4::GSVector4(const GSVector4i& v)
 {
-#if defined(ARCH_X86)
+#if defined(SIMD_SSE)
 	m = _mm_cvtepi32_ps(v);
 #elif defined(ARCH_ARM64)
 	v4s = vcvtq_f32_s32(v.v4s);

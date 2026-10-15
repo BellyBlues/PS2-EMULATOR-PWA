@@ -105,7 +105,7 @@ struct Gif_Tag
 
 	__ri void analyzeTag()
 	{
-#ifdef ARCH_X86
+#ifdef SIMD_SSE
 		// zero out bits for registers which shouldn't be tested
 		__m128i vregs = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(tag.REGS));
 		vregs = _mm_and_si128(vregs, _mm_srli_epi64(_mm_set1_epi32(0xFFFFFFFFu), (64 - nRegs * 4)));

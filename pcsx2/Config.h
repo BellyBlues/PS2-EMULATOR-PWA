@@ -1505,10 +1505,17 @@ namespace EmuFolders
 #define REC_VU1 false
 #endif
 #define INSTANT_VU1 (EmuConfig.Speedhacks.vu1Instant)
-#define CHECK_EEREC (EmuConfig.Cpu.Recompiler.EnableEE)
 #define CHECK_CACHE (EmuConfig.Cpu.Recompiler.EnableEECache)
+#ifdef ARCH_WASM
+// Interpreters only, and fastmem needs aliased mappings that wasm cannot make.
+#define CHECK_EEREC false
+#define CHECK_IOPREC false
+#define CHECK_FASTMEM false
+#else
+#define CHECK_EEREC (EmuConfig.Cpu.Recompiler.EnableEE)
 #define CHECK_IOPREC (EmuConfig.Cpu.Recompiler.EnableIOP)
 #define CHECK_FASTMEM (EmuConfig.Cpu.Recompiler.EnableEE && EmuConfig.Cpu.Recompiler.EnableFastmem)
+#endif
 #define CHECK_EXTRAMEM (memGetExtraMemMode())
 
 //------------ SPECIAL GAME FIXES!!! ---------------

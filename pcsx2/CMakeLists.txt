@@ -673,6 +673,12 @@ set(pcsx2GSMetalShaders
 	GS/Renderers/Metal/fxaa.metal
 )
 
+# No FFmpeg in the browser: video capture compiles to a stub.
+if(EMSCRIPTEN)
+	list(REMOVE_ITEM pcsx2GSSources GS/GSCapture.cpp)
+	list(APPEND pcsx2GSSources GS/GSCaptureNull.cpp)
+endif()
+
 if(WIN32)
 	list(APPEND pcsx2DEV9Sources
 		DEV9/Win32/pcap_io_win32.cpp
@@ -732,6 +738,12 @@ else()
 	list(APPEND pcsx2USBSources
 		USB/usb-eyetoy/cam-noop.cpp
 	)
+endif()
+
+if(EMSCRIPTEN)
+	# No disc drives or packet capture in the browser.
+	list(APPEND pcsx2CDVDSources CDVD/Emscripten/IOCtlSrc.cpp)
+	list(APPEND pcsx2DEV9Sources DEV9/Emscripten/pcap_stub.cpp)
 endif()
 
 # IPU sources
@@ -1059,6 +1071,11 @@ set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
 )
 
+# WebAssembly (no recompilers)
+set(pcsx2wasmSources
+	wasm/RecStubs.cpp
+	)
+
 # These ones benefit a lot from LTO
 set(pcsx2LTOSources
 	${pcsx2Sources}
@@ -1077,6 +1094,8 @@ if(ARCH_X86)
 elseif(ARCH_ARM64)
 	list(APPEND pcsx2LTOSources ${pcsx2arm64Sources} ${pcsx2arm64Headers})
 	target_link_libraries(PCSX2_FLAGS INTERFACE vixl)
+elseif(ARCH_WASM)
+	list(APPEND pcsx2LTOSources ${pcsx2wasmSources})
 endif()
 
 if(LTO_PCSX2_CORE)
@@ -1197,7 +1216,7 @@ if(WIN32)
 		dwmapi.lib
 		OneCore.lib
 	)
-else()
+elseif(NOT EMSCRIPTEN)
 	target_link_libraries(PCSX2_FLAGS INTERFACE
 		PCAP::PCAP
 	)
