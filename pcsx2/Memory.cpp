@@ -109,12 +109,17 @@ bool SysMemory::AllocateMemoryMap()
 		return false;
 	}
 
+#ifndef ARCH_WASM
 	if ((s_code_memory = s_memory_mapping_area->Map(nullptr, 0, s_memory_mapping_area->OffsetPointer(HostMemoryMap::MainSize), HostMemoryMap::CodeSize, PageAccess_Any())) == nullptr)
 	{
 		Host::ReportErrorAsync("Error", "Failed to allocate code memory.");
 		ReleaseMemoryMap();
 		return false;
 	}
+#else
+	// Nothing generates native code on wasm, so the 305 MB of code caches stay unallocated.
+	s_code_memory = nullptr;
+#endif
 
 	HostMemoryMap::EEmem = (uptr)(s_data_memory + HostMemoryMap::EEmemOffset);
 	HostMemoryMap::IOPmem = (uptr)(s_data_memory + HostMemoryMap::IOPmemOffset);
@@ -135,6 +140,9 @@ void SysMemory::DumpMemoryMap()
 	DUMP_REGION("VU0/1 On-Chip Memory", s_data_memory, HostMemoryMap::VUmemOffset, HostMemoryMap::VUmemSize);
 	DUMP_REGION("VTLB Virtual Map", s_data_memory, HostMemoryMap::VTLBVirtualMapOffset, HostMemoryMap::VTLBVirtualMapSize);
 	DUMP_REGION("VTLB Address Map", s_data_memory, HostMemoryMap::VTLBAddressMapOffset, HostMemoryMap::VTLBAddressMapSize);
+
+	if (!s_code_memory)
+		return;
 
 	DUMP_REGION("R5900 Recompiler Cache", s_code_memory, HostMemoryMap::EErecOffset, HostMemoryMap::EErecSize);
 	DUMP_REGION("R3000A Recompiler Cache", s_code_memory, HostMemoryMap::IOPrecOffset, HostMemoryMap::IOPrecSize);
@@ -223,6 +231,7 @@ u8* SysMemory::GetDataPtr(size_t offset)
 u8* SysMemory::GetCodePtr(size_t offset)
 {
 	pxAssert(offset <= HostMemoryMap::CodeSize);
+	pxAssertMsg(s_code_memory, "No code memory on this platform");
 	return s_code_memory + offset;
 }
 

@@ -63,6 +63,9 @@ if(ENABLE_TESTS)
 	add_subdirectory(tests/ctest)
 endif()
 
+# headless runner (no window/audio/input), used to bring up the WebAssembly build
+add_subdirectory(pcsx2-headless EXCLUDE_FROM_ALL)
+
 # gsrunner
 if(ENABLE_GSRUNNER)
 	add_subdirectory(pcsx2-gsrunner)

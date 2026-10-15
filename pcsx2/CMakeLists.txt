@@ -677,6 +677,8 @@ set(pcsx2GSMetalShaders
 if(EMSCRIPTEN)
 	list(REMOVE_ITEM pcsx2GSSources GS/GSCapture.cpp)
 	list(APPEND pcsx2GSSources GS/GSCaptureNull.cpp)
+	# Headless GPU-less device until there is a WebGPU backend.
+	list(APPEND pcsx2GSSources GS/Renderers/Null/GSDeviceNull.cpp)
 endif()
 
 if(WIN32)

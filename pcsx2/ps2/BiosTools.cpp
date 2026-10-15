@@ -213,19 +213,33 @@ static void ChecksumIt(u32& result, u32 offset, u32 size)
 //
 static void LoadExtraRom(const char* ext, u32 offset, u32 size)
 {
-	// Try first a basic extension concatenation (normally results in something like name.bin.rom1)
-	std::string Bios1(StringUtil::StdStringFromFormat("%s.%s", BiosPath.c_str(), ext));
+	// Try a basic extension concatenation (name.bin.rom1), then the name properly
+	// extensioned (name.rom1). Dumps often use upper-case extensions (NAME.ROM1), and
+	// file names are case-sensitive on Linux, so try those spellings as well.
+	const std::string upper_ext = StringUtil::toUpper(ext);
 
-	s64 filesize;
-	if ((filesize = FileSystem::GetPathFileSize(Bios1.c_str())) <= 0)
+	const std::string candidates[] = {
+		StringUtil::StdStringFromFormat("%s.%s", BiosPath.c_str(), ext),
+		Path::ReplaceExtension(BiosPath, ext),
+		StringUtil::StdStringFromFormat("%s.%s", BiosPath.c_str(), upper_ext.c_str()),
+		Path::ReplaceExtension(BiosPath, upper_ext),
+	};
+
+	std::string Bios1;
+	s64 filesize = 0;
+	for (const std::string& candidate : candidates)
 	{
-		// Try the name properly extensioned next (name.rom1)
-		Bios1 = Path::ReplaceExtension(BiosPath, ext);
-		if ((filesize = FileSystem::GetPathFileSize(Bios1.c_str())) <= 0)
+		if ((filesize = FileSystem::GetPathFileSize(candidate.c_str())) > 0)
 		{
-			Console.WriteLn(Color_Gray, "BIOS %s module not found, skipping...", ext);
-			return;
+			Bios1 = candidate;
+			break;
 		}
+	}
+
+	if (Bios1.empty())
+	{
+		Console.WriteLn(Color_Gray, "BIOS %s module not found, skipping...", ext);
+		return;
 	}
 
 	BiosRom.resize(offset + size);

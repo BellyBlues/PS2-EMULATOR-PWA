@@ -90,7 +90,7 @@ static std::unordered_multimap<u32, u32> s_fastmem_physical_mapping; // maps mai
 static std::unordered_map<uptr, LoadstoreBackpatchInfo> s_fastmem_backpatch_info;
 static std::unordered_set<u32> s_fastmem_faulting_pcs;
 
-vtlb_private::VTLBPhysical vtlb_private::VTLBPhysical::fromPointer(sptr ptr)
+vtlb_private::VTLBPhysical vtlb_private::VTLBPhysical::fromPointer(vtlb_sptr ptr)
 {
 	pxAssertMsg(ptr >= 0, "Address too high");
 	return VTLBPhysical(ptr);
@@ -105,7 +105,7 @@ vtlb_private::VTLBVirtual::VTLBVirtual(VTLBPhysical phys, u32 paddr, u32 vaddr)
 {
 	pxAssertMsg(0 == (paddr & VTLB_PAGE_MASK), "Should be page aligned");
 	pxAssertMsg(0 == (vaddr & VTLB_PAGE_MASK), "Should be page aligned");
-	pxAssertMsg((uptr)paddr < POINTER_SIGN_BIT, "Address too high");
+	pxAssertMsg((vtlb_uptr)paddr < POINTER_SIGN_BIT, "Address too high");
 	if (phys.isHandler())
 	{
 		value = phys.raw() + paddr - vaddr;
@@ -761,14 +761,14 @@ void vtlb_MapBlock(void* base, u32 start, u32 size, u32 blocksize)
 	verify(0 == (blocksize & VTLB_PAGE_MASK) && blocksize > 0);
 	verify(0 == (size % blocksize));
 
-	sptr baseint = (sptr)base;
+	vtlb_sptr baseint = static_cast<vtlb_sptr>(reinterpret_cast<uptr>(base));
 	u32 end = start + (size - VTLB_PAGE_SIZE);
 	verify((end >> VTLB_PAGE_BITS) < std::size(vtlbdata.pmap));
 
 	while (start <= end)
 	{
 		u32 loopsz = blocksize;
-		sptr ptr = baseint;
+		vtlb_sptr ptr = baseint;
 
 		while (loopsz > 0)
 		{
@@ -927,6 +927,10 @@ static bool vtlb_GetMainMemoryOffset(u32 paddr, u32* mainmem_offset, u32* mainme
 
 static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageProtectionMode& mode)
 {
+	// No fastmem table on platforms without fastmem (wasm): indexing it would write through null.
+	if (s_fastmem_virtual_mapping.empty())
+		return;
+
 	FASTMEM_LOG("Create fastmem mapping @ vaddr %08X mainmem %08X", vaddr, mainmem_offset);
 
 	const u32 page = vaddr / VTLB_PAGE_SIZE;
@@ -976,6 +980,9 @@ static void vtlb_CreateFastmemMapping(u32 vaddr, u32 mainmem_offset, const PageP
 
 static void vtlb_RemoveFastmemMapping(u32 vaddr)
 {
+	if (s_fastmem_virtual_mapping.empty())
+		return;
+
 	const u32 page = vaddr / VTLB_PAGE_SIZE;
 	if (s_fastmem_virtual_mapping[page] == NO_FASTMEM_MAPPING)
 		return;
@@ -1002,6 +1009,9 @@ static void vtlb_RemoveFastmemMappings(u32 vaddr, u32 size)
 {
 	pxAssert((vaddr & VTLB_PAGE_MASK) == 0);
 	pxAssert(size > 0 && (size & VTLB_PAGE_MASK) == 0);
+
+	if (s_fastmem_virtual_mapping.empty())
+		return;
 
 	const u32 num_pages = size / VTLB_PAGE_SIZE;
 	for (u32 i = 0; i < num_pages; i++, vaddr += VTLB_PAGE_SIZE)
@@ -1035,6 +1045,9 @@ static void vtlb_RemoveFastmemMappings()
 
 bool vtlb_ResolveFastmemMapping(uptr* addr)
 {
+	if (s_fastmem_virtual_mapping.empty())
+		return false;
+
 	uptr uaddr = *addr;
 	uptr fastmem_start = (uptr)vtlbdata.fastmem_base;
 	uptr fastmem_end = fastmem_start + 0xFFFFFFFFu;

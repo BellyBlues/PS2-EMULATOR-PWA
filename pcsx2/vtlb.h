@@ -127,52 +127,63 @@ namespace vtlb_private
 
 	static const uint VTLB_HANDLER_ITEMS = 128;
 
-	static const uptr POINTER_SIGN_BIT = 1ULL << (sizeof(uptr) * 8 - 1);
+	// Entries hold a host pointer, or a handler ID tagged with the top bit plus a
+	// 32-bit guest address. With 32-bit host pointers (wasm32) that address would
+	// run into the tag bit, so entries are 64-bit there. Elsewhere they are uptr.
+#ifdef ARCH_WASM
+	using vtlb_uptr = u64;
+	using vtlb_sptr = s64;
+#else
+	using vtlb_uptr = uptr;
+	using vtlb_sptr = sptr;
+#endif
+
+	static const vtlb_uptr POINTER_SIGN_BIT = 1ULL << (sizeof(vtlb_uptr) * 8 - 1);
 
 	struct VTLBPhysical
 	{
 	private:
-		sptr value;
-		explicit VTLBPhysical(sptr value): value(value) { }
+		vtlb_sptr value;
+		explicit VTLBPhysical(vtlb_sptr value): value(value) { }
 	public:
 		VTLBPhysical(): value(0) {}
 		/// Create from a pointer to raw memory
-		static VTLBPhysical fromPointer(void *ptr) { return fromPointer((sptr)ptr); }
+		static VTLBPhysical fromPointer(void *ptr) { return fromPointer(static_cast<vtlb_sptr>(reinterpret_cast<uptr>(ptr))); }
 		/// Create from an integer representing a pointer to raw memory
-		static VTLBPhysical fromPointer(sptr ptr);
+		static VTLBPhysical fromPointer(vtlb_sptr ptr);
 		/// Create from a handler and address
 		static VTLBPhysical fromHandler(vtlbHandler handler);
 
 		/// Get the raw value held by the entry
-		uptr raw() const { return value; }
+		vtlb_uptr raw() const { return value; }
 		/// Returns whether or not this entry is a handler
 		bool isHandler() const { return value < 0; }
 		/// Assumes the entry is a pointer, giving back its value
-		uptr assumePtr() const { return value; }
+		uptr assumePtr() const { return static_cast<uptr>(value); }
 		/// Assumes the entry is a handler, and gets the raw handler ID
-		u8 assumeHandler() const { return value; }
+		u8 assumeHandler() const { return static_cast<u8>(value); }
 	};
 
 	struct VTLBVirtual
 	{
 	private:
-		uptr value;
-		explicit VTLBVirtual(uptr value): value(value) { }
+		vtlb_uptr value;
+		explicit VTLBVirtual(vtlb_uptr value): value(value) { }
 	public:
 		VTLBVirtual(): value(0) {}
 		VTLBVirtual(VTLBPhysical phys, u32 paddr, u32 vaddr);
 		static VTLBVirtual fromPointer(uptr ptr, u32 vaddr) {
-			return VTLBVirtual(VTLBPhysical::fromPointer(ptr), 0, vaddr);
+			return VTLBVirtual(VTLBPhysical::fromPointer(static_cast<vtlb_sptr>(ptr)), 0, vaddr);
 		}
 
 		/// Get the raw value held by the entry
-		uptr raw() const { return value; }
+		vtlb_uptr raw() const { return value; }
 		/// Returns whether or not this entry is a handler
-		bool isHandler(u32 vaddr) const { return (sptr)(value + vaddr) < 0; }
+		bool isHandler(u32 vaddr) const { return (vtlb_sptr)(value + vaddr) < 0; }
 		/// Assumes the entry is a pointer, giving back its value
-		uptr assumePtr(u32 vaddr) const { return value + vaddr; }
+		uptr assumePtr(u32 vaddr) const { return static_cast<uptr>(value + vaddr); }
 		/// Assumes the entry is a handler, and gets the raw handler ID
-		u8 assumeHandlerGetID() const { return value; }
+		u8 assumeHandlerGetID() const { return static_cast<u8>(value); }
 		/// Assumes the entry is a handler, and gets the physical address
 		u32 assumeHandlerGetPAddr(u32 vaddr) const { return static_cast<u32>((value + vaddr - assumeHandlerGetID()) & ~POINTER_SIGN_BIT); }
 		/// Assumes the entry is a handler, returning it as a void*

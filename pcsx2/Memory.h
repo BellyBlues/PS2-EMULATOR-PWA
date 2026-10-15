@@ -39,9 +39,13 @@ namespace HostMemoryMap
 	static constexpr u32 VUmemOffset = IOPmemOffset + IOPmemSize;
 	static constexpr u32 VUmemSize = 0x100000;
 
-	// VTLB virtual map ((4GB / 4096) * sizeof(ptr))
+	// VTLB virtual map ((4GB / 4096) * sizeof(VTLBVirtual)); entries are 64-bit on wasm32 too.
 	static constexpr u32 VTLBVirtualMapOffset = VUmemOffset + VUmemSize;
+#ifdef ARCH_WASM
+	static constexpr u32 VTLBVirtualMapSize = (0x100000000ULL / 4096) * sizeof(u64);
+#else
 	static constexpr u32 VTLBVirtualMapSize = (0x100000000ULL / 4096) * sizeof(void*);
+#endif
 
 	// VTLB address map ((4GB / 4096) * sizeof(u32))
 	static constexpr u32 VTLBAddressMapOffset = VTLBVirtualMapOffset + VTLBVirtualMapSize;

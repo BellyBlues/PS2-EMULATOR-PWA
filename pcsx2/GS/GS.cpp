@@ -19,6 +19,9 @@
 #include "MTGS.h"
 #include "pcsx2/GS.h"
 #include "GS/Renderers/Null/GSRendererNull.h"
+#ifdef __EMSCRIPTEN__
+#include "GS/Renderers/Null/GSDeviceNull.h"
+#endif
 #include "GS/Renderers/HW/GSRendererHW.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
 #include "VMManager.h"
@@ -78,6 +81,12 @@ std::string GetDefaultAdapter()
 
 static RenderAPI GetAPIForRenderer(GSRendererType renderer)
 {
+#ifdef __EMSCRIPTEN__
+	// No GPU backend on the web yet: Null and SW run on the in-memory null device.
+	if (renderer == GSRendererType::Null || renderer == GSRendererType::SW)
+		return RenderAPI::None;
+#endif
+
 	switch (renderer)
 	{
 		case GSRendererType::OGL:
@@ -133,6 +142,12 @@ static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool
 #ifdef ENABLE_VULKAN
 		case RenderAPI::Vulkan:
 			g_gs_device = std::make_unique<GSDeviceVK>();
+			break;
+#endif
+
+#ifdef __EMSCRIPTEN__
+		case RenderAPI::None:
+			g_gs_device = std::make_unique<GSDeviceNull>();
 			break;
 #endif
 

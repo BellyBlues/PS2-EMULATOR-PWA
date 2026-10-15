@@ -88,8 +88,7 @@ if(EMSCRIPTEN)
 	add_compile_options("-msimd128" "-msse4.1" "-sSUPPORT_LONGJMP=wasm")
 	add_link_options("-sSUPPORT_LONGJMP=wasm")
 	# The core has ~210 MB of static data (fixed ring buffers etc.) before any allocation.
-	# Memory stays under 2 GB: vtlb tags handler entries with the sign bit of a uptr, so a
-	# wasm32 pointer above 2 GB would be read as a handler.
+	# 2 GB is a conservative ceiling: wasm32 allows 4 GB, but many devices refuse that much.
 	add_link_options("-sINITIAL_MEMORY=512MB" "-sALLOW_MEMORY_GROWTH=1" "-sMAXIMUM_MEMORY=2GB")
 elseif("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "amd64" OR
    "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64" OR "${CMAKE_OSX_ARCHITECTURES}" STREQUAL "x86_64")

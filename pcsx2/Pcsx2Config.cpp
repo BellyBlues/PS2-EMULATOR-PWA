@@ -1287,7 +1287,11 @@ void Pcsx2Config::SPU2Options::LoadSave(SettingsWrapper& wrap)
 		SettingsWrapEntry(StandardVolume);
 		SettingsWrapEntry(FastForwardVolume);
 		SettingsWrapEntry(OutputMuted);
-		SettingsWrapParsedEnum(Backend, "Backend", &AudioStream::ParseBackendName, &AudioStream::GetBackendName);
+		// Through a lambda on purpose: when the address of the external ParseBackendName is
+		// passed straight in, clang (Emscripten 6.0.12) declares it with no parameters, and
+		// wasm-ld replaces the mismatched call with a trap.
+		SettingsWrapParsedEnum(Backend, "Backend", +[](const char* str) { return AudioStream::ParseBackendName(str); },
+			&AudioStream::GetBackendName);
 		SettingsWrapParsedEnum(SyncMode, "SyncMode", &ParseSyncMode, &GetSyncModeName);
 		SettingsWrapEntry(DriverName);
 		SettingsWrapEntry(DeviceName);
