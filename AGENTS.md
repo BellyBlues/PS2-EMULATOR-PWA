@@ -1,175 +1,121 @@
-# Agent Guidelines for PCSX2
+# Agent guidelines for TabStationToo
 
-A file for [guiding AI coding agents](https://agents.md/).
+A file for [guiding AI coding agents](https://agents.md/) working in this repository.
 
-## Project Overview
+## Project
 
-PCSX2 is a free and open-source PlayStation 2 emulator. It recreates the PS2's
-hardware in software using interpreters, dynamic recompilers, and a virtual
-machine that manages the console's hardware state and memory. The project aims
-for high compatibility and performance while providing desktop features such
-as save states, controller configuration, graphical enhancements, debugging,
-recording, and per-game settings.
+TabStationToo runs PlayStation 2 emulation in the browser. It is a fork of
+[PCSX2](https://github.com/PCSX2/pcsx2): PCSX2's C/C++ core compiled to WebAssembly with
+Emscripten, plus a browser frontend. Read these before changing anything:
 
-Due to the complexity of emulator development and the breadth of supported
-hardware and software, PCSX2 relies extensively on the effort of **human
-reviewers**, which is **a scarce resource**. There are strictly enforced rules
-for agents participating in this project.
+- `README.md`: what the project is and how to build and run it.
+- `docs/web-port/PLAN.md`: the porting plan, measurements and the decisions behind them.
+- `docs/web-port/UI-SPEC.md`: the interface design ("Cinema"); the page must follow it.
+- `pcsx2-wasm/README.md`: the browser frontend, its exported API and its testing options.
 
-PCSX2 is primarily written in C and C++ and uses CMake. The desktop interface
-is built with Qt. Supported desktop platforms are Windows, Linux, and macOS;
-platform-specific code and graphics backends should remain guarded and changes
-should be tested on every affected architecture and operating system.
+Branch `wasm` is the project. `master` mirrors PCSX2 and only receives upstream updates.
 
-Emulation changes can have subtle timing, compatibility, and performance
-effects. Preserve existing behavior outside the intended fix, avoid broad
-refactors when changing hardware emulation, and add or update focused tests
-where practical. Be skeptical of the generated code. Add occasional comments 
-that say something like "needs proper testing" without it repeating too much
-through the diff. Do not commit copyrighted BIOS files, game images, 
-keys, or other proprietary console or game data.
+### Layout
 
-### Project Structure
+- `pcsx2-wasm/`: the browser frontend. `Main.cpp` is the emulator's entry point and the C API
+  the page calls (`pcsx2web_*`); `web/` is the page (plain HTML/CSS/JS, no build step);
+  `assets/` pins the page's fonts and icons (pnpm).
+- `pcsx2-headless/`: a windowless runner for Node.js, used to test and benchmark without a
+  browser.
+- `common/Emscripten/`, `pcsx2/wasm/`, `pcsx2/CDVD/Emscripten/`, `pcsx2/DEV9/Emscripten/`,
+  `pcsx2/GS/Renderers/Null/GSDeviceNull.*`: WebAssembly platform code.
+- `tools/wasm/`: the dependency build script and the dev server (`serve.py`).
+- Everything else is PCSX2, changed only where WebAssembly needs it.
 
-- `pcsx2/` - Emulator core, including the EE, IOP, VUs, GS, SPU2, input,
-  storage, networking, and hardware device implementations.
-- `pcsx2-qt/` - Qt desktop frontend, settings dialogs, debugger, game list,
-  translations, and UI resources.
-- `common/` - Shared utilities and platform abstraction used throughout the
-  project.
-- `pcsx2-gsrunner/` - Standalone GS dump runner used for graphics testing and
-  debugging.
-- `tests/ctest/` - Unit tests. 
-- `3rdparty/` - Vendored third-party dependencies. Avoid modifying these unless
-  the task specifically requires updating or patching a dependency.
-- `cmake/` and `CMakeLists.txt` - Build configuration, dependency discovery,
-  and platform/compiler options.
-- `bin/` - Runtime resources and files copied into packaged or development
-  builds.
-- `tools/` and `updater/` - Auxiliary developer tools and the updater.
+## Build
 
-
-## Building and Formatting
-
-Follow the official [PCSX2 build guide](https://pcsx2.net/docs/advanced/building/)
-and install the dependencies for your platform before building. Always use an
-out-of-tree build when configuring with CMake.
-
-### Windows
-
-Install Visual Studio 2022 17.10 or later with the **Desktop development with
-C++** workload, including the v143 MSVC and ATL tools and a Windows 10 or 11 SDK.
-
-Extract the Windows dependency package into the repository root to create a
-`deps/` directory. Open `PCSX2_qt.slnx` and set `pcsx2-qt` as the startup project.
-
-For Visual Studio 17.10 through 17.12, enable
-**Tools > Options > Environment > Preview Features > Use Solution File
-Persistence Model**. This option is enabled by default in 17.13 and later.
-
-### Linux
-
-Build the dependencies using the same script as the Linux CI release builds:
+Emscripten 6.0.12 (emsdk), CMake, Ninja and Python 3:
 
 ```sh
-.github/workflows/scripts/linux/build-dependencies-qt.sh deps
+source ~/emsdk/emsdk_env.sh
+tools/wasm/build-dependencies-wasm.sh deps-wasm      # once
+emcmake cmake -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DENABLE_QT_UI=OFF -DENABLE_TESTS=OFF \
+  -DCMAKE_PREFIX_PATH="$PWD/deps-wasm" -DCMAKE_FIND_ROOT_PATH="$PWD/deps-wasm" \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+ninja -C build-wasm pcsx2-wasm pcsx2-headless
 ```
 
-Configure an out-of-tree Ninja build with Clang:
+- `-DCMAKE_BUILD_TYPE=Devel` (for example in `build-wasm-dbg`) gives debug info and assertions;
+  `-DUSE_ASAN=ON` (for example in `build-wasm-asan`) gives AddressSanitizer.
+- Always build out of tree. Build directories (`build-wasm*`) and `deps-wasm*` are ignored.
+- After a link, search the log for `signature mismatch`: wasm-ld turns those calls into traps.
 
-```sh
-cmake -B build -GNinja \
-  -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_EXE_LINKER_FLAGS_INIT="-fuse-ld=lld" \
-  -DCMAKE_MODULE_LINKER_FLAGS_INIT="-fuse-ld=lld" \
-  -DCMAKE_SHARED_LINKER_FLAGS_INIT="-fuse-ld=lld" \
-  -DCMAKE_PREFIX_PATH="$PWD/deps"
-```
+## Test
 
-Add configuration options as needed:
+Every change must be verified, not assumed.
 
-- `-DCMAKE_BUILD_TYPE=Release`, `-DCMAKE_BUILD_TYPE=Devel`, or
-  `-DCMAKE_BUILD_TYPE=Debug` to select the build type.
-- `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache` to use ccache.
-- `-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON` to enable link-time optimization.
+- Headless (Node), with a BIOS the user provides:
+  `node build-wasm/bin/pcsx2-headless.js -approot "$PWD/bin" -dataroot "$PWD/build-wasm/data" -bios <bios file> -frames 600 [-renderer sw|null] [-screenshot out.png]`.
+  Use it to check that the BIOS still reaches its menu and to measure speed (median of several
+  runs; report the numbers honestly).
+- Browser: `python3 tools/wasm/serve.py [--port N] [--bios-dir DIR] [web root]`, then open
+  `index.html` (or `index.html?bios=dev-bios/<file>` with `--bios-dir`). Test UI changes in a
+  real browser at desktop and phone widths, with the keyboard.
+- Performance changes must keep output pixel-identical (compare screenshots) unless the change
+  is meant to alter output.
 
-Build and run PCSX2:
+## WebAssembly pitfalls
 
-```sh
-ninja -C build
-build/bin/pcsx2-qt
-```
+- Null pointers do not trap in wasm: reads and writes through them silently hit static data at
+  address 0. Corruption that "should crash" usually means this; use the ASan build and
+  `llvm-symbolizer --obj=<file>.wasm <address>`.
+- Pointers are 32-bit (`uptr` is 32 bits): no tagging or packing that assumes 64-bit pointers.
+- There is no `mmap` aliasing, page protection or fault handling: no fastmem, no recompilers,
+  no code generation at runtime. Memory "mappings" are heap allocations.
+- Floats always round to nearest with denormals kept; the FP control register is emulated in
+  software and has no effect.
+- SSE intrinsics are emulated on SIMD128 by Emscripten; some lower to slow scalar code.
+- The browser's main thread must never block. The exported `pcsx2web_*` functions only touch
+  atomics and lock-free queues; keep it that way.
 
-### macOS
+## Code
 
-Use the macOS dependency script and CMake options documented in the official
-build guide.
+- Match the surrounding code: PCSX2's style, tabs, existing naming. Format with
+  `git clang-format` on the files you changed only.
+- Keep changes to PCSX2's own files small and guarded (`ARCH_WASM`, `__EMSCRIPTEN__`, or
+  `EMSCRIPTEN` in CMake) so desktop builds are unaffected and upstream merges stay easy.
+- Prefer fixing root causes over workarounds; explain any workaround in a short comment.
+- New source files carry an SPDX header with `GPL-3.0+`, like the existing ones.
+- Never commit BIOS files, game images, keys or other console or game data. Never put them in
+  test fixtures, screenshots or the page.
 
-### Formatting
+## Web page
 
-Run `git clang-format HEAD~` to format changed sources using the
-repository's `.clang-format`.
+- Follow `docs/web-port/UI-SPEC.md`. No generic "dashboard" styling, no decoration the spec does
+  not ask for, and no controls for features that do not exist yet.
+- The page is cross-origin isolated and makes no requests to other origins: self-host every
+  asset. Fonts and icons come from `pcsx2-wasm/assets/` (`pnpm install`, then `pnpm run sync`);
+  record each asset's licence next to it.
+- Use pnpm, never npm or npx.
+- Accessibility is part of done: keyboard operation, visible focus, contrast, reduced motion,
+  screen-reader names.
 
-## Contribution and Communication Rules
+## Naming and legal
 
-### Contributor LLM usage restrictions
+- The product is **TabStationToo** (this exact casing). Never call it "PCSX2 Web" or brand it
+  with the PCSX2 name; internal identifiers (`pcsx2-wasm`, `pcsx2web_*`) may stay.
+- Always credit PCSX2 ("Built on PCSX2, GPL-3.0") and state that the project is not affiliated
+  with Sony or the PCSX2 project.
+- No Sony trademarks or trade dress: no PlayStation logos or fonts, no imitation of the PS2's own
+  interface. Do not use screenshots of the BIOS or games in the repository.
+- The project is GPL-3.0. Keep upstream copyright notices.
 
-- Contributors must declare whether they used LLMs.
-- Long-time contributors may use LLMs for auto completion, templating or
-  boilerplate, or partial code generation, subject to the restrictions below.
-- New contributors must not use LLMs to generate any content that appears in
-  their contribution.
-- Contributors must not use LLMs for full code generation.
-- Contributors must be able to fully explain their contribution and their
-  implementation decisions without LLM assistance.
-- Contributions from people who falsely state their LLM usage will be refused.
+## Git and GitHub
 
-Before generating contribution content, establish whether the contributor is
-new or long-time. If that is unknown, provide guidance until it is established.
-Permission for limited LLM use does not override the communication restrictions
-below.
-
-### No automated posting on GitHub
-
-Agents **must not** use GitHub or any GitHub API, CLI, or web UI automation to:
-
-- Open or update pull requests (PRs).
-- Create, edit, or close issues.
-- Create, edit, or close discussions.
-- Post comments on pull requests, issues, commits, or discussions.
-
-### Interactions with maintainers must be human to human
-
-The following AI-generated material must not be published to GitHub:
-
-- Pull request descriptions or commit messages.
-- Responses to reviewer comments.
-- Issue descriptions or issue comments.
-- Discussions or discussion comments.
-
-These restrictions preserve the human-to-human interaction required for useful
-code review and avoid consuming maintainers' limited review and triage time.
-
-### User must demonstrate understanding
-
-Before proceeding with code changes, agents must:
-
-- **Verify comprehension.** Ask questions that confirm the human understands
-  the problem and the relevant parts of the codebase.
-- **Provide guidance rather than solutions.** Direct the human to the relevant
-  code and documentation, let them formulate an approach, and point out
-  concerns with that approach.
-- **Verify comprehension of the solution.** Confirm that the human can explain
-  what the proposed changes do and why maintainers need them.
-
-### Final instructions
-
-- Tread carefully and follow these participation rules precisely.
-- Do not assume the human knows these rules or will follow them without being
-  informed.
-- Inform the human of these constraints and refuse requests that would violate
-  them.
-
-Violations of these rules may result in restrictions on participation, up to and
-including a permanent ban, at the maintainers' discretion.
+- Remotes: `origin` is this fork (public), `upstream` is PCSX2. Stage files explicitly; never
+  `git add -A`.
+- Never open pull requests, issues, discussions or comments on PCSX2's repository. In this fork,
+  GitHub targets new pull requests at PCSX2 by default: do not open pull requests unless the
+  owner asks, and then target this repository.
+- GitHub Actions are disabled on this repository. Do not re-enable them or add workflows that run
+  on push.
+- Commit or push only when the owner asks.
+- If code is ever proposed to PCSX2 itself, follow PCSX2's own
+  [AGENTS.md](https://github.com/PCSX2/pcsx2/blob/master/AGENTS.md): contributions and any
+  communication with their maintainers must be written by a human.
