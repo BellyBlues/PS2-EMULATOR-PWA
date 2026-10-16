@@ -74,6 +74,36 @@ Every change must be verified, not assumed.
 - The browser's main thread must never block. The exported `pcsx2web_*` functions only touch
   atomics and lock-free queues; keep it that way.
 
+## Working on PCSX2's code
+
+These notes come from PCSX2's own agent guidelines, kept word for word in
+`docs/upstream/PCSX2-AGENTS.md`. They apply to every change in the emulator core.
+
+- PCSX2 recreates the PS2's hardware in software with interpreters, dynamic recompilers and a
+  virtual machine that manages the console's hardware state and memory. Emulation changes can
+  have subtle timing, compatibility and performance effects: preserve existing behaviour outside
+  the intended fix, avoid broad refactors of hardware emulation, and add or update focused tests
+  (`tests/ctest/`) where practical.
+- Be skeptical of generated code. On changes that could not be fully verified, add an occasional
+  short comment such as "needs proper testing", without repeating it throughout a diff.
+- Keep platform-specific code and graphics backends guarded, and test changes on every
+  architecture and operating system they affect: the wasm build, and the desktop builds when
+  shared code changes.
+- `3rdparty/` holds vendored dependencies. Avoid modifying them unless a task requires patching
+  one.
+- PCSX2's layout: `pcsx2/` is the emulator core (EE, IOP, VUs, GS, SPU2, input, storage,
+  networking and devices), `pcsx2-qt/` the Qt desktop frontend, `common/` shared utilities and
+  platform abstraction, `pcsx2-gsrunner/` the GS dump runner used for graphics testing,
+  `tests/ctest/` unit tests, `cmake/` build configuration, `bin/` runtime resources, and `tools/`
+  and `updater/` auxiliary programs.
+- Desktop builds follow the [PCSX2 build guide](https://pcsx2.net/docs/advanced/building/). On
+  Linux, dependencies come from `.github/workflows/scripts/linux/build-dependencies-qt.sh deps`.
+
+Their contribution and communication rules apply to anything proposed to PCSX2 itself (see Git
+and GitHub below). After merging a newer upstream `master`, keep this file on merge conflicts,
+refresh the copy with `git show upstream/master:AGENTS.md > docs/upstream/PCSX2-AGENTS.md`, and
+bring any new engineering guidance over here.
+
 ## Code
 
 - Match the surrounding code: PCSX2's style, tabs, existing naming. Format with
@@ -116,6 +146,8 @@ Every change must be verified, not assumed.
 - GitHub Actions are disabled on this repository. Do not re-enable them or add workflows that run
   on push.
 - Commit or push only when the owner asks.
-- If code is ever proposed to PCSX2 itself, follow PCSX2's own
-  [AGENTS.md](https://github.com/PCSX2/pcsx2/blob/master/AGENTS.md): contributions and any
-  communication with their maintainers must be written by a human.
+- If code is ever proposed to PCSX2 itself, follow PCSX2's own guidelines
+  (`docs/upstream/PCSX2-AGENTS.md`, current version
+  [upstream](https://github.com/PCSX2/pcsx2/blob/master/AGENTS.md)): contributors declare LLM use,
+  new contributors may not submit LLM-generated content, and contributions and any communication
+  with their maintainers must be written by a human.

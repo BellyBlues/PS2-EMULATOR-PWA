@@ -91,6 +91,7 @@ repository.
 | `common/Emscripten/`, `pcsx2/wasm/` | WebAssembly platform code for PCSX2's core |
 | `tools/wasm/` | Dependency build script and the dev server |
 | `docs/web-port/` | Porting plan and interface design |
+| `docs/upstream/` | PCSX2's own guidance kept for reference (its agent guidelines) |
 | everything else | PCSX2, with changes for WebAssembly where needed |
 
 ## Licence and credits
