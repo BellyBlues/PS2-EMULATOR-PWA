@@ -19,6 +19,7 @@ permissions: {}
 
 env:
   EMSCRIPTEN_VERSION: "6.0.12"
+  CMAKE_VERSION: "4.4.4"
   # emscripten-core/emsdk at tag 6.0.12
   EMSDK_COMMIT: 35ff8a6d150541276abbc6bae512ca90bcfbe220
 
@@ -50,12 +51,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # CMake comes with the runner image; Ninja and ccache from Ubuntu.
-      - name: Install Ninja and ccache
+      # CMake 4.4.4 from PyPI, the version used for development: the runner's CMake 3.31 configures
+      # libzip without a usable off_t size under Emscripten.
+      - name: Install CMake, Ninja and ccache
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends ninja-build ccache
-          cmake --version | head -1
+          pipx install "cmake==$CMAKE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cmake" --version | head -1
           ninja --version
           ccache --version | head -1
 
@@ -81,7 +85,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: deps-wasm
-          key: deps-wasm-${{ env.EMSCRIPTEN_VERSION }}-${{ runner.os }}-${{ hashFiles('tools/wasm/build-dependencies-wasm.sh') }}
+          key: deps-wasm-${{ env.EMSCRIPTEN_VERSION }}-cmake${{ env.CMAKE_VERSION }}-${{ runner.os }}-${{ hashFiles('tools/wasm/build-dependencies-wasm.sh') }}
 
       - name: Build the third-party libraries
         if: steps.deps-cache.outputs.cache-hit != 'true'
