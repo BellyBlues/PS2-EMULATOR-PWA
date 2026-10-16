@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -4 20 20">
+<!-- TabStationToo mark (in-house, GPL-3.0): the unlit screen and its tally, on the house colour. -->
+<rect x="-2" y="-4" width="20" height="20" fill="#121110"/>
+<rect x="0.75" y="0.75" width="14.5" height="10.5" fill="none" stroke="#ECE8E1" stroke-width="1.5"/>
+<rect x="8.5" y="4.5" width="4" height="4" fill="#F2B544"/>
+</svg>

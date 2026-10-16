@@ -6,13 +6,14 @@
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSTexture.h"
 
+#include <functional>
 #include <vector>
 
-// A GPU-less device for headless runs (the WebAssembly bring-up has no GPU backend
-// yet). Textures live in ordinary memory, so uploads, maps, copies and readbacks
-// work. Stretch, merge and interlace are plain CPU nearest-neighbour copies, enough
-// to screenshot the software renderer's output. Hardware draws, shader effects and
-// presentation are no-ops.
+// A GPU-less device for the WebAssembly bring-up (no GPU backend yet). Textures live
+// in ordinary memory, so uploads, maps, copies and readbacks work. Stretch, merge,
+// interlace and present are CPU nearest-neighbour versions of the GPU passes, enough
+// to show the software renderer's output; presented frames go to a host callback.
+// Hardware draws, post-processing and TV shaders are no-ops.
 
 class GSTextureNull final : public GSTexture
 {
@@ -66,6 +67,13 @@ private:
 class GSDeviceNull final : public GSDevice
 {
 public:
+	/// Receives each presented frame on the GS thread: tightly packed RGBA8 rows,
+	/// alpha forced to 255, valid only for the duration of the call.
+	using PresentCallback = std::function<void(const u32* pixels, u32 width, u32 height)>;
+
+	/// Set before the GS opens. Without a callback nothing is presented (headless).
+	static void SetPresentCallback(PresentCallback callback);
+
 	GSDeviceNull();
 	~GSDeviceNull() override;
 
@@ -122,6 +130,10 @@ public:
 
 protected:
 	GSTexture* CreateSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format) override;
+
+private:
+	std::vector<u32> m_present_buffer;
+	bool m_presenting = false;
 
 	void DoStretchRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 		ShaderConvertSelector shader, Filter filter) override;

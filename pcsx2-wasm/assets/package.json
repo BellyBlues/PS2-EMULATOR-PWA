@@ -1,0 +1,14 @@
+{
+  "name": "pcsx2-wasm-ui-assets",
+  "private": true,
+  "description": "Pinned sources for the self-hosted fonts and icons of the pcsx2-wasm web page. `pnpm install` then `pnpm run sync` copies them into ../web.",
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "sync": "node sync-assets.mjs"
+  },
+  "devDependencies": {
+    "@fontsource-variable/archivo": "5.3.0",
+    "@fontsource-variable/chivo-mono": "5.3.0",
+    "@phosphor-icons/core": "2.1.1"
+  }
+}

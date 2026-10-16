@@ -6,6 +6,8 @@
 #include "common/Assertions.h"
 #include "common/StringUtil.h"
 
+#include "imgui.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -39,46 +41,86 @@ namespace
 		t->SetState(GSTexture::State::Dirty);
 	}
 
-	// Nearest-neighbour copy of a normalised source rectangle into a pixel destination
-	// rectangle. RGBA8 only, no filtering, blending or shader effects: enough to see what
-	// the GS displays (screenshots), not a renderer.
-	void BlitColor(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect)
+	// Nearest-neighbour resampling of a normalised source rectangle into the pixel rectangle
+	// dRect of a destination buffer. keep_row(y) selects which destination rows are written
+	// (field-based interlacing), op(dst, src) combines each pixel. RGBA8 only: enough to show
+	// what the GS displays, not a renderer.
+	template <typename KeepRow, typename PixelOp>
+	void Resample(const GSTextureNull* src, const GSVector4& sRect, u32* dst, u32 dst_pitch_px, int dst_w, int dst_h,
+		const GSVector4& dRect, KeepRow keep_row, PixelOp op)
 	{
-		GSTextureNull* const src = static_cast<GSTextureNull*>(sTex);
-		GSTextureNull* const dst = static_cast<GSTextureNull*>(dTex);
-		if (!src || !dst || src->GetFormat() != GSTexture::Format::Color || dst->GetFormat() != GSTexture::Format::Color)
-			return;
-
-		CommitClearNull(src);
-		CommitClearNull(dst);
-
 		const float dw = dRect.z - dRect.x;
 		const float dh = dRect.w - dRect.y;
 		const int dx0 = std::max(0, static_cast<int>(dRect.x));
 		const int dy0 = std::max(0, static_cast<int>(dRect.y));
-		const int dx1 = std::min(dst->GetWidth(), static_cast<int>(dRect.z));
-		const int dy1 = std::min(dst->GetHeight(), static_cast<int>(dRect.w));
+		const int dx1 = std::min(dst_w, static_cast<int>(dRect.z));
+		const int dy1 = std::min(dst_h, static_cast<int>(dRect.w));
 		if (dw <= 0.0f || dh <= 0.0f || dx1 <= dx0 || dy1 <= dy0)
 			return;
 
-		const float sw = static_cast<float>(src->GetWidth());
-		const float sh = static_cast<float>(src->GetHeight());
-		const float u0 = sRect.x * sw;
-		const float v0 = sRect.y * sh;
-		const float du = (sRect.z - sRect.x) * sw / dw;
-		const float dv = (sRect.w - sRect.y) * sh / dh;
+		const int sw = src->GetWidth();
+		const int sh = src->GetHeight();
+		const float u0 = sRect.x * static_cast<float>(sw);
+		const float v0 = sRect.y * static_cast<float>(sh);
+		const float du = (sRect.z - sRect.x) * static_cast<float>(sw) / dw;
+		const float dv = (sRect.w - sRect.y) * static_cast<float>(sh) / dh;
+		const u8* const src_data = const_cast<GSTextureNull*>(src)->GetData();
 
 		for (int y = dy0; y < dy1; y++)
 		{
-			const int sy = std::clamp(static_cast<int>(v0 + (static_cast<float>(y) - dRect.y + 0.5f) * dv), 0, src->GetHeight() - 1);
-			const u32* srow = reinterpret_cast<const u32*>(src->GetData() + src->GetOffset(0, sy));
-			u32* drow = reinterpret_cast<u32*>(dst->GetData() + dst->GetOffset(0, y));
+			if (!keep_row(y))
+				continue;
+
+			const int sy = std::clamp(static_cast<int>(v0 + (static_cast<float>(y) - dRect.y + 0.5f) * dv), 0, sh - 1);
+			const u32* srow = reinterpret_cast<const u32*>(src_data + src->GetOffset(0, sy));
+			u32* drow = dst + static_cast<size_t>(y) * dst_pitch_px;
 			for (int x = dx0; x < dx1; x++)
 			{
-				const int sx = std::clamp(static_cast<int>(u0 + (static_cast<float>(x) - dRect.x + 0.5f) * du), 0, src->GetWidth() - 1);
-				drow[x] = srow[sx];
+				const int sx = std::clamp(static_cast<int>(u0 + (static_cast<float>(x) - dRect.x + 0.5f) * du), 0, sw - 1);
+				drow[x] = op(drow[x], srow[sx], sy, sx);
 			}
 		}
+	}
+
+	bool IsColorNull(GSTexture* t)
+	{
+		return t && t->GetFormat() == GSTexture::Format::Color;
+	}
+
+	template <typename KeepRow, typename PixelOp>
+	void ResampleTo(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, KeepRow keep_row, PixelOp op)
+	{
+		if (!IsColorNull(sTex) || !IsColorNull(dTex))
+			return;
+
+		GSTextureNull* const src = static_cast<GSTextureNull*>(sTex);
+		GSTextureNull* const dst = static_cast<GSTextureNull*>(dTex);
+		CommitClearNull(src);
+		CommitClearNull(dst);
+		Resample(src, sRect, reinterpret_cast<u32*>(dst->GetData()), dst->GetPitch() / sizeof(u32), dst->GetWidth(),
+			dst->GetHeight(), dRect, keep_row, op);
+	}
+
+	constexpr auto ALL_ROWS = [](int) { return true; };
+	constexpr auto COPY = [](u32 d, u32 s, int, int) { return s; };
+
+	void BlitColor(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect)
+	{
+		ResampleTo(sTex, sRect, dTex, dRect, ALL_ROWS, COPY);
+	}
+
+	// out = src * a + dst * (1 - a) per channel, a in [0, 255].
+	__fi u32 BlendRGBA8(u32 d, u32 s, u32 a, bool keep_dst_alpha)
+	{
+		u32 out = 0;
+		for (u32 shift = 0; shift < 32; shift += 8)
+		{
+			const u32 sc = (s >> shift) & 0xFFu;
+			const u32 dc = (d >> shift) & 0xFFu;
+			const u32 c = (shift == 24 && keep_dst_alpha) ? dc : ((sc * a + dc * (255u - a) + 127u) / 255u);
+			out |= c << shift;
+		}
+		return out;
 	}
 } // namespace
 
@@ -223,6 +265,13 @@ void GSDownloadTextureNull::SetDebugName(std::string_view name)
 // GSDeviceNull
 // ----------------------------------------------------------------------------
 
+static GSDeviceNull::PresentCallback s_present_callback;
+
+void GSDeviceNull::SetPresentCallback(PresentCallback callback)
+{
+	s_present_callback = std::move(callback);
+}
+
 GSDeviceNull::GSDeviceNull() = default;
 
 GSDeviceNull::~GSDeviceNull() = default;
@@ -236,11 +285,16 @@ bool GSDeviceNull::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	m_features = FeatureSupport();
 	m_max_texture_size = 8192;
 
-	// A fixed virtual "window" so the OSD layout has a size to work with.
-	m_window_info.type = WindowInfo::Type::Surfaceless;
-	m_window_info.surface_width = 640;
-	m_window_info.surface_height = 480;
-	m_window_info.surface_scale = 1.0f;
+	// The host decides the size frames are presented at; default to 640x480 when it has no
+	// opinion, so the OSD layout and the presented frame always have a size.
+	if (!AcquireWindow(false) || m_window_info.surface_width == 0 || m_window_info.surface_height == 0)
+	{
+		m_window_info.type = WindowInfo::Type::Surfaceless;
+		m_window_info.surface_width = 640;
+		m_window_info.surface_height = 480;
+		m_window_info.surface_scale = 1.0f;
+	}
+
 	return true;
 }
 
@@ -279,12 +333,27 @@ bool GSDeviceNull::SupportsExclusiveFullscreen() const
 
 GSDevice::PresentResult GSDeviceNull::BeginPresent(bool frame_skip)
 {
-	// Nothing to present to.
-	return PresentResult::FrameSkipped;
+	// Without a host callback there is nothing to present to.
+	if (frame_skip || !s_present_callback)
+		return PresentResult::FrameSkipped;
+
+	const size_t pixels = static_cast<size_t>(m_window_info.surface_width) * m_window_info.surface_height;
+	m_present_buffer.assign(pixels, 0xFF000000u); // opaque black
+	m_presenting = true;
+	return PresentResult::OK;
 }
 
 void GSDeviceNull::EndPresent()
 {
+	// GPU backends end the ImGui frame when they draw it (ImGui::Render()); the OSD is not
+	// drawn here, but the frame must still end before GSRenderer starts the next one.
+	ImGui::EndFrame();
+
+	if (!m_presenting)
+		return;
+
+	m_presenting = false;
+	s_present_callback(m_present_buffer.data(), m_window_info.surface_width, m_window_info.surface_height);
 }
 
 void GSDeviceNull::SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle)
@@ -366,12 +435,31 @@ void GSDeviceNull::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 void GSDeviceNull::PresentRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 	PresentShader shader, float shaderTime, Filter filter)
 {
+	if (dTex)
+	{
+		BlitColor(sTex, sRect, dTex, dRect);
+		return;
+	}
+
+	// Into the presented frame. TV shaders and filtering are not applied.
+	if (!m_presenting || !IsColorNull(sTex))
+		return;
+
+	GSTextureNull* const src = static_cast<GSTextureNull*>(sTex);
+	CommitClearNull(src);
+	Resample(src, sRect, m_present_buffer.data(), m_window_info.surface_width, static_cast<int>(m_window_info.surface_width),
+		static_cast<int>(m_window_info.surface_height), dRect, ALL_ROWS,
+		[](u32 d, u32 s, int, int) { return s | 0xFF000000u; });
 }
 
 void GSDeviceNull::DoStretchRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 	ShaderConvertSelector shader, Filter filter)
 {
-	BlitColor(sTex, sRect, dTex, dRect);
+	// Other convert shaders (depth, palette, colclip...) only matter for the HW renderer.
+	if (shader.Shader() == ShaderConvert::TRANSPARENCY_FILTER)
+		ResampleTo(sTex, sRect, dTex, dRect, ALL_ROWS, [](u32 d, u32 s, int, int) { return s | 0xFF000000u; });
+	else
+		BlitColor(sTex, sRect, dTex, dRect);
 }
 
 void GSDeviceNull::UpdateCLUTTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, GSTexture* dTex,
@@ -400,25 +488,103 @@ void GSDeviceNull::ClearSamplerCache()
 void GSDeviceNull::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex, GSVector4* dRect,
 	const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c, const Filter filter)
 {
-	GSTextureNull* const dst = static_cast<GSTextureNull*>(dTex);
-	if (!dst || dst->GetFormat() != GSTexture::Format::Color)
+	if (!IsColorNull(dTex))
 		return;
 
-	// Background colour, then circuit 2 under circuit 1. PMODE alpha blending between the
-	// circuits and the EXTBUF write-back are not done; needs proper testing.
+	// Same order as the GPU backends (see GSDeviceOGL::DoMerge): background colour, circuit 2
+	// copied unless SLBG selects the background, then circuit 1 blended over it with either
+	// the constant ALP (MMOD=1, carried in c's alpha byte) or twice its own alpha. The EXTBUF
+	// feedback write-back is not done; needs proper testing.
+	GSTextureNull* const dst = static_cast<GSTextureNull*>(dTex);
 	dst->SetClearColor(c);
 	CommitClearNull(dst);
-	if (sTex[1])
+
+	if (sTex[1] && PMODE.SLBG == 0)
 		BlitColor(sTex[1], sRect[1], dTex, dRect[1]);
+
 	if (sTex[0])
-		BlitColor(sTex[0], sRect[0], dTex, dRect[0]);
+	{
+		const bool keep_dst_alpha = (PMODE.AMOD == 1);
+		if (PMODE.MMOD == 1)
+		{
+			const u32 a = c >> 24;
+			ResampleTo(sTex[0], sRect[0], dTex, dRect[0], ALL_ROWS,
+				[a, keep_dst_alpha](u32 d, u32 s, int, int) { return BlendRGBA8(d, s, a, keep_dst_alpha); });
+		}
+		else
+		{
+			ResampleTo(sTex[0], sRect[0], dTex, dRect[0], ALL_ROWS, [keep_dst_alpha](u32 d, u32 s, int, int) {
+				const u32 a = std::min<u32>((s >> 24) * 2u, 255u);
+				return BlendRGBA8(d, s, a, keep_dst_alpha);
+			});
+		}
+	}
 }
 
 void GSDeviceNull::DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 	ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb)
 {
-	// Straight copy: no field weaving or blending.
-	BlitColor(sTex, sRect, dTex, dRect);
+	// CPU versions of the interlace shaders (bin/resources/shaders/*/interlace.*).
+	const int idx = static_cast<int>(cb.ZrH.x);
+	const int field = idx & 1;
+	switch (shader)
+	{
+		case ShaderInterlace::WEAVE:
+			// Only the current field's lines; the others keep the previous field.
+			ResampleTo(sTex, sRect, dTex, dRect, [field](int y) { return (y & 1) == field; }, COPY);
+			break;
+
+		case ShaderInterlace::MAD_BUFFER:
+		{
+			// Each bank of the MAD buffer interleaves both fields; update the current field's lines.
+			const int bank = idx >> 1;
+			const int vres = static_cast<int>(cb.ZrH.z) >> 1;
+			const int lofs = ((((vres + 1) >> 1) << 1) - vres) & bank;
+			ResampleTo(sTex, sRect, dTex, dRect, [field, lofs](int y) { return ((y + lofs) & 1) == field; }, COPY);
+			break;
+		}
+
+		case ShaderInterlace::MAD_RECONSTRUCT:
+		{
+			// The shader's static path: the current field's lines from the current bank, the
+			// missing lines from the bank it calls p_t1 (the previous field), i.e. a weave of the
+			// two newest fields. Motion detection is not done.
+			const int bank = idx >> 1;
+			const int prev_bank = bank ^ (field ^ 1);
+			const auto bank_rect = [&sRect](int b) {
+				return GSVector4(sRect.x, static_cast<float>(b) * 0.5f, sRect.z, static_cast<float>(b) * 0.5f + 0.5f);
+			};
+			ResampleTo(sTex, bank_rect(bank), dTex, dRect, [field](int y) { return (y & 1) == field; }, COPY);
+			ResampleTo(sTex, bank_rect(prev_bank), dTex, dRect, [field](int y) { return (y & 1) != field; }, COPY);
+			break;
+		}
+
+		case ShaderInterlace::BLEND:
+			// Vertical 1-2-1 filter over neighbouring source lines.
+			if (IsColorNull(sTex))
+			{
+				const GSTextureNull* const src = static_cast<GSTextureNull*>(sTex);
+				const u8* const data = const_cast<GSTextureNull*>(src)->GetData();
+				const int last_row = src->GetHeight() - 1;
+				ResampleTo(sTex, sRect, dTex, dRect, ALL_ROWS, [src, data, last_row](u32 d, u32 s, int sy, int sx) {
+					const u32 up = reinterpret_cast<const u32*>(data + src->GetOffset(0, std::max(sy - 1, 0)))[sx];
+					const u32 down = reinterpret_cast<const u32*>(data + src->GetOffset(0, std::min(sy + 1, last_row)))[sx];
+					u32 out = 0;
+					for (u32 shift = 0; shift < 32; shift += 8)
+					{
+						const u32 v = ((up >> shift) & 0xFFu) + 2u * ((s >> shift) & 0xFFu) + ((down >> shift) & 0xFFu);
+						out |= ((v + 2u) / 4u) << shift;
+					}
+					return out;
+				});
+			}
+			break;
+
+		case ShaderInterlace::BOB:
+		default:
+			BlitColor(sTex, sRect, dTex, dRect);
+			break;
+	}
 }
 
 void GSDeviceNull::DoFXAA(GSTexture* sTex, GSTexture* dTex)

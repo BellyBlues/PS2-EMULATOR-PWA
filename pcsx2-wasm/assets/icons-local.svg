@@ -1,0 +1,6 @@
+<!-- TabStationToo, in-house (GPL-3.0): face-button glyphs on the Phosphor 256 grid with a 16-unit stroke, and the mark. -->
+<symbol id="i-triangle" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16" stroke-linejoin="round"><path d="M128,48 L216,200 H40 Z"/></symbol>
+<symbol id="i-circle" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16"><circle cx="128" cy="128" r="80"/></symbol>
+<symbol id="i-cross" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"><path d="M64,64 L192,192 M192,64 L64,192"/></symbol>
+<symbol id="i-square" viewBox="0 0 256 256" fill="none" stroke="currentColor" stroke-width="16" stroke-linejoin="round"><rect x="56" y="56" width="144" height="144" rx="8"/></symbol>
+<symbol id="i-mark" viewBox="0 0 16 12"><rect x="0.75" y="0.75" width="14.5" height="10.5" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="8.5" y="4.5" width="4" height="4" fill="#F2B544"/></symbol>

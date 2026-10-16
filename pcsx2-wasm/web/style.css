@@ -1,0 +1,2005 @@
+/* TabStationToo, "House Lights" (docs/web-port/UI-SPEC.md). Same-origin, self-hosted fonts only: the page
+   is cross-origin isolated (COEP require-corp), so nothing may come from another origin.
+   Order: @font-face, tokens, base, layout, components, states, media queries.
+   Page states are styled only through body[data-*] (see app.js render()). */
+
+/* ---------------------------------------------------------------- @font-face */
+
+@font-face {
+  font-family: "Archivo";
+  src: url("fonts/archivo.woff2") format("woff2");
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Chivo Mono";
+  src: url("fonts/chivo-mono.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---------------------------------------------------------------- tokens */
+
+:root {
+  color-scheme: dark;
+
+  --house: #121110;
+  --house-down: #000000;
+  --slate: #1c1b19;
+  --raise: #262421;
+  --line: #2e2c29;
+  --line-2: #726d65;
+  --ink: #ece8e1;
+  --ink-2: #aba59c;
+  --ink-3: #968f86;
+  --amber: #f2b544;
+  --amber-hover: #f7c566;
+  --amber-pressed: #e0a537;
+  --amber-ink: #1a1306;
+  --coral: #ee7b62;
+  --sand: #d9c08a;
+  --band: rgb(0 0 0 / 0.86);
+
+  --sans: "Archivo", ui-sans-serif, sans-serif;
+  --mono: "Chivo Mono", ui-monospace, monospace;
+
+  --gutter: 24px;
+  /* The column under the screen (sill, transport, drawer, credits); see the drawer state. */
+  --col-w: var(--screen-w, 100%);
+  --marquee-h: 48px;
+  --sill-h: 32px;
+  --transport-h: 48px;
+  --credits-h: 32px;
+  --hit: 40px;
+
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --d-lights-down: 900ms;
+  --d-lights-up: 300ms;
+  --d-chrome-hide: 480ms;
+  --d-chrome-show: 140ms;
+  --d-slate: 180ms;
+  --d-slate-out: 240ms;
+  --d-dim: 700ms;
+  --d-line: 160ms;
+  --d-hairline: 200ms;
+  --d-drawer-in: 200ms;
+  --d-drawer-out: 120ms;
+  --d-sub-in: 140ms;
+  --d-sub-out: 320ms;
+  --d-cap: 120ms;
+}
+
+/* ---------------------------------------------------------------- base */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--house);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: clip;
+  transition: background-color var(--d-lights-up) var(--ease-out);
+}
+
+[hidden] {
+  display: none !important;
+}
+
+h1,
+h2,
+p,
+dl,
+dd,
+pre {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+button,
+summary,
+label {
+  -webkit-tap-highlight-color: transparent;
+}
+
+a {
+  color: inherit;
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+a:hover {
+  color: var(--ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.vh {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.icon {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  fill: currentColor;
+}
+
+.icon-ext {
+  width: 0.85em;
+  height: 0.85em;
+  margin-left: 2px;
+  vertical-align: -0.05em;
+  fill: currentColor;
+}
+
+.num {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 450;
+}
+
+.unit {
+  font-family: var(--sans);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 540;
+  font-stretch: 70%;
+  letter-spacing: 0.03em;
+  color: var(--ink-3);
+}
+
+.name {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 450;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- layout */
+
+body {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 560px;
+}
+
+.marquee {
+  height: var(--marquee-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-inline: max(var(--gutter), env(safe-area-inset-left)) max(calc(var(--gutter) - 12px), env(safe-area-inset-right));
+}
+
+.theatre {
+  display: grid;
+  /* The picture gives way to the drawer (whose Log body is capped so the picture keeps
+     about half the height), so nothing ever runs into the credits. */
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
+  min-height: 0;
+  padding-inline: max(var(--gutter), env(safe-area-inset-left)) max(var(--gutter), env(safe-area-inset-right));
+}
+
+.stage-box {
+  grid-row: 1;
+  container-type: size;
+  display: grid;
+  place-items: center;
+  padding: 4px;
+  min-height: 0;
+}
+
+.screen,
+.slate {
+  grid-area: 1 / 1;
+  width: min(100cqw, calc(100cqh * 4 / 3));
+  aspect-ratio: 4 / 3;
+}
+
+.sill,
+.transport,
+.drawer,
+.credits > p {
+  width: var(--col-w);
+  max-width: 100%;
+  justify-self: center;
+  margin-inline: auto;
+}
+
+.sill {
+  grid-row: 2;
+}
+
+.transport {
+  grid-row: 3;
+}
+
+.drawer {
+  grid-row: 4;
+}
+
+.credits {
+  min-height: var(--credits-h);
+  display: flex;
+  align-items: center;
+  padding: 7px max(var(--gutter), env(safe-area-inset-right)) calc(7px + env(safe-area-inset-bottom)) max(var(--gutter), env(safe-area-inset-left));
+}
+
+/* ---------------------------------------------------------------- components: marquee */
+
+.wordmark {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 16px;
+  line-height: 20px;
+  font-weight: 640;
+  font-stretch: 125%;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
+/* One word, two weights: "TabStation" 640, "Too" 400 in ink-2. */
+.wm-too {
+  font-weight: 400;
+  color: var(--ink-2);
+}
+
+.mark {
+  width: 16px;
+  height: 12px;
+  flex: none;
+  color: var(--ink);
+}
+
+/* ---------------------------------------------------------------- components: buttons */
+
+.btn-primary,
+.btn-quiet,
+.btn-icon,
+.t-btn,
+.bios-btn,
+.menu-item,
+.capture-btn {
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 560;
+  font-stretch: 100%;
+  text-align: left;
+  transition: background-color var(--d-line) var(--ease-out), color var(--d-line) var(--ease-out);
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--hit);
+  padding: 0 16px;
+  background: var(--amber);
+  color: var(--amber-ink);
+}
+
+.btn-primary:hover {
+  background: var(--amber-hover);
+}
+
+.btn-primary:active {
+  background: var(--amber-pressed);
+}
+
+.btn-primary .icon {
+  margin-left: -4px;
+}
+
+.cap-enter {
+  margin-left: 4px;
+  padding: 0 4px;
+  border: 1px solid rgb(26 19 6 / 0.45);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+}
+
+.btn-quiet {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--hit);
+  padding: 0 12px;
+  color: var(--ink-2);
+}
+
+.btn-quiet:hover,
+.btn-icon:hover,
+.t-btn:hover,
+.bios-btn:hover,
+.bios-btn[aria-expanded="true"] {
+  background: var(--raise);
+  color: var(--ink);
+}
+
+/* The BIOS menu and About are on --raise already: their quiet buttons step up to --line. */
+.menu .btn-quiet:hover,
+.about .btn-quiet:hover {
+  background: var(--line);
+}
+
+.btn-icon {
+  display: inline-grid;
+  place-items: center;
+  width: var(--hit);
+  height: var(--hit);
+  color: var(--ink-2);
+}
+
+/* ---------------------------------------------------------------- components: screen */
+
+.screen {
+  position: relative;
+  background: var(--slate);
+  outline: 1px solid var(--line);
+  outline-offset: 2px;
+  transition: outline-color var(--d-line) var(--ease-out);
+}
+
+.screen:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+#canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  image-rendering: auto;
+  transition: filter var(--d-dim) var(--ease-out);
+}
+
+.hairline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.hairline-fill {
+  height: 100%;
+  background: var(--amber);
+  transform-origin: left center;
+  transform: scaleX(0);
+  transition: transform var(--d-hairline) linear;
+}
+
+/* ---------------------------------------------------------------- components: slate */
+
+.slate {
+  position: relative; /* above the positioned screen */
+  container-type: inline-size;
+  display: grid;
+  align-content: center;
+  overflow: auto;
+  pointer-events: none;
+  transition: opacity var(--d-slate) var(--ease-out);
+}
+
+.slate-inner {
+  pointer-events: auto;
+  margin-left: calc(100cqw / 12);
+  max-width: min(30rem, calc(100cqw * 10 / 12));
+  padding-block: 24px;
+}
+
+.slate-inner.swap {
+  animation: fade-in var(--d-slate) var(--ease-out);
+}
+
+.slate h2 {
+  font-size: clamp(26px, 2.4vw, 36px);
+  line-height: 1.08;
+  font-weight: 500;
+  font-stretch: 125%;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+
+.slate h2:focus {
+  outline: none;
+}
+
+.slate h2 .num {
+  font-size: 0.8em;
+  line-height: inherit;
+  font-weight: 450;
+}
+
+.slate .body {
+  margin-top: 12px;
+  max-width: 44ch;
+  color: var(--ink-2);
+  text-wrap: pretty;
+}
+
+.slate .body.meta {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+}
+
+.slate .body .sep,
+.menu-where .sep {
+  color: var(--ink-3);
+}
+
+.excerpt {
+  margin-top: 16px;
+  padding: 12px 16px;
+  overflow: hidden;
+  background: var(--raise);
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 450;
+  /* One row per log line, cut with an ellipsis: six lines are exactly six rows, and the box
+     never scrolls. The full lines stay in the text for copying and screen readers. */
+  white-space: pre;
+  text-overflow: ellipsis;
+}
+
+/* A build failure lists what is missing: every word matters there, so it wraps. */
+.excerpt.wrap {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 4px;
+  margin-top: 24px;
+}
+
+.actions .btn-primary {
+  margin-right: 8px;
+}
+
+.aside {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.error {
+  margin-top: 16px;
+  max-width: 44ch;
+  color: var(--coral);
+}
+
+.slate .fine {
+  display: grid;
+  gap: 4px;
+  margin-top: 16px;
+}
+
+.slate .fine:empty {
+  display: none;
+}
+
+.fine p,
+p.fine {
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--ink-3);
+  text-wrap: pretty;
+}
+
+.fine a,
+.link-btn {
+  color: var(--ink-2);
+}
+
+.link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.link-btn:hover {
+  color: var(--ink);
+}
+
+.dev {
+  margin-top: 16px;
+  color: var(--ink-2);
+}
+
+.dev summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--hit);
+  list-style: none;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 560;
+}
+
+.dev summary::-webkit-details-marker {
+  display: none;
+}
+
+.dev summary:hover {
+  color: var(--ink);
+}
+
+.dev .caret {
+  width: 16px;
+  height: 16px;
+  transform: rotate(90deg);
+}
+
+.dev[open] .caret {
+  transform: rotate(180deg);
+}
+
+.checks {
+  display: grid;
+  grid-template-columns: auto auto;
+  justify-content: start;
+  gap: 4px 24px;
+  margin: 8px 0 12px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+}
+
+.checks dd[data-pass="false"] {
+  color: var(--coral);
+}
+
+.code {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--raise);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 450;
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cmd {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.cmd .code {
+  flex: 1 1 auto;
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- components: sill */
+
+.sill {
+  container: sill / inline-size;
+  min-height: var(--sill-h);
+  display: flex;
+  flex-wrap: wrap; /* only a narrow sill wraps: see @container sill */
+  align-items: center;
+  gap: 0 16px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.capture {
+  flex: none;
+  min-width: 0;
+}
+
+.load-line .num {
+  color: var(--ink);
+}
+
+.capture-btn {
+  position: relative;
+  margin-left: -8px;
+  min-height: 32px;
+  padding: 0 8px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink);
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.capture-btn:hover {
+  background: var(--raise);
+}
+
+/* The ring stays inside the 32 px sill, clear of the screen's frame line just above. */
+.capture-btn:focus-visible {
+  outline-offset: -2px;
+}
+
+.subtitle {
+  flex: 1 1 0; /* never pushes the readout to a second line */
+  min-width: 0;
+  color: var(--ink);
+  opacity: 0;
+  transition: opacity var(--d-sub-out) var(--ease-in);
+  /* Two lines fit the 32 px sill, so a subtitle never resizes the screen. */
+  line-height: 16px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.meter {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.readout {
+  white-space: nowrap;
+  /* The spaces between items are Chivo Mono's, exactly 1ch wide; with the margins below the
+     items sit 12 px apart. Numbers have fixed widths, so the right-aligned row never shifts. */
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.readout .num {
+  display: inline-block;
+  text-align: right;
+  color: var(--ink-2);
+}
+
+/* The no-break space before a unit is Archivo's, under 2 px at width 70: 2 px more makes the
+   number and its unit read as a pair, still well inside the 12 px between items. */
+.readout .unit {
+  padding-left: 2px;
+}
+
+.readout .w4 {
+  min-width: 4ch;
+}
+
+.readout .w2 {
+  min-width: 2ch;
+}
+
+.readout .r-speed .num {
+  font-weight: 600;
+}
+
+.r-rest,
+.r-rest .num:not(:first-child) {
+  margin-left: calc(12px - 1ch);
+}
+
+.r-dash {
+  color: var(--ink-3);
+}
+
+.tally {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border: 1px solid var(--line-2);
+  background: transparent;
+  transition: background-color var(--d-line) var(--ease-out), border-color var(--d-line) var(--ease-out);
+}
+
+/* ---------------------------------------------------------------- components: transport */
+
+.transport {
+  container: transport / inline-size;
+  min-height: var(--transport-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-inline: auto;
+}
+
+.t-left,
+.t-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.transport > .t-left {
+  margin-left: -10px;
+}
+
+.transport > .t-right {
+  margin-right: -10px;
+}
+
+.t-btn,
+.bios-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--hit);
+  padding: 0 10px;
+  color: var(--ink-2);
+}
+
+/* Pressed toggles: a 2 px ink bar under the icon. */
+.t-btn[aria-pressed="true"]::before,
+.t-btn[aria-expanded="true"]::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  bottom: 3px;
+  width: 20px;
+  height: 2px;
+  background: var(--ink);
+}
+
+.bios-btn {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.bios-btn-name {
+  min-width: 0;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 450;
+  color: var(--ink);
+}
+
+.bios-btn .caret {
+  width: 16px;
+  height: 16px;
+}
+
+/* Icon-only buttons: the tooltip hangs below the button, over the credits or the drawer's top
+   edge, so the sill's text stays readable. A bridge keeps it hovered on the way to it (WCAG
+   1.4.13), and Esc hides it (app.js, .tip-off). */
+.tip {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  translate: -50% 0;
+  z-index: 2;
+  padding: 4px 8px;
+  white-space: nowrap;
+  background: var(--raise);
+  border: 1px solid var(--line-2);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  cursor: default;
+}
+
+.tip::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 7px;
+}
+
+.t-left > :first-child .tip {
+  left: 0;
+  translate: none;
+}
+
+.t-right > :last-child .tip {
+  left: auto;
+  right: 0;
+  translate: none;
+}
+
+.tip kbd,
+.shortcuts kbd {
+  display: inline-block;
+  min-width: 20px;
+  margin-left: 4px;
+  padding: 1px 4px;
+  text-align: center;
+  background: var(--house);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.tip kbd + kbd {
+  margin-left: 2px;
+}
+
+.t-btn.tip-off .tip {
+  display: none !important;
+}
+
+/* ---------------------------------------------------------------- components: drawers */
+
+.drawer {
+  padding: 12px 0 16px;
+  border-top: 1px solid var(--line);
+  animation: drawer-in var(--d-drawer-in) var(--ease-out);
+}
+
+.drawer.closing {
+  opacity: 0;
+  transition: opacity var(--d-drawer-out) var(--ease-in);
+}
+
+.pad kbd,
+.sticks kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 6px;
+  background: var(--raise);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  transition: background-color var(--d-cap) var(--ease-out), border-color var(--d-cap) var(--ease-out), color var(--d-cap) var(--ease-out);
+}
+
+.pad kbd .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.pad kbd.down,
+.sticks kbd.down {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: var(--amber-ink);
+  transition: none;
+}
+
+.pad {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: start;
+  gap: 16px 24px;
+}
+
+.pad-l,
+.pad-r {
+  display: grid;
+  gap: 12px;
+}
+
+.pad-l {
+  justify-items: start;
+}
+
+.pad-r {
+  justify-items: end;
+}
+
+.shoulder {
+  display: flex;
+  gap: 16px;
+}
+
+.bind {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.bind.col {
+  flex-direction: column;
+  gap: 4px;
+}
+
+.lbl {
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 540;
+  font-stretch: 70%;
+  letter-spacing: 0.03em;
+  color: var(--ink-2);
+}
+
+.dpad,
+.face {
+  display: grid;
+  grid-template-rows: repeat(3, 28px);
+  gap: 4px;
+}
+
+.dpad {
+  grid-template-columns: repeat(3, 28px);
+  margin-left: 12px;
+}
+
+.face {
+  grid-template-columns: repeat(3, auto);
+  column-gap: 8px;
+  margin-right: 12px;
+}
+
+.d-up,
+.f-top {
+  grid-area: 1 / 2;
+}
+
+.d-left,
+.f-left {
+  grid-area: 2 / 1;
+}
+
+.d-right,
+.f-right {
+  grid-area: 2 / 3;
+}
+
+.d-down,
+.f-bottom {
+  grid-area: 3 / 2;
+}
+
+.pad-m {
+  display: grid;
+  gap: 12px;
+  max-width: 26rem;
+}
+
+.sys {
+  display: flex;
+  justify-content: center;
+  gap: 24px;
+}
+
+.glyph {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--ink);
+}
+
+.glyph-inline {
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.15em;
+  color: var(--ink);
+}
+
+.sticks {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px 24px;
+  margin-top: 16px;
+}
+
+.stick-side {
+  display: flex;
+  gap: 24px;
+}
+
+.sticks .bind kbd + kbd {
+  margin-left: -2px;
+}
+
+.drawer-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px 16px;
+  margin-top: 12px;
+}
+
+.shortcuts {
+  flex: 1 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--ink-2);
+}
+
+.shortcut {
+  white-space: nowrap;
+}
+
+.shortcuts kbd {
+  margin: 0 2px 0 0;
+}
+
+.notes {
+  display: grid;
+  gap: 4px;
+  font-size: 12.5px;
+  line-height: 18px;
+  text-align: center;
+  text-wrap: balance;
+  color: var(--ink-2);
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--hit);
+  flex: none;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--ink);
+}
+
+.drawer-foot .btn-icon {
+  margin-left: auto;
+  margin-right: -10px;
+}
+
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: var(--hit);
+}
+
+.log-head h2 {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 560;
+  color: var(--ink);
+}
+
+.log-count {
+  margin-left: 8px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-3);
+}
+
+.log-count .num {
+  color: var(--ink-2);
+}
+
+.grow {
+  flex: 1 1 auto;
+}
+
+.log-head .btn-icon {
+  margin-right: -10px;
+}
+
+.log-frame {
+  position: relative;
+  margin-top: 8px;
+}
+
+.log-body {
+  /* 38vh, capped so the picture keeps about 45% of the window: 245 px is the marquee, credits,
+     sill, transport, stage padding and the drawer's own header and padding. */
+  height: clamp(96px, 55dvh - 245px, 38vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 450;
+  color: var(--ink-2);
+}
+
+.log-body > div {
+  padding: 0 8px 0 10px;
+  border-left: 2px solid transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-body > .l-err {
+  border-left-color: var(--coral);
+}
+
+.log-body > .l-warn {
+  border-left-color: var(--sand);
+}
+
+.log-empty {
+  position: absolute;
+  top: 0;
+  left: 12px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-3);
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------- components: BIOS menu */
+
+.menu {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  width: 296px;
+  max-width: calc(100vw - 2 * var(--gutter));
+  padding: 8px 0;
+  background: var(--raise);
+  color: var(--ink);
+  border: 1px solid var(--line-2);
+  outline: 1px solid #000;
+}
+
+.menu-file {
+  display: grid;
+  gap: 2px;
+  padding: 4px 16px 12px;
+}
+
+.menu-name {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 450;
+  overflow-wrap: anywhere;
+}
+
+.menu-where {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.menu-items {
+  display: grid;
+  border-top: 1px solid var(--line);
+  padding-top: 4px;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: var(--hit);
+  padding: 0 16px;
+  border-radius: 0;
+  color: var(--ink);
+}
+
+.menu-item .icon {
+  color: var(--ink-2);
+}
+
+.menu-item:hover {
+  background: var(--line);
+}
+
+.menu-item:focus-visible {
+  outline-offset: -2px;
+}
+
+.menu-item[aria-disabled="true"] {
+  color: var(--ink-3);
+  cursor: default;
+}
+
+.menu-item[aria-disabled="true"]:hover {
+  background: transparent;
+}
+
+.menu-reason {
+  padding: 4px 16px 4px 48px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.menu-confirm {
+  border-top: 1px solid var(--line);
+  padding: 12px 16px 0;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.menu-confirm-actions {
+  display: flex;
+  gap: 4px;
+  margin: 8px 0 0 -12px;
+}
+
+#menu-forget-yes {
+  color: var(--coral);
+}
+
+/* ---------------------------------------------------------------- components: credits, About */
+
+.credits > p {
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--ink-3);
+  text-wrap: balance;
+}
+
+/* When the column is too narrow for one line, break between the items, not inside them. */
+.credits .seg {
+  display: inline-block;
+}
+
+.credits a {
+  color: var(--ink-2);
+}
+
+/* Each separator ends the item before it, so a wrapped line can only end on one, never start
+   with one; app.js hides it there. */
+.credits .sep.eol {
+  visibility: hidden;
+}
+
+.about {
+  width: min(36rem, calc(100vw - 2 * var(--gutter)));
+  max-height: calc(100dvh - 2 * var(--gutter));
+  padding: 32px;
+  background: var(--raise);
+  color: var(--ink-2);
+  border: 1px solid var(--line-2);
+  outline: 1px solid #000;
+}
+
+.about::backdrop {
+  background: rgb(0 0 0 / 0.6);
+}
+
+.about h2 {
+  margin-bottom: 16px;
+  font-size: 26px;
+  line-height: 1.08;
+  font-weight: 500;
+  font-stretch: 125%;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+/* The dialog opens on its title (autofocus, tabindex=-1) so reading starts at the top. */
+.about h2:focus {
+  outline: none;
+}
+
+.about p + p {
+  margin-top: 12px;
+}
+
+.about p.fine {
+  margin-top: 16px;
+}
+
+.about p.fine + p.fine {
+  margin-top: 8px;
+}
+
+.about .fine a,
+.link-btn {
+  color: var(--ink-2);
+}
+
+.link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.link-btn:hover {
+  color: var(--ink);
+}
+
+.about-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 24px -12px 0 0;
+}
+
+.noscript {
+  padding: 24px var(--gutter);
+  color: var(--ink);
+}
+
+/* ---------------------------------------------------------------- motion */
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes drawer-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* ---------------------------------------------------------------- states */
+
+body[data-lights="down"] {
+  background: var(--house-down);
+  transition-duration: var(--d-lights-down);
+}
+
+/* While a drawer is open the column under the screen is at least 920 px (the credits' length on
+   one line): following the screen, which shrinks to make room, would wrap the drawer, squeeze
+   the subtitle and wrap the credits. app.js keeps data-drawer until the closing drawer is gone,
+   so everything resizes once. */
+body[data-drawer="keys"],
+body[data-drawer="log"] {
+  --col-w: max(var(--screen-w, 100%), 920px);
+}
+
+/* Frame line: 2 px amber where keys go (captured, keyboard focus, file drag); 1 px line otherwise. */
+body[data-capture="on"] .screen,
+body[data-drag="ok"] .screen {
+  outline: 2px solid var(--amber);
+}
+
+body[data-capture="off"] .screen:not(:focus-visible) {
+  outline: 1px solid var(--line);
+}
+
+body[data-capture="on"] .tally {
+  background: var(--amber);
+  border-color: var(--amber);
+}
+
+body[data-tally="delayed"] .tally {
+  transition-delay: var(--d-lights-down);
+}
+
+body[data-picture="live"] #canvas,
+body[data-picture="dim"] #canvas {
+  opacity: 1;
+}
+
+body[data-picture="dim"] #canvas {
+  filter: brightness(0.2) saturate(0.3);
+}
+
+/* A file dragged over the running picture: deeper, so the BIOS's own text does not run
+   through the slate's title. */
+body[data-picture="live"]:not([data-drag=""]) #canvas {
+  filter: brightness(0.1) saturate(0.2);
+}
+
+body[data-crisp="on"] #canvas {
+  image-rendering: pixelated;
+}
+
+/* On a dimmed frame ink-3 is too faint (3.95:1 on #333), so fine print, separators and units
+   step up to ink-2. */
+body[data-picture="dim"] .slate :is(.fine p, .sep, .unit),
+body[data-picture="live"] .slate :is(.fine p, .sep, .unit) {
+  color: var(--ink-2);
+}
+
+body[data-state="running"][data-drag=""] .slate {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--d-slate-out) var(--ease-in), visibility 0s linear var(--d-slate-out);
+}
+
+body[data-subtitle="on"] .subtitle {
+  opacity: 1;
+  transition: opacity var(--d-sub-in) var(--ease-out);
+}
+
+body[data-runtime="deferred"] .hairline,
+body:not([data-state="starting"]):not([data-state="running"]) #btn-stop,
+body[data-bios="none"] #bios-btn,
+body[data-state="dead"] :is(#bios-btn, #btn-crisp, #btn-keys, #btn-fs),
+body[data-state="unsupported"] :is(#bios-btn, #btn-crisp, #btn-keys, #btn-fs) {
+  display: none;
+}
+
+/* Hiding the controls while the PS2 runs (app.js updateChrome): only the picture, the frame
+   line, the speed and the tally remain. */
+.marquee,
+.credits,
+.transport,
+.capture,
+.r-rest,
+.readout .r-speed :is(.num, .unit) {
+  transition: opacity var(--d-chrome-show) var(--ease-out), color var(--d-chrome-show) var(--ease-out);
+}
+
+body[data-chrome="hidden"] :is(.marquee, .credits, .transport, .capture, .r-rest) {
+  opacity: 0;
+  transition: opacity var(--d-chrome-hide) var(--ease-in);
+}
+
+/* Once faded, VPS and FPS leave the row, so the speed sits next to the tally (D3). They come
+   back at once with the controls. */
+body[data-chrome="hidden"] .r-rest {
+  display: none;
+  transition: opacity var(--d-chrome-hide) var(--ease-in), display var(--d-chrome-hide) allow-discrete;
+}
+
+@starting-style {
+  body[data-chrome="shown"] .r-rest {
+    opacity: 0;
+  }
+}
+
+body[data-chrome="hidden"] .readout .r-speed :is(.num, .unit) {
+  color: var(--ink-3);
+  transition: color var(--d-chrome-hide) var(--ease-in);
+}
+
+body[data-chrome="hidden"] .screen {
+  cursor: none;
+}
+
+:is(.marquee, .transport, .sill, .credits):focus-within {
+  transition-duration: 0s;
+}
+
+/* ---------------------------------------------------------------- fullscreen theatre */
+
+.theatre:fullscreen {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  padding: 0;
+  background: #000;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.theatre:fullscreen .stage-box {
+  grid-row: 1;
+}
+
+.theatre:fullscreen :is(.sill, .transport, .drawer) {
+  position: absolute;
+  left: 0;
+  right: 0;
+  padding-inline: 16px;
+  background: var(--band);
+}
+
+/* The band ends at the picture's bottom edge (4 px up, the stage padding), so the frame line
+   stays whole around it instead of dimming along the bottom only. */
+.theatre:fullscreen .transport {
+  bottom: 4px;
+}
+
+.theatre:fullscreen .sill {
+  bottom: calc(var(--transport-h) + 4px);
+  transition: background-color var(--d-chrome-show) var(--ease-out);
+}
+
+.theatre:fullscreen .drawer {
+  bottom: calc(var(--transport-h) + var(--sill-h) + 4px);
+  max-height: calc(100vh - var(--transport-h) - var(--sill-h) - 8px);
+  overflow: auto;
+  border-top: 0;
+}
+
+.theatre:fullscreen .meter {
+  margin-right: -8px;
+  padding: 4px 8px;
+  background: #000;
+}
+
+body[data-chrome="hidden"] .theatre:fullscreen .sill {
+  background: transparent;
+  transition: background-color var(--d-chrome-hide) var(--ease-in);
+}
+
+/* Nothing is below the band in fullscreen: tooltips go above it. */
+.theatre:fullscreen .tip {
+  top: auto;
+  bottom: calc(100% + 4px + var(--sill-h));
+}
+
+.theatre:fullscreen .tip::before {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- media queries */
+
+/* Under 1024 px the transport is icons only, with a tooltip that names the shortcut. */
+@media (max-width: 1023px) {
+  .t-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .t-btn {
+    width: var(--hit);
+    padding: 0;
+    justify-content: center;
+  }
+
+  .t-btn[aria-pressed="true"]::before,
+  .t-btn[aria-expanded="true"]::before {
+    left: calc(50% - 10px);
+  }
+}
+
+/* Labels follow the viewport (above). This is only a fallback for wide but short windows, where
+   the screen, and so the column, is narrower than the labelled transport (about 580 px). A
+   drawer never triggers it: the column is 920 px then. */
+@container transport (max-width: 599px) {
+  .t-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .t-btn {
+    width: var(--hit);
+    padding: 0;
+    justify-content: center;
+  }
+
+  .t-btn[aria-pressed="true"]::before,
+  .t-btn[aria-expanded="true"]::before {
+    left: calc(50% - 10px);
+  }
+
+  .t-btn:hover .tip,
+  .t-btn:focus-visible .tip {
+    display: block;
+  }
+}
+
+@media (max-width: 1023px) and (hover: hover) {
+  .t-btn:hover .tip,
+  .t-btn:focus-visible .tip {
+    display: block;
+  }
+}
+
+/* Touch screens: labels sit under the icons. */
+@media (max-width: 1023px) and (hover: none) {
+  .t-btn {
+    flex-direction: column;
+    gap: 2px;
+    width: auto;
+    min-width: 64px;
+    height: 56px;
+    padding: 6px 8px 4px;
+  }
+
+  .t-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip-path: none;
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 480;
+  }
+
+  .t-btn[aria-pressed="true"]::before,
+  .t-btn[aria-expanded="true"]::before {
+    top: 28px;
+    bottom: auto;
+  }
+}
+
+@media (pointer: coarse) {
+  :root {
+    --hit: 44px;
+  }
+
+  /* 32 px to look at, 44 px to hit. The extra 12 px go up, over the gap and the screen's edge
+     (a tap there plays too), and stay clear of the Stop button below. */
+  .capture-btn::before {
+    content: "";
+    position: absolute;
+    inset: -12px 0 0;
+  }
+}
+
+/* Touch-only devices: no Enter key cap, no keyboard shortcuts, and the controls never hide. */
+@media (pointer: coarse) and (hover: none) {
+  .cap-enter,
+  .shortcuts,
+  .drawer-foot .check {
+    display: none;
+  }
+}
+
+/* A narrow sill (phones, short windows): the subtitle gets a row of its own instead of being
+   squeezed between the capture state and the readout. It stays rendered while empty (0 px tall),
+   so the live region is never display:none. */
+@container sill (max-width: 559px) {
+  .subtitle {
+    order: 3;
+    flex-basis: 100%;
+    display: block;
+    line-height: 18px;
+    -webkit-line-clamp: none;
+    line-clamp: none;
+  }
+
+  .subtitle:not(:empty) {
+    padding-bottom: 6px;
+  }
+}
+
+@media (max-width: 639px) {
+  :root {
+    --gutter: 16px;
+  }
+
+  body {
+    display: block;
+    height: auto;
+    min-height: 100dvh;
+  }
+
+  .marquee {
+    padding-right: max(4px, env(safe-area-inset-right));
+  }
+
+  .theatre {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* One column: screen, sill (so the tally stays under the screen's corner), slate, transport. */
+  .stage-box {
+    display: contents;
+  }
+
+  .screen {
+    order: 1;
+    width: 100%;
+    margin-block: 4px;
+  }
+
+  .sill {
+    order: 2;
+  }
+
+  .slate {
+    order: 3;
+  }
+
+  .transport {
+    order: 4;
+  }
+
+  .drawer {
+    order: 5;
+  }
+
+  .slate {
+    width: auto;
+    aspect-ratio: auto;
+    display: block;
+    overflow: visible;
+    container-type: normal;
+    pointer-events: auto;
+  }
+
+  .slate-inner {
+    margin: 0;
+    max-width: none;
+    padding: 8px 0 16px;
+  }
+
+  body[data-state="running"][data-drag=""] .slate {
+    display: none;
+  }
+
+  /* The full-width primary pushes the rest to a second row: the row starts 12 px left, so the
+     quiet buttons' text (inside their 12 px padding) lines up with the column. */
+  .actions {
+    margin-left: -12px;
+  }
+
+  .actions .btn-primary {
+    flex: 1 1 100%;
+    justify-content: center;
+    margin: 0 0 0 12px;
+  }
+
+  .actions .aside {
+    margin-left: 12px;
+  }
+
+  .sill {
+    column-gap: 12px;
+  }
+
+  .transport {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    padding: 4px 0 8px;
+  }
+
+  .transport > .t-left {
+    margin-left: -10px;
+  }
+
+  /* Row 1, Stop and the BIOS menu, has room for words: Stop is inline like the BIOS button. */
+  .t-left .t-btn {
+    flex-direction: row;
+    gap: 8px;
+    width: auto;
+    min-width: 0;
+    height: var(--hit);
+    padding: 0 10px;
+  }
+
+  .t-left .t-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip-path: none;
+    font-size: 14px;
+    line-height: 20px;
+    font-weight: 560;
+  }
+
+  .t-left .tip {
+    display: none !important;
+  }
+
+  .t-left .t-btn[aria-pressed="true"]::before,
+  .t-left .t-btn[aria-expanded="true"]::before {
+    left: 10px;
+  }
+
+  .t-right {
+    justify-content: space-around;
+  }
+
+  .pad {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas: "l r" "m m";
+    row-gap: 20px;
+  }
+
+  .pad-l {
+    grid-area: l;
+  }
+
+  .pad-r {
+    grid-area: r;
+  }
+
+  .pad-m {
+    grid-area: m;
+    justify-content: center;
+    margin-top: 0;
+  }
+
+  .dpad {
+    margin-left: 0;
+  }
+
+  .face {
+    margin-right: 0;
+  }
+
+  .shoulder {
+    gap: 10px;
+  }
+
+  .drawer-foot {
+    flex-wrap: wrap;
+  }
+
+  .shortcuts {
+    flex-basis: 100%;
+  }
+
+  .pad-m {
+    max-width: none;
+  }
+
+  .sys {
+    justify-content: center;
+  }
+
+  .log-body {
+    height: 50vh;
+  }
+
+  .credits {
+    padding-block: 12px calc(16px + env(safe-area-inset-bottom));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --d-lights-down: 0ms;
+    --d-lights-up: 0ms;
+    --d-chrome-hide: 0ms;
+    --d-chrome-show: 0ms;
+    --d-slate: 0ms;
+    --d-slate-out: 0ms;
+    --d-dim: 0ms;
+    --d-line: 0ms;
+    --d-hairline: 0ms;
+    --d-drawer-in: 0ms;
+    --d-drawer-out: 0ms;
+    --d-sub-in: 0ms;
+    --d-sub-out: 0ms;
+    --d-cap: 0ms;
+  }
+}
+
+@media (forced-colors: active) {
+  .screen {
+    outline-color: CanvasText;
+  }
+
+  body[data-capture="on"] .screen,
+  body[data-drag="ok"] .screen,
+  .screen:focus-visible {
+    outline-color: Highlight;
+  }
+
+  .tally {
+    forced-color-adjust: none;
+    border-color: CanvasText;
+    background: Canvas;
+  }
+
+  body[data-capture="on"] .tally {
+    border-color: Highlight;
+    background: Highlight;
+  }
+
+  .btn-primary {
+    border: 1px solid ButtonText;
+  }
+
+  .hairline-fill {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+
+  .t-btn[aria-pressed="true"]::before,
+  .t-btn[aria-expanded="true"]::before {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+
+  .pad kbd.down,
+  .sticks kbd.down {
+    forced-color-adjust: none;
+    background: Highlight;
+    border-color: Highlight;
+    color: HighlightText;
+  }
+
+  .menu-item[aria-disabled="true"],
+  .menu-item[aria-disabled="true"] .icon {
+    color: GrayText;
+  }
+}
