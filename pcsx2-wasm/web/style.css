@@ -839,6 +839,11 @@ p.fine {
   height: 16px;
 }
 
+/* The disc menu button (UI-SPEC §10) carries the game's title, which runs longer than a BIOS name. */
+.disc-btn .bios-btn-name {
+  max-width: 16rem;
+}
+
 /* Icon-only buttons: the tooltip hangs below the button, over the credits or the drawer's top
    edge, so the sill's text stays readable. A bridge keeps it hovered on the way to it (WCAG
    1.4.13), and Esc hides it (app.js, .tip-off). */
@@ -1501,8 +1506,9 @@ body[data-subtitle="on"] .subtitle {
 body[data-runtime="deferred"] .hairline,
 body:not([data-state="starting"]):not([data-state="running"]) #btn-stop,
 body[data-bios="none"] #bios-btn,
-body[data-state="dead"] :is(#bios-btn, #btn-crisp, #btn-keys, #btn-fs),
-body[data-state="unsupported"] :is(#bios-btn, #btn-crisp, #btn-keys, #btn-fs) {
+body[data-disc="none"] #disc-btn,
+body[data-state="dead"] :is(#bios-btn, #disc-btn, #btn-crisp, #btn-keys, #btn-fs),
+body[data-state="unsupported"] :is(#bios-btn, #disc-btn, #btn-crisp, #btn-keys, #btn-fs) {
   display: none;
 }
 
@@ -1866,6 +1872,10 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
 
   .t-left .tip {
     display: none !important;
+  }
+
+  .disc-btn .bios-btn-name {
+    max-width: 9rem;
   }
 
   .t-left .t-btn[aria-pressed="true"]::before,

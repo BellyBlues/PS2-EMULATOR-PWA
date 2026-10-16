@@ -43,6 +43,7 @@
 
 #include "pcsx2/Achievements.h"
 #include "pcsx2/CDVD/CDVD.h"
+#include "pcsx2/CDVD/Emscripten/WebDisc.h"
 #include "pcsx2/GS.h"
 #include "pcsx2/GS/GS.h"
 #include "pcsx2/GS/Renderers/Null/GSDeviceNull.h"
@@ -56,6 +57,7 @@
 #include "pcsx2/MTGS.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/ps2/BiosTools.h"
 
 namespace
 {
@@ -147,6 +149,171 @@ struct KeySlot
 static u32 s_key_poll_count = 0; // CPU thread only
 static KeySlot s_keys[NUM_KEYS + 1] = {}; // CPU thread only
 
+//////////////////////////////////////////////////////////////////////////
+// Discs, game details and memory cards
+//////////////////////////////////////////////////////////////////////////
+
+// Discs: the page opens the user's file (or a URL) in its disc worker (web/disc-worker.js), which
+// serves the request block pcsx2web_disc_block() returns (pcsx2/CDVD/Emscripten/WebDisc.h). It writes
+// a 0-byte placeholder at /disc/<name> and boots that path with pcsx2web_boot_disc(); the ISO reader
+// then reads the disc through WebDiscFileReader (docs/web-port/DISC-DESIGN.md).
+//
+// Memory cards: slot 1 holds Mcd001.ps2 in /memcards, which the page mounts as IDBFS before main()
+// runs and copies to IndexedDB after the card is written and when the VM stops (app.js, "memory
+// cards"). Slot 2 stays empty.
+
+static constexpr const char* DISC_DIRECTORY = "/disc";
+static constexpr const char* MEMCARD_DIRECTORY = "/memcards";
+
+// pcsx2web_boot_disc() flags.
+static constexpr int BOOT_FLAG_FULL_BOOT = 1; // run the BIOS intro instead of fast boot
+
+// The disc for the boot request in flight; written by pcsx2web_boot_disc() between its claim of the
+// STARTING state and the request, taken by RunVM() on the CPU thread.
+static char s_boot_disc_path[512];
+static std::atomic<int> s_boot_disc_flags{0};
+static std::atomic<bool> s_boot_disc_requested{false};
+
+struct BootDisc
+{
+	std::string path; // empty: the BIOS alone
+	bool full_boot = false;
+};
+
+// Game details for the page, as a seqlock: the CPU thread makes seq odd, writes, then makes it even;
+// the page copies the fields and keeps them only if seq was even and unchanged.
+struct GameDetails
+{
+	std::atomic<u32> seq;
+	u32 disc_crc;
+	u32 elf_crc;
+	char serial[32];
+	char title[256];
+};
+static GameDetails s_game_details = {};
+
+static void ConfigureMemoryCards(SettingsInterface& si)
+{
+	si.SetStringValue("Folders", "MemoryCards", MEMCARD_DIRECTORY);
+	si.SetBoolValue("MemoryCards", "Slot1_Enable", true);
+	si.SetStringValue("MemoryCards", "Slot1_Filename", "Mcd001.ps2");
+	si.SetBoolValue("MemoryCards", "Slot2_Enable", false);
+}
+
+static bool EnsureDiscAndMemoryCardFolders()
+{
+	// The page creates both (and mounts IndexedDB on /memcards); without them the cards would fail.
+	Error error;
+	for (const char* dir : {DISC_DIRECTORY, MEMCARD_DIRECTORY})
+	{
+		if (!FileSystem::EnsureDirectoryExists(dir, false, &error))
+		{
+			Console.ErrorFmt("Failed to create {}: {}", dir, error.GetDescription());
+			return false;
+		}
+	}
+	return true;
+}
+
+// CPU thread, at the start of every RunVM(): the disc of this request, if it is a disc boot.
+static BootDisc TakeBootDisc()
+{
+	BootDisc disc;
+	if (s_boot_disc_requested.exchange(false, std::memory_order_acq_rel))
+	{
+		disc.path = s_boot_disc_path;
+		disc.full_boot = (s_boot_disc_flags.load(std::memory_order_relaxed) & BOOT_FLAG_FULL_BOOT) != 0;
+	}
+	return disc;
+}
+
+// RunVM() has set up a BIOS boot (no disc, no fast boot); a disc boot changes that.
+static void MakeBootParameters(const std::string& bios_name, const BootDisc& disc, VMBootParameters* params)
+{
+	if (disc.path.empty())
+	{
+		Console.WriteLnFmt("pcsx2-wasm: booting BIOS '{}'", bios_name);
+		return;
+	}
+
+	// Fast boot by default, as PCSX2's desktop frontend: the BIOS intro is skipped and the game starts.
+	params->filename = disc.path;
+	params->source_type = CDVD_SourceType::Iso;
+	params->fast_boot = !disc.full_boot;
+	Console.WriteLnFmt("pcsx2-wasm: booting '{}' with BIOS '{}' ({})", disc.path, bios_name,
+		disc.full_boot ? "full boot" : "fast boot");
+}
+
+// CPU thread (Host::OnGameChanged).
+static void PublishGameDetails(const std::string& title, const std::string& serial, u32 disc_crc, u32 elf_crc)
+{
+	GameDetails& d = s_game_details;
+	const u32 seq = d.seq.load(std::memory_order_relaxed);
+	d.seq.store(seq + 1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	StringUtil::Strlcpy(d.title, title, sizeof(d.title));
+	StringUtil::Strlcpy(d.serial, serial, sizeof(d.serial));
+	d.disc_crc = disc_crc;
+	d.elf_crc = elf_crc;
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	d.seq.store(seq + 2, std::memory_order_release);
+}
+
+extern "C" {
+
+/// Boots the disc at disc_path ("/disc/<name>", served by the page's disc worker) with the BIOS named
+/// bios_filename inside /bios. flags: 1 = full boot (the BIOS intro), otherwise fast boot. 0 if
+/// accepted; -1 as pcsx2web_boot(), or if disc_path is not a disc path.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_boot_disc(const char* bios_filename, const char* disc_path, int flags)
+{
+	if (!bios_filename || !disc_path || s_fatal_error.load(std::memory_order_acquire))
+		return -1;
+
+	const size_t bios_length = std::strlen(bios_filename);
+	const size_t disc_length = std::strlen(disc_path);
+	if (bios_length == 0 || bios_length >= sizeof(s_boot_bios_name) || std::strchr(bios_filename, '/') ||
+		std::strcmp(bios_filename, ".") == 0 || std::strcmp(bios_filename, "..") == 0 ||
+		disc_length >= sizeof(s_boot_disc_path) || !WebDisc::IsDiscPath(disc_path))
+	{
+		return -1;
+	}
+
+	int state = s_state.load(std::memory_order_acquire);
+	do
+	{
+		if (state == WEB_STATE_STARTING || state == WEB_STATE_RUNNING)
+			return -1;
+	} while (!s_state.compare_exchange_weak(state, WEB_STATE_STARTING, std::memory_order_acq_rel));
+
+	std::memcpy(s_boot_bios_name, bios_filename, bios_length + 1);
+	std::memcpy(s_boot_disc_path, disc_path, disc_length + 1);
+	s_boot_disc_flags.store(flags, std::memory_order_relaxed);
+	s_boot_disc_requested.store(true, std::memory_order_release);
+	s_stop_requested.store(false, std::memory_order_release);
+	// The last Stop cancelled disc reads; this boot reads again. Here, before the request, and on the page's
+	// thread like pcsx2web_stop(): a Stop that follows this call always cancels this boot's reads.
+	WebDisc::ResumeReads();
+	s_boot_request.store(1, std::memory_order_release);
+	emscripten_futex_wake(&s_boot_request, 1);
+	return 0;
+}
+
+/// The disc request block the page's disc worker serves (docs/web-port/DISC-DESIGN.md, 4.1).
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_disc_block(void)
+{
+	return WebDisc::GetBlock();
+}
+
+/// The running game, as {seq, disc CRC, ELF CRC, serial[32], title[256]} (UTF-8, NUL-terminated).
+/// seq is odd while the CPU thread writes; copy the fields, then keep them only if seq was even and
+/// has not changed.
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_game(void)
+{
+	return &s_game_details;
+}
+
+} // extern "C"
+
 static bool InitializeConfig()
 {
 	// Resources are preloaded at /resources (see CMakeLists.txt); the data root is in MEMFS.
@@ -169,6 +336,8 @@ static bool InitializeConfig()
 		Console.ErrorFmt("Failed to create {}: {}", BIOS_DIRECTORY, error.GetDescription());
 		return false;
 	}
+	if (!EnsureDiscAndMemoryCardFolders())
+		return false;
 
 	const char* hw_error;
 	if (!VMManager::PerformEarlyHardwareChecks(&hw_error))
@@ -205,7 +374,7 @@ static bool InitializeConfig()
 	VMManager::SetDefaultSettings(si, true, true, true, true, true);
 
 	// Software renderer into GSDeviceNull, no audio, keyboard only (the default port 1
-	// keyboard bindings stay), no memory cards yet. Hotkeys are cleared: most of them
+	// keyboard bindings stay), memory card slot 1 only. Hotkeys are cleared: most of them
 	// (pause menu, save states, screenshots) need host support that is not there yet.
 	si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::SW));
 	// The legacy "OutputModule" key is no longer read; without this Cubeb fails and falls back.
@@ -213,8 +382,7 @@ static bool InitializeConfig()
 	si.SetBoolValue("InputSources", "SDL", false);
 	si.SetBoolValue("InputSources", "XInput", false);
 	si.ClearSection("Hotkeys");
-	for (u32 i = 0; i < 2; i++)
-		si.SetBoolValue("MemoryCards", fmt::format("Slot{}_Enable", i + 1).c_str(), false);
+	ConfigureMemoryCards(si);
 
 	// Show what the PS2 itself prints (it reaches the page through Module.print).
 	si.SetBoolValue("Logging", "EnableSystemConsole", true);
@@ -327,9 +495,31 @@ static std::string WaitForBootRequest()
 	return name;
 }
 
+// The same test as PCSX2's BIOS list (IsBIOS()): a ROM directory with a ROMVER entry.
+static bool IsValidBIOSFile(const std::string& bios_name)
+{
+	const std::string path = Path::Combine(BIOS_DIRECTORY, bios_name);
+	if (!FileSystem::FileExists(path.c_str()))
+	{
+		Console.ErrorFmt("pcsx2-wasm: BIOS '{}' not found.", path);
+		return false;
+	}
+
+	u32 version, region;
+	std::string description, zone;
+	if (!IsBIOS(path.c_str(), version, description, region, zone))
+	{
+		Console.ErrorFmt("pcsx2-wasm: '{}' is not a PS2 BIOS image: it has no ROM directory with a version.", bios_name);
+		return false;
+	}
+
+	return true;
+}
+
 static void RunVM(const std::string& bios_name)
 {
 	DiscardKeyEvents();
+	const BootDisc disc = TakeBootDisc();
 
 	{
 		auto lock = Host::GetSettingsLock();
@@ -343,18 +533,28 @@ static void RunVM(const std::string& bios_name)
 		return;
 	}
 
+	// PCSX2 boots whatever file it is given; only its BIOS list checks the contents. Anything else (a
+	// blank or wrong file) runs garbage that resets the PS2 over and over, so check it here first.
+	if (!IsValidBIOSFile(bios_name))
+	{
+		s_state.store(WEB_STATE_FAILED, std::memory_order_release);
+		return;
+	}
+
 	VMBootParameters params;
 	params.source_type = CDVD_SourceType::NoDisc;
 	params.fast_boot = false;
 
-	Console.WriteLnFmt("pcsx2-wasm: booting BIOS '{}'", bios_name);
+	MakeBootParameters(bios_name, disc, &params);
 	Error error;
 	const VMBootResult result = VMManager::Initialize(params, &error);
 	if (result != VMBootResult::StartupSuccess)
 	{
 		Console.ErrorFmt("pcsx2-wasm: VM failed to start (result {}): {}", static_cast<int>(result),
 			error.GetDescription());
-		s_state.store(WEB_STATE_FAILED, std::memory_order_release);
+		// A Stop while the disc was opening cancels its reads, which can fail the boot: that is a stop.
+		s_state.store(s_stop_requested.load(std::memory_order_acquire) ? WEB_STATE_STOPPED : WEB_STATE_FAILED,
+			std::memory_order_release);
 		return;
 	}
 
@@ -472,7 +672,11 @@ EMSCRIPTEN_KEEPALIVE void pcsx2web_stop(void)
 {
 	const int state = s_state.load(std::memory_order_acquire);
 	if (state == WEB_STATE_STARTING || state == WEB_STATE_RUNNING)
+	{
 		s_stop_requested.store(true, std::memory_order_release);
+		// A disc read waiting on a slow source must not hold the CPU thread (and the stop) back.
+		WebDisc::AbortReads();
+	}
 }
 
 EMSCRIPTEN_KEEPALIVE int pcsx2web_state(void)
@@ -708,6 +912,7 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
 	const std::string& disc_serial, u32 disc_crc, u32 current_crc)
 {
 	INFO_LOG("pcsx2-wasm: running '{}' (serial '{}', ELF CRC {:08X})", title, disc_serial, current_crc);
+	PublishGameDetails(title, disc_serial, disc_crc, current_crc);
 }
 
 void Host::OnPerformanceMetricsUpdated()

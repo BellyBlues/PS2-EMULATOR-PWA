@@ -54,6 +54,12 @@ set(PCSX2_WASM_EXPORTS
 	_pcsx2web_key
 	_pcsx2web_frame
 )
+# Discs, game details and memory cards (Main.cpp).
+list(APPEND PCSX2_WASM_EXPORTS
+	_pcsx2web_boot_disc
+	_pcsx2web_disc_block
+	_pcsx2web_game
+)
 list(JOIN PCSX2_WASM_EXPORTS "," PCSX2_WASM_EXPORTS)
 
 # main() runs on a worker (PROXY_TO_PTHREAD) so the page's thread never blocks; the pool
@@ -89,3 +95,6 @@ add_custom_target(pcsx2-wasm-web
 	VERBATIM
 )
 add_dependencies(pcsx2-wasm pcsx2-wasm-web)
+
+# The page mounts IndexedDB (IDBFS) on /memcards, so memory cards outlive a reload.
+target_link_options(pcsx2-wasm PRIVATE "-lidbfs.js")
