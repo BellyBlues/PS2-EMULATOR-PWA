@@ -10,11 +10,14 @@ yet.
 
 - `Main.cpp`: the frontend (Host callbacks, settings, CPU thread loop, `pcsx2web_*` exports)
 - `web/`: the page (`index.html`, `app.js`, `disc-worker.js`, `style.css`, `icons.svg`,
-  `favicon.svg`, `fonts/`, `icons/`), copied next to the build output. The design is
+  `favicon.svg`, `fonts/`, `icons/`, and `isolation.js` with `coi-serviceworker.js` for hosts
+  without isolation headers), copied next to the build output. The design is
   `docs/web-port/UI-SPEC.md` (§10 for discs).
 - `../pcsx2/CDVD/Emscripten/WebDisc.*`, `WebDiscFileReader.*`: the emulator's side of the disc
   reader; `web/disc-worker.js` is the page's side (`docs/web-port/DISC-DESIGN.md`).
 - `../tools/wasm/serve.py`: local dev server with the headers the page needs
+- `../tools/wasm/assemble-site.py`, `../tools/wasm/smoke-test.mjs`, `../.github/workflows/pages.yml`:
+  the deployed site (see [Deploying](#deploying))
 
 ## Build
 
@@ -47,7 +50,9 @@ python3 tools/wasm/serve.py --port 9000 build-wasm-dbg/bin
 ```
 
 It binds to 127.0.0.1 only, sends the isolation headers and `Cache-Control: no-store` on every
-response, and never lists directories or serves anything outside the web root. For the same
+response, and never lists directories or serves anything outside the web root. `--no-isolation`
+leaves the isolation headers out and `--max-age 600` lets the browser cache files for 10 minutes,
+which together behave like GitHub Pages (see [Deploying](#deploying)). For the same
 reason the page loads nothing from other origins: no CDN, and same-origin, self-hosted fonts
 (Archivo and Chivo Mono, OFL 1.1, in `web/fonts/`; Phosphor icons, MIT, in `web/icons.svg`).
 
@@ -172,6 +177,7 @@ other origins). Fonts and icons come from pinned packages managed with pnpm in `
 | Archivo (variable, Latin) | `@fontsource-variable/archivo` | SIL OFL 1.1 | `fonts/archivo.woff2`, `fonts/Archivo-OFL.txt` |
 | Chivo Mono (variable, Latin) | `@fontsource-variable/chivo-mono` | SIL OFL 1.1 | `fonts/chivo-mono.woff2`, `fonts/ChivoMono-OFL.txt` |
 | Phosphor icons (Regular) | `@phosphor-icons/core` | MIT | `icons.svg`, `icons/Phosphor-LICENSE.txt` |
+| coi-serviceworker (verbatim) | `coi-serviceworker` | MIT | `coi-serviceworker.js`, `coi-serviceworker-LICENSE.txt` |
 
 `icons.svg` is generated: the Phosphor icons listed in `assets/sync-assets.mjs` followed by the
 in-house symbols in `assets/icons-local.svg` (face-button glyphs and the mark). To update an
@@ -183,6 +189,114 @@ pnpm run sync
 ```
 
 Commit the regenerated files in `web/` together with `package.json` and `pnpm-lock.yaml`.
+
+## Deploying
+
+The site is static. `.github/workflows/pages.yml` builds it on GitHub Actions and publishes it on
+GitHub Pages; the same tools work by hand.
+
+### What is published
+
+```sh
+python3 tools/wasm/assemble-site.py --out _site     # after building pcsx2-wasm in build-wasm
+```
+
+`assemble-site.py` copies every file of `web/` and `pcsx2-wasm.js`/`.wasm`/`.data` from
+`build-wasm/bin/` into `_site/`, and nothing else: no headless or GS runner, no BIOS (the build's
+`data/` directory holds one), no test files. It stops with the reasons when a page file differs
+from `web/` (a stale build), when the `.data` package holds anything outside `/resources/`, when
+any file looks like console or game data (a BIOS ROM directory, an ISO 9660 volume, BIOS, disc,
+memory card or save state names and extensions), or when a file is over 100 MiB (GitHub's limit
+for a push) or the site over 1 GB (GitHub Pages' limit). Today the site is 17 files, about 14 MB.
+
+### Cross-origin isolation without headers
+
+GitHub Pages cannot send `Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy`.
+`index.html` therefore loads two scripts before anything else:
+
+- `coi-serviceworker.js` ([coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) 0.1.7,
+  MIT, copied verbatim by `assets/sync-assets.mjs`) registers itself as a service worker for the
+  site's directory. The worker passes every request through to the network and adds the headers to
+  the response. On the first visit the page reloads once so that the worker serves it; after that
+  the worker is already in charge and nothing reloads. It caches nothing: the HTTP cache decides
+  what is fresh, as without it.
+- `isolation.js` configures it and tells `app.js` what is happening. `app.js` waits for the reload
+  instead of reporting the page as unsupported, and loads nothing meanwhile. When the worker cannot
+  help (no service workers in a private window, site data blocked, the reload did not isolate the
+  page, or nothing happened within 15 s), the page shows "This site needs a service worker to run
+  the emulator, and this browser blocked it. Private windows often do." and the Log gives the
+  reason. A second reload within a minute is allowed (a reload can race the worker's activation);
+  past that it stops, so it can never loop.
+
+When the server sends the headers (`serve.py`), the page is isolated from the start and neither
+script does anything: no worker is registered. A worker registered earlier for the same origin
+(scheme, host and port), for example by a `serve.py --no-isolation` run, stays until the site data
+is cleared; keep separate ports for the two.
+
+The worker uses COEP `require-corp`, the policy `serve.py` sends, rather than `credentialless`:
+the page loads nothing from other origins, so `require-corp` costs nothing, Safari only supports
+`require-corp`, and coi-serviceworker keeps the `credentialless` choice in a variable that is lost
+whenever the browser restarts the worker. A later service worker (offline use, caching) must be
+merged with this one: a scope has one worker.
+
+### Updates and caching
+
+GitHub Pages sends `Cache-Control: max-age=600` on every file (and serves byte ranges), so a
+browser may reuse any file for up to 10 minutes without asking. To keep the page, the emulator and
+its workers from one deploy together, `assemble-site.py` stamps a build id (a hash of every file)
+into `index.html`: `app.js`, `style.css`, `isolation.js` and `icons.svg` are loaded as
+`?v=<build id>`, and `app.js` adds the same `?v=` to `pcsx2-wasm.js` (and so to the pthread
+workers, which load the script's own URL), `pcsx2-wasm.wasm`, `pcsx2-wasm.data` and
+`disc-worker.js`. GitHub Pages ignores the query; the browser's cache does not. After a deploy:
+
+- a visit within 10 minutes of the previous one may still show the previous deploy, whole: its
+  `index.html` asks for its own `?v=` files;
+- a reload, or any visit once the 10 minutes are over, gets the new `index.html` and with it only
+  new files (the new `?v=` has never been cached);
+- the only mix left is a cached old `index.html` whose own files have been evicted from the cache
+  meanwhile: they then come from the new deploy. Bumping the build id cannot prevent that; only
+  file names with the hash in them could.
+
+`coi-serviceworker.js` keeps its plain URL: a worker is identified by its script's URL, so a new
+URL on every deploy would reinstall it and reload every visitor's page. The browser checks the
+script for changes itself on navigations, bypassing the HTTP cache.
+
+Everything the page keeps in the browser (the remembered BIOS, the memory card, the last disc's
+file handle, preferences) belongs to the site's origin. Moving the site to another address starts
+from nothing there, so choose the final address before people use it. On a project site
+(`<user>.github.io/TabStationToo/`) the origin is shared with the user's other project sites.
+
+### The workflow
+
+`.github/workflows/pages.yml` runs on pushes to `wasm` that change more than Markdown files or
+`docs/`, and by hand (`gh workflow run pages.yml --ref wasm`). It runs only in
+`TabStationToo/TabStationToo` and only for `wasm`: never on forks or on `master`. Its build job
+(read-only token) installs Emscripten 6.0.12 from the official emsdk repository at a pinned commit,
+builds the third-party libraries with `tools/wasm/build-dependencies-wasm.sh` (each cached; the
+libraries by the script's hash), builds `pcsx2-wasm` through ccache (`EM_COMPILER_WRAPPER`, cached
+per commit), fails on `signature mismatch`, assembles the site and runs `tools/wasm/smoke-test.mjs`
+twice in headless Chrome: without the isolation headers (the service worker's path, as on GitHub
+Pages) and with them. Each run must reach the BIOS intake with the runtime ready,
+cross-origin isolated, with no console error, failed request or request to another origin. A newer
+push cancels a build in progress; deploys queue and never overlap. Every action is pinned to a
+commit SHA.
+
+A third job deploys the site to this repository's GitHub Pages,
+https://tabstationtoo.github.io/TabStationToo/ (Settings > Pages > Source: GitHub Actions; the
+`github-pages` environment must allow `wasm`). It needs no secrets: `actions/deploy-pages` uses the
+workflow's own token with `pages: write`. The smoke test runs locally too:
+
+```sh
+python3 tools/wasm/assemble-site.py --out _site --force
+node tools/wasm/smoke-test.mjs --site _site            # like GitHub Pages
+node tools/wasm/smoke-test.mjs --site _site --headers  # like serve.py
+```
+
+To try a deploy by hand, serve `_site` like GitHub Pages and open it in a browser:
+
+```sh
+python3 tools/wasm/serve.py --no-isolation --max-age 600 --port 8090 _site
+```
 
 ## How the page talks to the emulator
 
@@ -232,4 +346,5 @@ on reading it; after three restarts it fails what is waiting instead.
 - Only the main BIOS file is loaded (no separate ROM1/ROM2/NVM/MEC files).
 - Needs a recent desktop browser with cross-origin isolation (Chrome, Edge or Firefox; Safari is
   untested). The module reserves 512 MB of memory at start, which many phones refuse.
-- The dev server is for local use only; hosting elsewhere needs the same COOP/COEP headers.
+- The dev server is for local use only. Elsewhere the page isolates itself with a service worker
+  (see [Deploying](#deploying)), which some private windows refuse.

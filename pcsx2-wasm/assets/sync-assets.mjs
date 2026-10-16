@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-// Copies the self-hosted fonts and licences from the pinned packages (see package.json and
-// pnpm-lock.yaml) into ../web, and builds ../web/icons.svg: the Phosphor icons listed below
-// as <symbol>s (paths copied verbatim) followed by the in-house symbols in icons-local.svg.
+// Copies the self-hosted fonts, the cross-origin isolation service worker and their licences from
+// the pinned packages (see package.json and pnpm-lock.yaml) into ../web, and builds ../web/icons.svg:
+// the Phosphor icons listed below as <symbol>s (paths copied verbatim) followed by the in-house
+// symbols in icons-local.svg.
 // Run after `pnpm install`:  pnpm run sync
 // Only Node built-ins, so the page itself keeps no build step.
 
@@ -22,6 +23,9 @@ const FILES = [
 	['@fontsource-variable/chivo-mono/files/chivo-mono-latin-wght-normal.woff2', 'fonts/chivo-mono.woff2'],
 	['@fontsource-variable/chivo-mono/LICENSE', 'fonts/ChivoMono-OFL.txt'],
 	['@phosphor-icons/core/LICENSE', 'icons/Phosphor-LICENSE.txt'],
+	// Verbatim, next to index.html: a service worker only controls pages at or below its own URL.
+	['coi-serviceworker/coi-serviceworker.js', 'coi-serviceworker.js'],
+	['coi-serviceworker/LICENSE', 'coi-serviceworker-LICENSE.txt'],
 ];
 
 // Phosphor Regular icons used by the page; each becomes <symbol id="i-NAME">.

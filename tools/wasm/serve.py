@@ -15,6 +15,16 @@ threads) requires:
 Every response, errors included, carries them, plus Cache-Control: no-store so a rebuilt .wasm is
 always picked up.
 
+With --no-isolation the three isolation headers are left out, as on GitHub Pages, which cannot send
+them: the page's service worker (coi-serviceworker.js) then adds them and reloads the page once.
+With --max-age SECONDS files may be cached for that long instead of never (GitHub Pages sends
+max-age=600). Together they simulate a GitHub Pages deploy:
+
+    python3 tools/wasm/serve.py --no-isolation --max-age 600 --port 8161 _site
+
+The service worker stays registered for that origin (scheme, host and port) until the browser's
+site data for it is cleared, so keep such a port for --no-isolation runs.
+
 With --bios-dir DIR the files directly inside DIR are also served, read-only, under /dev-bios/, so
 automated runs can open index.html?bios=dev-bios/<file> and boot without picking a file. With
 --disc FILE that one disc image is served, read-only, as /dev-disc/<its file name> (nothing else in
@@ -29,7 +39,8 @@ sectors on demand. Multiple ranges, other units and malformed headers are ignore
 it): the whole file is sent with 200.
 
 Usage:
-    python3 tools/wasm/serve.py [--port 8080] [--bios-dir DIR] [--disc FILE] [--quiet] [DIRECTORY]
+    python3 tools/wasm/serve.py [--port 8080] [--bios-dir DIR] [--disc FILE] [--no-isolation]
+                                [--max-age SECONDS] [--quiet] [DIRECTORY]
 """
 
 from __future__ import annotations
@@ -51,11 +62,12 @@ BIND_ADDRESS = "127.0.0.1"
 DEV_BIOS_PREFIX = "/dev-bios/"
 DEV_DISC_PREFIX = "/dev-disc/"
 
-EXTRA_HEADERS = (
+ISOLATION_HEADERS = (
     ("Cross-Origin-Opener-Policy", "same-origin"),
     ("Cross-Origin-Embedder-Policy", "require-corp"),
     ("Cross-Origin-Resource-Policy", "same-origin"),
-    ("Cache-Control", "no-store"),
+)
+EXTRA_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
 )
 
@@ -131,12 +143,15 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
     # wait for the browser's delayed ACK (about 40 ms per 2 KiB disc read on Linux).
     disable_nagle_algorithm = True
 
-    def __init__(self, *args, root: Path, bios_dir: Path | None, disc: Path | None, quiet: bool, **kwargs):
+    def __init__(self, *args, root: Path, bios_dir: Path | None, disc: Path | None, quiet: bool,
+                 isolation: bool = True, cache_control: str = "no-store", **kwargs):
         # Set before super().__init__(), which handles the request immediately.
         self.root = root
         self.bios_dir = bios_dir
         self.disc = disc
         self.quiet = quiet
+        self.isolation = isolation
+        self.cache_control = cache_control
         self.send_range = (0, 0)  # (offset, length) of the body send_head() prepared
         super().__init__(*args, directory=str(root), **kwargs)
 
@@ -145,6 +160,10 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
 
     # Every response goes through end_headers(), including send_error() pages and redirects.
     def end_headers(self) -> None:
+        if self.isolation:
+            for name, value in ISOLATION_HEADERS:
+                self.send_header(name, value)
+        self.send_header("Cache-Control", self.cache_control)
         for name, value in EXTRA_HEADERS:
             self.send_header(name, value)
         super().end_headers()
@@ -224,7 +243,7 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
     def send_head(self):
         host = (self.headers.get("Host") or "").strip().lower()
         if host not in self.server.allowed_hosts:
-            self.send_error(421, "Misdirected Request")  # still carries the isolation headers
+            self.send_error(421, "Misdirected Request")  # still carries the usual headers
             return None
 
         path, kind, redirect = self.resolve_request()
@@ -312,8 +331,15 @@ def main() -> int:
     parser.add_argument("--disc", metavar="FILE",
                         help="also serve this one disc image, read-only, as /dev-disc/<its file name> "
                              "(for automated disc reads; nothing else in its directory is served)")
+    parser.add_argument("--no-isolation", action="store_true",
+                        help="leave out the COOP/COEP/CORP headers, as on GitHub Pages (the page's service "
+                             "worker then adds them; it stays registered for this port)")
+    parser.add_argument("--max-age", type=int, metavar="SECONDS",
+                        help="let browsers cache files for SECONDS (GitHub Pages: 600) instead of no-store")
     parser.add_argument("--quiet", action="store_true", help="do not log each request")
     args = parser.parse_args()
+    if args.max_age is not None and args.max_age < 0:
+        parser.error("--max-age must be 0 or more")
 
     root = Path(args.directory).expanduser().resolve()
     if not root.is_dir():
@@ -343,7 +369,9 @@ def main() -> int:
             print(f"error: --disc {disc}: hidden files are not served", file=sys.stderr)
             return 1
 
-    handler = functools.partial(IsolatedHandler, root=root, bios_dir=bios_dir, disc=disc, quiet=args.quiet)
+    cache_control = "no-store" if args.max_age is None else f"max-age={args.max_age}"
+    handler = functools.partial(IsolatedHandler, root=root, bios_dir=bios_dir, disc=disc, quiet=args.quiet,
+                                isolation=not args.no_isolation, cache_control=cache_control)
     try:
         server = http.server.ThreadingHTTPServer((BIND_ADDRESS, args.port), handler)
     except OSError as e:
@@ -359,6 +387,11 @@ def main() -> int:
     base = f"http://{BIND_ADDRESS}:{port}/"
     print(f"Serving {root}")
     print(f"  {base}")
+    if args.no_isolation:
+        print("Without cross-origin isolation headers (like GitHub Pages): the page's service worker adds them "
+              "and reloads once. It stays registered for this port.")
+    if args.max_age is not None:
+        print(f"Cache-Control: {cache_control}")
     # ?bios= and ?disc= values are encoded twice: the page reads them with URLSearchParams (one decode)
     # and then resolves them as URL paths (second decode), so '#', '?', '&', '+' and '%' survive.
     def query_path(prefix: str, name: str) -> str:

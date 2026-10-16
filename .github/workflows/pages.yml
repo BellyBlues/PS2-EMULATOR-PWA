@@ -1,0 +1,160 @@
+# Builds TabStationToo (pcsx2-wasm) and deploys it as a static site to this repository's GitHub
+# Pages, https://tabstationtoo.github.io/TabStationToo/ (Settings > Pages > Source: GitHub Actions).
+#
+# Runs on pushes to wasm and by hand (workflow_dispatch), only in TabStationToo/TabStationToo and
+# only for wasm: never on forks, and never on master, which mirrors PCSX2.
+# pcsx2-wasm/README.md ("Deploying") explains it.
+
+name: Pages
+
+on:
+  push:
+    branches: [wasm]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  EMSCRIPTEN_VERSION: "6.0.12"
+  # emscripten-core/emsdk at tag 6.0.12
+  EMSDK_COMMIT: 35ff8a6d150541276abbc6bae512ca90bcfbe220
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and test
+    if: github.repository == 'TabStationToo/TabStationToo' && github.ref == 'refs/heads/wasm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    # A newer push replaces a build that is still running; deploys queue separately below.
+    concurrency:
+      group: pages-build
+      cancel-in-progress: true
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 1G
+      # emcc runs clang through this wrapper.
+      EM_COMPILER_WRAPPER: ccache
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # CMake comes with the runner image; Ninja and ccache from Ubuntu.
+      - name: Install Ninja and ccache
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build ccache
+          cmake --version | head -1
+          ninja --version
+          ccache --version | head -1
+
+      - name: Restore Emscripten
+        id: emsdk-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSCRIPTEN_VERSION }}-${{ env.EMSDK_COMMIT }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Emscripten ${{ env.EMSCRIPTEN_VERSION }}
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q ~/emsdk
+          git -C ~/emsdk fetch -q --depth 1 https://github.com/emscripten-core/emsdk.git "$EMSDK_COMMIT"
+          git -C ~/emsdk checkout -q --detach FETCH_HEAD
+          test "$(git -C ~/emsdk rev-parse HEAD)" = "$EMSDK_COMMIT"
+          ~/emsdk/emsdk install "$EMSCRIPTEN_VERSION"
+          ~/emsdk/emsdk activate "$EMSCRIPTEN_VERSION"
+
+      - name: Restore the third-party libraries
+        id: deps-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: deps-wasm
+          key: deps-wasm-${{ env.EMSCRIPTEN_VERSION }}-${{ runner.os }}-${{ hashFiles('tools/wasm/build-dependencies-wasm.sh') }}
+
+      - name: Build the third-party libraries
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        env:
+          EM_COMPILER_WRAPPER: ""
+        run: |
+          source ~/emsdk/emsdk_env.sh > /dev/null
+          tools/wasm/build-dependencies-wasm.sh deps-wasm
+          rm -rf deps-build-wasm
+
+      # One entry per commit, restored from the newest one: ccache only reuses what is unchanged.
+      - name: Restore ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ccache
+          key: ccache-${{ env.EMSCRIPTEN_VERSION }}-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-${{ env.EMSCRIPTEN_VERSION }}-${{ runner.os }}-
+
+      - name: Build pcsx2-wasm
+        run: |
+          source ~/emsdk/emsdk_env.sh > /dev/null
+          ccache --zero-stats > /dev/null
+          emcmake cmake -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_QT_UI=OFF -DENABLE_TESTS=OFF \
+            -DCMAKE_PREFIX_PATH="$PWD/deps-wasm" -DCMAKE_FIND_ROOT_PATH="$PWD/deps-wasm" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          ninja -C build-wasm pcsx2-wasm 2>&1 | tee build.log
+          ccache --show-stats
+          # wasm-ld turns calls with mismatched signatures into traps (AGENTS.md).
+          if grep -n "signature mismatch" build.log; then
+            echo "::error::The link reported signature mismatches"
+            exit 1
+          fi
+
+      - name: Assemble the site
+        run: |
+          python3 tools/wasm/assemble-site.py --out _site | tee site.txt
+          { echo '### Site'; echo '```'; cat site.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      # The page must reach its BIOS intake in Chrome without a BIOS, cross-origin isolated, with
+      # no errors: served like GitHub Pages (the service worker isolates it), then with the headers.
+      - name: Smoke test in headless Chrome
+        run: |
+          source ~/emsdk/emsdk_env.sh > /dev/null
+          chrome="$(command -v google-chrome)"
+          "$chrome" --version
+          # A throwaway profile on a throwaway runner, loading only this build: no sandbox needed.
+          "$EMSDK_NODE" tools/wasm/smoke-test.mjs --site _site --chrome "$chrome" -- --no-sandbox
+          "$EMSDK_NODE" tools/wasm/smoke-test.mjs --site _site --chrome "$chrome" --headers -- --no-sandbox
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.repository == 'TabStationToo/TabStationToo' && github.ref == 'refs/heads/wasm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    # Deploys never overlap or get cancelled halfway; a newer one waits for the current one.
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+

@@ -7,6 +7,8 @@ TabStationToo runs PlayStation 2 emulation in a browser tab. It is the
 around it. You bring the BIOS from your own console and disc images of your own games; nothing is
 uploaded anywhere.
 
+**Try it:** https://tabstationtoo.github.io/TabStationToo/ (desktop Chrome or Edge).
+
 TabStationToo is built on PCSX2 and would not exist without the PCSX2 team and its contributors,
 who have developed it for more than twenty years. It is an independent project: it is not
 affiliated with, endorsed by or supported by the PCSX2 project or Sony Interactive Entertainment.
@@ -86,7 +88,8 @@ the screen to give it the keyboard, and press Esc to take the keyboard back. The
 the controls.
 
 More detail, including the frontend's API and testing options, is in
-[pcsx2-wasm/README.md](pcsx2-wasm/README.md).
+[pcsx2-wasm/README.md](pcsx2-wasm/README.md). Its "Deploying" section covers hosting the page
+elsewhere, including on GitHub Pages, which cannot send those headers.
 
 ## BIOS and games
 
@@ -103,7 +106,7 @@ anywhere else in this repository.
 | `pcsx2-wasm/` | The browser frontend: `Main.cpp` (the emulator's entry point and the API the page uses) and `web/` (the page) |
 | `pcsx2-headless/` | A windowless runner for Node.js, used to test and benchmark without a browser |
 | `common/Emscripten/`, `pcsx2/wasm/`, `pcsx2/CDVD/Emscripten/` | WebAssembly platform code for PCSX2's core (`CDVD/Emscripten/` reads discs through the page's disc worker) |
-| `tools/wasm/` | Dependency build script and the dev server |
+| `tools/wasm/` | Dependency build script, the dev server, and the scripts that assemble and smoke-test the deployed site |
 | `docs/web-port/` | Porting plan and interface design |
 | `docs/upstream/` | PCSX2's own guidance kept for reference (its agent guidelines) |
 | everything else | PCSX2, with changes for WebAssembly where needed |
@@ -118,6 +121,7 @@ TabStationToo is free software under the GNU General Public License v3.0, like P
 - [Archivo](https://github.com/Omnibus-Type/Archivo) and
   [Chivo Mono](https://github.com/Omnibus-Type/Chivo) by Omnibus-Type, SIL Open Font License 1.1.
 - [Phosphor Icons](https://phosphoricons.com), MIT License.
+- [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) by Guido Zuidhof, MIT License.
 - The third-party libraries PCSX2 uses are listed with their licences in
   [bin/docs/ThirdPartyLicenses.html](bin/docs/ThirdPartyLicenses.html).
 

@@ -17,6 +17,19 @@
 	const WASM_FILE = 'pcsx2-wasm.wasm';
 	const DATA_FILE = 'pcsx2-wasm.data';
 
+	// The deploy this page belongs to. tools/wasm/assemble-site.py loads app.js as app.js?v=<build id>
+	// (a dev build has none), and every file loaded from here carries the same id. A browser may keep
+	// files for a while (GitHub Pages allows 10 minutes): with the id, a page from an older deploy
+	// keeps asking for that deploy's URLs instead of mixing its files with a newer emulator's.
+	const BUILD_ID = (() => {
+		try {
+			return new URL(document.currentScript.src).searchParams.get('v') || '';
+		} catch {
+			return '';
+		}
+	})();
+	const versioned = (file) => (BUILD_ID ? `${file}?v=${encodeURIComponent(BUILD_ID)}` : file);
+
 	const STATE = { WAITING: 0, STARTING: 1, RUNNING: 2, STOPPED: 3, FAILED: 4 };
 	const STATE_NAMES = ['waiting', 'starting', 'running', 'stopped', 'failed'];
 
@@ -45,12 +58,10 @@
 	const PREF_KEEP_CHROME = 'pcsx2web.keepChrome';
 	const PREF_HINTED = 'pcsx2web.firstBootHint';
 
-	// The repository is private for now: before this page is served to anyone else (GPL), make it
-	// public or point this at a public copy of the source.
-	const SOURCE_URL = 'https://github.com/Aegyptiacus11/pcsx2-web/tree/wasm';
+	const SOURCE_URL = 'https://github.com/TabStationToo/TabStationToo';
 	const DUMP_URL = 'https://pcsx2.net/docs/setup/bios/';
 	const SVG_NS = 'http://www.w3.org/2000/svg';
-	const icon = (name) => 'icons.svg#i-' + name;
+	const icon = (name) => versioned('icons.svg') + '#i-' + name;
 
 	const CHROME_IDLE_MS = 2500;
 	const CHROME_MOVE_PX = 4;
@@ -159,6 +170,7 @@
 		buildBroken: 'This build of the emulator is incomplete.',
 		unsupported: 'This page can’t run the emulator.',
 		causeHeaders: 'The server has to send cross-origin isolation headers, and this one doesn’t.',
+		causeWorker: 'This site needs a service worker to run the emulator, and this browser blocked it. Private windows often do.',
 		causeFile: 'You opened the file from disk. Start the dev server instead.',
 		causeInsecure: 'This address isn’t a secure context. Use http://127.0.0.1 or HTTPS.',
 		causeWasm: 'This browser can’t run WebAssembly.',
@@ -564,10 +576,27 @@
 		else if (!secure)
 			cause = COPY.causeInsecure;
 		else if (!isolated)
-			cause = COPY.causeHeaders;
+			cause = isolationWorkerFailed() ? COPY.causeWorker : COPY.causeHeaders;
 		else if (!threads)
 			cause = `${COPY.causeThreads} ${COPY.tryBrowser}`;
-		return cause ? { cause, checks } : null;
+		// isolation: the only thing missing is cross-origin isolation, which the service worker may
+		// still bring (see isolationPending()).
+		return cause ? { cause, checks, isolation: !isolated && cause === COPY.causeHeaders } : null;
+	}
+
+	// isolation.js and coi-serviceworker.js, loaded before this file, make the page cross-origin
+	// isolated on hosts that cannot send the headers (GitHub Pages): a service worker adds them, and
+	// the page reloads once.
+	function isolationState() {
+		return window.TabStationTooIsolation || { status: 'none', reason: '' };
+	}
+
+	function isolationWorkerFailed() {
+		return isolationState().status === 'unavailable';
+	}
+
+	function isolationPending() {
+		return isolationState().status === 'pending';
 	}
 
 	// ------------------------------------------------------------------ Emscripten Module
@@ -595,7 +624,7 @@
 	// Fetches the .wasm ourselves to report download progress, while keeping streaming
 	// compilation. Pthread workers do not use this: they get the compiled module by postMessage.
 	function instantiateWasm(imports, receiveInstance) {
-		const url = new URL(WASM_FILE, document.baseURI).href;
+		const url = new URL(versioned(WASM_FILE), document.baseURI).href;
 		const report = () => renderProgress();
 		(async () => {
 			for (const ns of Object.values(imports))
@@ -779,6 +808,9 @@
 			setStatus: onSetStatus,
 			monitorRunDependencies: onRunDependencies,
 			instantiateWasm,
+			// pcsx2-wasm.data, with this deploy's id. (The .wasm comes from instantiateWasm, and the
+			// pthread workers load pcsx2-wasm.js from the script's own URL, id included.)
+			locateFile: (path, dir) => dir + versioned(path),
 			onRuntimeInitialized,
 			onAbort: (what) => fatal('crash', 'The emulator aborted', what),
 			onExit,
@@ -787,12 +819,12 @@
 		};
 
 		const script = document.createElement('script');
-		script.src = JS_FILE;
+		script.src = versioned(JS_FILE);
 		script.async = true;
 		script.addEventListener('error', async () => {
 			let reason = 'not found';
 			try {
-				const r = await fetch(JS_FILE, { method: 'HEAD', cache: 'no-store' });
+				const r = await fetch(versioned(JS_FILE), { method: 'HEAD', cache: 'no-store' });
 				reason = r.ok ? 'failed to load' : `HTTP ${r.status}`;
 			} catch {
 				reason = 'network error';
@@ -806,7 +838,8 @@
 
 	// Loads the runtime once. Touch-only devices wait for a BIOS first (the download is large).
 	function ensureRuntime() {
-		if (page.runtimeRequested || page.phase !== 'loading')
+		// Not before the page is isolated (see isolationPending()): the runtime needs shared memory.
+		if (page.runtimeRequested || page.phase !== 'loading' || !window.crossOriginIsolated)
 			return;
 		page.runtimeRequested = true;
 		loadRuntime();
@@ -2042,7 +2075,7 @@
 		disc.gamePtr = typeof M._pcsx2web_game === 'function' ? M._pcsx2web_game() >>> 0 : 0;
 		let worker;
 		try {
-			worker = new Worker(DISC_WORKER_FILE);
+			worker = new Worker(versioned(DISC_WORKER_FILE));
 		} catch (err) {
 			discReaderGone(`Could not start the disc reader: ${errorText(err)}`);
 			return;
@@ -4289,6 +4322,16 @@
 
 	// ------------------------------------------------------------------ start
 
+	function showUnsupported(problem) {
+		page.phase = 'unsupported';
+		page.env = problem;
+		const iso = isolationState();
+		if (iso.status === 'unavailable')
+			pageLog(`The cross-origin isolation service worker could not help: ${iso.reason}.`, 'warn');
+		pageLog(`This page can't run the emulator: ${problem.cause}`, 'warn');
+		render();
+	}
+
 	function main() {
 		wireUi();
 		wireDiscUi();
@@ -4302,14 +4345,22 @@
 		applyLayoutLabels();
 		renderLogCount();
 
+		if (BUILD_ID)
+			pageLog(`Build ${BUILD_ID}.`);
 		const problem = environmentProblem();
-		if (problem) {
-			page.phase = 'unsupported';
-			page.env = problem;
-			pageLog(`This page can't run the emulator: ${problem.cause}`, 'warn');
+		if (problem && problem.isolation && isolationPending()) {
+			// The service worker is being installed and the page reloads by itself, usually within a
+			// second. Until then the intake shows as on any first visit, and nothing downloads.
+			window.addEventListener('tabstationtoo-isolation', () => showUnsupported(environmentProblem()), { once: true });
 			render();
+			return;
+		}
+		if (problem) {
+			showUnsupported(problem);
 			return; // do not load the wasm
 		}
+		if (navigator.serviceWorker && navigator.serviceWorker.controller)
+			pageLog('A service worker (coi-serviceworker.js) serves this page and adds the cross-origin isolation headers.');
 
 		const biosParam = params.get('bios');
 		const discParam = params.get('disc');

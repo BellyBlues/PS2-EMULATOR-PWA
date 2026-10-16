@@ -17,6 +17,9 @@ importers:
       '@phosphor-icons/core':
         specifier: 2.1.1
         version: 2.1.1
+      coi-serviceworker:
+        specifier: 0.1.7
+        version: 0.1.7
 
 packages:
 
@@ -29,6 +32,9 @@ packages:
   '@phosphor-icons/core@2.1.1':
     resolution: {integrity: sha512-v4ARvrip4qBCImOE5rmPUylOEK4iiED9ZyKjcvzuezqMaiRASCHKcRIuvvxL/twvLpkfnEODCOJp5dM4eZilxQ==}
 
+  coi-serviceworker@0.1.7:
+    resolution: {integrity: sha512-bjSUqEngCPOkErY2vbyWsaIGCNRODYzlNycaREVw5s12/C8SM+RnRUUeX6pZbTtov6C52ZLY/+tvHK+BDxuUuA==}
+
 snapshots:
 
   '@fontsource-variable/archivo@5.3.0': {}
@@ -36,3 +42,5 @@ snapshots:
   '@fontsource-variable/chivo-mono@5.3.0': {}
 
   '@phosphor-icons/core@2.1.1': {}
+
+  coi-serviceworker@0.1.7: {}

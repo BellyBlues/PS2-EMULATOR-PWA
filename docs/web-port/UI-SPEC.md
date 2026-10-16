@@ -272,6 +272,7 @@ With reduced motion, every duration is 0. The controls still hide.
   - Build failure: "This build of the emulator is incomplete."
 - **Unsupported:** "This page can't run the emulator.", then one of:
   - "The server has to send cross-origin isolation headers, and this one doesn't."
+  - "This site needs a service worker to run the emulator, and this browser blocked it. Private windows often do." (on a host without the headers, such as GitHub Pages, when the isolation service worker cannot start; while it installs and reloads the page once, the intake shows as usual and nothing downloads)
   - "You opened the file from disk. Start the dev server instead."
   - "This address isn't a secure context. Use http://127.0.0.1 or HTTPS."
   - "This browser can't run WebAssembly." or "This browser doesn't support shared-memory threads.", followed by "Try a recent Chrome or Edge on a computer."
@@ -392,7 +393,7 @@ Pointer activity, focus entering the controls (they show at once), a page shortc
   - keyboard-layout labels
   - fullscreen on `#theatre`
   - a deferred `loadRuntime()` on touch-only devices
-- **Source link:** every Source link points to `SOURCE_URL = "https://github.com/Aegyptiacus11/pcsx2-web/tree/wasm"`. That repo is private, so before the page is served to anyone else (GPL), either make it public or point the link at a public copy.
+- **Source link:** every Source link points to `SOURCE_URL = "https://github.com/TabStationToo/TabStationToo"`, the public repository (its default branch is `wasm`).
 
 **Delete:**
 - the top bar: `.topbar`, `.brand` and its logo, the `.tag` chip, the `.status` pill and its dot

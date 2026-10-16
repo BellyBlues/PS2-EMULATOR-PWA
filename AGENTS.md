@@ -143,8 +143,18 @@ bring any new engineering guidance over here.
 - Never open pull requests, issues, discussions or comments on PCSX2's repository. In this fork,
   GitHub targets new pull requests at PCSX2 by default: do not open pull requests unless the
   owner asks, and then target this repository.
-- GitHub Actions are disabled on this repository. Do not re-enable them or add workflows that run
-  on push.
+- GitHub Actions run only `.github/workflows/pages.yml`, which builds `wasm`, smoke-tests the page
+  and deploys it to GitHub Pages (`pcsx2-wasm/README.md`, "Deploying"). PCSX2's workflows,
+  `dependabot.yml` and `labeler.yml` are deleted on `wasm`, and PCSX2's workflows are also disabled
+  in the repository settings, because `master` still carries them. Never run CI on `master`: it
+  only mirrors PCSX2. Do not re-enable PCSX2's workflows or add another workflow unless the owner
+  asks.
+- After merging a newer upstream `master` into `wasm`, delete again any workflow, `dependabot.yml`
+  or `labeler.yml` the merge brings back. Before pushing `master`, list the workflows upstream added
+  (`git diff --name-only <old master> <new master> -- .github/workflows`): GitHub can only disable a
+  workflow it has seen, so a new one with a push trigger runs once on that push. Disable each one
+  right after (`gh workflow disable <file name> --repo TabStationToo/TabStationToo`), or ask the
+  owner whether to push `master` at all.
 - Commit or push only when the owner asks.
 - If code is ever proposed to PCSX2 itself, follow PCSX2's own guidelines
   (`docs/upstream/PCSX2-AGENTS.md`, current version
