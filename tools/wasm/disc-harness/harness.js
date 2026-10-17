@@ -16,6 +16,8 @@
 
 	const params = new URLSearchParams(location.search);
 	const DISC_WORKER_URL = new URL('../../../pcsx2-wasm/web/disc-worker.js', location.href).href;
+	// The same worker with test hooks (disc-worker-probe.js): kill its loop, hold its fetches.
+	const PROBE_WORKER_URL = new URL('disc-worker-probe.js', location.href).href;
 
 	const KB = 1024;
 	const MB = 1024 * KB;
@@ -69,8 +71,8 @@
 	// ------------------------------------------------------------------ workers
 
 	class DiscWorker {
-		constructor() {
-			this.worker = new Worker(DISC_WORKER_URL);
+		constructor(url = DISC_WORKER_URL) {
+			this.worker = new Worker(url);
 			this.seq = 0;
 			this.waiting = new Map();
 			this.statuses = [];
@@ -82,6 +84,9 @@
 					this.statuses.push({ t: performance.now(), state: m.status.state, error: m.status.error });
 				} else if (m.type === 'reply') {
 					this.status = m.status;
+					this.waiting.get(m.id)?.(m);
+					this.waiting.delete(m.id);
+				} else if (m.type === 'test-reply') {
 					this.waiting.get(m.id)?.(m);
 					this.waiting.delete(m.id);
 				}
@@ -474,9 +479,14 @@
 			const after = await read({ length: 2048, offset: 16 * 2048, bytes: 6 });
 			record('read-after-cancel', { ...ctx, source: 'url' }, after.result === 2048, { result: after.result });
 
-			// Stop while a read is in flight: the requester wakes with CANCELLED, later reads fail fast.
+			// Stop while a read is in flight: the requester wakes with CANCELLED, later reads fail fast. Its fetch is
+			// held in the probe worker, so a warm page cache cannot finish it before the stop.
+			h.disc.terminate();
+			await attachWorker(lockName(), null, PROBE_WORKER_URL);
+			await open('url');
+			await h.disc.call({ type: 'test-hold-fetch', range: `bytes=${300 * MB}-${316 * MB - 1}` });
 			const pending = read({ length: 16 * MB, offset: 300 * MB }, 1);
-			await sleep(3);
+			await sleep(30);
 			const t1 = performance.now();
 			const stopped = await h.disc.call({ type: 'stop' });
 			const inflight = await pending;
@@ -520,6 +530,18 @@
 		return true;
 	}
 
+	// A URL read whose requester runs out of time: S_CANCEL = 2 after 20 ms, as the C++ reader's deadline
+	// does. Its fetch is held in the probe worker (h.disc must be one), so it cannot finish first however fast
+	// the server is: a 16 MiB read from a warm page cache can take less than 20 ms.
+	async function deadlineRead() {
+		const offset = 200 * MB;
+		const length = 16 * MB;
+		await h.disc.call({ type: 'test-hold-fetch', range: `bytes=${offset}-${offset + length - 1}` });
+		const result = await read({ length, offset, cancelAfterMs: 20, cancelValue: 2 });
+		await h.disc.call({ type: 'test-release-fetch' });
+		return result;
+	}
+
 	// A request whose requester ran out of time (S_CANCEL = 2, as the C++ reader's deadline does) is
 	// answered TIMEOUT and makes the source unavailable: the next reads fail at once instead of waiting,
 	// until a probe finds the source answering again (here it always answers, so after about 1 s).
@@ -527,8 +549,10 @@
 		if (!h.discUrl)
 			return;
 		const ctx = { source: 'url', read: 'async', impl: h.impl, loop: h.loop };
+		h.disc.terminate();
+		await attachWorker(lockName(), null, PROBE_WORKER_URL);
 		await open('url');
-		const timedOut = await read({ length: 16 * MB, offset: 200 * MB, cancelAfterMs: 20, cancelValue: 2 });
+		const timedOut = await deadlineRead();
 		await sleep(20);
 		const st = h.disc.status;
 		record('deadline-cancel-times-out', ctx, timedOut.result === E.TIMEOUT && st.state === 'error' && st.error?.code === 'TIMEOUT',
@@ -576,8 +600,8 @@
 		return Promise.race([granted, sleep(10000).then(() => { throw new Error(`the lock ${name} was not released`); })]);
 	}
 
-	async function attachWorker(lock, resume) {
-		h.disc = new DiscWorker();
+	async function attachWorker(lock, resume, url) {
+		h.disc = new DiscWorker(url);
 		const msg = { type: 'attach', memory: h.memory, block: BLOCK, loop: h.loop === 'blocking' ? 'blocking' : 'auto', lock };
 		if (resume)
 			msg.resume = resume;
@@ -604,7 +628,8 @@
 		record('life-lock-released-on-terminate', ctx, goneMs < 2000, { ms: +goneMs.toFixed(1) });
 		const handed = handBack();
 		lock = lockName();
-		const resumed = await attachWorker(lock, { file: syntheticBlob(), name: 'synthetic', generation: gen, size });
+		// A probe worker: the URL read below holds its fetch in it.
+		const resumed = await attachWorker(lock, { file: syntheticBlob(), name: 'synthetic', generation: gen, size }, PROBE_WORKER_URL);
 		const got = await waiting;
 		const again = await read({ length: 2048, offset: 0, generation: gen });
 		record('resume-keeps-generation', { ...ctx, source: 'blob' }, resumed.ok && resumed.status.disc?.generation === gen &&
@@ -615,8 +640,10 @@
 		if (h.discUrl) {
 			const urlOpen = await open('url');
 			const genU = h.generation;
+			// Held, so it is still busy when the worker dies however fast the server answers.
+			await h.disc.call({ type: 'test-hold-fetch', range: `bytes=${700 * MB}-${716 * MB - 1}` });
 			const busy = read({ length: 16 * MB, offset: 700 * MB, hash: true, generation: genU });
-			await sleep(5);
+			await sleep(30);
 			const atDeath = slotStates();
 			t0 = performance.now();
 			h.disc.terminate();
@@ -644,6 +671,132 @@
 		record('resume-mismatch-has-no-disc', ctx, wrong.ok && !wrong.status.disc && wrong.status.state === 'idle' && !!wrong.status.error &&
 			(stale.result === E.STALE || stale.result === E.NO_DISC),
 			{ state: wrong.status.state, error: wrong.status.error, read: stale.result });
+		await setup({});
+	}
+
+	const blockWord = (k) => Atomics.load(new Int32Array(h.memory.buffer), (BLOCK >> 2) + k);
+	function ringDoorbell() {
+		const i32 = new Int32Array(h.memory.buffer);
+		Atomics.add(i32, (BLOCK >> 2) + 5, 1);
+		Atomics.notify(i32, (BLOCK >> 2) + 5);
+	}
+	const statesSince = (t) => h.disc.statuses.filter((s) => s.t >= t).map((s) => s.state);
+
+	// Holds a Web Lock until the returned function is called.
+	async function holdLock(name) {
+		let release;
+		const held = new Promise((r) => { release = r; });
+		await new Promise((granted) => navigator.locks.request(name, () => { granted(); return held; }));
+		return release;
+	}
+
+	// Stop is for good, even when it arrives while attach still waits (for its life lock, or for the disc it
+	// resumes): the worker never starts serving, the block ends stopped and what waits in it fails CANCELLED.
+	async function testStopDuringAttach() {
+		const ctx = { impl: h.impl, loop: h.loop };
+		h.disc.terminate();
+		let lock = lockName();
+		const release = await holdLock(lock);
+		const attaching = attachWorker(lock);
+		await sleep(30);
+		const t0 = performance.now();
+		const stopped = await h.disc.call({ type: 'stop' });
+		release();
+		const attached = await attaching;
+		await sleep(60);
+		const later = await h.disc.call({ type: 'status' });
+		const afterStop = await read({ length: 2048, offset: 0 });
+		record('stop-while-attach-waits-for-lock', ctx, stopped.ok && stopped.status.state === 'stopped' && !attached.ok &&
+			later.status.state === 'stopped' && statesSince(t0).every((s) => s === 'stopped' || s === 'detached') && blockWord(4) === 3 &&
+			afterStop.result === E.CANCELLED,
+			{ stop: stopped.status.state, attach: attached.ok ? 'ok' : attached.error, later: later.status.state, states: statesSince(t0),
+				blockState: blockWord(4), readAfter: afterStop.result });
+
+		if (h.discUrl) {
+			// The disc a dead worker served, resumed by a worker that is stopped while it opens the source again.
+			await setup({});
+			const urlOpen = await open('url');
+			const gen = h.generation;
+			h.disc.terminate();
+			await sleep(20);
+			lock = lockName();
+			h.disc = new DiscWorker(PROBE_WORKER_URL);
+			await h.disc.call({ type: 'test-hold-fetch', range: 'bytes=0-0' });
+			const resuming = h.disc.call({ type: 'attach', memory: h.memory, block: BLOCK, loop: h.loop === 'blocking' ? 'blocking' : 'auto',
+				lock, resume: { url: h.discUrl, generation: gen, size: urlOpen.info.size } });
+			const waiting = read({ length: 2048, offset: 16 * 2048, generation: gen }); // nobody serves it yet
+			await sleep(50);
+			const t1 = performance.now();
+			const stopped2 = await h.disc.call({ type: 'stop' });
+			// The worker holds its lock, so it stops the block at once, while the resume's fetch is still held:
+			// the waiting read fails without waiting for that open to end.
+			const waited = await Promise.race([waiting, sleep(1000).then(() => ({ result: 'still waiting' }))]);
+			const blockAtStop = blockWord(4);
+			const stopToWakeMs = +(performance.now() - t1).toFixed(1);
+			await h.disc.call({ type: 'test-release-fetch' });
+			const resumed = await resuming;
+			await waiting;
+			await sleep(60);
+			const later2 = await h.disc.call({ type: 'status' });
+			record('stop-while-resume-opens', { ...ctx, source: 'url' }, stopped2.ok && !resumed.ok && later2.status.state === 'stopped' &&
+				!later2.status.disc && statesSince(t1).every((s) => s === 'stopped') && blockAtStop === 3 && blockWord(4) === 3 &&
+				waited.result === E.CANCELLED,
+				{ attach: resumed.ok ? 'ok' : resumed.error, later: later2.status.state, disc: later2.status.disc?.name || null,
+					states: statesSince(t1), blockAtStop, blockState: blockWord(4), waitingRead: waited.result,
+					stopToWakeMs });
+		}
+		await setup({});
+	}
+
+	// A worker whose loop died says 'stopped' and stays so: a check or a probe that was under way when the
+	// loop died must not bring it back to 'error' (or 'ready'), or the page would take it for alive.
+	async function testLoopDeathIsFinal() {
+		if (!h.discUrl)
+			return;
+		const ctx = { source: 'url', read: 'async', impl: h.impl, loop: h.loop };
+		h.disc.terminate();
+		await attachWorker(lockName(), null, PROBE_WORKER_URL);
+		await open('url');
+
+		// A check whose read is under way when the loop dies, and then fails.
+		await h.disc.call({ type: 'test-hold-fetch', range: 'bytes=0-0' });
+		const checking = h.disc.call({ type: 'check' });
+		await sleep(30);
+		await h.disc.call({ type: 'test-kill-loop' });
+		ringDoorbell();
+		let t0 = performance.now();
+		while (h.disc.status?.state !== 'stopped' && performance.now() - t0 < 2000)
+			await sleep(10);
+		const died = h.disc.status?.state;
+		t0 = performance.now();
+		await h.disc.call({ type: 'test-release-fetch', fail: true });
+		const checked = await checking;
+		await sleep(60);
+		const later = await h.disc.call({ type: 'status' });
+		record('loop-death-final-after-check', ctx, died === 'stopped' && !checked.ok && later.status.state === 'stopped' &&
+			statesSince(t0).every((s) => s === 'stopped'),
+			{ died, check: checked.error, later: later.status.state, states: statesSince(t0) });
+
+		// A probe of an unavailable source that is under way when the loop dies, and then finds the disc gone.
+		h.disc.terminate();
+		await attachWorker(lockName(), null, PROBE_WORKER_URL);
+		await open('url');
+		const timedOut = await deadlineRead();
+		await h.disc.call({ type: 'test-hold-fetch', range: 'bytes=0-0' });
+		await sleep(1300); // the first probe starts after 1 s, and waits on the held fetch
+		await h.disc.call({ type: 'test-kill-loop' });
+		ringDoorbell();
+		t0 = performance.now();
+		while (h.disc.status?.state !== 'stopped' && performance.now() - t0 < 2000)
+			await sleep(10);
+		const died2 = h.disc.status?.state;
+		t0 = performance.now();
+		await h.disc.call({ type: 'test-release-fetch', notFound: true });
+		await sleep(200);
+		const later2 = await h.disc.call({ type: 'status' });
+		record('loop-death-final-after-probe', ctx, timedOut.result === E.TIMEOUT && died2 === 'stopped' && later2.status.state === 'stopped' &&
+			statesSince(t0).every((s) => s === 'stopped'),
+			{ timedOut: timedOut.result, died: died2, later: later2.status.state, states: statesSince(t0) });
 		await setup({});
 	}
 
@@ -780,6 +933,8 @@
 		await testErrors();
 		await testUnavailable();
 		await testRestart();
+		await testStopDuringAttach();
+		await testLoopDeathIsFinal();
 		const failed = results.filter((r) => r.pass === false).length;
 		log(`core done: ${results.length} rows, ${failed} failed`);
 		return { rows: results.length, failed };
@@ -829,7 +984,7 @@
 	$('#remove').addEventListener('click', () => busy(async () => log(`OPFS now: ${JSON.stringify(await removeOpfsCopy())}`)));
 
 	Object.assign(h, { setup, teardown, open, read, testEnvironment, testIso, testPattern, testGrowth, testConcurrency, testErrors,
-		testUnavailable, testRestart,
+		testUnavailable, testRestart, testStopDuringAttach, testLoopDeathIsFinal,
 		bench, importToOpfs, removeOpfsCopy, hasOpfsCopy, loadDiscBlob, streamSpeed, opfsWriteSpeed, runCore, runBench, referenceHash, E });
 	window.discHarness = h;
 	log(`ready; crossOriginIsolated=${self.crossOriginIsolated}`);

@@ -42,8 +42,9 @@
 //   {type: 'check'}                          read the start of the disc now (5 s at most): ok when
 //                                            the source still answers, as the page asks before each
 //                                            boot. Clears the error state on success.
-//   {type: 'stop'}                           fail every request and stop serving, then the page
-//                                            terminates the worker
+//   {type: 'stop'}                           fail every request and stop serving, for good (a stop
+//                                            during an attach included), then the page terminates
+//                                            the worker
 //   {type: 'status'}                         just the reply
 // Messages to the page: {type: 'status', status} whenever the state or the error changes. A status
 // is {state, disc, error, stats, loop, features, lock}; state is one of STATE_* below, disc is
@@ -164,6 +165,7 @@ let loopMode = null; // 'async' | 'blocking'
 let running = false;
 let attaching = false;
 let lockHeld = false;
+let mayWrite = false; // attach holds its life lock (or has none to take): the worker may write into the memory
 let lastError = null;
 const inflight = []; // per slot: the request this worker is serving, or null
 
@@ -205,7 +207,11 @@ function postStatus() {
 	self.postMessage({ type: 'status', status: snapshot() });
 }
 
+// Stopped is final (a stop, or a loop that died): a check, a probe or a read that ends afterwards must not
+// bring the worker back to 'error' or 'ready', or the page would take it for one that still serves.
 function setState(next, error) {
+	if (state === STATE_STOPPED)
+		return;
 	const errorChanged = error !== undefined && (error?.code !== lastError?.code || error?.message !== lastError?.message);
 	if (error !== undefined)
 		lastError = error;
@@ -854,6 +860,8 @@ async function resume(r) {
 }
 
 async function attach(msg) {
+	if (state === STATE_STOPPED)
+		throw new DiscError(E_CANCELLED, 'The disc worker was stopped; start a new one.');
 	if (state !== STATE_DETACHED || attaching)
 		throw new DiscError(E_INVALID, 'The disc worker is already attached; start a new one.');
 	const mem = msg.memory;
@@ -887,14 +895,23 @@ async function attach(msg) {
 	try {
 		// Nothing below writes into the memory before the lock is held.
 		lockHeld = await holdLifeLock(msg.lock);
+		mayWrite = true;
 		refreshViews();
-		Atomics.store(i32, hdr + H_MAX_REQUEST, MAX_REQUEST);
-		if (msg.resume) {
-			try {
-				await resume(msg.resume);
-			} catch (err) {
-				resumeError = asDiscError(err);
+		if (state !== STATE_STOPPED) {
+			Atomics.store(i32, hdr + H_MAX_REQUEST, MAX_REQUEST);
+			if (msg.resume) {
+				try {
+					await resume(msg.resume);
+				} catch (err) {
+					resumeError = asDiscError(err);
+				}
 			}
+		}
+		// A stop that came while this waited (for the lock, or for the disc it resumes) is for good too: the
+		// worker never serves, and the block is stopped now that this worker may write into it.
+		if (state === STATE_STOPPED) {
+			stopBlock();
+			throw new DiscError(E_CANCELLED, 'The disc worker was stopped before it attached.');
 		}
 		if (!source) {
 			generation = word(H_GENERATION) >>> 0;
@@ -913,9 +930,10 @@ async function attach(msg) {
 }
 
 // If the loop ever dies, this worker serves nothing more. It hands back what it took and says
-// 'stopped'; the page then terminates it and starts a worker that resumes the disc. The block stays
-// ready meanwhile, so requesters wait (each at most its 10 s deadline) rather than fail at once, which
-// would end in a read error for the game: PCSX2's retries take far less than a restart.
+// 'stopped', for good (setState); the page then terminates it and starts a worker that resumes the
+// disc. The block stays ready meanwhile, so requesters wait (each at most its 10 s deadline) rather
+// than fail at once, which would end in a read error for the game: PCSX2's retries take far less
+// than a restart.
 function loopDied(err) {
 	if (state === STATE_STOPPED)
 		return;
@@ -996,22 +1014,27 @@ async function check() {
 	}
 }
 
-// Stops serving for good: pending and busy requests fail CANCELLED, and the block says stopped, so
-// requesters never wait on it again.
+// The block says stopped, so requesters never wait on it again; pending and busy requests fail CANCELLED.
+function stopBlock() {
+	openSeq++;
+	try {
+		dropSource(E_CANCELLED);
+	} finally {
+		Atomics.store(i32, hdr + H_STATE, BLOCK_STOPPED);
+		Atomics.add(i32, hdr + H_DOORBELL, 1);
+		Atomics.notify(i32, hdr + H_DOORBELL); // ends the loop's wait
+	}
+}
+
+// Stops serving for good. While attach still waits for its life lock, nothing may be written into the memory:
+// attach stops the block itself once it holds the lock. Once it does (attach may still wait for the disc it
+// resumes), the block is stopped now.
 function shutDown(error) {
 	if (state === STATE_STOPPED)
 		return;
 	running = false;
-	if (state !== STATE_DETACHED) {
-		openSeq++;
-		try {
-			dropSource(E_CANCELLED);
-		} finally {
-			Atomics.store(i32, hdr + H_STATE, BLOCK_STOPPED);
-			Atomics.add(i32, hdr + H_DOORBELL, 1);
-			Atomics.notify(i32, hdr + H_DOORBELL); // ends the loop's wait
-		}
-	}
+	if (state !== STATE_DETACHED || mayWrite)
+		stopBlock();
 	setState(STATE_STOPPED, error);
 }
 

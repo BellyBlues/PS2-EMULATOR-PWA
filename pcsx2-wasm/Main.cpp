@@ -47,6 +47,7 @@
 #include "pcsx2/GS.h"
 #include "pcsx2/GS/GS.h"
 #include "pcsx2/GS/Renderers/Null/GSDeviceNull.h"
+#include "pcsx2/GameDatabase.h"
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/Host/AudioStream.h"
@@ -912,7 +913,11 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
 	const std::string& disc_serial, u32 disc_crc, u32 current_crc)
 {
 	INFO_LOG("pcsx2-wasm: running '{}' (serial '{}', ELF CRC {:08X})", title, disc_serial, current_crc);
-	PublishGameDetails(title, disc_serial, disc_crc, current_crc);
+	// The page names a game after PCSX2's game database. For a disc the database does not know, VMManager
+	// makes a title up ("Unknown Game", "<serial> [?]", "<elf> [?]"), which the page would show and remember:
+	// it gets no title then, and keeps the disc's file name.
+	const GameDatabaseSchema::GameEntry* entry = disc_serial.empty() ? nullptr : GameDatabase::findGame(disc_serial);
+	PublishGameDetails(entry ? entry->name : std::string(), disc_serial, disc_crc, current_crc);
 }
 
 void Host::OnPerformanceMetricsUpdated()

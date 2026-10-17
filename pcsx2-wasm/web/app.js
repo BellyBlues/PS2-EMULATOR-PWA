@@ -1044,6 +1044,20 @@
 			subtitle(COPY.alreadyStarting);
 			return;
 		}
+		// The disc is still being opened or read (?disc=, a disc just chosen, a disc reader being restarted, the
+		// check before a boot): the boot waits for it, queued like one pressed while the emulator downloads.
+		if (page.phase === 'ready' && page.bios && !discBootable()) {
+			if (disc.checking && !discCheckShown())
+				return; // a second press of the boot that is reading the start of the disc right now
+			if (reopenDisc()) {
+				page.autoBoot = true; // a failed open says so and drops it (openDiscInWorker)
+				render();
+				return;
+			}
+			page.autoBoot = !page.autoBoot;
+			render();
+			return;
+		}
 		startVm();
 	}
 
@@ -1249,9 +1263,10 @@
 	function setBios(name, bytes, origin, remembered) {
 		page.bios = { name, size: bytes.length, origin, remembered, saveFailed: false };
 		page.outcome = null;
-		// A disc error stays: with ?bios= and ?disc= the BIOS often arrives after the disc failed, and the
-		// error is then the only sign of why the queued boot did not run.
-		if (!page.errorIsDisc)
+		// A BIOS the user chooses is a new attempt, so the error line goes. One that arrives by itself (?bios=,
+		// or the one remembered here) keeps a disc error: with ?bios= and ?disc= the BIOS often arrives after
+		// the disc failed, and the error is then the only sign of why the queued boot did not run.
+		if (origin === 'file' || !page.errorIsDisc)
 			page.error = '';
 		if (page.phase === 'ready') {
 			writeBiosToFs(name, bytes);
@@ -1508,6 +1523,10 @@
 	const DISC_BOOT_FULL = 1; // pcsx2web_boot_disc(): the BIOS intro instead of fast boot
 	const DISC_POLL_MS = 500;
 	const DISC_ERROR_MS = 8000;
+	// The check before a boot usually takes milliseconds; the slate says it is reading the disc only after this.
+	const DISC_CHECK_SHOW_MS = 300;
+	// ?disc= headers: as long as the disc worker gives a URL to open (URL_OPEN_TIMEOUT_MS).
+	const DISC_URL_TIMEOUT_MS = 15000;
 	const DISC_WORKER_RESTARTS = 3;
 	// Without Web Locks the page cannot know when a terminated worker is gone; it waits this long. That is
 	// safe for the sources it sends (a File or a URL: their bytes reach the memory only through the
@@ -1560,11 +1579,13 @@
 		lostServer: 'The disc server stopped answering, so the game can’t read its disc.',
 		lostUrl: 'The game can’t read its disc from the server any more.',
 		readable: 'The disc can be read again. If the game doesn’t go on, stop it and boot again.',
+		checking: 'Reading the disc…',
 		readerFailed: 'The disc reader stopped working. Reload the page to read discs again.',
 		removed: 'Disc removed. Boot opens the console’s menus.',
 		memcardFailed: 'Couldn’t keep the memory card in this browser. Saves last for this visit.',
 		announceReady: 'Disc ready.',
 		announceRemoved: 'Disc removed.',
+		announceChecking: 'Reading the disc.',
 	};
 
 	const discEls = {
@@ -1589,6 +1610,9 @@
 		restarting: false, // a worker died; the next one is not attached yet
 		restarts: 0,
 		checking: false, // the disc is being read before a boot (checkDiscThenBoot)
+		checkSlow: false, // that check has taken DISC_CHECK_SHOW_MS or more
+		checkQueued: false, // the slate already showed that boot queued when the check began
+		checkTimer: 0,
 		block: 0, // address of the request block (pcsx2web_disc_block)
 		gamePtr: 0, // address of the game details (pcsx2web_game)
 		status: null, // the worker's last status
@@ -1613,6 +1637,24 @@
 
 	function discBootable() {
 		return !disc.urlPending && !disc.opening && !disc.checking && !disc.restarting && (!disc.current || disc.current.opened);
+	}
+
+	// The chosen disc is closed and nothing opens it: a restarted disc reader could not take it over and opening
+	// it again failed too. A boot opens it again (DISC-DESIGN 5.6); false when there is nothing to open.
+	function reopenDisc() {
+		const d = disc.current;
+		if (!d || d.opened || disc.opening || disc.urlPending || disc.checking || disc.restarting || !disc.attached)
+			return false;
+		disc.opening = d;
+		pageLog(`Opening ${d.name} again for the boot.`);
+		openDiscInWorker(d, disc.op);
+		return true;
+	}
+
+	// Whether the slate shows the boot that waits for the disc check: once the check takes a while, or at once
+	// when that boot was already shown queued (so the slate does not flip back to the title card meanwhile).
+	function discCheckShown() {
+		return disc.checkSlow || disc.checkQueued;
 	}
 
 	// The game's title for a file name: no extension, no trailing region or language tags.
@@ -1778,10 +1820,17 @@
 	async function openDiscInWorker(d, op) {
 		if (!disc.attached)
 			return; // opened once the worker is attached
+		const worker = disc.worker;
 		const msg = d.url ? { type: 'open', url: d.url, name: d.name } : { type: 'open', file: d.file, name: d.name };
 		const reply = await discCall(msg);
 		if (op !== disc.op || disc.opening !== d)
 			return; // a newer choice or Remove won
+		if (!reply.ok && worker !== disc.worker) {
+			// The disc reader stopped during the open: nothing was learnt about the disc. It stays the one being
+			// opened, so the restarted reader opens it (startDiscWorker), and a reader that cannot restart says so.
+			pageLog(`The disc reader stopped while it opened ${d.name}; the next one opens it again.`, 'warn');
+			return;
+		}
 		disc.opening = null;
 		if (!reply.ok) {
 			// The worker keeps serving the disc it had, so the previous choice stands.
@@ -1952,8 +2001,17 @@
 		}
 		let bytes;
 		let size = 0;
+		// Until this answers, a queued boot waits for the disc: a server that never answers must not hold it.
+		const controller = new AbortController();
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, DISC_URL_TIMEOUT_MS);
 		try {
-			const res = await fetch(url.href, { headers: { Range: `bytes=0-${DISC_HEADER_BYTES - 1}` }, cache: 'no-store' });
+			const res = await fetch(url.href, {
+				headers: { Range: `bytes=0-${DISC_HEADER_BYTES - 1}` }, cache: 'no-store', signal: controller.signal,
+			});
 			if (res.status !== 206) {
 				if (res.body)
 					res.body.cancel().catch(() => {});
@@ -1967,10 +2025,13 @@
 		} catch (err) {
 			disc.urlPending = false;
 			page.autoBoot = false;
-			pageLog(`Could not fetch the disc from ${url.pathname}: ${errorText(err)}`, 'warn');
-			discError(DISC_COPY.fetchFailed(displayPath(url.href), err && err.httpStatus ? `HTTP ${err.httpStatus}`
-				: /byte ranges/.test(String(err && err.message)) ? 'no byte ranges' : 'network error'));
+			const why = timedOut ? 'no answer in time' : err && err.httpStatus ? `HTTP ${err.httpStatus}`
+				: /byte ranges/.test(String(err && err.message)) ? 'no byte ranges' : 'network error';
+			pageLog(`Could not fetch the disc from ${url.pathname}: ${timedOut ? `no answer in ${DISC_URL_TIMEOUT_MS / 1000} s` : errorText(err)}`, 'warn');
+			discError(DISC_COPY.fetchFailed(displayPath(url.href), why));
 			return;
+		} finally {
+			clearTimeout(timer);
 		}
 		disc.urlPending = false;
 		if (size < DISC_MIN_SIZE || discLayout(bytes) === null) {
@@ -2010,10 +2071,13 @@
 	}
 
 	// No disc reader in this page any more: a chosen disc cannot be read, so it is dropped (Boot then
-	// opens the console's menus) and the slate says why.
+	// opens the console's menus) and the slate says why. The request block is stopped, so what waits in it
+	// fails now and later reads fail at once, instead of each waiting out its deadline for a reader that
+	// never comes (no worker is left that could write into it).
 	function discReaderGone(why) {
 		disc.dead = true;
 		disc.restarting = false;
+		failDiscRequests();
 		pageLog(why, 'error');
 		const had = disc.current || disc.opening;
 		disc.current = null;
@@ -2239,9 +2303,8 @@
 				return;
 			if (restart) {
 				handBackDiscRequests();
-				startDiscWorker(discResumeFor(disc.current));
+				startDiscWorker(discResumeFor(disc.current)); // if it cannot start, discReaderGone() stops the block
 			} else {
-				failDiscRequests();
 				discReaderGone('The disc reader kept failing; discs cannot be read until the page reloads.');
 			}
 		});
@@ -2290,19 +2353,39 @@
 		return !!(d && d.opened && !disc.dead && disc.attached);
 	}
 
+	// Meanwhile the boot waits like a queued one (page.autoBoot; pressing Boot again cancels it). The slate
+	// shows it only if the check takes a while: "Reading the disc…" (UI-SPEC.md §10).
 	function checkDiscThenBoot() {
 		const d = disc.current;
 		const op = disc.op;
 		disc.checking = true;
+		disc.checkSlow = false;
+		disc.checkQueued = page.lastState === 'queued';
+		page.autoBoot = true;
+		clearTimeout(disc.checkTimer);
+		disc.checkTimer = setTimeout(() => {
+			if (!disc.checking)
+				return;
+			const before = page.lastState;
+			disc.checkSlow = true;
+			render();
+			if (before === 'queued' && page.lastState === 'queued')
+				announce(DISC_COPY.announceChecking); // already queued: no state change says it
+		}, DISC_CHECK_SHOW_MS);
 		render();
 		discCall({ type: 'check' }).then((reply) => {
+			clearTimeout(disc.checkTimer);
 			disc.checking = false;
+			disc.checkSlow = false;
+			disc.checkQueued = false;
 			if (op !== disc.op || disc.current !== d) {
+				page.autoBoot = false; // the disc was changed or removed meanwhile: this boot was for the old one
 				render();
 				return;
 			}
-			if (!reply.ok && reply.error && reply.error.code === 'CANCELLED') {
-				// The disc reader stopped during the check and is being restarted: nothing was learnt.
+			if (!reply.ok && reply.error && reply.error.code === 'CANCELLED' && (disc.restarting || disc.dead)) {
+				// The disc reader stopped during the check. A restarted one runs the queued boot (and a new check)
+				// once it has the disc; a reader that could not restart has said why (discReaderGone).
 				pageLog(`The disc check was interrupted: ${reply.error.message}`, 'warn');
 				render();
 				return;
@@ -2313,6 +2396,11 @@
 				discError(discFailureText(d, reply.error));
 				return;
 			}
+			if (!page.autoBoot) {
+				render(); // cancelled meanwhile
+				return;
+			}
+			page.autoBoot = false;
 			startVm(true);
 		});
 	}
@@ -2354,13 +2442,14 @@
 		const serial = cString(copy.subarray(0, GAME_SERIAL_BYTES));
 		const title = cString(copy.subarray(GAME_SERIAL_BYTES));
 		const live = page.vmState === STATE.STARTING || page.vmState === STATE.RUNNING;
-		if (!disc.runIsDisc || !live || !title || (title === disc.runTitle && serial === disc.runSerial))
+		if (!disc.runIsDisc || !live || (title === disc.runTitle && serial === disc.runSerial))
 			return;
+		// No title for a disc PCSX2's game database does not know (Host::OnGameChanged): the file name stays.
 		disc.runTitle = title;
 		disc.runSerial = serial;
-		pageLog(`Game: ${title}${serial ? ` (${serial})` : ''}`);
+		pageLog(`Game: ${title || 'not in the game database'}${serial ? ` (${serial})` : ''}`);
 		const d = disc.current;
-		if (d && d.title !== title) {
+		if (title && d && d.title !== title) {
 			d.title = title;
 			if (d.remembered)
 				rememberDisc(d);
@@ -2378,7 +2467,9 @@
 			}
 		}
 		checkMemoryCards(false);
-		const title = disc.runIsDisc && disc.runTitle && pageState() === 'running' ? `${disc.runTitle} · TabStationToo` : 'TabStationToo';
+		const running = disc.runIsDisc && disc.current && pageState() === 'running';
+		const game = running ? disc.runTitle || discDisplayTitle(disc.current) : '';
+		const title = game ? `${game} · TabStationToo` : 'TabStationToo';
 		if (document.title !== title)
 			document.title = title;
 	}
@@ -2388,7 +2479,7 @@
 	function memcardLine() {
 		if (memcards.otherTab)
 			return DISC_COPY.savesOtherTab;
-		if (memcards.failed)
+		if (memcards.failed || memcards.visitOnly)
 			return DISC_COPY.savesVisit;
 		// Before the runtime mounts the cards, the line says what will happen.
 		return memcards.persistent || (!memcards.mounted && typeof indexedDB !== 'undefined') ? DISC_COPY.savesKept : DISC_COPY.savesVisit;
@@ -2423,6 +2514,8 @@
 		case 'queued':
 			if (d)
 				m.body = discLine(d);
+			if (disc.checking && disc.checkSlow)
+				m.title = [DISC_COPY.checking];
 			break;
 		case 'starting':
 			if (disc.runIsDisc && d && page.vmState !== STATE.RUNNING)
@@ -2571,6 +2664,10 @@
 		}
 		if (!rec || !rec.handle || typeof rec.handle.requestPermission !== 'function' || disc.current || disc.opening)
 			return;
+		// Earlier versions kept the title VMManager makes up for a disc its database does not know; the file
+		// name reads better.
+		if (typeof rec.title !== 'string' || rec.title === 'Unknown Game' || / \[\?\]$/.test(rec.title))
+			rec.title = '';
 		disc.remembered = rec;
 		pageLog(`Last disc: ${rec.name} (reopens with one press).`);
 		render();
@@ -2586,14 +2683,22 @@
 	// page is hidden. FS.syncfs copies only files whose time changed; for an 8 MB card that blocks this
 	// thread for 30-50 ms. The copy is asynchronous and cannot finish during an unload, so from the first write
 	// until the copy is done, leaving or reloading the page asks first (beforeunload).
+	// A copy that fails is tried again later (MEMCARD_RETRY_MS; the copy on leaving does not wait, and is not
+	// counted); after the last try the page gives up until the game writes to the card again, and the card line
+	// says that saves last for this visit.
 
 	const MEMCARD_DIR = '/memcards';
 	const MEMCARD_QUIET_MS = 1500;
+	const MEMCARD_RETRY_MS = [2000, 5000, 15000]; // after the 1st, 2nd and 3rd failed copy in a row
 	const MEMCARD_LOCK = 'tabstationtoo-memcards';
 	const MEMCARD_LOCK_WAIT_MS = 2000; // on a reload, the page being replaced may hold the lock a moment longer
 	const memcards = {
 		mounted: false, persistent: false, failed: false, owner: false, otherTab: false,
 		seen: '', changedAt: 0, saved: '', syncing: false, again: false, warned: false, guarded: false,
+		// Writes are counted (FS.write on a card) because file times are whole milliseconds: a write in the
+		// same millisecond as the last copy changes neither the signature nor what IDBFS compares.
+		writes: 0, savedWrites: 0, dirty: new Set(), lastTime: 0,
+		failures: 0, retryAt: 0, gaveUp: false, visitOnly: false,
 	};
 
 	// Resolves true once this tab owns the cards, false when another tab keeps them.
@@ -2624,21 +2729,24 @@
 		const watched = function (stream) {
 			const result = write.apply(this, arguments);
 			if (stream && typeof stream.path === 'string' && stream.path.startsWith(`${MEMCARD_DIR}/`))
-				onMemcardWrite();
+				onMemcardWrite(stream.path);
 			return result;
 		};
 		watched.memcardWatch = true;
 		FS.write = watched;
 	}
 
-	function onMemcardWrite() {
+	function onMemcardWrite(path) {
 		memcards.changedAt = performance.now();
+		memcards.writes++;
+		memcards.dirty.add(path);
+		memcards.gaveUp = false; // a new save: try to keep it again
 		if (memcards.owner && memcards.persistent)
 			setMemcardGuard(true);
 	}
 
 	function onBeforeUnloadWithCard(e) {
-		persistMemoryCards();
+		persistMemoryCards(true);
 		e.preventDefault();
 		e.returnValue = ''; // browsers before preventDefault() was honoured here
 	}
@@ -2693,6 +2801,9 @@
 				} else {
 					memcards.persistent = true;
 				}
+				// Loading wrote the cards through FS.write: what is there now is what IndexedDB holds.
+				memcards.savedWrites = memcards.writes;
+				memcards.dirty.clear();
 				memcards.seen = memcards.saved = memcardSignature();
 				if (memcards.saved)
 					pageLog(`Memory cards from this browser: ${memcards.saved.split(';').filter(Boolean).map((e) => e.split(':')[0]).join(', ')}`);
@@ -2719,6 +2830,12 @@
 		return sig;
 	}
 
+	// Something is not in IndexedDB yet: a write since the last copy began, or a change the signature shows
+	// (a card created, resized or removed).
+	function memcardsUnsaved(sig = memcardSignature()) {
+		return memcards.writes !== memcards.savedWrites || sig !== memcards.saved;
+	}
+
 	function checkMemoryCards(now) {
 		if (!memcards.persistent || !memcards.owner)
 			return;
@@ -2727,47 +2844,104 @@
 		if (sig !== memcards.seen) {
 			memcards.seen = sig;
 			memcards.changedAt = t;
+			memcards.gaveUp = false;
 		}
-		const unsaved = sig !== memcards.saved;
+		if (memcards.gaveUp) {
+			setMemcardGuard(memcards.syncing);
+			return;
+		}
+		const unsaved = memcardsUnsaved(sig);
 		setMemcardGuard(unsaved || memcards.syncing);
-		if (unsaved && (now || t - memcards.changedAt >= MEMCARD_QUIET_MS))
+		if (unsaved && t >= memcards.retryAt && (now || t - memcards.changedAt >= MEMCARD_QUIET_MS))
 			persistMemoryCards();
 	}
 
-	function persistMemoryCards() {
-		if (!memcards.persistent || !memcards.owner)
+	// leaving: the page is being hidden or left. That copy does not wait for the retry pause (it may be the
+	// last chance to keep the card), and its failure does not count toward giving up: a few quick tab switches
+	// say nothing new about IndexedDB, so only the timed copies decide that.
+	function persistMemoryCards(leaving = false) {
+		if (!memcards.persistent || !memcards.owner || memcards.gaveUp)
 			return;
 		if (memcards.syncing) {
 			memcards.again = true;
 			return;
 		}
-		const sig = memcardSignature();
-		if (sig === memcards.saved) {
+		if (!memcardsUnsaved()) {
 			setMemcardGuard(false);
 			return;
 		}
+		// IDBFS copies a file only when its time differs from the stored copy's, in whole milliseconds. The
+		// stored time is one the page gave (below) or a write's, so every file written since the last copy
+		// began gets a time later than its own and than any the page gave before: it is copied even when it
+		// was written in the millisecond the last copy took its time from. Writes from now on go to the next
+		// copy (they may also reach this one).
+		const FS = window.Module.FS;
+		const writes = memcards.writes;
+		const dirty = memcards.dirty;
+		memcards.dirty = new Set();
+		for (const path of dirty) {
+			try {
+				const st = FS.stat(path);
+				const time = Math.max(Date.now(), st.mtime.getTime() + 1, memcards.lastTime + 1);
+				memcards.lastTime = time;
+				FS.utime(path, st.atime.getTime(), time);
+			} catch {
+				// removed since: the copy removes it too
+			}
+		}
+		const sig = memcardSignature();
+		memcards.seen = sig; // the new times are not a change of their own
 		memcards.syncing = true;
 		setMemcardGuard(true);
-		window.Module.FS.syncfs(false, (err) => {
+		FS.syncfs(false, (err) => {
 			memcards.syncing = false;
 			if (err) {
-				pageLog(`Could not save the memory card in this browser: ${errorText(err)}`, 'warn');
-				if (!memcards.warned) {
-					memcards.warned = true;
-					subtitle(DISC_COPY.memcardFailed);
-				}
+				for (const path of dirty)
+					memcards.dirty.add(path);
+				memcardCopyFailed(err, !leaving);
 			} else {
+				memcards.savedWrites = writes;
 				memcards.saved = sig;
+				memcards.failures = 0;
+				memcards.retryAt = 0;
 				pageLog('Memory card saved in this browser.');
+				if (memcards.visitOnly) {
+					memcards.visitOnly = false; // kept again: the card line says so
+					render();
+				}
 			}
-			if (memcards.again) {
-				memcards.again = false;
+			const again = memcards.again && !err;
+			memcards.again = false;
+			if (again)
 				persistMemoryCards();
-			} else {
-				// A write during the copy keeps the guard up until the next copy.
-				setMemcardGuard(memcardSignature() !== memcards.saved);
-			}
+			else // a write during the copy keeps the guard up until the next copy
+				setMemcardGuard(!memcards.gaveUp && memcardsUnsaved());
 		});
+	}
+
+	// Tried again after a pause that grows; after the last try, no more copies (each one reads the whole
+	// card) and no "Leave site?" question until the game writes to the card again, and the card line and
+	// one subtitle say that saves last for this visit.
+	function memcardCopyFailed(err, counted) {
+		pageLog(`Could not save the memory card in this browser: ${errorText(err)}${counted ? '' : ' (copy on leaving; not counted)'}`, 'warn');
+		if (!counted)
+			return; // the next timed copy tries again, on the current pause
+		memcards.failures++;
+		if (memcards.failures <= MEMCARD_RETRY_MS.length) {
+			memcards.retryAt = performance.now() + MEMCARD_RETRY_MS[memcards.failures - 1];
+			return;
+		}
+		memcards.gaveUp = true;
+		memcards.visitOnly = true;
+		memcards.failures = 0;
+		memcards.retryAt = 0;
+		setMemcardGuard(false);
+		pageLog('Stopped saving the memory card in this browser until the game writes to it again.', 'warn');
+		if (!memcards.warned) {
+			memcards.warned = true;
+			subtitle(DISC_COPY.memcardFailed);
+		}
+		render();
 	}
 
 	// ---- wiring
@@ -2819,10 +2993,10 @@
 
 		// Keep the memory card when the page goes into the background, and start the copy when it goes
 		// away (the unload guard has asked first while a write was not copied yet).
-		window.addEventListener('pagehide', persistMemoryCards);
+		window.addEventListener('pagehide', () => persistMemoryCards(true));
 		document.addEventListener('visibilitychange', () => {
 			if (document.visibilityState === 'hidden')
-				persistMemoryCards();
+				persistMemoryCards(true);
 		});
 	}
 
@@ -2843,7 +3017,8 @@
 			game: { title: disc.runTitle, serial: disc.runSerial, disc: disc.runIsDisc },
 			lastDisc: disc.remembered ? disc.remembered.name : null,
 			memcards: { persistent: memcards.persistent, owner: memcards.owner, otherTab: memcards.otherTab, failed: memcards.failed,
-				saved: memcards.saved, syncing: memcards.syncing, unloadGuard: memcards.guarded },
+				saved: memcards.saved, syncing: memcards.syncing, unloadGuard: memcards.guarded, writes: memcards.writes,
+				savedWrites: memcards.savedWrites, failures: memcards.failures, gaveUp: memcards.gaveUp, visitOnly: memcards.visitOnly },
 		}),
 	});
 
@@ -3567,7 +3742,8 @@
 		// title card it will land on, not the intake.
 		if (!page.bios)
 			return page.urlBiosName ? (page.autoBoot ? 'queued' : 'ready') : 'nobios';
-		if (page.autoBoot)
+		// A boot waiting for the disc check shows as queued only once the check takes a while (discCheckShown).
+		if (page.autoBoot && (!disc.checking || discCheckShown()))
 			return 'queued';
 		if (page.outcome === 'failed')
 			return 'failed';
@@ -3619,7 +3795,9 @@
 				rich(els.loadLine, [COPY.preparing]);
 			}
 		}
-		if (page.lastState === 'queued')
+		// The queued title's percentage. Not when the boot has just left the queue: render() calls this before it
+		// updates page.lastState, and the slate would show the queue again until the next render.
+		if (page.lastState === 'queued' && pageState() === 'queued')
 			renderSlate('queued');
 	}
 
@@ -3707,8 +3885,10 @@
 				m.error = COPY.saveFailed;
 			break;
 		case 'queued': {
+			// The percentage is the emulator's download; once it runs, the boot waits for the disc or ?bios=.
+			const loading = page.phase === 'loading' && page.runtimeRequested;
 			const pct = Math.round(loadFraction() * 100);
-			m.title = [COPY.queued, page.runtimeRequested ? ' · ' : '', page.runtimeRequested ? { num: `${pct}%` } : ''];
+			m.title = [COPY.queued, loading ? ' · ' : '', loading ? { num: `${pct}%` } : ''];
 			m.body = b ? biosLine(b) : fetchingBiosLine();
 			m.meta = true;
 			m.primary = { label: COPY.boot, icon: 'play', cap: false, action: boot };
@@ -3974,7 +4154,7 @@
 				announce(COPY.announce.starting);
 			break;
 		case 'queued':
-			announce(COPY.announce.queued);
+			announce(disc.checking && disc.checkSlow ? DISC_COPY.announceChecking : COPY.announce.queued);
 			break;
 		case 'ready':
 			announce(COPY.announce.ready);

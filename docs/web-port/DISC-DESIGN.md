@@ -325,11 +325,14 @@ Data copied before the `DONE` store is visible after the requester's atomic load
   reply is ok, `status.disc` is null and `status.error` says why).
 - **A loop that dies** (an exception escaping the serving loop) hands back the requests the worker
   had taken (`BUSY`→`PENDING`, their late results dropped) and reports `stopped`, so the page
-  starts a worker that resumes the disc.
+  starts a worker that resumes the disc. It stays `stopped`: a check, probe or read that ends
+  afterwards never brings the state back to `error` or `ready`.
 - **Stop.** The worker sets `STATE = stopped`, fails pending and busy requests with `CANCELLED`
   (measured: the waiting requester woke 0.4–1.1 ms after `stop`), aborts fetches and ends its
   loop. Later requests fail at once because requesters check `STATE` first. The page must send
-  `stop` before `terminate()` (see 7).
+  `stop` before `terminate()` (see 7). Stop is for good: one that arrives while `attach` still waits
+  (for its life lock, or for the disc it resumes) makes that attach fail `CANCELLED`, and the worker
+  stops the block as soon as it holds the lock (it writes nothing into the memory before that).
 - **Status for the page.** Messages are `{type: 'status', status}` on every change of state or
   error, plus `{type: 'reply', id, ok, error, status}` for each message that carried an `id`.
   - `status = {state, disc, error, stats, loop, features}`.
@@ -348,7 +351,7 @@ Data copied before the `DONE` store is visible after the requester's atomic load
 | `{type: 'open', file \| handle \| url, name?, read?}` | opens the new disc while the old one keeps being served; once it is open, drops the old one (its requests fail `STALE`) and publishes size and generation in one step, `STATE` = ready. An open that fails leaves the old disc in place; one overtaken by a newer `open` or a `close` fails with `CANCELLED`. `read`: `'auto'` (FileReaderSync for files, `fetch` for URLs), `'sync'` or `'async'` |
 | `{type: 'close'}` | `STATE` = no disc; requests fail `NO_DISC` |
 | `{type: 'check'}` | reads the first sector now (5 s at most); ok, or the error (and state `error`) |
-| `{type: 'stop'}` | as above; afterwards the page may `terminate()` the worker |
+| `{type: 'stop'}` | as above, for good (also during an `attach`); afterwards the page may `terminate()` the worker |
 | `{type: 'status'}` | only the reply |
 
 ## 5. Phase 2: the C++ side and the interface
@@ -595,10 +598,12 @@ down.
   whose bytes reach the memory only through the worker's JS; it never sends OPFS handles). It then
   hands back the busy slots (`BUSY`→`PENDING`) and starts a worker that resumes the current disc
   under the same generation, at most three times; a running game goes on reading its disc. After
-  the third restart the page stops the block and finishes pending and busy slots with `CANCELLED`
-  (CAS `PENDING`→`BUSY` first, so a requester withdrawing at the same moment loses cleanly). A
+  the third restart, or when a new worker cannot be started, the page stops the block and finishes
+  pending and busy slots with `CANCELLED` (CAS `PENDING`→`BUSY` first, so a requester withdrawing at
+  the same moment loses cleanly), so nothing waits out its deadline for a worker that never comes. A
   resume that fails leaves the game without its disc; the page then says so and opens the disc
-  again for the next boot.
+  again for the next boot. A disc the page was opening when the worker died stays the one being
+  opened, and the next worker opens it.
 - *A failed disc swap keeps the old disc readable*: `open` no longer drops the current disc first
   (4.3). The page offers no swap while a game runs anyway, so PCSX2's own `ChangeDisc()` revert
   path is never asked to reopen a stale generation; that needs a source per generation (v2) before
@@ -624,6 +629,12 @@ down.
   `check-ok`, `check-file-gone`, `life-lock-held`, `life-lock-released-on-terminate` (0.4–1.6 ms),
   `resume-keeps-generation`, `resume-serves-handed-back-read` (a 16 MiB URL read taken by a worker
   that was then terminated, served by the next one, hash checked) and `resume-mismatch-has-no-disc`.
+  After the third review it passes 63, adding `stop-while-attach-waits-for-lock`,
+  `stop-while-resume-opens`, `loop-death-final-after-check` and `loop-death-final-after-probe`
+  (all four fail against the worker before that review). These and the deadline checks drive
+  `disc-worker-probe.js`, the real worker with test hooks: it kills the serving loop and holds,
+  fails or redirects chosen fetches, so a 16 MiB read cannot beat its 20 ms deadline from a warm
+  page cache (`deadline-cancel-times-out` failed now and then before).
 - The life lock, measured: a worker terminated 1–20 ms into an 860 ms synchronous OPFS read into a
   `SharedArrayBuffer` went on writing for about 800 ms; its lock was granted only after the write
   ended (805–889 ms), with nothing written afterwards. A fixed wait after `terminate()` is not enough
@@ -685,7 +696,7 @@ them.
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Slow storage (HDD, USB, network shares): cold random reads of 5–15 ms | Medium | Stutter in streaming games | Readahead in `ThreadedFileReader`. A larger or longer readahead on wasm if `FinishRead` waits show up. These numbers are warm-cache. |
-| `terminate()` without `stop` while a request is `BUSY`: the requester waits for ever | Low | Hung CPU thread | On a worker `error` event (or a worker that stopped by itself) the page terminates it, waits for its life lock, hands its busy slots to a new worker that resumes the disc, and after three restarts stores `STATE = stopped` and fails pending and busy slots (built, 5.6). C++ waits in slices, re-checks `STATE`, and after 10 s withdraws a pending request or asks the worker to cancel a busy one. |
+| `terminate()` without `stop` while a request is `BUSY`: the requester waits for ever | Low | Hung CPU thread | On a worker `error` event (or a worker that stopped by itself) the page terminates it, waits for its life lock, hands its busy slots to a new worker that resumes the disc, and after three restarts (or a worker that cannot start) stores `STATE = stopped` and fails pending and busy slots (built, 5.6). C++ waits in slices, re-checks `STATE`, and after 10 s withdraws a pending request or asks the worker to cancel a busy one. |
 | File changed in place at the same size | Low | Wrong data, no error | Picked files are snapshots whose modification time browsers are expected to check (not measured here). OPFS same-size rewrites are not detected (measured). Remember size and `lastModified`, and recheck sector 16 on reopen. |
 | `Atomics.waitAsync` missing | Low (Chrome 152/155 and Firefox 157 have it; Safari 16.4+ per its documentation) | Up to 50 ms latency for page messages only | Blocking fallback, tested with the full suite. |
 | Electron/Chrome 152 storage limits (OPFS file cap of 2000 MiB, large Blob fetch fails) | Certain in the pane | OPFS option unusable there | The main path does not use them. Re-measure before offering the OPFS option. |
@@ -711,6 +722,8 @@ them.
   - `requester.js`: a JS requester.
   - `requester.c` and `build-requester.sh`: the C requester, which builds `requester.wasm`
     (ignored by git).
+  - `disc-worker-probe.js`: the disc worker with test hooks (kill its loop; hold, fail or redirect
+    chosen fetches), for the restart, stop and deadline checks.
   - `opfs-tool.js`: OPFS import, write speed and changed-file helpers.
 
 **Running it.**
@@ -718,7 +731,7 @@ them.
 ```sh
 python3 tools/wasm/serve.py --port 8110 --disc /path/to/disc.iso .   # repository root as web root
 # open http://127.0.0.1:8110/tools/wasm/disc-harness/index.html?disc=/dev-disc/<url-encoded name>
-# Run tests (about 4 s), Run benchmarks; "Copy the disc URL into OPFS" adds the OPFS sources;
+# Run tests (10-20 s), Run benchmarks; "Copy the disc URL into OPFS" adds the OPFS sources;
 # the file input runs the File tests on a file you pick. From the console:
 #   await discHarness.runCore({impl: 'wasm', loop: 'blocking'})   // after build-requester.sh
 ```

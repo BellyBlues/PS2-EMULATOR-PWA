@@ -111,10 +111,15 @@ so you do not have to pick it again. **Forget this BIOS** deletes it.
 Slot 1 holds an 8 MB card, `/memcards/Mcd001.ps2`; slot 2 is empty. `/memcards` is an IDBFS mount
 (Emscripten's IndexedDB-backed file system, database `/memcards`), loaded before `main()` runs.
 PCSX2 keeps the card file open and writes it in place (unbuffered on wasm), so the page copies it
-to IndexedDB itself: 1.5 s after the card's modification time stops changing, at once when the VM
-stops (Stop closes the card, so a normal Stop never loses a save), and when the page is hidden.
-`FS.syncfs` only copies files whose time changed, and on wasm PCSX2 rewrites the card's checksum at
-shutdown only if it changed, so a Stop without a save copies nothing. A copy of the 8 MB card blocks
+to IndexedDB itself: 1.5 s after the game's last write to it, at once when the VM stops (Stop
+closes the card, so a normal Stop never loses a save), and when the page is hidden. The page counts
+the card's writes (`FS.write`) rather than trusting its time alone: `FS.syncfs` only copies files
+whose time changed, in whole milliseconds, so before each copy the page moves the time of every card
+written since the last one past any time it had, and a write in the same millisecond as the last copy
+is still copied. On wasm PCSX2 rewrites the card's checksum at shutdown only if it changed, so a Stop
+without a save copies nothing. A copy that fails is tried again after 2, 5 and 15 s; then the page
+stops copying until the game writes to the card again, and says that saves last for the visit. The copy when the page is
+hidden or left does not wait for that pause, and its failure does not count toward giving up. A copy of the 8 MB card blocks
 the page's thread for 30–50 ms (measured: 28–31 ms on an idle machine, 42–51 ms with another emulator
 running), once per save, so the picture may skip a frame or two then. The copy is asynchronous and
 cannot finish while the page unloads, so from the first card write (seen as it happens, through
@@ -334,7 +339,9 @@ the page says so. Before each disc boot the worker reads the start of the disc, 
 away is reported on the slate instead of hanging the boot. If the worker dies, the page waits until
 it is really gone (it is granted the Web Lock the worker held), hands back the reads it had taken,
 and starts a new worker that takes the disc over under the same generation, so a running game goes
-on reading it; after three restarts it fails what is waiting instead.
+on reading it; after three restarts, or when a new worker cannot start, it stops the request block
+so that what is waiting fails at once. A disc being opened when its worker died is opened again by
+the next one.
 
 ## Current limitations
 
