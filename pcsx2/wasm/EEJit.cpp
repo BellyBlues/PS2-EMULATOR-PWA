@@ -14,8 +14,9 @@
 // - Branches: the delay slot runs with cpuRegs.branch set, then intJitBranchEnd() runs the interpreter's own branch
 //   end (wait loop skip, intUpdateCPUCycles(), the event test and the BIOS hooks). Branches not taken run the
 //   interpreter's event test where it does (BEQ/BNE and the likely branches).
-// - Other instructions: ALU, shifts, HI/LO moves, multiplies and the aligned loads and stores of RAM/ROM/scratchpad
-//   are emitted; everything else (FPU, COP0, COP2/VU0 macro mode, MMI, divides, unaligned and I/O accesses, traps,
+// - Other instructions: ALU, shifts, HI/LO moves, multiplies, the aligned loads and stores of RAM/ROM/scratchpad,
+//   and with VU0 idle the common COP2 ops (FMAC ops with their flags, moves, LQC2/SQC2, QMFC2/QMTC2, CFC2/CTC2)
+//   are emitted; everything else (FPU, COP0, other COP2 ops, MMI, divides, unaligned and I/O accesses, traps,
 //   syscalls) calls the interpreter's function for that opcode with cpuRegs.pc and cpuRegs.code set as execI() sets
 //   them. After such a call, a changed PC (an exception) leaves the block.
 // - Self-modifying code: each block checks, on entry, its page's vtlb mapping and its instruction words against the
@@ -26,6 +27,7 @@
 #include "Common.h"
 #include "R5900OpcodeTables.h"
 #include "vtlb.h"
+#include "VUmicro.h"
 
 #include "wasm/EEJit.h"
 #include "wasm/WasmEmitter.h"
@@ -53,6 +55,7 @@ namespace EEJit
 	u32 g_trace_shift = 16;
 	u64 g_trace_from = ~0ull, g_trace_to = 0;
 	bool g_stats = false;
+	u32 g_dbgmask = 0;
 } // namespace EEJit
 
 namespace
@@ -130,7 +133,9 @@ namespace
 		// rt = rs op imm.
 		ADDIU, DADDIU, SLTI, SLTIU, ANDI, ORI, XORI, LUI,
 		// Memory.
-		LB, LBU, LH, LHU, LW, LWU, LD, LQ, SB, SH, SW, SD, SQ, LWC1, SWC1,
+		LB, LBU, LH, LHU, LW, LWU, LD, LQ, SB, SH, SW, SD, SQ, LWC1, SWC1, LQC2, SQC2,
+		// COP2: VU0 macro mode (the ops EmitCop2() knows; the rest call the interpreter).
+		COP2,
 		// Branches.
 		J, JAL, JR, JALR, BEQ, BNE, BLEZ, BGTZ, BEQL, BNEL, BLEZL, BGTZL,
 		BLTZ, BGEZ, BLTZL, BGEZL, BLTZAL, BGEZAL, BLTZALL, BGEZALL,
@@ -164,6 +169,7 @@ namespace
 			{LB, Kind::LB}, {LBU, Kind::LBU}, {LH, Kind::LH}, {LHU, Kind::LHU}, {LW, Kind::LW}, {LWU, Kind::LWU},
 			{LD, Kind::LD}, {LQ, Kind::LQ}, {SB, Kind::SB}, {SH, Kind::SH}, {SW, Kind::SW}, {SD, Kind::SD},
 			{SQ, Kind::SQ}, {LWC1, Kind::LWC1}, {SWC1, Kind::SWC1},
+			{LQC2, Kind::LQC2}, {SQC2, Kind::SQC2}, {COP2, Kind::COP2},
 			{SYNC, Kind::Nop}, {PREF, Kind::Nop},
 			{J, Kind::J}, {JAL, Kind::JAL}, {JR, Kind::JR}, {JALR, Kind::JALR}, {BEQ, Kind::BEQ}, {BNE, Kind::BNE},
 			{BLEZ, Kind::BLEZ}, {BGTZ, Kind::BGTZ}, {BEQL, Kind::BEQL}, {BNEL, Kind::BNEL}, {BLEZL, Kind::BLEZL},
@@ -191,7 +197,7 @@ namespace
 		if ((k == Kind::JAL || k == Kind::JR) && EmuConfig.Gamefixes.GoemonTlbHack)
 			k = Kind::Fallback;
 		// With the EE cache emulated, memory goes through the interpreter's cache model.
-		if (k >= Kind::LB && k <= Kind::SWC1 && CHECK_CACHE)
+		if (k >= Kind::LB && k <= Kind::SQC2 && CHECK_CACHE)
 			k = Kind::Fallback;
 		return {&op, k};
 	}
@@ -682,12 +688,534 @@ namespace
 					EmitMemory(pc, code, d, in_delay_slot);
 					return;
 
+				case Kind::LQC2: case Kind::SQC2: case Kind::COP2:
+					if (!EmitCop2(pc, code, d, in_delay_slot))
+						EmitFallback(pc, code, d, in_delay_slot);
+					return;
+
 				default:
 					EmitFallback(pc, code, d, in_delay_slot);
 					return;
 			}
 			m_pending += d.op->cycles;
 			s_native_instrs++;
+		}
+
+		// ---- COP2 (VU0 macro mode) ------------------------------------------------------------------------
+		// Every COP2 instruction first runs VU0 if a micro program is running (vu0Sync(), _vu0FinishMicro(),
+		// _vu0WaitMicro() in VU0.cpp): generated code handles only the case where it is not (VPU_STAT bit 0
+		// clear, where those calls do nothing) and calls the interpreter's function otherwise. The FMAC ops follow
+		// the VU1 JIT's (VU1JitEmit.cpp, Upper(), Clamp(), Flags()), which match VUops.cpp bit for bit, then
+		// SYNCMSFLAGS() (VUops.cpp).
+
+		u32 VLocal(int i)
+		{
+			if (!m_vloc_ok[i])
+			{
+				m_vloc[i] = m_fn.local(ValType::V128);
+				m_vloc_ok[i] = true;
+			}
+			return m_vloc[i];
+		}
+		void Splat(u32 v) { m_fn.v128_pooled_i32x4(v, v, v, v); }
+		void SimdOp(WasmJit::Simd o) { m_fn.simd(o); }
+		void LdV(u32 addr) { m_fn.i32_const(0); m_fn.v128_load(addr); }
+		void Ld32(u32 addr) { m_fn.i32_const(0); m_fn.i32_load(addr); }
+		static u32 DestMask(u32 dest, u32 lane) { return (dest & (8 >> lane)) ? 0xffffffffu : 0; }
+		void DestConst(u32 dest)
+		{
+			m_fn.v128_pooled_i32x4(DestMask(dest, 0), DestMask(dest, 1), DestMask(dest, 2), DestMask(dest, 3));
+		}
+		// VF/ACC at addr = local v, lanes outside dest kept.
+		void StoreMerged(u32 addr, u32 v, u32 dest)
+		{
+			if ((dest & 0xf) == 0)
+				return;
+			m_fn.i32_const(0);
+			m_fn.local_get(v);
+			if ((dest & 0xf) != 0xf)
+			{
+				LdV(addr);
+				DestConst(dest);
+				SimdOp(WasmJit::Simd::V128Bitselect);
+			}
+			m_fn.v128_store(addr);
+		}
+
+		static constexpr u32 EXP = 0x7f800000u;
+		static constexpr u32 SIGN = 0x80000000u;
+
+		// local v = vuDouble(v) with the overflow clamp on (also VU_MAC_UPDATE's result).
+		void Clamp(u32 v)
+		{
+			using S = WasmJit::Simd;
+			Function& f = m_fn;
+			const u32 e = VLocal(6), sgn = VLocal(7);
+			f.local_get(v);
+			Splat(EXP);
+			SimdOp(S::V128And);
+			f.local_set(e);
+			f.local_get(v);
+			Splat(SIGN);
+			SimdOp(S::V128And);
+			f.local_tee(sgn);
+			Splat(0x7f7fffffu);
+			SimdOp(S::V128Or);
+			f.local_get(v);
+			f.local_get(e);
+			Splat(EXP);
+			SimdOp(S::I32x4Eq);
+			SimdOp(S::V128Bitselect);
+			f.local_set(v);
+			f.local_get(sgn);
+			f.local_get(v);
+			f.local_get(e);
+			Splat(0);
+			SimdOp(S::I32x4Eq);
+			SimdOp(S::V128Bitselect);
+			f.local_set(v);
+		}
+
+		// VU0.macflag and VU0.statusflag from the raw result in local r (VU_MAC_UPDATE, VU_MACx_CLEAR,
+		// VU_STAT_UPDATE), then SYNCMSFLAGS().
+		void Flags(u32 r, u32 dest)
+		{
+			using S = WasmJit::Simd;
+			Function& f = m_fn;
+			const u32 e = VLocal(6), zm = VLocal(7), sm = VLocal(5), n = VLocal(4);
+			const bool all = (dest & 0xf) == 0xf;
+			if (!m_t_ok)
+			{
+				m_t = f.local(ValType::I32); // not m_j: a delay slot runs between JR's target read and its use
+				m_t_ok = true;
+			}
+			f.local_get(r);
+			Splat(EXP);
+			SimdOp(S::V128And);
+			f.local_set(e);
+			f.local_get(e);
+			Splat(0);
+			SimdOp(S::I32x4Eq);
+			if (!all)
+			{
+				DestConst(dest);
+				SimdOp(S::V128And);
+			}
+			f.local_set(zm);
+			f.local_get(r);
+			f.i32_const(31);
+			SimdOp(S::I32x4ShrS);
+			if (!all)
+			{
+				DestConst(dest);
+				SimdOp(S::V128And);
+			}
+			f.local_set(sm);
+			f.local_get(zm);
+			f.local_get(sm);
+			SimdOp(S::I16x8NarrowI32x4S);
+			f.local_get(zm);
+			f.local_get(r);
+			Splat(0x007fffffu);
+			SimdOp(S::V128And);
+			Splat(0);
+			SimdOp(S::I32x4Eq);
+			SimdOp(S::V128AndNot);
+			f.local_get(e);
+			Splat(EXP);
+			SimdOp(S::I32x4Eq);
+			if (!all)
+			{
+				DestConst(dest);
+				SimdOp(S::V128And);
+			}
+			SimdOp(S::I16x8NarrowI32x4S);
+			SimdOp(S::I8x16NarrowI16x8S); // bytes: zero xyzw, sign xyzw, underflow xyzw, overflow xyzw
+			f.local_set(n);
+			// macflag = (macflag & ~0xffff) | mac; VI[MAC] = macflag
+			f.i32_const(0);
+			Ld32(Addr(&VU0.macflag));
+			f.i32_const(static_cast<s32>(0xffff0000u));
+			f.i32_and();
+			f.local_get(n);
+			f.local_get(n);
+			static constexpr u8 rev[16] = {3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12};
+			f.shuffle(rev);
+			SimdOp(S::I8x16Bitmask);
+			f.i32_or();
+			f.local_tee(m_t);
+			f.i32_store(Addr(&VU0.macflag));
+			f.i32_const(0);
+			f.local_get(m_t);
+			f.i32_store(Addr(&VU0.VI[REG_MAC_FLAG].UL));
+			// statusflag = one bit per group; VI[STATUS] = (VI[STATUS] & 0xfc0) | sf | (sf << 6)
+			f.local_get(n);
+			Splat(0);
+			SimdOp(S::I32x4Ne);
+			SimdOp(S::I32x4Bitmask);
+			f.local_set(m_t);
+			f.i32_const(0);
+			f.local_get(m_t);
+			f.i32_store(Addr(&VU0.statusflag));
+			f.i32_const(0);
+			Ld32(Addr(&VU0.VI[REG_STATUS_FLAG].UL));
+			f.i32_const(0xfc0);
+			f.i32_and();
+			f.local_get(m_t);
+			f.i32_or();
+			f.local_get(m_t);
+			f.i32_const(6);
+			f.i32_shl();
+			f.i32_or();
+			f.i32_store(Addr(&VU0.VI[REG_STATUS_FLAG].UL));
+		}
+
+		void StoreVU0Code(u32 code)
+		{
+			m_fn.i32_const(0);
+			m_fn.i32_const(static_cast<s32>(code));
+			m_fn.i32_store(Addr(&VU0.code));
+		}
+
+		enum class C2 { None, Fmac, QMFC2, QMTC2, CFC2, CTC2, NOP, MOVE, MR32, ABS, ITOF, FTOI };
+		enum FK { FADD, FSUB, FMUL, FMADD, FMSUB };
+		struct Cop2Op
+		{
+			C2 type = C2::None;
+			FK k = FADD;
+			int bc = -1; // 0-3 lane of ft, 4 I, 5 Q, -1 vector
+			bool acc = false;
+			u32 sub = 0; // ITOF/FTOI: 0, 4, 12, 15
+		};
+
+		// The COP2 instructions generated code runs (with VU0 idle).
+		static Cop2Op DecodeCop2(u32 code)
+		{
+			Cop2Op o;
+			const u32 rs = Rs(code), fs = Rd(code);
+			switch (rs)
+			{
+				case 1: o.type = C2::QMFC2; return o;
+				case 5: o.type = C2::QMTC2; return o;
+				case 2: o.type = C2::CFC2; return o;
+				case 6:
+					if (fs != REG_R && fs != REG_FBRST && fs != REG_CMSAR1)
+						o.type = C2::CTC2;
+					return o;
+				default:
+					if (rs < 16)
+						return o;
+					break;
+			}
+			const u32 fn = code & 0x3f;
+			const bool sp2 = fn >= 0x3c;
+			const u32 op = sp2 ? ((code & 3) | ((code >> 4) & 0x7c)) : fn;
+			static constexpr u32 offs[4] = {0, 4, 12, 15};
+			o.acc = sp2;
+			auto fmac = [&](FK k, int bc) { o.type = C2::Fmac; o.k = k; o.bc = bc; };
+			if (op < 0x10)
+			{
+				static constexpr FK kinds[4] = {FADD, FSUB, FMADD, FMSUB};
+				fmac(kinds[op >> 2], static_cast<int>(op & 3));
+				return o;
+			}
+			if (op >= 0x18 && op <= 0x1b)
+			{
+				fmac(FMUL, static_cast<int>(op & 3));
+				return o;
+			}
+			switch (op)
+			{
+				case 0x1c: fmac(FMUL, 5); break;
+				case 0x1e: fmac(FMUL, 4); break;
+				case 0x20: fmac(FADD, 5); break;
+				case 0x21: fmac(FMADD, 5); break;
+				case 0x22:
+					if (!sp2 && CHECK_VUADDSUBHACK)
+						break; // vuADDbc_addsubhack
+					fmac(FADD, 4);
+					break;
+				case 0x23: fmac(FMADD, 4); break;
+				case 0x24: fmac(FSUB, 5); break;
+				case 0x25: fmac(FMSUB, 5); break;
+				case 0x26: fmac(FSUB, 4); break;
+				case 0x27: fmac(FMSUB, 4); break;
+				case 0x28: fmac(FADD, -1); break;
+				case 0x29: fmac(FMADD, -1); break;
+				case 0x2a: fmac(FMUL, -1); break;
+				case 0x2c: fmac(FSUB, -1); break;
+				case 0x2d: fmac(FMSUB, -1); break;
+				default:
+					if (!sp2)
+						break;
+					switch (op)
+					{
+						case 0x2f: o.type = C2::NOP; break;
+						case 0x30: o.type = C2::MOVE; break;
+						case 0x31: o.type = C2::MR32; break;
+						case 0x1d: o.type = C2::ABS; break;
+						case 0x10: case 0x11: case 0x12: case 0x13: o.type = C2::ITOF; o.sub = offs[op & 3]; break;
+						case 0x14: case 0x15: case 0x16: case 0x17: o.type = C2::FTOI; o.sub = offs[op & 3]; break;
+						default: break;
+					}
+					break;
+			}
+			// vuDouble and VU_MAC_UPDATE as generated here assume the VU0 overflow clamp.
+			if (o.type == C2::Fmac && !CHECK_VU_OVERFLOW(0))
+				o.type = C2::None;
+			return o;
+		}
+
+		void EmitCop2Body(u32 code, const Cop2Op& o)
+		{
+			using S = WasmJit::Simd;
+			Function& f = m_fn;
+			const u32 rt = Rt(code);
+			const u32 ft = rt, fs = Rd(code), fd = Sa(code), dest = (code >> 21) & 0xf;
+			switch (o.type)
+			{
+				case C2::QMFC2:
+					if (rt != 0)
+					{
+						f.i32_const(0);
+						LdV(Addr(&VU0.VF[fs]));
+						f.v128_store(GPR(rt));
+					}
+					return;
+				case C2::QMTC2:
+					if (fs != 0)
+					{
+						f.i32_const(0);
+						LdV(GPR(rt));
+						f.v128_store(Addr(&VU0.VF[fs]));
+					}
+					return;
+				case C2::CFC2:
+					if (rt == 0)
+						return;
+					if (fs == REG_R)
+					{
+						f.i32_const(0);
+						Ld32(Addr(&VU0.VI[REG_R].UL));
+						f.i32_const(0x7fffff);
+						f.i32_and();
+						f.i32_store(GPR(rt));
+					}
+					else
+					{
+						f.i32_const(0);
+						f.i32_const(0);
+						f.i64_load32_s(Addr(&VU0.VI[fs].UL));
+						f.i64_store(GPR(rt));
+					}
+					return;
+				case C2::CTC2:
+					switch (fs)
+					{
+						case 0: case REG_MAC_FLAG: case REG_TPC: case REG_VPU_STAT:
+							return; // read-only
+						case REG_CLIP_FLAG:
+							f.i32_const(0);
+							LoadGPR32(rt);
+							f.i32_store(Addr(&VU0.clipflag));
+							break;
+						default:
+							break;
+					}
+					f.i32_const(0);
+					LoadGPR32(rt);
+					f.i32_store(Addr(&VU0.VI[fs].UL));
+					return;
+				case C2::NOP:
+					StoreVU0Code(code);
+					return;
+				case C2::MOVE:
+				case C2::MR32:
+				case C2::ABS:
+				case C2::ITOF:
+				{
+					StoreVU0Code(code);
+					if (ft == 0)
+						return;
+					const u32 r = VLocal(1);
+					LdV(Addr(&VU0.VF[fs]));
+					if (o.type == C2::MR32)
+					{
+						static constexpr u8 rot[16] = {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3};
+						f.shuffle1(rot, VLocal(2));
+					}
+					else if (o.type == C2::ABS)
+					{
+						Splat(0x7fffffffu);
+						SimdOp(S::V128And);
+					}
+					else if (o.type == C2::ITOF)
+					{
+						SimdOp(S::F32x4ConvertI32x4S);
+						if (o.sub)
+						{
+							Splat(0x3f800000u - (o.sub << 23));
+							SimdOp(S::F32x4Mul);
+						}
+					}
+					f.local_set(r);
+					StoreMerged(Addr(&VU0.VF[ft]), r, dest);
+					return;
+				}
+				case C2::FTOI:
+				{
+					StoreVU0Code(code);
+					if (ft == 0)
+						return;
+					const u32 u = VLocal(0), r = VLocal(1);
+					LdV(Addr(&VU0.VF[fs]));
+					if (o.sub)
+					{
+						Splat(0x3f800000u + (o.sub << 23));
+						SimdOp(S::F32x4Mul);
+					}
+					f.local_tee(u);
+					Splat(0x7fffffffu);
+					f.local_get(u);
+					f.i32_const(31);
+					SimdOp(S::I32x4ShrU);
+					SimdOp(S::I32x4Add); // the saturated value by sign
+					f.local_get(u);
+					SimdOp(S::I32x4TruncSatF32x4S);
+					f.local_get(u);
+					Splat(EXP);
+					SimdOp(S::V128And);
+					Splat(0x4f000000u);
+					SimdOp(S::I32x4GeU);
+					SimdOp(S::V128Bitselect);
+					f.local_set(r);
+					StoreMerged(Addr(&VU0.VF[ft]), r, dest);
+					return;
+				}
+				case C2::Fmac:
+				{
+					// applyBinaryMACOp / applyTernaryMACOp and their broadcasts (VUops.cpp).
+					StoreVU0Code(code);
+					const int bc = o.bc;
+					const u32 a = VLocal(0), b = VLocal(1), c = VLocal(2), r = VLocal(3);
+					LdV(Addr(&VU0.VF[fs]));
+					f.local_set(a);
+					Clamp(a);
+					if (bc < 0)
+						LdV(Addr(&VU0.VF[ft]));
+					else
+					{
+						f.i32_const(0);
+						f.simd_mem(S::V128Load32Splat,
+							(bc < 4) ? Addr(&VU0.VF[ft].UL[bc]) : Addr(&VU0.VI[(bc == 4) ? REG_I : REG_Q].UL), 2);
+					}
+					f.local_set(b);
+					Clamp(b);
+					if (o.k == FMADD || o.k == FMSUB)
+					{
+						LdV(Addr(&VU0.ACC));
+						f.local_set(c);
+						Clamp(c);
+						f.local_get(c);
+						f.local_get(a);
+						f.local_get(b);
+						SimdOp(S::F32x4Mul);
+						SimdOp(o.k == FMADD ? S::F32x4Add : S::F32x4Sub);
+					}
+					else
+					{
+						f.local_get(a);
+						f.local_get(b);
+						SimdOp(o.k == FADD ? S::F32x4Add : o.k == FSUB ? S::F32x4Sub : S::F32x4Mul);
+					}
+					f.local_set(r);
+					Flags(r, dest);
+					if (o.acc || fd != 0) // fd 0 writes RDzero, which nothing reads
+					{
+						Clamp(r);
+						StoreMerged(o.acc ? Addr(&VU0.ACC) : Addr(&VU0.VF[fd]), r, dest);
+					}
+					return;
+				}
+				default:
+					return;
+			}
+		}
+
+		bool EmitCop2(u32 pc, u32 code, const Decoded& d, bool in_delay_slot)
+		{
+			Function& f = m_fn;
+			const bool lq = d.kind == Kind::LQC2, sq = d.kind == Kind::SQC2;
+			Cop2Op o;
+			if (!lq && !sq)
+			{
+				o = DecodeCop2(code);
+				if (o.type == C2::None)
+					return false;
+				if (EEJit::g_dbgmask & (1u << static_cast<int>(o.type)))
+					return false;
+			}
+			else if (EEJit::g_dbgmask & 0x10000)
+				return false;
+			m_pending += d.op->cycles;
+			s_native_instrs++;
+			f.block(); // done
+			f.block(); // slow
+			Ld32(Addr(&VU0.VI[REG_VPU_STAT].UL));
+			f.i32_const(1);
+			f.i32_and();
+			f.br_if(0);
+			if (lq || sq)
+			{
+				const u32 rs = Rs(code), rt = Rt(code);
+				LoadGPR32(rs);
+				f.i32_const(Imm(code));
+				f.i32_add();
+				f.local_tee(m_a);
+				f.i32_const(12);
+				f.i32_shr_u();
+				f.i32_const(3);
+				f.i32_shl();
+				f.i64_load(static_cast<u32>(s_vmap_base));
+				f.local_get(m_a);
+				f.i64_extend_i32_u();
+				f.i64_add();
+				f.local_tee(m_v);
+				f.i64_const(0);
+				f.i64_lt_s();
+				f.br_if(0);
+				if (lq)
+				{
+					if (rt != 0)
+					{
+						f.i32_const(0);
+						f.local_get(m_v);
+						f.i32_wrap_i64();
+						f.v128_load(0);
+						f.v128_store(Addr(&VU0.VF[rt]));
+					}
+				}
+				else
+				{
+					f.local_get(m_v);
+					f.i32_wrap_i64();
+					LdV(Addr(&VU0.VF[rt]));
+					f.v128_store(0);
+				}
+			}
+			else
+				EmitCop2Body(code, o);
+			f.br(1);
+			f.end(); // slow
+			StorePcCode(pc, code);
+			FlushCyclesSlowPath();
+			CallVoid(FnIndex(d.op->interpret));
+			if (!in_delay_slot)
+				CheckPc(pc + 4);
+			f.end(); // done
+			if (m_pending || m_cyc_dirty)
+				m_cyc_dirty = true;
+			return true;
 		}
 
 		// An aligned access to directly mapped memory inline; anything else calls the interpreter's function, which
@@ -962,6 +1490,10 @@ namespace
 		u64 m_vmap_raw;
 		Function m_fn;
 		u32 m_a, m_j, m_cyc, m_f;
+		u32 m_vloc[8] = {};
+		u32 m_t = 0;
+		bool m_t_ok = false;
+		bool m_vloc_ok[8] = {};
 		u32 m_v;
 		u32 m_pending = 0; // cycles not yet written, before the Config factor
 		bool m_cyc_dirty = false; // m_cyc may be non-zero
@@ -1181,6 +1713,8 @@ void EEJit::TraceStep()
 	HashWords(h, &cpuRegs, offsetof(cpuRegisters, code) + 4); // GPRs, HI/LO, COP0, sa, pc, code
 	HashWords(h, &cpuRegs.cycle, 8);
 	HashWords(h, &fpuRegs, sizeof(fpuRegs));
+	HashWords(h, &VU0.VF[0], sizeof(VU0.VF) + sizeof(VU0.VI) + sizeof(VU0.ACC)); // VF, VI, ACC (VU.h)
+	HashWords(h, &VU0.macflag, 12); // macflag, statusflag, clipflag
 	s_trace_hash = h;
 	const u64 step = ++s_trace_step;
 	if (step >= g_trace_from && step <= g_trace_to)

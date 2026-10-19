@@ -27,6 +27,7 @@ namespace EEJit
 
 	// Statistics (-eejit-stats): counts executions of the instructions that fall back to the interpreter.
 	extern bool g_stats;
+	extern u32 g_dbgmask; // debugging: COP2 kinds (bit per EEJit.cpp C2 value, 0x10000 LQC2/SQC2) left to the interpreter
 	void PrintStats();
 
 	// Runs guest code until the interpreter's longjmp leaves intExecute(). Returns only if the JIT could not
