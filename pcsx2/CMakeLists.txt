@@ -1103,6 +1103,7 @@ set(pcsx2arm64Headers
 # docs/web-port/VU1-JIT-DESIGN.md)
 set(pcsx2wasmSources
 	wasm/EEJit.cpp
+	wasm/IopJit.cpp
 	wasm/RecStubs.cpp
 	wasm/VU0Jit.cpp
 	wasm/VU1Jit.cpp
@@ -1127,6 +1128,7 @@ set(pcsx2wasmHeaders
 
 set(pcsx2wasmHeaders
 	wasm/EEJit.h
+	wasm/IopJit.h
 	wasm/WasmEmitter.h
 	wasm/WasmJitRuntime.h
 	)

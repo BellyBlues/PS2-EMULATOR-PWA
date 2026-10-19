@@ -964,6 +964,8 @@
 			args.push('-gs-idle', 'block');
 		if (params.get('eejit') === '0')
 			args.push('-eejit', '0');
+		if (params.get('iopjit') === '0')
+			args.push('-iopjit', '0');
 		if (GPU_ALLOWED && navigator.gpu && !HAS_JSPI)
 			pageLog('WebGPU needs JSPI, which this browser lacks: drawing through the 2D canvas.', 'warn');
 		args.push(...audioModuleArguments());

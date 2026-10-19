@@ -11,6 +11,10 @@
 #include "IopBios.h"
 #include "IopHw.h"
 
+#ifdef ARCH_WASM
+#include "wasm/IopJit.h"
+#endif
+
 using namespace R3000A;
 
 // Used to flag delay slot instructions when throwig exceptions.
@@ -258,7 +262,9 @@ static __fi bool psxIsIdleLoop(u32 tar)
 }
 #endif
 
-static void doBranch(s32 tar) {
+// doBranch() is split around its delay slot so that the IOP JIT (pcsx2/wasm/IopJit.cpp) runs the same code.
+static __fi void doBranchStart(s32 tar)
+{
 	if (tar == 0x0)
 		DevCon.Warning("[R3000 Interpreter] Warning: Branch to 0x0!");
 
@@ -278,8 +284,10 @@ static void doBranch(s32 tar) {
 
 	branch2 = iopIsDelaySlot = true;
 	branchPC = tar;
-	execI();
-	PSXCPU_LOG( "\n" );
+}
+
+static __fi void doBranchEnd(u32 tar)
+{
 	iopIsDelaySlot = false;
 #ifdef ARCH_WASM
 	// Idle loop: a branch back over nothing but nops, with a nop in its delay slot, waits for an interrupt.
@@ -300,6 +308,54 @@ static void doBranch(s32 tar) {
 	iopEventTest();
 }
 
+static void doBranch(s32 tar) {
+	doBranchStart(tar);
+	execI();
+	PSXCPU_LOG( "\n" );
+	doBranchEnd(tar);
+}
+
+#ifdef ARCH_WASM
+// Entry points for the IOP JIT (pcsx2/wasm/IopJit.cpp).
+
+// A taken branch: doBranch() before its delay slot.
+void psxJitBranchStart(u32 tar)
+{
+	doBranchStart(tar);
+}
+
+// After the delay slot, with psxRegs.pc and psxRegs.code as execI() leaves them.
+void psxJitBranchEnd(u32 tar)
+{
+	doBranchEnd(tar);
+}
+
+// True once a taken branch ended the run of instructions intExecuteBlock() is in.
+bool psxJitBranched()
+{
+	return branch2;
+}
+
+bool* psxJitBranchFlag()
+{
+	return &branch2;
+}
+
+// One instruction of that run, as intExecuteBlock() runs it; true when the run ends.
+bool psxJitExecOne(u64 last_cycle)
+{
+	execI();
+	if (branch2)
+		return true;
+	if ((psxRegs.cycle - last_cycle) >= 0x10000)
+	{
+		iopEventTest();
+		return true;
+	}
+	return false;
+}
+#endif
+
 static void intReserve() {
 }
 
@@ -308,6 +364,9 @@ static void intAlloc() {
 
 static void intReset() {
 	intAlloc();
+#ifdef ARCH_WASM
+	IopJit::RequestFlush();
+#endif
 }
 
 static s32 intExecuteBlock( s32 eeCycles )
@@ -323,6 +382,11 @@ static s32 intExecuteBlock( s32 eeCycles )
 			psxBiosCall();
 
 		branch2 = 0;
+#ifdef ARCH_WASM
+		if (IopJit::g_mode)
+			IopJit::Run(lastIOPCycle);
+		else
+#endif
 		while (!branch2)
 		{
 			execI();

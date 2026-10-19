@@ -32,6 +32,7 @@
 #include "R5900OpcodeTables.h"
 #include "vtlb.h"
 #include "VUmicro.h"
+#include "R3000A.h"
 
 #include "wasm/EEJit.h"
 #include "wasm/WasmEmitter.h"
@@ -2179,6 +2180,7 @@ void EEJit::TraceStep()
 	HashWords(h, &fpuRegs, sizeof(fpuRegs));
 	HashWords(h, &VU0.VF[0], sizeof(VU0.VF) + sizeof(VU0.VI) + sizeof(VU0.ACC)); // VF, VI, ACC (VU.h)
 	HashWords(h, &VU0.macflag, 12); // macflag, statusflag, clipflag
+	HashWords(h, &psxRegs, offsetof(psxRegisters, interrupt)); // IOP: GPRs, HI/LO, COP0, GTE, pc, code, cycle
 	s_trace_hash = h;
 	const u64 step = ++s_trace_step;
 	if (step >= g_trace_from && step <= g_trace_to)
