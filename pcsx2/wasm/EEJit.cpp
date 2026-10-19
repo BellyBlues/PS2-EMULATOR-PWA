@@ -16,7 +16,8 @@
 //   interpreter's event test where it does (BEQ/BNE and the likely branches).
 // - Other instructions: ALU, shifts, HI/LO moves, multiplies, the aligned loads and stores of RAM/ROM/scratchpad,
 //   and with VU0 idle the common COP2 ops (FMAC ops with their flags, moves, LQC2/SQC2, QMFC2/QMTC2, CFC2/CTC2)
-//   are emitted; everything else (FPU, COP0, other COP2 ops, MMI, divides, unaligned and I/O accesses, traps,
+//   the FPU's moves, compares, BC1x branches and arithmetic (FPU.cpp's clamping and flags; not DIV, SQRT, RSQRT)
+//   are emitted; everything else (COP0, other FPU and COP2 ops, MMI, divides, unaligned and I/O accesses, traps,
 //   syscalls) calls the interpreter's function for that opcode with cpuRegs.pc and cpuRegs.code set as execI() sets
 //   them. After such a call, a changed PC (an exception) leaves the block.
 // - Self-modifying code: each block checks, on entry, its page's vtlb mapping and its instruction words against the
@@ -136,9 +137,13 @@ namespace
 		LB, LBU, LH, LHU, LW, LWU, LD, LQ, SB, SH, SW, SD, SQ, LWC1, SWC1, LQC2, SQC2,
 		// COP2: VU0 macro mode (the ops EmitCop2() knows; the rest call the interpreter).
 		COP2,
+		// COP1 (FPU.cpp).
+		MFC1, MTC1, CFC1, CTC1, ADD_S, SUB_S, MUL_S, ADDA_S, SUBA_S, MULA_S, MADD_S, MSUB_S, MADDA_S, MSUBA_S,
+		ABS_S, NEG_S, MOV_S, MAX_S, MIN_S, C_F, C_EQ, C_LT, C_LE, CVT_S, CVT_W,
 		// Branches.
 		J, JAL, JR, JALR, BEQ, BNE, BLEZ, BGTZ, BEQL, BNEL, BLEZL, BGTZL,
 		BLTZ, BGEZ, BLTZL, BGEZL, BLTZAL, BGEZAL, BLTZALL, BGEZALL,
+		BC1F, BC1T, BC1FL, BC1TL,
 	};
 
 	struct Decoded
@@ -170,6 +175,15 @@ namespace
 			{LD, Kind::LD}, {LQ, Kind::LQ}, {SB, Kind::SB}, {SH, Kind::SH}, {SW, Kind::SW}, {SD, Kind::SD},
 			{SQ, Kind::SQ}, {LWC1, Kind::LWC1}, {SWC1, Kind::SWC1},
 			{LQC2, Kind::LQC2}, {SQC2, Kind::SQC2}, {COP2, Kind::COP2},
+			{COP1::MFC1, Kind::MFC1}, {COP1::MTC1, Kind::MTC1}, {COP1::CFC1, Kind::CFC1}, {COP1::CTC1, Kind::CTC1},
+			{COP1::ADD_S, Kind::ADD_S}, {COP1::SUB_S, Kind::SUB_S}, {COP1::MUL_S, Kind::MUL_S},
+			{COP1::ADDA_S, Kind::ADDA_S}, {COP1::SUBA_S, Kind::SUBA_S}, {COP1::MULA_S, Kind::MULA_S},
+			{COP1::MADD_S, Kind::MADD_S}, {COP1::MSUB_S, Kind::MSUB_S}, {COP1::MADDA_S, Kind::MADDA_S},
+			{COP1::MSUBA_S, Kind::MSUBA_S}, {COP1::ABS_S, Kind::ABS_S}, {COP1::NEG_S, Kind::NEG_S},
+			{COP1::MOV_S, Kind::MOV_S}, {COP1::MAX_S, Kind::MAX_S}, {COP1::MIN_S, Kind::MIN_S}, {COP1::C_F, Kind::C_F},
+			{COP1::C_EQ, Kind::C_EQ}, {COP1::C_LT, Kind::C_LT}, {COP1::C_LE, Kind::C_LE}, {COP1::CVT_S, Kind::CVT_S},
+			{COP1::CVT_W, Kind::CVT_W},
+			{COP1::BC1F, Kind::BC1F}, {COP1::BC1T, Kind::BC1T}, {COP1::BC1FL, Kind::BC1FL}, {COP1::BC1TL, Kind::BC1TL},
 			{SYNC, Kind::Nop}, {PREF, Kind::Nop},
 			{J, Kind::J}, {JAL, Kind::JAL}, {JR, Kind::JR}, {JALR, Kind::JALR}, {BEQ, Kind::BEQ}, {BNE, Kind::BNE},
 			{BLEZ, Kind::BLEZ}, {BGTZ, Kind::BGTZ}, {BEQL, Kind::BEQL}, {BNEL, Kind::BNEL}, {BLEZL, Kind::BLEZL},
@@ -259,6 +273,8 @@ namespace
 						case Kind::BGEZL:
 						case Kind::BLTZALL:
 						case Kind::BGEZALL:
+						case Kind::BC1FL:
+						case Kind::BC1TL:
 							pc += 8; // the delay slot is read by the taken path
 							continue;
 						default:
@@ -688,6 +704,14 @@ namespace
 					EmitMemory(pc, code, d, in_delay_slot);
 					return;
 
+				case Kind::MFC1: case Kind::MTC1: case Kind::CFC1: case Kind::CTC1: case Kind::ADD_S: case Kind::SUB_S:
+				case Kind::MUL_S: case Kind::ADDA_S: case Kind::SUBA_S: case Kind::MULA_S: case Kind::MADD_S:
+				case Kind::MSUB_S: case Kind::MADDA_S: case Kind::MSUBA_S: case Kind::ABS_S: case Kind::NEG_S:
+				case Kind::MOV_S: case Kind::MAX_S: case Kind::MIN_S: case Kind::C_F: case Kind::C_EQ: case Kind::C_LT:
+				case Kind::C_LE: case Kind::CVT_S: case Kind::CVT_W:
+					EmitFpu(code, d.kind);
+					break;
+
 				case Kind::LQC2: case Kind::SQC2: case Kind::COP2:
 					if (!EmitCop2(pc, code, d, in_delay_slot))
 						EmitFallback(pc, code, d, in_delay_slot);
@@ -699,6 +723,313 @@ namespace
 			}
 			m_pending += d.op->cycles;
 			s_native_instrs++;
+		}
+
+		// ---- COP1 (FPU.cpp) --------------------------------------------------------------------------------
+		u32 FPR(u32 r) { return Addr(&fpuRegs.fpr[r].UL); }
+		u32 FCR31() { return Addr(&fpuRegs.fprc[31]); }
+		u32 ILocal(int i)
+		{
+			if (!m_iloc_ok[i])
+			{
+				m_iloc[i] = m_fn.local(ValType::I32);
+				m_iloc_ok[i] = true;
+			}
+			return m_iloc[i];
+		}
+		// fpuDouble() of the i32 bits on the stack, as f32: exponent 0 gives the signed zero, 255 the signed maximum.
+		void FpuDouble()
+		{
+			Function& f = m_fn;
+			const u32 x = ILocal(0), e = ILocal(1);
+			f.local_tee(x);
+			f.i32_const(0x7f800000);
+			f.i32_and();
+			f.local_set(e);
+			// e == 0x7f800000 ? (x & sign) | max : x
+			f.local_get(x);
+			f.i32_const(static_cast<s32>(0x80000000u));
+			f.i32_and();
+			f.i32_const(0x7f7fffff);
+			f.i32_or();
+			f.local_get(x);
+			f.local_get(e);
+			f.i32_const(0x7f800000);
+			f.i32_eq();
+			f.select();
+			// e == 0 ? x & sign : that
+			f.local_set(x); // x now holds the clamped value; the sign is the same
+			f.local_get(x);
+			f.i32_const(static_cast<s32>(0x80000000u));
+			f.i32_and();
+			f.local_get(x);
+			f.local_get(e);
+			f.i32_eqz();
+			f.select();
+			f.f32_reinterpret_i32();
+		}
+		void FpuDoubleReg(u32 addr)
+		{
+			m_fn.i32_const(0);
+			m_fn.i32_load(addr);
+			FpuDouble();
+		}
+		// FCR31 = (FCR31 & and_mask) | or_value
+		void Fcr31AndOr(u32 and_mask, u32 or_value)
+		{
+			Function& f = m_fn;
+			f.i32_const(0);
+			f.i32_const(0);
+			f.i32_load(FCR31());
+			if (and_mask != 0xffffffffu)
+			{
+				f.i32_const(static_cast<s32>(and_mask));
+				f.i32_and();
+			}
+			if (or_value)
+			{
+				f.i32_const(static_cast<s32>(or_value));
+				f.i32_or();
+			}
+			f.i32_store(FCR31());
+		}
+		// The f32 result on the stack goes to dst through checkOverflow(O | SO) and checkUnderflow(U | SU).
+		void FpuStoreChecked(u32 dst)
+		{
+			Function& f = m_fn;
+			const u32 r = ILocal(2);
+			f.i32_reinterpret_f32();
+			f.local_tee(r);
+			f.i32_const(0x7fffffff);
+			f.i32_and();
+			f.i32_const(0x7f800000);
+			f.i32_eq();
+			f.if_();
+			{
+				f.local_get(r);
+				f.i32_const(static_cast<s32>(0x80000000u));
+				f.i32_and();
+				f.i32_const(0x7f7fffff);
+				f.i32_or();
+				f.local_set(r);
+				Fcr31AndOr(0xffffffffu, 0x00008000 | 0x00000010);
+			}
+			f.else_();
+			{
+				// clear O, then underflow: exponent 0 and a mantissa
+				f.local_get(r);
+				f.i32_const(0x7f800000);
+				f.i32_and();
+				f.i32_eqz();
+				f.local_get(r);
+				f.i32_const(0x007fffff);
+				f.i32_and();
+				f.i32_const(0);
+				f.i32_ne();
+				f.i32_and();
+				f.if_();
+				{
+					f.local_get(r);
+					f.i32_const(static_cast<s32>(0x80000000u));
+					f.i32_and();
+					f.local_set(r);
+					Fcr31AndOr(~0x00008000u, 0x00004000 | 0x00000008);
+				}
+				f.else_();
+				Fcr31AndOr(~(0x00008000u | 0x00004000u), 0);
+				f.end();
+			}
+			f.end();
+			f.i32_const(0);
+			f.local_get(r);
+			f.i32_store(dst);
+		}
+
+		void EmitFpu(u32 code, Kind k)
+		{
+			Function& f = m_fn;
+			const u32 rt = Rt(code), ft = Rt(code), fs = Rd(code), fd = Sa(code);
+			const u32 acc = Addr(&fpuRegs.ACC.UL);
+			switch (k)
+			{
+				case Kind::MFC1:
+					if (rt == 0)
+						return;
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i64_load32_s(FPR(fs));
+					f.i64_store(GPR(rt));
+					return;
+				case Kind::MTC1:
+					f.i32_const(0);
+					LoadGPR32(rt);
+					f.i32_store(FPR(fs));
+					return;
+				case Kind::CFC1:
+					if (rt == 0)
+						return;
+					f.i32_const(0);
+					if (fs == 31)
+					{
+						f.i32_const(0);
+						f.i64_load32_s(FCR31());
+					}
+					else
+						f.i64_const(fs == 0 ? 0x2E00 : 0);
+					f.i64_store(GPR(rt));
+					return;
+				case Kind::CTC1:
+					if (fs != 31)
+						return;
+					f.i32_const(0);
+					LoadGPR32(rt);
+					f.i32_store(FCR31());
+					return;
+				case Kind::ADD_S: case Kind::SUB_S: case Kind::MUL_S:
+				case Kind::ADDA_S: case Kind::SUBA_S: case Kind::MULA_S:
+				{
+					const bool a = k == Kind::ADDA_S || k == Kind::SUBA_S || k == Kind::MULA_S;
+					FpuDoubleReg(FPR(fs));
+					FpuDoubleReg(FPR(ft));
+					if (k == Kind::ADD_S || k == Kind::ADDA_S) f.f32_add();
+					else if (k == Kind::SUB_S || k == Kind::SUBA_S) f.f32_sub();
+					else f.f32_mul();
+					FpuStoreChecked(a ? acc : FPR(fd));
+					return;
+				}
+				case Kind::MADD_S: case Kind::MSUB_S:
+				{
+					// temp = fpuDouble(fs) * fpuDouble(ft); fd = fpuDouble(ACC) +- fpuDouble(temp)
+					FpuDoubleReg(acc);
+					FpuDoubleReg(FPR(fs));
+					FpuDoubleReg(FPR(ft));
+					f.f32_mul();
+					f.i32_reinterpret_f32();
+					FpuDouble();
+					if (k == Kind::MADD_S) f.f32_add(); else f.f32_sub();
+					FpuStoreChecked(FPR(fd));
+					return;
+				}
+				case Kind::MADDA_S: case Kind::MSUBA_S:
+				{
+					// ACC +-= fpuDouble(fs) * fpuDouble(ft), on the raw ACC and product
+					f.i32_const(0);
+					f.f32_load(acc);
+					FpuDoubleReg(FPR(fs));
+					FpuDoubleReg(FPR(ft));
+					f.f32_mul();
+					if (k == Kind::MADDA_S) f.f32_add(); else f.f32_sub();
+					FpuStoreChecked(acc);
+					return;
+				}
+				case Kind::ABS_S: case Kind::NEG_S:
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i32_load(FPR(fs));
+					if (k == Kind::ABS_S)
+					{
+						f.i32_const(0x7fffffff);
+						f.i32_and();
+					}
+					else
+					{
+						f.i32_const(static_cast<s32>(0x80000000u));
+						f.i32_xor();
+					}
+					f.i32_store(FPR(fd));
+					Fcr31AndOr(~(0x00008000u | 0x00004000u), 0);
+					return;
+				case Kind::MOV_S:
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i32_load(FPR(fs));
+					f.i32_store(FPR(fd));
+					return;
+				case Kind::MAX_S: case Kind::MIN_S:
+				{
+					// fp_max/fp_min: both negative ? min/max : max/min, as s32
+					const u32 a = ILocal(0), b = ILocal(1);
+					const bool mx = k == Kind::MAX_S;
+					f.i32_const(0);
+					f.i32_load(FPR(fs));
+					f.local_set(a);
+					f.i32_const(0);
+					f.i32_load(FPR(ft));
+					f.local_set(b);
+					f.i32_const(0);
+					// smaller (signed) and larger
+					auto smaller = [&] { f.local_get(a); f.local_get(b); f.local_get(a); f.local_get(b); f.i32_lt_s(); f.select(); };
+					auto larger = [&] { f.local_get(a); f.local_get(b); f.local_get(a); f.local_get(b); f.i32_gt_s(); f.select(); };
+					if (mx) smaller(); else larger();
+					if (mx) larger(); else smaller();
+					f.local_get(a);
+					f.local_get(b);
+					f.i32_and();
+					f.i32_const(0);
+					f.i32_lt_s(); // both negative
+					f.select();
+					f.i32_store(FPR(fd));
+					Fcr31AndOr(~(0x00008000u | 0x00004000u), 0);
+					return;
+				}
+				case Kind::C_F:
+					Fcr31AndOr(~0x00800000u, 0);
+					return;
+				case Kind::C_EQ: case Kind::C_LT: case Kind::C_LE:
+				{
+					const u32 c = ILocal(2);
+					FpuDoubleReg(FPR(fs));
+					FpuDoubleReg(FPR(ft));
+					if (k == Kind::C_EQ) f.f32_eq(); else if (k == Kind::C_LT) f.f32_lt(); else f.f32_le();
+					f.local_set(c);
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i32_load(FCR31());
+					f.i32_const(static_cast<s32>(~0x00800000u));
+					f.i32_and();
+					f.local_get(c);
+					f.i32_const(23);
+					f.i32_shl();
+					f.i32_or();
+					f.i32_store(FCR31());
+					return;
+				}
+				case Kind::CVT_S:
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i32_load(FPR(fs));
+					f.f32_convert_i32_s();
+					f.f32_store(FPR(fd));
+					return;
+				case Kind::CVT_W:
+				{
+					// exponent <= 0x4e8: (s32)f; else 0x7fffffff or 0x80000000 by sign
+					const u32 x = ILocal(0);
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i32_load(FPR(fs));
+					f.local_tee(x);
+					f.i32_const(0x7f800000);
+					f.i32_and();
+					f.i32_const(0x4e800000);
+					f.i32_le_u();
+					f.if_(static_cast<u8>(ValType::I32));
+					f.local_get(x);
+					f.f32_reinterpret_i32();
+					f.i32_trunc_f32_s();
+					f.else_();
+					f.i32_const(0x7fffffff);
+					f.local_get(x);
+					f.i32_const(31);
+					f.i32_shr_u();
+					f.i32_add(); // 0x7fffffff + 1 = 0x80000000 when negative
+					f.end();
+					f.i32_store(FPR(fd));
+					return;
+				}
+				default:
+					return;
+			}
 		}
 
 		// ---- COP2 (VU0 macro mode) ------------------------------------------------------------------------
@@ -1379,13 +1710,26 @@ namespace
 
 			const bool likely = d.kind == Kind::BEQL || d.kind == Kind::BNEL || d.kind == Kind::BLEZL ||
 								d.kind == Kind::BGTZL || d.kind == Kind::BLTZL || d.kind == Kind::BGEZL ||
-								d.kind == Kind::BLTZALL || d.kind == Kind::BGEZALL;
+								d.kind == Kind::BLTZALL || d.kind == Kind::BGEZALL || d.kind == Kind::BC1FL ||
+								d.kind == Kind::BC1TL;
+			const bool fpu = d.kind == Kind::BC1F || d.kind == Kind::BC1T || d.kind == Kind::BC1FL || d.kind == Kind::BC1TL;
 			const bool links = d.kind == Kind::BLTZAL || d.kind == Kind::BGEZAL || d.kind == Kind::BLTZALL ||
 							   d.kind == Kind::BGEZALL;
 			if (links)
 				link(31);
 
-			// Condition (64-bit signed compares, as the interpreter does).
+			// Condition (64-bit signed compares, as the interpreter does; BC1x: FCR31's C bit).
+			if (fpu)
+			{
+				f.i32_const(0);
+				f.i32_load(Addr(&fpuRegs.fprc[31]));
+				f.i32_const(0x00800000);
+				f.i32_and();
+				if (d.kind == Kind::BC1F || d.kind == Kind::BC1FL)
+					f.i32_eqz();
+			}
+			else
+			{
 			LoadGPR64(rs);
 			switch (d.kind)
 			{
@@ -1396,13 +1740,15 @@ namespace
 				case Kind::BLTZ: case Kind::BLTZL: case Kind::BLTZAL: case Kind::BLTZALL: f.i64_const(0); f.i64_lt_s(); break;
 				default: f.i64_const(0); f.i64_ge_s(); break;
 			}
+			}
 			f.if_();
 			taken(false);
 			f.end();
 			if (in_page(btarget))
 				next->push_back(btarget);
 
-			const bool tests = likely || d.kind == Kind::BEQ || d.kind == Kind::BNE;
+			// BC1FL/BC1TL not taken skip the delay slot without the branch test (FPU.cpp, BC1L).
+			const bool tests = (likely && !fpu) || d.kind == Kind::BEQ || d.kind == Kind::BNE;
 			const u32 resume = likely ? pc + 8 : pc + 4;
 			if (tests)
 			{
@@ -1492,6 +1838,8 @@ namespace
 		u32 m_a, m_j, m_cyc, m_f;
 		u32 m_vloc[8] = {};
 		u32 m_t = 0;
+		u32 m_iloc[4] = {};
+		bool m_iloc_ok[4] = {};
 		bool m_t_ok = false;
 		bool m_vloc_ok[8] = {};
 		u32 m_v;

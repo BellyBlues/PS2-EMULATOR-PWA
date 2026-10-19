@@ -258,6 +258,11 @@ namespace WasmJit
 		void i64_or() { op(0x84); }
 		void i64_shl() { op(0x86); }
 		void i64_shr_u() { op(0x88); }
+		void f32_eq() { op(0x5b); }
+		void f32_lt() { op(0x5d); }
+		void f32_le() { op(0x5f); }
+		void i32_trunc_f32_s() { op(0xa8); }
+		void f32_convert_i32_s() { op(0xb2); }
 		void f32_add() { op(0x92); }
 		void f32_sub() { op(0x93); }
 		void f32_mul() { op(0x94); }
