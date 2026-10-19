@@ -1130,11 +1130,13 @@ static bool InitializeConfig()
 	// The VU0 micro-mode JIT (pcsx2/wasm/VU0Jit.h) is off too.
 	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", false);
 
-	// Software renderer into GSDeviceNull, sound through the page's Web Audio worklet, keyboard
-	// only (the default port 1 keyboard bindings stay), memory card slot 1 only. Hotkeys are
+	// The hardware renderer on the WebGPU device (without WebGPU the GS falls back to the software
+	// renderer into GSDeviceNull; the page's ?renderer=sw picks the software renderer), sound through
+	// the page's Web Audio worklet, keyboard only (the default port 1 keyboard bindings stay), memory
+	// card slot 1 only. Hotkeys are
 	// cleared: most of them (pause menu, save states, screenshots) need host support that is not
 	// there yet.
-	si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::SW));
+	si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::WebGPU));
 	// The software renderer's rasterizer threads limit 3D scenes with PCSX2's default of 2 (BT3 fight, 16
 	// threads: 30 VPS with 2, 38 with 4, 41 with 6; output identical). Leave about four threads to the EE, VU1,
 	// GS threads and the browser. The thread pool (CMakeLists.txt) covers 6.

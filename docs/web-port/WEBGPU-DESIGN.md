@@ -1462,6 +1462,29 @@ measured again on the fixed build (same setup; the machine was shared with other
 - Intro wall time with the HW renderer is no worse than with the SW renderer (both are EE-bound), and
   MTGS plus SW-thread CPU time is lower.
 
+#### Step 2 results (2026-10-19)
+
+Built and made the page's default renderer (`?renderer=sw` goes back to the SW renderer); headless
+Chromium 155 on the RADV adapter (§12.5).
+
+- **What is built:** `tfx.wgsl` (the whole `vulkan/tfx.glsl` template except the ROV, PrimID-DATE and
+  triangle-AA1 paths), specialised by `WGSLPreprocessor` with GSDeviceVK's macro list; one module per
+  VS and PS selector, pipelines keyed by `TFXPipelineKey`, created asynchronously and waited for. 620
+  preprocessed variants (every PS macro value, 400 random selectors, every VS variant) compile and
+  build pipelines with the §8.1 layout (only the PrimID-init outputs fail, as expected). `RenderHW` follows
+  GSDevice11: feedback through RT copies (one-barrier and full-barrier loops), depth feedback through full
+  depth copies (`depth_feedback = 1`, no DS-as-RT), stencil DATE, colclip HW, VS expansion of points,
+  lines and sprites with the base vertex in `firstInstance`, render-pass reuse. Depth and stencil convert
+  targets, partial depth copies (`DEPTH_COPY` draws), CLUT, indexed and downsample conversions.
+- **Feature profile:** as §4 except `test_and_sample_depth = 0`, `depth_feedback = multidraw_fb_copy`,
+  `primitive_id = 0`, `aa1 = 0`. Dual-source blending is required for the HW renderer; without it (or
+  without a WebGPU device) the GS falls back to the SW renderer.
+- **Results:** BIOS intro and OSDSYS menus (SCPH-39001) and BT3 (title, memory card prompts, menus,
+  character select, a fight) render correctly with 0 uncaptured errors and 0 skipped draws; device loss
+  recovers. BT3 fight: 49–50 VPS (full speed, PAL) against 22–30 VPS with the SW renderer (6 raster threads).
+- **Not done:** no DX11 reference census (compared with the SW renderer and by eye); GenerateMipmap is
+  still a stub; upscaling not tested; the `WGSLPreprocessor` unit test.
+
 ### Step 3: the rest of TFX, readbacks, device loss, performance (size XL; +≈ 1.8k C++, +0.7k WGSL)
 
 **Scope:**

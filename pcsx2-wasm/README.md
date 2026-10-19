@@ -3,11 +3,10 @@
 TabStationToo is a browser frontend for the WebAssembly build of PCSX2 (the `pcsx2-wasm`
 target). It is built on PCSX2 (GPL-3.0) and is not affiliated with Sony or the PCSX2 project.
 You pick your own PS2 BIOS and, if you like, a disc image of one of your games, press Boot, and the
-game (or the BIOS menu) renders in a `<canvas>`, driven from the keyboard. It runs the interpreters
-(no JIT on wasm) with the software renderer. Where the browser offers WebGPU, the GS merges,
-deinterlaces and presents that renderer's output on the GPU and posts each frame to the page as an
-`ImageBitmap` (the WebGPU device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise the output is copied
-to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio worklet.
+game (or the BIOS menu) renders in a `<canvas>`, driven from the keyboard. Where the browser offers
+WebGPU, the GS draws with PCSX2's hardware renderer on the GPU and posts each frame to the page as an
+`ImageBitmap` (the WebGPU device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise it uses the software
+renderer and its output is copied to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio worklet.
 Memory card slot 1 is kept in the browser. There are no save states yet.
 
 - `Main.cpp`: the frontend (Host callbacks, settings, CPU thread loop, `pcsx2web_*` exports)
@@ -167,7 +166,7 @@ Switches for comparisons and tests (all optional):
 | Query | Effect |
 | --- | --- |
 | `?gpu=0` | No WebGPU: the GS presents through its in-memory device and the page draws on a 2D canvas |
-| `?renderer=hw` | Draws with PCSX2's hardware renderer on the WebGPU device (`?renderer=sw`: the software renderer, the default). Without a WebGPU device the GS uses the software renderer |
+| `?renderer=sw` | Draws with PCSX2's software renderer instead of the hardware renderer on the WebGPU device (the default, `?renderer=hw`). Without a WebGPU device the GS uses the software renderer |
 | `?set=Section/Key=Value` | Overrides one setting after the defaults (repeatable), e.g. `?set=EmuCore/GS/deinterlace_mode=2` |
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |
@@ -498,8 +497,8 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
   BIN/CUE), and no disc swap or eject while a game runs.
 - Interpreters only, so most content runs below full speed: game menus mostly run at 60–100 %,
   3D battles at 10–20 %.
-- The GS always uses the software renderer; WebGPU only merges, deinterlaces and presents its output
-  (the hardware renderer on WebGPU is the next step of `docs/web-port/WEBGPU-DESIGN.md`).
+- The hardware renderer on WebGPU needs dual-source blending (not in Safari) and does not have
+  upscaling, PrimID DATE, AA1, CAS or FXAA yet (`docs/web-port/WEBGPU-DESIGN.md`, step 3).
 - Only the main BIOS file is loaded (no separate ROM1/ROM2/NVM/MEC files).
 - Needs a recent desktop browser with cross-origin isolation (Chrome, Edge or Firefox; Safari is
   untested). WebGPU presentation also needs JSPI (Chrome 137+, Firefox 157 has it); without it,

@@ -131,8 +131,8 @@
 	const FRAME_PORT_TIMEOUT_MS = 5000;
 	const LATENCY_SAMPLES = 600;
 	const VU1JIT_PARAM = params.get('vu1jit');
-	// ?renderer=hw draws with PCSX2's hardware renderer on the WebGPU device, ?renderer=sw with the software
-	// renderer (the default). Without WebGPU the GS falls back to the software renderer either way.
+	// PCSX2's hardware renderer on the WebGPU device is the default (?renderer=hw); ?renderer=sw picks the
+	// software renderer. Without WebGPU the GS falls back to the software renderer either way.
 	const RENDERER_PARAM = params.get('renderer');
 
 	// ------------------------------------------------------------------ copy
