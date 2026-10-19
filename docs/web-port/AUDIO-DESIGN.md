@@ -931,6 +931,13 @@ python3 aggregate.py results/matrix.jsonl         # or any results file
 7. `Module.pcsx2webAudioReady(node | null)` instead of `pcsx2webAudioNode`; `EM_JS_DEPS()` instead
    of `DEFAULT_LIBRARY_FUNCS_TO_INCLUDE`; block words 11–14 defined (§4.5).
 8. Test switches: `?mute=1`, `?audio=null`, `?audiotap=SECONDS` and `?audiorate=HZ` (UI-SPEC §11).
+9. **An underrun at the 50 ms step moves to the 100 ms step at once** (2026-10-19), and the step back
+   down waits until 30 s have passed without one. With the JITs and the WebGPU renderer the game runs
+   at 92-100 %, where the stretcher stays at tempo 1 (it only wakes outside 20 % of its target) and
+   frame time spikes emptied the 50 ms buffer: Budokai Tenkaichi 3 from boot to the fight in headless
+   Brave had 15 gaps (290 ms, 12 of them around the fight's start) before, 3 (114 ms) after. Pitch and
+   tempo at full speed were already right (the title music matches the headless reference with a
+   constant lag, spectral similarity 0.98).
 
 ### 10.3 Measurements with the real emulator
 

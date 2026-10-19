@@ -477,11 +477,20 @@ static constexpr std::array<float, 5> AUDIO_STEP_MIN_SPEED = {75.0f, 50.0f, 28.0
 static constexpr double AUDIO_STEP_UP_AFTER = 1.0; // s
 static constexpr double AUDIO_STEP_DOWN_AFTER = 10.0; // s
 static constexpr double AUDIO_STEP_DOWN_RATE = 100.0; // ms of target per s
+// Near full speed, frame time spikes (a slow frame, a disc read, a GPU stall) can empty the 50 ms buffer: the
+// stretcher stays at tempo 1 within 20 % of the target (AudioStream::UpdateStretchTempo()), so it does not slow the
+// sound down for a scene at 90-99 % speed either. An underrun at the first step therefore moves to the second at
+// once, and it steps back down only after AUDIO_UNDERRUN_HOLD without one.
+static constexpr double AUDIO_UNDERRUN_HOLD = 30.0; // s
+static constexpr double AUDIO_UNDERRUN_GRACE = 3.0; // s after a stream attaches: underruns there are the start's
 static u32 s_audio_step = 0; // CPU thread
 static double s_audio_target_ms = AUDIO_BUFFER_STEPS[0]; // what the stream aims for: the step's, or above it
 static Common::Timer::Value s_audio_step_up_since = 0;
 static Common::Timer::Value s_audio_step_down_since = 0;
 static Common::Timer::Value s_audio_target_updated = 0; // 0: not while running
+static u32 s_audio_short_seen = 0; // AUDIO_SHORT_QUANTA at the last look
+static Common::Timer::Value s_audio_underrun_at = 0; // the last underrun noticed while running, 0: none
+static Common::Timer::Value s_audio_running_since = 0; // attached and running since, 0: not
 
 static bool AudioRender(int num_inputs, const AudioSampleFrame* inputs, int num_outputs, AudioSampleFrame* outputs,
 	int num_params, const AudioParamFrame* params, void* user_data);
@@ -921,6 +930,8 @@ static void ResetAudioBufferStep()
 	s_audio_step_up_since = 0;
 	s_audio_step_down_since = 0;
 	s_audio_target_updated = 0;
+	s_audio_underrun_at = 0;
+	s_audio_running_since = 0;
 }
 
 // The speed it takes to step down to a step: half as fast again as its minimum, at most 15 points more (90 % for the
@@ -951,7 +962,7 @@ static void SetAudioTarget(double target_ms)
 }
 
 // A bigger step applies at once; a smaller one is reached by UpdateAudioTarget().
-static void ApplyAudioBufferStep(u32 step, float speed)
+static void ApplyAudioBufferStep(u32 step, float speed, const char* why = "")
 {
 	const u16 buffer_ms = AUDIO_BUFFER_STEPS[step];
 	s_audio_step = step;
@@ -960,7 +971,7 @@ static void ApplyAudioBufferStep(u32 step, float speed)
 	if (buffer_ms > s_audio_target_ms)
 		SetAudioTarget(buffer_ms);
 	s_audio_block[AUDIO_STEPS].fetch_add(1, std::memory_order_relaxed);
-	Console.WriteLnFmt("pcsx2-wasm: audio buffer {} ms at {:.0f}% speed", buffer_ms, speed);
+	Console.WriteLnFmt("pcsx2-wasm: audio buffer {} ms at {:.0f}% speed{}", buffer_ms, speed, why);
 }
 
 // Down towards the step's buffer at AUDIO_STEP_DOWN_RATE.
@@ -982,13 +993,30 @@ static void UpdateAudioTarget(Common::Timer::Value now)
 static void UpdateAudioBufferStep(Common::Timer::Value now)
 {
 	const float speed = s_speed.load(std::memory_order_relaxed);
+	const u32 short_quanta = s_audio_block[AUDIO_SHORT_QUANTA].load(std::memory_order_relaxed);
+	const bool underrun = (short_quanta != s_audio_short_seen);
+	s_audio_short_seen = short_quanta;
 	if (!s_audio_stream || speed <= 0.0f || VMManager::GetState() != VMState::Running)
 	{
 		s_audio_step_up_since = 0;
 		s_audio_step_down_since = 0;
 		s_audio_target_updated = 0;
+		s_audio_running_since = 0;
 		return;
 	}
+	if (s_audio_block[AUDIO_ATTACHED].load(std::memory_order_relaxed) == 0)
+		s_audio_running_since = 0;
+	else if (s_audio_running_since == 0)
+		s_audio_running_since = now;
+	if (underrun && s_audio_running_since != 0 &&
+		Common::Timer::ConvertValueToSeconds(now - s_audio_running_since) >= AUDIO_UNDERRUN_GRACE)
+	{
+		s_audio_underrun_at = now;
+		if (s_audio_step == 0)
+			ApplyAudioBufferStep(1, speed, " after an underrun");
+	}
+	const bool underrun_recently = s_audio_underrun_at != 0 &&
+								   Common::Timer::ConvertValueToSeconds(now - s_audio_underrun_at) < AUDIO_UNDERRUN_HOLD;
 
 	const auto held_for = [now](Common::Timer::Value& since) {
 		if (since == 0)
@@ -996,7 +1024,7 @@ static void UpdateAudioBufferStep(Common::Timer::Value now)
 		return Common::Timer::ConvertValueToSeconds(now - since);
 	};
 	const u32 slower = AudioStepForSpeed(speed, false);
-	const u32 faster = AudioStepForSpeed(speed, true);
+	const u32 faster = std::max(AudioStepForSpeed(speed, true), underrun_recently ? 1u : 0u);
 	if (slower > s_audio_step)
 	{
 		s_audio_step_down_since = 0;
