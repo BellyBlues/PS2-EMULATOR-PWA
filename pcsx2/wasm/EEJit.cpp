@@ -20,6 +20,9 @@
 //   are emitted; everything else (COP0, other FPU and COP2 ops, MMI, divides, unaligned and I/O accesses, traps,
 //   syscalls) calls the interpreter's function for that opcode with cpuRegs.pc and cpuRegs.code set as execI() sets
 //   them. After such a call, a changed PC (an exception) leaves the block.
+// - Dispatch: a block that ends goes on to the next one itself (Leave()): a tail call to the target's function when
+//   it is in the same module, else a lookup of the dispatcher's cache in wasm, so that the C++ dispatcher (Execute())
+//   only runs for compiles, invalidations and the straight-line event test. -eejit-link 0 turns that off.
 // - Self-modifying code: each block checks, on entry, its page's vtlb mapping and its instruction words against the
 //   values it was compiled from, and is recompiled when they differ. That covers stores by the CPU, DMA and TLB
 //   changes without write tracking. Code that changes the rest of its own block while it runs is not detected
@@ -52,6 +55,7 @@ using namespace vtlb_private;
 namespace EEJit
 {
 	int g_mode = 1;
+	bool g_link = true;
 	bool g_trace = false;
 	u32 g_trace_shift = 16;
 	u64 g_trace_from = ~0ull, g_trace_to = 0;
@@ -70,6 +74,7 @@ namespace
 	constexpr size_t kMaxGroups = 6000; // about 20 KB each in V8; flush everything beyond
 
 	using BlockFn = int (*)();
+	constexpr u32 kAnyPc = 1; // Leave(): an exit to whatever cpuRegs.pc is
 
 	struct Group
 	{
@@ -83,6 +88,7 @@ namespace
 	std::unordered_map<int, Group*> s_slot_group;
 	std::vector<std::unique_ptr<Group>> s_groups;
 	bool s_flush_requested = false;
+	bool s_link = false; // block linking (tail calls): set by Execute() when the engine has them
 	bool s_failed = false;
 	uptr s_vmap_base = 0;
 
@@ -451,8 +457,44 @@ namespace
 			f.i32_const(0);
 			f.i32_const(static_cast<s32>(pc));
 			f.i32_store(Addr(&cpuRegs.pc));
-			f.i32_const(0);
-			f.return_();
+			Leave(pc, true);
+		}
+
+		// Leaves the block for `target` (kAnyPc: whatever cpuRegs.pc is) with everything written, as the dispatcher
+		// expects. Block linking: when the dispatcher would not run its straight-line event test (cpuBlockCycles
+		// below 2^20), the next block runs without going back to it, its own entry checks running as they would
+		// from the dispatcher: a target in this page (when the PC is that target: pc_known, or checked here, as a
+		// branch end can take an exception) is tail-called directly; anything else goes through the module's
+		// lookup function (EmitLookup()), the dispatcher's cache lookup in wasm. CompileGroup() patches the calls
+		// with the index of the target's function in this module, or of the lookup function.
+		void Leave(u32 target, bool pc_known)
+		{
+			Function& f = m_fn;
+			if (!s_link)
+			{
+				f.i32_const(0);
+				f.return_();
+				return;
+			}
+			if (target >= m_page && target < m_page + 4096 && !(target & 3))
+			{
+				f.i32_const(0);
+				f.i32_load(Addr(intJitBlockCycles()));
+				f.i32_const(1 << 20);
+				f.i32_lt_u();
+				if (!pc_known)
+				{
+					f.i32_const(0);
+					f.i32_load(Addr(&cpuRegs.pc));
+					f.i32_const(static_cast<s32>(target));
+					f.i32_eq();
+					f.i32_and();
+				}
+				f.if_();
+				m_links.push_back({f.return_call_patchable(), target});
+				f.end();
+			}
+			m_links.push_back({f.return_call_patchable(), kAnyPc});
 		}
 
 		void CountStat(const char* name)
@@ -1663,7 +1705,7 @@ namespace
 				f.i64_store(GPR(r));
 			};
 			// Taken: delay slot, then the interpreter's branch end, then leave.
-			auto taken = [&](bool from_local) {
+			auto taken = [&](bool from_local, u32 target) {
 				const u32 saved_pending = m_pending;
 				const bool saved_dirty = m_cyc_dirty;
 				EmitDelaySlot(pc + 4);
@@ -1674,8 +1716,7 @@ namespace
 					f.i32_const(static_cast<s32>(btarget));
 				f.i32_const(static_cast<s32>(FnIndex(&intJitBranchEnd)));
 				f.call_indirect(m_tiv, 0);
-				f.i32_const(0);
-				f.return_();
+				Leave(target, false);
 				m_pending = saved_pending;
 				m_cyc_dirty = saved_dirty;
 			};
@@ -1688,7 +1729,7 @@ namespace
 						link(31);
 					f.i32_const(static_cast<s32>(jtarget));
 					f.local_set(m_j);
-					taken(true);
+					taken(true, jtarget);
 					if (in_page(jtarget))
 						next->push_back(jtarget);
 					if (in_page(pc + 8))
@@ -1700,7 +1741,7 @@ namespace
 					f.local_set(m_j);
 					if (d.kind == Kind::JALR && rd)
 						link(rd);
-					taken(true);
+					taken(true, kAnyPc);
 					if (in_page(pc + 8))
 						next->push_back(pc + 8);
 					return false;
@@ -1742,7 +1783,7 @@ namespace
 			}
 			}
 			f.if_();
-			taken(false);
+			taken(false, btarget);
 			f.end();
 			if (in_page(btarget))
 				next->push_back(btarget);
@@ -1774,6 +1815,8 @@ namespace
 		{
 			return CompileLoop(start, next);
 		}
+		Function& Body() { return m_fn; }
+		std::vector<std::pair<size_t, u32>> m_links; // tail calls to patch: body offset, target PC
 
 	private:
 		Function& CompileLoop(u32 start, std::vector<u32>* next)
@@ -1805,8 +1848,7 @@ namespace
 					if (!ds_ok)
 					{
 						EmitFallback(pc, code, d, false);
-						f.i32_const(0);
-						f.return_();
+						Leave(kAnyPc, false);
 						break;
 					}
 					if (!EmitBranch(pc, code, d, next))
@@ -1817,8 +1859,7 @@ namespace
 				if (IsBranch(d))
 				{
 					EmitFallback(pc, code, d, false);
-					f.i32_const(0);
-					f.return_();
+					Leave(kAnyPc, false);
 					if (pc + 8 < m_page + 4096)
 						next->push_back(pc + 8);
 					break;
@@ -1900,6 +1941,52 @@ namespace
 		s_flushes++;
 	}
 
+	// The dispatcher's lookup in wasm (Execute()), for linked exits: tail-calls the compiled block at cpuRegs.pc,
+	// or returns 0 to the dispatcher when cpuBlockCycles calls for its event test or there is no block.
+	Function EmitLookup(u32 type_v_i)
+	{
+		Function f(0);
+		const u32 pc = f.local(ValType::I32), p = f.local(ValType::I32);
+		auto ret0_if = [&] {
+			f.if_();
+			f.i32_const(0);
+			f.return_();
+			f.end();
+		};
+		f.i32_const(0);
+		f.i32_load(Addr(intJitBlockCycles()));
+		f.i32_const(1 << 20);
+		f.i32_ge_u();
+		ret0_if();
+		f.i32_const(0);
+		f.i32_load(Addr(&cpuRegs.pc));
+		f.local_tee(pc);
+		f.i32_const(3);
+		f.i32_and();
+		ret0_if();
+		f.local_get(pc);
+		f.i32_const(12);
+		f.i32_shr_u();
+		f.i32_const(2);
+		f.i32_shl();
+		f.i32_load(Addr(&s_pages[0]));
+		f.local_tee(p);
+		f.i32_eqz();
+		ret0_if();
+		f.local_get(p);
+		f.local_get(pc);
+		f.i32_const(0xffc);
+		f.i32_and();
+		f.i32_add();
+		f.i32_load(0);
+		f.local_tee(p);
+		f.i32_eqz();
+		ret0_if();
+		f.local_get(p);
+		f.return_call_indirect(type_v_i, 0);
+		return f;
+	}
+
 	// Compiles the block at pc and its neighbours in the same page into one module. False if pc cannot be compiled.
 	bool CompileGroup(u32 entry)
 	{
@@ -1918,6 +2005,7 @@ namespace
 		m.import_table("env", "table", 0);
 
 		std::vector<u32> pcs;
+		std::vector<std::unique_ptr<BlockCompiler>> blocks;
 		std::vector<u32> work{entry};
 		while (!work.empty() && pcs.size() < kMaxGroupBlocks)
 		{
@@ -1928,16 +2016,29 @@ namespace
 			if (pc != entry && SlotRef(pc) != 0)
 				continue;
 			std::vector<u32> next;
-			BlockCompiler bc(t_v_v, t_i_v, page, host, vmv.raw());
-			Function& fn = bc.Run(pc, &next);
-			const u32 index = m.add_function(t_v_i, fn);
-			char name[16];
-			std::snprintf(name, sizeof(name), "b%u", static_cast<u32>(pcs.size()));
-			m.export_function(name, index);
+			blocks.push_back(std::make_unique<BlockCompiler>(t_v_v, t_i_v, page, host, vmv.raw()));
+			blocks.back()->Run(pc, &next);
 			pcs.push_back(pc);
 			for (u32 n : next)
 				work.push_back(n);
 		}
+		// Block i is function i; function pcs.size() returns 0 (links to blocks outside the module).
+		const u32 nblocks = static_cast<u32>(pcs.size());
+		for (u32 i = 0; i < nblocks; i++)
+		{
+			Function& fn = blocks[i]->Body();
+			for (const auto& [at, target] : blocks[i]->m_links)
+			{
+				const auto it = std::find(pcs.begin(), pcs.end(), target);
+				fn.patch_func(at, static_cast<u32>(it - pcs.begin())); // nblocks (the lookup) when not found
+			}
+			const u32 index = m.add_function(t_v_i, fn);
+			char name[16];
+			std::snprintf(name, sizeof(name), "b%u", i);
+			m.export_function(name, index);
+		}
+		m.add_function(t_v_i, EmitLookup(t_v_i));
+		blocks.clear();
 
 		const std::vector<u8> bytes = m.finish();
 		s_wasm_bytes += bytes.size();
@@ -2024,6 +2125,18 @@ void EEJit::Execute()
 		s_vmap_base = reinterpret_cast<uptr>(vtlbdata.vmap);
 	}
 
+	static const bool can_link = [] {
+		// Tail calls (return_call): in every current engine, but check.
+		WasmJit::Module m;
+		const u32 t = m.type({}, {ValType::I32});
+		Function fn(0);
+		fn.patch_func(fn.return_call_patchable(), 0);
+		m.add_function(t, fn);
+		const std::vector<u8> bytes = m.finish();
+		return wasmjit_validate(bytes.data(), bytes.size()) != 0;
+	}();
+	s_link = can_link && g_link;
+
 	u32* const block_cycles = intJitBlockCycles();
 	for (;;)
 	{
@@ -2038,7 +2151,10 @@ void EEJit::Execute()
 					intJitStraightLineTest();
 				continue;
 			}
-			// The code or its mapping changed.
+			// The code or its mapping changed. A linked block that failed its checks leaves the PC at its own
+			// start: the dispatcher then calls it again through the cache and drops it below.
+			if (cpuRegs.pc != pc)
+				continue;
 			s_invalidations++;
 			ReleaseSlot(slot);
 			page[(pc >> 2) & (kPageWords - 1)] = 0;

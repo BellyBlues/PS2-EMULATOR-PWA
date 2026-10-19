@@ -198,6 +198,21 @@ namespace WasmJit
 		}
 		void call(u32 func) { op(0x10); m_body.uleb(func); }
 		void call_indirect(u32 type, u32 table = 0) { op(0x11); m_body.uleb(type); m_body.uleb(table); }
+		// Tail call (return_call) whose function index is patched later with patch_func(): returns where it is.
+		size_t return_call_patchable()
+		{
+			op(0x12);
+			const size_t at = m_body.data.size();
+			static constexpr u8 pad[5] = {0x80, 0x80, 0x80, 0x80, 0x00};
+			m_body.bytes(pad, sizeof(pad));
+			return at;
+		}
+		void patch_func(size_t at, u32 func)
+		{
+			for (int i = 0; i < 5; i++)
+				m_body.data[at + i] = static_cast<u8>(((func >> (7 * i)) & 0x7f) | (i < 4 ? 0x80 : 0));
+		}
+		void return_call_indirect(u32 type, u32 table = 0) { op(0x13); m_body.uleb(type); m_body.uleb(table); }
 		void drop() { op(0x1a); }
 		void select() { op(0x1b); }
 		void unreachable() { op(0x00); }

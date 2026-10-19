@@ -15,6 +15,8 @@ namespace EEJit
 {
 	// 0: interpreter only; 1: JIT (default). Read when the EE starts executing (intExecute()).
 	extern int g_mode;
+	// Block linking (-eejit-link 0 turns it off, for comparisons).
+	extern bool g_link;
 
 	// Compare mode (-eejit-trace in the headless runner): a hash of the EE state is updated at every branch test
 	// and printed every 2^g_trace_shift tests, so that a JIT run and an interpreter run can be compared state by

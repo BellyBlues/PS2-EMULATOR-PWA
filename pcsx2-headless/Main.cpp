@@ -398,6 +398,8 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 		}
 		else if (arg == "-eejit" && has_value)
 			EEJit::g_mode = StringUtil::FromChars<int>(argv[++i]).value_or(1);
+		else if (arg == "-eejit-link" && has_value)
+			EEJit::g_link = StringUtil::FromChars<int>(argv[++i]).value_or(1) != 0;
 		else if (arg == "-eejit-mask" && has_value)
 			EEJit::g_dbgmask = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
 		else if (arg == "-eejit-stats")
@@ -436,7 +438,7 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-loadstate FILE] [-savestate FILE] [-unlimited]\n"
 								 "         [-wav FILE.wav [-wav-realtime [-wav-period FRAMES]]]\n"
 								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n"
-								 "         [-eejit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n", argv[0]);
+								 "         [-eejit 0|1] [-eejit-link 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n", argv[0]);
 			std::fprintf(stderr, "  -eejit 0 runs the EE interpreter instead of the EE JIT; -eejit-trace prints EE state hashes to compare runs.\n");
 #ifdef __EMSCRIPTEN__
 			std::fprintf(stderr, "         [-vu1jit-fuzz SEED:COUNT[:timing|jit|both[:hashes]]] [-vu1jit-oracle] [-vu1jit-lockstep] [-vu0jit-lockstep]\n"
