@@ -17,6 +17,7 @@ int tst_canvas_create(const char* selector, u32 width, u32 height);
 void tst_canvas_destroy(const char* selector);
 double tst_post_frame(u32 frame, u32 device, u32 vsync);
 void tst_post_fallback(const char* reason, int permanent);
+void tst_post_mode(int hw, int webgpu, const char* reason);
 void tst_sleep_suspending(double ms);
 double tst_event_loop_stalled_ms();
 void tst_staging_map(WGPUBuffer buffer);
@@ -38,6 +39,9 @@ namespace
 	u32 s_devices = 0;
 	bool s_recovering = false;
 	bool s_suspended = false;
+	std::string s_failure;
+	bool s_failure_no_adapter = false;
+	std::string s_hw_unsupported;
 
 	// Surface size from the page: width and height packed in one word so they change together.
 	std::atomic<u32> s_surface_size{0};
@@ -115,6 +119,47 @@ void WebGPUHost::NoteUnavailable(const char* reason)
 bool WebGPUHost::ConsumeTestDeviceLossRequest()
 {
 	return s_test_loss_requested.exchange(false, std::memory_order_acq_rel);
+}
+
+void WebGPUHost::ClearFailure()
+{
+	s_failure.clear();
+	s_failure_no_adapter = false;
+	s_hw_unsupported.clear();
+}
+
+void WebGPUHost::SetFailure(std::string reason, bool no_adapter)
+{
+	// The first reason is the cause; later ones are consequences.
+	if (!s_failure.empty())
+		return;
+	s_failure = std::move(reason);
+	s_failure_no_adapter = no_adapter;
+}
+
+const char* WebGPUHost::FailureReason()
+{
+	return s_failure.empty() ? "no WebGPU device could be created (the log has details)" : s_failure.c_str();
+}
+
+bool WebGPUHost::FailureWasNoAdapter()
+{
+	return s_failure_no_adapter;
+}
+
+void WebGPUHost::SetHWUnsupported(std::string reason)
+{
+	s_hw_unsupported = std::move(reason);
+}
+
+const std::string& WebGPUHost::HWUnsupported()
+{
+	return s_hw_unsupported;
+}
+
+void WebGPUHost::NoteRenderer(bool hw, bool webgpu, const char* reason)
+{
+	tst_post_mode(hw ? 1 : 0, webgpu ? 1 : 0, reason ? reason : "");
 }
 
 bool WebGPUHost::GetSurfaceSize(u32* width, u32* height, float* scale)

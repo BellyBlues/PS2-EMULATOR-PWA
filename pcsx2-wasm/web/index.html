@@ -97,6 +97,10 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
         <svg class="icon" aria-hidden="true" focusable="false"><use id="btn-sound-icon" href="icons.svg#i-speaker-high"/></svg><span class="t-label">Sound</span>
         <span class="tip" aria-hidden="true">Sound <kbd>M</kbd></span>
       </button>
+      <button type="button" class="t-btn" id="btn-gfx" popovertarget="gfx-menu" aria-controls="gfx-menu" aria-expanded="false" aria-label="Graphics">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-graphics-card"/></svg><span class="t-label">Graphics</span>
+        <span class="tip" aria-hidden="true">Graphics</span>
+      </button>
       <button type="button" class="t-btn" id="btn-crisp" aria-pressed="false">
         <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-checkerboard"/></svg><span class="t-label">Crisp</span>
         <span class="tip" aria-hidden="true">Crisp pixels</span>
@@ -205,6 +209,21 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
     <div class="menu-items">
       <button type="button" class="menu-item" id="sound-mute" aria-pressed="false" aria-keyshortcuts="M"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-speaker-x"/></svg>Mute<kbd class="cap-key" aria-hidden="true">M</kbd></button>
       <p class="menu-reason" id="sound-note" hidden></p>
+    </div>
+  </div>
+
+  <div class="menu gfx-menu" id="gfx-menu" popover role="group" aria-label="Graphics">
+    <p class="menu-file"><span class="menu-where">Now</span><span class="gfx-mode" id="gfx-mode">Not started yet</span><span class="menu-where" id="gfx-why" hidden></span></p>
+    <fieldset class="gfx-choice">
+      <legend class="sound-label">Renderer</legend>
+      <label class="gfx-option"><input type="radio" name="gfx-choice" value="auto" checked><span>Auto<span class="gfx-hint">GPU when it works, software otherwise</span></span></label>
+      <label class="gfx-option"><input type="radio" name="gfx-choice" value="gpu"><span>GPU<span class="gfx-hint">PCSX2’s hardware renderer on WebGPU</span></span></label>
+      <label class="gfx-option"><input type="radio" name="gfx-choice" value="sw"><span>Software<span class="gfx-hint">No WebGPU: drawn by the CPU on a 2D canvas</span></span></label>
+      <p class="menu-reason" id="gfx-applies">Applies at the next boot.</p>
+    </fieldset>
+    <div class="menu-items">
+      <button type="button" class="menu-item" id="gfx-check"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-graphics-card"/></svg>Check WebGPU</button>
+      <div class="gfx-result" id="gfx-result" role="status" aria-live="polite"></div>
     </div>
   </div>
 

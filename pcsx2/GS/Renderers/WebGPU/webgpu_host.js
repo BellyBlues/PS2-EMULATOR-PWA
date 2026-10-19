@@ -83,6 +83,14 @@ addToLibrary({
     else postMessage({ cmd: {{{ CMD_CALL_HANDLER }}}, handler: 'tstGpuFallback', args: [message.reason, message.permanent] });
   },
 
+  // Tells the page which renderer the GS opened and on which display path (see WebGPUHost::NoteRenderer).
+  tst_post_mode__deps: ['$tstGs', '$UTF8ToString'],
+  tst_post_mode: (hw, webgpu, reason) => {
+    const message = { type: 'mode', hw: !!hw, webgpu: !!webgpu, reason: UTF8ToString(reason) };
+    if (tstGs.port && webgpu) tstGs.port.postMessage(message);
+    else postMessage({ cmd: {{{ CMD_CALL_HANDLER }}}, handler: 'tstGpuMode', args: [message] });
+  },
+
   // A sleep that suspends the calling thread's stack (JSPI) instead of blocking its worker, so the
   // worker's event loop runs meanwhile. Atomics.waitAsync with a timeout on a word nobody notifies:
   // unlike setTimeout it is not clamped when nested, and unlike emscripten_atomic_wait_suspending()

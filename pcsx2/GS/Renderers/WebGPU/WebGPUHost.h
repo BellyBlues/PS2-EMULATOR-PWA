@@ -54,6 +54,23 @@ namespace WebGPUHost
 
 	bool ConsumeTestDeviceLossRequest();
 
+	/// Why the last device creation failed, in plain words for the page ("the browser gave no WebGPU
+	/// adapter"), and whether it got no adapter at all (then the adapter retries already took their
+	/// time and the GS does not try a whole device again). ClearFailure() at the start of a creation.
+	void ClearFailure();
+	void SetFailure(std::string reason, bool no_adapter = false);
+	const char* FailureReason();
+	bool FailureWasNoAdapter();
+
+	/// The device works for presenting but lacks what the hardware renderer needs (dual-source
+	/// blending): the GS then draws with the SW renderer through it. Empty when the HW renderer can run.
+	void SetHWUnsupported(std::string reason);
+	const std::string& HWUnsupported();
+
+	/// Tells the page which renderer the GS opened (hw: PCSX2's hardware renderer on WebGPU, else the
+	/// software one) and, when it is not the one asked for or WebGPU is not used, why.
+	void NoteRenderer(bool hw, bool webgpu, const char* reason);
+
 	/// Called when a device is ready: frames posted from now on carry the next device number, so
 	/// the page can tell when a recovered device's frames arrive. Ends a recovery.
 	void NoteDeviceCreated();

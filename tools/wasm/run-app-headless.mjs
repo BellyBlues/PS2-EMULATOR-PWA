@@ -34,7 +34,8 @@
 //   --out DIR           where captures, snapshots and console.log go
 //   --profile-root DIR  where the throwaway Chrome profile is created (deleted at exit)
 //   --timeout S         give up after S seconds (default 300)
-//   --gpu core|swiftshader|none   Chrome's WebGPU adapter (default core: Dawn Vulkan on the GPU)
+//   --gpu core|swiftshader|none|plain   Chrome's WebGPU adapter (default core: Dawn Vulkan on the GPU;
+//                       plain: no WebGPU switches, as the browser ships)
 //   --init-script JS    run JS in the page and in every worker before their own scripts (for example
 //                       to hide navigator.gpu)
 //   --cpus LIST         run Chrome under taskset -c LIST
@@ -66,6 +67,8 @@ const GPU_FLAGS = {
 		"--disable-vulkan-surface"],
 	swiftshader: ["--enable-unsafe-webgpu", "--use-webgpu-adapter=swiftshader"],
 	none: ["--disable-features=WebGPU"],
+	// The browser as shipped: on Linux, Chromium then usually gives no adapter (UI-SPEC.md §12).
+	plain: [],
 };
 
 function parseArgs(argv) {
@@ -106,7 +109,7 @@ function parseArgs(argv) {
 		else throw new Error(`unknown argument ${a}`);
 	}
 	if (!o.biosDir || !o.bios) throw new Error("--bios-dir and --bios are required");
-	if (!GPU_FLAGS[o.gpu]) throw new Error("--gpu must be core, swiftshader or none");
+	if (!GPU_FLAGS[o.gpu]) throw new Error("--gpu must be core, swiftshader, none or plain");
 	return o;
 }
 

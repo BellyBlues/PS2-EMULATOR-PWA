@@ -179,13 +179,15 @@ static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool
 	if (!okay && new_api == RenderAPI::WebGPU)
 	{
 		const bool recovering = WebGPUHost::IsRecoveringFromLoss();
-		for (int attempt = recovering ? 2 : 3; attempt <= 3 && !okay; attempt++)
+		// No adapter at all: the adapter retries took their time already, so no second device.
+		const int first = (recovering || WebGPUHost::FailureWasNoAdapter()) ? 3 : 2;
+		for (int attempt = first; attempt <= 3 && !okay; attempt++)
 		{
 			g_gs_device->Destroy();
 			g_gs_device.reset();
 			if (attempt == 2)
 			{
-				Console.Warning("WebGPU device creation failed, trying once more.");
+				Console.WarningFmt("WebGPU device creation failed ({}), trying once more.", WebGPUHost::FailureReason());
 				g_gs_device = std::unique_ptr<GSDevice>(MakeGSDeviceWebGPU());
 			}
 			else
@@ -193,7 +195,7 @@ static bool OpenGSDevice(GSRendererType renderer, bool clear_state_on_fail, bool
 				if (recovering)
 					WebGPUHost::GiveUp("the WebGPU device could not be created twice");
 				else
-					WebGPUHost::NoteUnavailable("no WebGPU device could be created");
+					WebGPUHost::NoteUnavailable(WebGPUHost::FailureReason());
 				g_gs_device = std::make_unique<GSDeviceNull>();
 			}
 			okay = g_gs_device->Create(vsync_mode, allow_present_throttle);
@@ -267,13 +269,22 @@ static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
 static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 {
 #ifdef __EMSCRIPTEN__
-	// The HW renderer needs the WebGPU device; without one (no adapter, no dual-source blending) the GS
-	// draws with the SW renderer on whatever device it got.
-	if (renderer == GSRendererType::WebGPU && g_gs_device->GetRenderAPI() != RenderAPI::WebGPU)
+	// The HW renderer needs the WebGPU device with dual-source blending; without the device (no
+	// adapter) the GS draws with the SW renderer on the null device (the page's 2D canvas), without
+	// the feature with the SW renderer presenting through the WebGPU device.
+	const bool webgpu = g_gs_device->GetRenderAPI() == RenderAPI::WebGPU;
+	std::string why;
+	if (!webgpu)
+		why = WebGPUHost::IsAvailable() ? WebGPUHost::FailureReason() : "";
+	if (renderer == GSRendererType::WebGPU && (!webgpu || !WebGPUHost::HWUnsupported().empty()))
 	{
-		Console.Warning("GS: no WebGPU device for the hardware renderer, using the software renderer.");
+		if (webgpu)
+			why = WebGPUHost::HWUnsupported();
+		Console.WarningFmt("GS: the hardware renderer cannot run ({}), using the software renderer.",
+			why.empty() ? "no WebGPU device" : why);
 		renderer = GSRendererType::SW;
 	}
+	WebGPUHost::NoteRenderer(renderer == GSRendererType::WebGPU, webgpu, why.c_str());
 #endif
 
 	// Must be done first, initialization routines in GSState use GSIsHardwareRenderer().

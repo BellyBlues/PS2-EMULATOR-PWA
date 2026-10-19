@@ -1445,6 +1445,97 @@ p.fine {
   padding-left: 16px;
 }
 
+/* Graphics menu (UI-SPEC.md §12): what runs now, the renderer choice, the WebGPU check. */
+.gfx-menu {
+  width: 320px;
+  max-height: calc(100dvh - 96px);
+  overflow-y: auto;
+}
+
+.gfx-mode {
+  font-size: 15px;
+  line-height: 20px;
+  font-weight: 560;
+}
+
+.gfx-choice {
+  display: grid;
+  margin: 0;
+  padding: 8px 0 4px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  min-inline-size: 0;
+}
+
+.gfx-choice legend {
+  float: left;
+  width: 100%;
+  padding: 0 16px 4px;
+}
+
+.gfx-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-height: var(--hit);
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+.gfx-option:hover {
+  background: var(--line);
+}
+
+.gfx-option input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--ink);
+}
+
+.gfx-option input:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.gfx-option > span {
+  display: grid;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+}
+
+.gfx-hint {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.gfx-menu .menu-reason {
+  padding-left: 16px;
+}
+
+.gfx-result {
+  display: grid;
+  gap: 6px;
+  padding: 0 16px;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.gfx-result:not(:empty) {
+  padding-block: 4px 8px;
+}
+
+.gfx-result p:first-child {
+  color: var(--ink);
+}
+
 /* Touch-only devices have no M key to show. */
 @media (pointer: coarse) and (hover: none) {
   .menu-item .cap-key {
@@ -1776,9 +1867,9 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
 }
 
 /* Labels follow the viewport (above). This is only a fallback for wide but short windows, where
-   the screen, and so the column, is narrower than the labelled transport (about 580 px). A
+   the screen, and so the column, is narrower than the labelled transport (about 670 px). A
    drawer never triggers it: the column is 920 px then. */
-@container transport (max-width: 599px) {
+@container transport (max-width: 689px) {
   .t-label {
     position: absolute;
     width: 1px;
@@ -2074,6 +2165,14 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
 
   .credits {
     padding-block: 12px calc(16px + env(safe-area-inset-bottom));
+  }
+}
+
+/* Phones by touch: six tools (Sound, Graphics, Crisp, Keys, Log, Fullscreen) fit 358 px at 56 px each. */
+@media (max-width: 639px) and (hover: none) {
+  .t-right .t-btn {
+    min-width: 56px;
+    padding-inline: 4px;
   }
 }
 

@@ -54,10 +54,12 @@ namespace
 	constexpr u32 STAGING_GRANULARITY = 1024 * 1024;
 	constexpr size_t MAX_STAGING_BUFFERS = 6;
 
-	// requestAdapter can answer null while the GPU process starts or restarts (§4 step 2): four tries
-	// over 0.75 s. Without any adapter (a blocklisted GPU) that is the boot delay before the 2D path.
-	constexpr u32 ADAPTER_ATTEMPTS = 4;
-	constexpr double ADAPTER_RETRY_MS = 250.0;
+	// requestAdapter can answer null while the GPU process starts or restarts (§4 step 2): six tries
+	// over about 3 s, alternating high-performance and the default power preference. Without any
+	// adapter (a GPU the browser does not enable WebGPU on, such as most Linux GPUs in Chromium without
+	// "Unsafe WebGPU Support") that is the boot delay before the 2D path.
+	constexpr u32 ADAPTER_ATTEMPTS = 6;
+	constexpr double ADAPTER_RETRY_MS[ADAPTER_ATTEMPTS - 1] = {150.0, 300.0, 500.0, 800.0, 1200.0};
 	constexpr double REQUEST_TIMEOUT_MS = 5000.0;
 	constexpr double PIPELINE_TIMEOUT_MS = 10000.0;
 	constexpr u32 MAX_LOGGED_ERRORS = 10;
@@ -239,16 +241,23 @@ bool GSDeviceWebGPU::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	s_cb.lost = false;
 	s_cb.error_count = 0;
 	s_cb.errors_reported = 0;
+	WebGPUHost::ClearFailure();
 
 	if (!AcquireWindow(true))
+	{
+		WebGPUHost::SetFailure("the page gave no window to draw into");
 		return false;
+	}
 
 	if (!CreateInstanceAndDevice())
 		return false;
 	const double t_device = WebGPUHost::Now();
 
 	if (!CheckFeatures())
+	{
+		WebGPUHost::SetFailure("the WebGPU device lacks a texture format it needs");
 		return false;
+	}
 
 	// Everything below must validate; a validation error fails Create() (§4 step 6).
 	wgpuDevicePushErrorScope(m_device, WGPUErrorFilter_Validation);
@@ -286,7 +295,10 @@ bool GSDeviceWebGPU::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	}
 
 	if (!ok)
+	{
+		WebGPUHost::SetFailure("setting up the WebGPU device failed (the log has the error)");
 		return false;
+	}
 
 	// While this device exists, the GS thread's idle wait suspends instead of blocking, so its
 	// worker keeps delivering WebGPU callbacks (device loss, errors) when it has no work (§3.2).
@@ -318,6 +330,7 @@ bool GSDeviceWebGPU::CreateInstanceAndDevice()
 	if (!m_instance)
 	{
 		Console.Error("WebGPU: wgpuCreateInstance() failed (needs JSPI for timed waits).");
+		WebGPUHost::SetFailure("WebGPU could not start in the emulator's worker (it needs JSPI)");
 		return false;
 	}
 
@@ -342,7 +355,8 @@ bool GSDeviceWebGPU::CreateInstanceAndDevice()
 		AdapterRequest* const req = new AdapterRequest();
 		WGPURequestAdapterOptions opts = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
 		opts.featureLevel = WGPUFeatureLevel_Core;
-		opts.powerPreference = WGPUPowerPreference_HighPerformance;
+		// Odd attempts ask for the high-performance GPU, even ones for the browser's default choice.
+		opts.powerPreference = (attempt % 2) ? WGPUPowerPreference_HighPerformance : WGPUPowerPreference_Undefined;
 		WGPURequestAdapterCallbackInfo cb = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
 		cb.mode = WGPUCallbackMode_WaitAnyOnly;
 		cb.userdata1 = req;
@@ -362,13 +376,19 @@ bool GSDeviceWebGPU::CreateInstanceAndDevice()
 			break;
 		}
 
-		Console.WarningFmt("WebGPU: requestAdapter attempt {} gave no adapter after {:.0f} ms (wait {}): {}", attempt,
-			WebGPUHost::Now() - t0, static_cast<int>(ws), res.message);
+		Console.WarningFmt("WebGPU: requestAdapter attempt {} ({}) gave no adapter after {:.0f} ms (wait {}): {}", attempt,
+			(attempt % 2) ? "high-performance" : "default", WebGPUHost::Now() - t0, static_cast<int>(ws),
+			res.message.empty() ? "no message" : res.message);
 		if (attempt < ADAPTER_ATTEMPTS)
-			WebGPUHost::SleepSuspending(ADAPTER_RETRY_MS);
+			WebGPUHost::SleepSuspending(ADAPTER_RETRY_MS[attempt - 1]);
 	}
 	if (!m_adapter)
+	{
+		WebGPUHost::SetFailure(fmt::format("the browser gave no WebGPU adapter after {} tries; it may have WebGPU "
+										   "turned off for this GPU", ADAPTER_ATTEMPTS),
+			true);
 		return false;
+	}
 
 	WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
 	wgpuAdapterGetInfo(m_adapter, &info);
@@ -385,16 +405,28 @@ bool GSDeviceWebGPU::CreateInstanceAndDevice()
 	WGPULimits adapter_limits = WGPU_LIMITS_INIT;
 	wgpuAdapterGetLimits(m_adapter, &adapter_limits);
 
-	// Optional features (§4); none is required by step 1.
-	static const WGPUFeatureName wanted[] = {WGPUFeatureName_Depth32FloatStencil8, WGPUFeatureName_TextureCompressionBC,
-		WGPUFeatureName_Float32Filterable, WGPUFeatureName_Float32Blendable, WGPUFeatureName_DualSourceBlending,
-		WGPUFeatureName_PrimitiveIndex, WGPUFeatureName_TextureFormatsTier1};
+	// Optional features (§4): each is asked for only when the adapter has it. Only dual-source blending
+	// is a requirement, of the HW renderer alone (CheckFeatures()); the SW renderer presents without any.
+	static constexpr std::pair<WGPUFeatureName, const char*> wanted[] = {
+		{WGPUFeatureName_Depth32FloatStencil8, "depth32float-stencil8"},
+		{WGPUFeatureName_TextureCompressionBC, "texture-compression-bc"},
+		{WGPUFeatureName_Float32Filterable, "float32-filterable"},
+		{WGPUFeatureName_Float32Blendable, "float32-blendable"},
+		{WGPUFeatureName_DualSourceBlending, "dual-source-blending"},
+		{WGPUFeatureName_PrimitiveIndex, "primitive-index"},
+		{WGPUFeatureName_TextureFormatsTier1, "texture-formats-tier1"},
+	};
 	std::vector<WGPUFeatureName> features;
-	for (const WGPUFeatureName f : wanted)
+	std::string missing;
+	for (const auto& [f, name] : wanted)
 	{
 		if (wgpuAdapterHasFeature(m_adapter, f))
 			features.push_back(f);
+		else
+			missing += fmt::format("{}{}", missing.empty() ? "" : ", ", name);
 	}
+	Console.WriteLnFmt("WebGPU: adapter {}; optional features missing: {}", m_adapter_name,
+		missing.empty() ? "none" : missing);
 
 	WGPULimits limits = WGPU_LIMITS_INIT;
 	limits.maxTextureDimension2D = adapter_limits.maxTextureDimension2D;
@@ -428,6 +460,8 @@ bool GSDeviceWebGPU::CreateInstanceAndDevice()
 	if (!res.device)
 	{
 		Console.ErrorFmt("WebGPU: requestDevice failed: {}", res.message);
+		WebGPUHost::SetFailure(fmt::format("the browser refused a WebGPU device on {} ({})", m_adapter_name,
+			res.message.empty() ? "no reason given" : res.message));
 		return false;
 	}
 
@@ -470,9 +504,11 @@ bool GSDeviceWebGPU::CheckFeatures()
 	m_has_dual_source = wgpuDeviceHasFeature(m_device, WGPUFeatureName_DualSourceBlending);
 	if (GSConfig.Renderer == GSRendererType::WebGPU && !m_has_dual_source)
 	{
-		// The HW renderer needs SRC1 blend factors (§10.5): the GS falls back to the SW renderer.
-		Console.Error("WebGPU: this adapter has no dual-source blending, which the hardware renderer needs.");
-		return false;
+		// The HW renderer needs SRC1 blend factors (§10.5): the GS draws with the SW renderer and
+		// presents through this device (OpenGSRenderer()).
+		Console.Warning("WebGPU: this adapter has no dual-source blending, which the hardware renderer needs; "
+						"the software renderer draws and WebGPU presents.");
+		WebGPUHost::SetHWUnsupported("the GPU's WebGPU adapter lacks dual-source-blending, which the GPU renderer needs");
 	}
 
 	// Every format the utility passes render to must be renderable and sampleable; the core

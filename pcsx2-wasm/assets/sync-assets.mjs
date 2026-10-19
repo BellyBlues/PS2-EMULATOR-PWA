@@ -33,7 +33,7 @@ const ICONS = [
 	'play', 'stop', 'memory', 'caret-up', 'folder-open', 'trash', 'checkerboard', 'keyboard',
 	'terminal-window', 'corners-out', 'corners-in', 'copy', 'x', 'arrow-clockwise', 'arrow-up-right',
 	'arrow-line-down', 'arrow-up', 'arrow-down', 'arrow-left', 'arrow-right', 'disc',
-	'speaker-high', 'speaker-low', 'speaker-x', 'speaker-slash',
+	'speaker-high', 'speaker-low', 'speaker-x', 'speaker-slash', 'graphics-card',
 ];
 
 for (const [from, to] of FILES) {

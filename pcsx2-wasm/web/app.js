@@ -55,6 +55,8 @@
 	const IDB_STORE = 'bios';
 	const IDB_KEY = 'last';
 	const PREF_CRISP = 'pcsx2web.crisp';
+	// The Graphics menu's choice (UI-SPEC.md §12): 'auto', 'gpu' or 'sw'; ?gpu= and ?renderer= win over it.
+	const PREF_RENDERER = 'pcsx2web.renderer';
 	const PREF_KEEP_CHROME = 'pcsx2web.keepChrome';
 	const PREF_HINTED = 'pcsx2web.firstBootHint';
 
@@ -118,8 +120,19 @@
 
 	const params = new URLSearchParams(location.search);
 	const MIRROR_CONSOLE = params.get('console') === '1';
-	// ?gpu=0 keeps the GS on its in-memory device and this page on the 2D canvas (README).
-	const GPU_ALLOWED = params.get('gpu') !== '0';
+	// The Graphics menu's stored choice, read once: the runtime takes it when it starts.
+	const RENDERER_CHOICE = (() => {
+		try {
+			const v = localStorage.getItem(PREF_RENDERER);
+			return v === 'gpu' || v === 'sw' ? v : 'auto';
+		} catch {
+			return 'auto';
+		}
+	})();
+	const URL_GRAPHICS = params.has('gpu') || params.has('renderer');
+	// ?gpu=0 keeps the GS on its in-memory device and this page on the 2D canvas (README), and so does
+	// the Graphics menu's Software choice when the address has neither switch.
+	const GPU_ALLOWED = URL_GRAPHICS ? params.get('gpu') !== '0' : RENDERER_CHOICE !== 'sw';
 	// The WebGPU device needs JSPI (the GS thread suspends while it waits for the GPU). Without it the
 	// module still starts (pcsx2-wasm/jspi-fallback.js) and draws through the 2D canvas.
 	const HAS_JSPI = typeof WebAssembly === 'object' && typeof WebAssembly.Suspending === 'function' &&
@@ -133,7 +146,8 @@
 	const VU1JIT_PARAM = params.get('vu1jit');
 	// PCSX2's hardware renderer on the WebGPU device is the default (?renderer=hw); ?renderer=sw picks the
 	// software renderer. Without WebGPU the GS falls back to the software renderer either way.
-	const RENDERER_PARAM = params.get('renderer');
+	const RENDERER_PARAM = URL_GRAPHICS ? params.get('renderer') :
+		RENDERER_CHOICE === 'gpu' ? 'hw' : RENDERER_CHOICE === 'sw' ? 'sw' : null;
 
 	// ------------------------------------------------------------------ copy
 
@@ -391,6 +405,7 @@
 		lastPosted: 0, // the GS's post count at the last bitmap shown (posted - shown = dropped)
 		latencies: [], // ms from the GS thread's post to transferFromImageBitmap, newest last
 		fallback: '', // why the GS gave up WebGPU, once it has
+		mode: null, // { hw, webgpu, reason } as the GS opened its renderer (WebGPUHost::NoteRenderer)
 		portWarned: false,
 		captures: new Map(), // wanted vsync -> { vsync, width, height, rgba } of the first frame at or after it
 		device: 0, // number of the GS device whose frames arrive (a recovered device has the next one)
@@ -973,6 +988,7 @@
 			arguments: args,
 			tstFramePort: onFramePort,
 			tstGpuFallback: onGpuFallback,
+			tstGpuMode: onGpuMode,
 			print: (text) => appendLog(text, 'stdout'),
 			printErr: (text) => appendLog(text, 'stderr'),
 			setStatus: onSetStatus,
@@ -1138,6 +1154,8 @@
 				showBitmapFrame(m);
 			else if (m.type === 'fallback')
 				onGpuFallback(m.reason, m.permanent);
+			else if (m.type === 'mode')
+				onGpuMode(m);
 		};
 		pageLog('WebGPU frame port connected.');
 	}
@@ -1201,6 +1219,18 @@
 			`WebGPU unavailable for this boot: ${gpu.fallback}. Drawing through the 2D canvas.`, 'warn');
 		if (permanent && gpu.frames > gpu.framesAtBoot)
 			subtitle(COPY.gpuFallback);
+		if (permanent)
+			gpu.mode = { hw: false, webgpu: false, reason: gpu.fallback };
+		renderGfx();
+	}
+
+	// The renderer the GS opened, and why it is not the GPU one when it is not.
+	function onGpuMode(m) {
+		gpu.mode = { hw: !!m.hw, webgpu: !!m.webgpu, reason: m.reason || '' };
+		const name = gfxModeName(gpu.mode);
+		const why = gfxWhy(gpu.mode);
+		pageLog(`Graphics: ${name}${why ? ` (${why})` : ''}.`, gpu.mode.hw ? undefined : 'warn');
+		renderGfx();
 	}
 
 	function latencySummary() {
@@ -3955,7 +3985,7 @@
 
 	// Esc: native dialog/popover close first, then a drawer, then the keyboard.
 	function onEscape(e) {
-		if (els.about.open || menuOpen() || discMenuOpen() || soundMenuOpen())
+		if (els.about.open || menuOpen() || discMenuOpen() || soundMenuOpen() || gfxMenuOpen())
 			return;
 		dismissTips();
 		const a = document.activeElement;
@@ -4099,6 +4129,208 @@
 	function keyLabel(code, fallback) {
 		const ch = layoutMap && layoutMap.get(code);
 		return ch && ch.length === 1 && ch.trim() ? ch.toUpperCase() : fallback;
+	}
+
+	// ------------------------------------------------------------------ graphics (UI-SPEC.md §12)
+
+	const gfxEls = {
+		btn: $('btn-gfx'),
+		menu: $('gfx-menu'),
+		mode: $('gfx-mode'),
+		why: $('gfx-why'),
+		applies: $('gfx-applies'),
+		check: $('gfx-check'),
+		result: $('gfx-result'),
+		radios: [...document.querySelectorAll('input[name="gfx-choice"]')],
+	};
+	// The HW renderer's one hard requirement, then the features it uses when they are there
+	// (GSDeviceWebGPU::CreateInstanceAndDevice()).
+	const GFX_REQUIRED = ['dual-source-blending'];
+	const GFX_OPTIONAL = ['depth32float-stencil8', 'texture-compression-bc', 'float32-filterable', 'float32-blendable',
+		'primitive-index', 'texture-formats-tier1'];
+	let gfxChecking = false;
+
+	function gfxMenuOpen() {
+		try {
+			return gfxEls.menu.matches(':popover-open');
+		} catch {
+			return false;
+		}
+	}
+
+	function hideGfxMenu() {
+		if (gfxMenuOpen())
+			gfxEls.menu.hidePopover();
+	}
+
+	function placeGfxMenu() {
+		const r = gfxEls.btn.getBoundingClientRect();
+		const width = Math.min(320, window.innerWidth - 32);
+		const right = Math.max(16, Math.min(window.innerWidth - r.right, window.innerWidth - width - 16));
+		gfxEls.menu.style.right = `${Math.round(right)}px`;
+		gfxEls.menu.style.bottom = `${Math.round(Math.max(8, window.innerHeight - r.top + 8))}px`;
+	}
+
+	function gfxModeName(mode) {
+		if (!mode)
+			return 'Not started yet';
+		if (mode.hw)
+			return 'GPU renderer';
+		return mode.webgpu ? 'GPU display, software drawing' : 'Software on a 2D canvas';
+	}
+
+	// Why WebGPU (or its renderer) is not used, in plain words; empty when the GPU renderer runs.
+	function gfxWhy(mode) {
+		if (!mode || mode.hw)
+			return '';
+		if (mode.reason)
+			return mode.reason;
+		if (!GPU_ALLOWED)
+			return URL_GRAPHICS ? 'the address has ?gpu=0' : 'you chose Software';
+		if (!navigator.gpu)
+			return 'this browser has no WebGPU';
+		if (!HAS_JSPI)
+			return 'WebGPU needs JSPI, which this browser lacks';
+		if (RENDERER_PARAM === 'sw')
+			return 'the address has ?renderer=sw';
+		return gpu.fallback || '';
+	}
+
+	function currentChoice() {
+		const r = gfxEls.radios.find((x) => x.checked);
+		return r ? r.value : 'auto';
+	}
+
+	function renderGfx() {
+		const name = gfxModeName(gpu.mode);
+		const why = gfxWhy(gpu.mode);
+		gfxEls.mode.textContent = name;
+		// No WebGPU although it was allowed: the flags hint says how to turn it on (Linux Chromium).
+		const hint = gpu.mode && !gpu.mode.webgpu && GPU_ALLOWED ? gfxFlagsHint() : '';
+		gfxEls.why.hidden = !why;
+		gfxEls.why.textContent = why ? `Because ${why}.${hint ? ` ${hint}` : ''}` : '';
+		gfxEls.btn.setAttribute('aria-label', gpu.mode ? `Graphics, ${name}` : 'Graphics');
+		const changed = currentChoice() !== RENDERER_CHOICE;
+		gfxEls.applies.textContent = URL_GRAPHICS ? 'The address’s ?gpu= or ?renderer= decides for this visit.' :
+			changed ? 'Applies when the page is reloaded.' : 'Remembered in this browser. A change applies after a reload.';
+	}
+
+	// Linux desktop Chromium ships WebGPU off for most GPUs; the flags page turns it on.
+	function gfxFlagsHint() {
+		const ua = navigator.userAgent;
+		if (!/Linux/.test(ua) || /Android/.test(ua) || !/Chrom(e|ium)\//.test(ua))
+			return '';
+		const flags = navigator.brave ? 'brave://flags' : /Edg\//.test(ua) ? 'edge://flags' : /OPR\//.test(ua) ? 'opera://flags' : 'chrome://flags';
+		return `On Linux this browser keeps WebGPU off for most GPUs. Open ${flags}, enable “Unsafe WebGPU Support” and “Vulkan”, then relaunch the browser.`;
+	}
+
+	function showGfxResult(lines) {
+		gfxEls.result.replaceChildren(...lines.filter(Boolean).map((t) => {
+			const p = document.createElement('p');
+			p.textContent = t;
+			return p;
+		}));
+		pageLog(`Check WebGPU: ${lines.filter(Boolean).join(' ')}`);
+	}
+
+	// Asks this page (not the emulator's worker) for an adapter and a device with the features the GPU
+	// renderer uses, and says what it got.
+	async function checkWebGPU() {
+		if (gfxChecking)
+			return;
+		gfxChecking = true;
+		gfxEls.check.setAttribute('aria-disabled', 'true');
+		gfxEls.result.replaceChildren(Object.assign(document.createElement('p'), { textContent: 'Checking…' }));
+		const hint = gfxFlagsHint();
+		try {
+			if (!navigator.gpu) {
+				showGfxResult(['No WebGPU: this browser doesn’t offer it here.', hint]);
+				return;
+			}
+			let adapter = null;
+			for (const options of [{ powerPreference: 'high-performance' }, {}]) {
+				adapter = await navigator.gpu.requestAdapter(options).catch(() => null);
+				if (adapter)
+					break;
+			}
+			if (!adapter) {
+				showGfxResult(['WebGPU is there, but the browser gave no adapter: it has WebGPU turned off for this GPU, or the GPU is blocklisted.',
+					hint || 'Check that hardware acceleration is on in the browser’s settings.']);
+				return;
+			}
+			const info = adapter.info || {};
+			const gpuName = [info.vendor, info.architecture, info.description].filter(Boolean).join(' ') || 'unknown GPU';
+			const missingRequired = GFX_REQUIRED.filter((f) => !adapter.features.has(f));
+			const missingOptional = GFX_OPTIONAL.filter((f) => !adapter.features.has(f));
+			let device = null, refused = '';
+			try {
+				device = await adapter.requestDevice({ requiredFeatures: [...GFX_REQUIRED, ...GFX_OPTIONAL].filter((f) => adapter.features.has(f)) });
+			} catch (e) {
+				refused = String(e && e.message || e);
+			}
+			if (device)
+				device.destroy();
+			const lines = [];
+			if (!device)
+				lines.push(`The browser gave an adapter (${gpuName}) but refused a device: ${refused || 'no reason given'}.`);
+			else if (missingRequired.length)
+				lines.push(`WebGPU works on ${gpuName}, but it lacks ${missingRequired.join(', ')}, which the GPU renderer needs: the picture is drawn in software and shown through WebGPU.`);
+			else
+				lines.push(`WebGPU works on ${gpuName}${info.isFallbackAdapter || adapter.isFallbackAdapter ? ' (a software fallback adapter, slow)' : ''}. The GPU renderer can run.`);
+			if (device && missingOptional.length)
+				lines.push(`Missing optional features: ${missingOptional.join(', ')}.`);
+			if (device && !HAS_JSPI)
+				lines.push('The emulator can’t use it in this browser, though: it needs JSPI (WebAssembly stack switching).');
+			showGfxResult(lines);
+		} catch (e) {
+			showGfxResult([`The check failed: ${e && e.message || e}.`, hint]);
+		} finally {
+			gfxChecking = false;
+			gfxEls.check.removeAttribute('aria-disabled');
+		}
+	}
+
+	function wireGfxUi() {
+		for (const r of gfxEls.radios) {
+			r.checked = r.value === RENDERER_CHOICE;
+			r.addEventListener('change', () => {
+				if (!r.checked)
+					return;
+				writePref(PREF_RENDERER, r.value);
+				pageLog(`Graphics choice: ${r.value} (applies after a reload).`);
+				renderGfx();
+			});
+		}
+		gfxEls.check.addEventListener('click', checkWebGPU);
+		gfxEls.menu.addEventListener('beforetoggle', (e) => {
+			if (e.newState === 'open') {
+				renderGfx();
+				placeGfxMenu();
+			}
+		});
+		gfxEls.menu.addEventListener('toggle', (e) => {
+			const open = e.newState === 'open';
+			gfxEls.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+			if (open) {
+				(gfxEls.radios.find((x) => x.checked) || gfxEls.radios[0]).focus({ preventScroll: true });
+			} else {
+				const a = document.activeElement;
+				if (!a || a === document.body || gfxEls.menu.contains(a))
+					gfxEls.btn.focus({ preventScroll: true });
+			}
+			updateChrome();
+		});
+		gfxEls.menu.addEventListener('focusout', (e) => {
+			const to = e.relatedTarget;
+			if (to && !gfxEls.menu.contains(to) && to !== gfxEls.btn)
+				hideGfxMenu();
+		});
+		for (const type of ['resize', 'fullscreenchange'])
+			(type === 'resize' ? window : document).addEventListener(type, () => {
+				if (gfxMenuOpen())
+					placeGfxMenu();
+			});
+		renderGfx();
 	}
 
 	// ------------------------------------------------------------------ preferences
@@ -4292,7 +4524,7 @@
 
 	function chromeMayHide() {
 		return pageState() === 'running' && captureActive() && document.hasFocus() &&
-			!page.drawer && !menuOpen() && !discMenuOpen() && !soundMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
+			!page.drawer && !menuOpen() && !discMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
 			!pointerOverChrome && !page.keepChrome && hoverQuery.matches;
 	}
 
@@ -5352,6 +5584,7 @@
 			gpuPosted: gpu.lastPosted,
 			gpuDevices: gpu.devices.map((d) => ({ ...d })),
 			gpuFallback: gpu.fallback,
+			gpuMode: gpu.mode,
 			latency: latencySummary(),
 			surface: surfaceFeed.width ? `${surfaceFeed.width}x${surfaceFeed.height}@${surfaceFeed.scale}` : null,
 		}),
@@ -5399,6 +5632,7 @@
 		wireDiscUi();
 		observeCanvasSize();
 		wireSoundUi();
+		wireGfxUi();
 		setCrisp(readPref(PREF_CRISP) === '1');
 		page.keepChrome = readPref(PREF_KEEP_CHROME) === '1';
 		els.keepChrome.checked = page.keepChrome;
