@@ -120,6 +120,9 @@ function buildCases() {
 	// interlace.wgsl
 	for (let i = 0; i < 5; i++) add({ file: "interlace", fs: `ps_main${i}`, targets: [color(F.Color)] });
 
+	// shadeboost.wgsl
+	add({ file: "shadeboost", fs: "ps_main", targets: [color(F.Color)] });
+
 	// imgui.wgsl
 	add({ file: "imgui", fs: "ps_main", vertex: "imgui", targets: [color(F.Present, { blend: IMGUI_BLEND })] });
 
@@ -167,7 +170,7 @@ async function main() {
 	device.lost.then((l) => log(`DEVICE LOST ${l.reason}: ${l.message}`));
 
 	// Shader modules: one per file, as the device will create them.
-	const files = ["convert", "present", "merge", "interlace", "imgui"];
+	const files = ["convert", "present", "merge", "interlace", "shadeboost", "imgui"];
 	const modules = {};
 	let warnings = 0;
 	for (const file of files) {
@@ -444,6 +447,30 @@ async function main() {
 		draw({ ...c, targets: [{ format: F.Color }] }, noBlend, { targets: [dst], group1Override: group1Nearest });
 		return compare(await readback(dst, 4), pattern, "rgba");
 	});
+	// GSDevice::ShadeBoost() passes the settings divided by 50: 50 everywhere is the identity.
+	const shadeBoostReference = ([brt, con, sat, gam]) => {
+		const out = new Uint8Array(SIZE * SIZE * 4);
+		for (let i = 0; i < SIZE * SIZE; i++) {
+			const c = [0, 1, 2].map((k) => (pattern[i * 4 + k] / 255) * brt);
+			const lum = 0.2125 * c[0] + 0.7154 * c[1] + 0.0721 * c[2];
+			for (let k = 0; k < 3; k++) {
+				const s = lum + (c[k] - lum) * sat;
+				const v = 0.5 + (s - 0.5) * con;
+				out[i * 4 + k] = Math.round(Math.min(Math.max(Math.pow(v, 1 / gam), 0), 1) * 255);
+			}
+			out[i * 4 + 3] = pattern[i * 4 + 3];
+		}
+		return out;
+	};
+	for (const params of [[1, 1, 1, 1], [1.2, 0.9, 0.8, 1.1]]) {
+		await check(`shadeboost ps_main with params ${params.join(", ")}`, async () => {
+			const { c, pipeline } = get("shadeboost", "ps_main");
+			setUniforms(new Float32Array(params));
+			const dst = texture(F.Color, "check");
+			draw(c, pipeline, { targets: [dst], group1Override: group1Nearest });
+			return compare(await readback(dst, 4), shadeBoostReference(params), "rgba", 1);
+		});
+	}
 	await check("interlace ps_main1 (bob) copies at LOD 0", async () => {
 		const { c, pipeline } = get("interlace", "ps_main1");
 		const dst = texture(F.Color, "check");

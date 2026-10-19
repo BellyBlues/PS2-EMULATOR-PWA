@@ -1,8 +1,9 @@
 # WebGPU GS device: design (M4)
 
 *Written 2026-10-16 for the M4 milestone of `docs/web-port/PLAN.md` (sections 3.4, 4 and M4), and
-revised the same day after phase 1 (the runtime spike and the utility shaders). No device code exists
-yet. The runtime architecture in §3.2 and §12 is the one the spike proved
+revised the same day after phase 1 (the runtime spike and the utility shaders). Step 1 of §15 (the
+device behind the SW renderer) is built; what it measured, and where it departs from this design, is in
+"Step 1 results" at the end of §15 Step 1. The runtime architecture in §3.2 and §12 is the one the spike proved
 (`tools/wasm/webgpu-spike/`, results in its `README.md`). The utility bindings in §8.2 are those of the
 shaders already written in `bin/resources/shaders/webgpu/` and validated by
 `tools/wasm/webgpu-shaders/validate-shaders.mjs`.*
@@ -771,7 +772,7 @@ hardware adapter and on SwiftShader, and offline through Tint (measured, `valida
 | `merge.wgsl` | VS + 2 (`ps_main0/1`, by `PMODE.MMOD`) | 46 | Written, validated; pixel check: alpha from BGColor | 1 |
 | `interlace.wgsl` | VS + 5 (weave, bob, blend, MAD buffer, MAD reconstruct) | 227 | Written, validated; pixel check: bob | 1 |
 | `imgui.wgsl` | VS + FS | 42 | Written, validated; pixel check: orientation with `uScale = (2/w, −2/h)`, `uTranslate = (−1, 1)` | 1 |
-| `shadeboost.wgsl` | 1 | 77 | **Not written** | 1 |
+| `shadeboost.wgsl` | 1 | 77 | Written, validated; pixel checks in `validate.js`, and in the device within 1 LSB of the formula | 1 |
 | `fxaa.wgsl` | 1 | 498 (`common/fxaa.fx`) | Not written | 3 |
 | `cas.wgsl` | 2 compute | 60 + the parts of `ffx_cas.h`/`ffx_a.h` (3.9k) that are used | Not written | 3 |
 | `tfx.wgsl` | VS + FS | 1990 | Not written | 2 (whole template; BIOS paths validated), 3 (all paths) |
@@ -1294,6 +1295,131 @@ for the app, or a sibling runner for the app).
   `navigator.gpu`).
 - Checked once by the owner in a windowed Chrome: the canvas shows frames (not only read back), and a
   tab hidden for 30 s keeps running.
+
+#### Step 1 results (2026-10-16)
+
+Measured in headless Chrome on the RADV adapter (§12.5) with `tools/wasm/run-app-headless.mjs`, the
+BIOS SCPH-39001; logs and screenshots stay outside the repository. Runs compared side by side were
+pinned to separate physical cores and swapped between rounds.
+
+| Exit criterion | Result |
+|---|---|
+| BIOS on GSDeviceWebGPU, menu, keyboard | The intro, the first-run screens and the OSDSYS menu (Browser, System Configuration) render; Cross (K) steps through the first-run screens. |
+| 0 uncaptured errors | 0 in every run, from 600 frames to 28,000 (the 10-minute run). A build with a deliberately invalid buffer shows the detection works. Exception, fixed in round 1: a canvas larger than the adapter's largest texture. |
+| Bitmaps per second = VPS; frame port | Bitmaps shown = bitmaps posted (no page drops); shown per second = VPS less the vsyncs PCSX2 skips presenting as duplicates (5 of 28,134 in the 10-minute run). Frames arrive over the port on every boot, including Stop then Boot again (the first 95 ms after Boot). |
+| Pixel check | At 1:1 with nearest presentation, Weave, Off or Bob deinterlacing: identical to GSDeviceNull's frame for the same vsync (every one of 62 vsyncs compared in two runs, up to vsync 800), and the `SaveSnapshotToMemory` PNGs are byte-identical. Explained differences: Blend differs by at most 1 LSB (rounding of the 1-2-1 filter); Automatic (MAD for this BIOS) differs only on the reconstructed field's lines, because GSDeviceNull's MAD has no motion detection; with the default bilinear presentation the GPU matches a float bilinear resample of the 1:1 frame within 1 LSB, and the 2D path matches a nearest resample exactly. |
+| ImGui OSD | FPS, VPS, speed and OSD messages render when enabled. |
+| Device loss | `destroy()`: first frame of the new device on the page 90–210 ms after the request (35–50 ms on the GS thread). GPU-process crash: 0.83–1.45 s; twice in one page when 120 s or more apart, or with Chrome's domain blocking off. With the idle wait kept blocking (`?gsidle=block`, frame limiter at 10x) the loss is noticed in the bounded event-loop turn and recovered in 0.83 s. Two failed recoveries in a row switch the page to the 2D path with a notice; frames stay identical to the 2D path's. |
+| JSPI gate | 450 BIOS frames: 47.93 s and 47.65 s without JSPI, 47.39 s and 48.30 s with it (+0.1 % on average). |
+| GS-thread CPU time, merge + interlace + present | **Not met: 3.1–3.4x lower, not 5x.** WebGPU 0.94–1.03 ms per vsync against 3.1–3.5 ms for GSDeviceNull (CPU profiles, intro and menu). These are sampled times, not CPU time; see the round-1 row below. |
+| Latency post to `transferFromImageBitmap` | Measured until `transferFromImageBitmap()` returns on the page, not until the frame is on screen. In `stats().latency`: median 0.57 ms, p99 3.7 ms, max 5.1 ms (last 600 frames of the 10-minute run). Runs that read frames back for tests see a p99 up to 50 ms, because the read-backs block the page. |
+| 10 minutes at the menu | 40.1 bitmaps shown per second for 40.1 vsyncs per second, none dropped (28,129 posted and shown); wasm memory 745 MB throughout; JS heap 11–17 MB after the first collection, with no upward trend; 0 errors. Not measured then, found in round 1: the GPU process grew by 5.5 KB a frame and the GS worker's JS heap by 41 B a frame (fixed, see below). |
+| `pcsx2-headless`, the 2D path, no WebGPU | Headless SW and Null boot as before (identical screenshots, time within noise). `?gpu=0`, a page and workers with `navigator.gpu` hidden, and a browser whose `requestAdapter` answers null all run the 2D path; the last starts 0.75 s later and shows no notice. |
+| Windowed Chrome, hidden tab | Not done (owner check). |
+
+**Departures from the design, and why:**
+
+- **Frames are identified by the vsync they show** (`PerformanceMetrics::GetFrameNumber() + 1`), on
+  both paths and in the test captures, not by a count of presented frames. `SkipDuplicateFrames`
+  (on by default) skips presenting frames that the internal-FPS detector, which works on 0.5 s
+  wall-clock windows, considers repeats, so how many frames were presented by a given vsync depends
+  on timing: the two paths' counts drifted apart by one in some runs.
+- **The event-loop check uses a microtask, not `onSubmittedWorkDone`.** After a GPU-process crash that
+  promise rejects, emdawnwebgpu leaves the rejection unhandled ("assumed not to reject"), and
+  Emscripten's pthread runtime turns an unhandled rejection into a fatal error. A microtask queued at
+  each present runs only when the GS thread suspends; while it is pending its age is how long the
+  event loop has not run.
+- **Large uploads go through mapped staging buffers** (`UploadTextureStaged`: MapWrite buffers
+  mapped again after the submit that used them). `queue.writeTexture` and `writeBuffer` copied the
+  SW renderer's 0.9–1.1 MB output at about 1.5 GB/s (0.67–0.78 ms a frame); filling a mapped range
+  takes 0.13–0.19 ms.
+- **Device loss:** a loss within 15 s of the last recovery counts as a failed recovery (upstream
+  aborts on the first); after two in a row, or when a recovery cannot create a device twice, the GS
+  gives WebGPU up for the page. At boot, a page that never had a device gives up after one attempt
+  (four adapter requests over 0.75 s, not ten over 5 s), so a browser without an adapter starts at
+  most 0.75 s later. Chrome refused adapters to the page after a second GPU-process crash 93 s after
+  the first, not 121 s or more after it (and never with `--disable-domain-blocking-for-3d-apis`): a
+  second crash soon after the first falls back to the 2D path in practice.
+- **OSD messages are off by default on both paths** (`OsdMessagesPos=None`): the 2D path cannot show
+  them, and the page has its own status line (UI-SPEC: no toasts). The FPS/VPS overlay and messages
+  work when enabled.
+- `GSDeviceNull` does no shadeboost, EXTBUF feedback or MAD motion detection, so those can only be
+  checked against formulas, not against the 2D path.
+
+**Known gaps:** the 5x target; the GPU memory budget of §6.5 is not implemented (the round-1 fixes
+removed a byte count nothing read); debug groups are no-ops; mip generation, depth copies, depth and
+stencil convert targets and the HW paths are stubs until step 2; only Chrome on Linux was tested,
+headless; the owner's windowed check is open.
+
+#### Step 1, round-1 verification fixes (2026-10-16)
+
+Two verifications of step 1 found the problems below; all are fixed, and the exit criteria were
+measured again on the fixed build (same setup; the machine was shared with other builds, load 6–22).
+
+- **GPU-process memory grew 5.5 KB a frame.** Chrome frees the GPU-process side of a WebGPU object
+  (the frame's encoder, passes, command buffer, canvas texture and view) only when the JS wrapper is
+  garbage collected in a major collection, and the GS worker allocates so little JS that V8 ran none
+  for minutes: the GPU process grew from 209 to 252 MB in 7,400 frames, and a forced collection gave
+  it back (measured). Destroying the canvas texture after each frame did not help (measured).
+  `tst_post_frame` now allocates and drops a 64 MB `ArrayBuffer` every 300 frames: V8 counts it as
+  external memory and starts a major collection, and the buffer is never touched, so nothing is
+  committed (0.05–4 ms per allocation in a loaded worker, measured). Over 10 minutes (20,080 frames)
+  the GPU process stayed at 209–216 MB.
+- **`WebGPU.Internals.futures` gained an entry a frame** (the staging buffers' `AllowSpontaneous`
+  `mapAsync`; emdawnwebgpu removes a future's entry only in a timed wait on it). The staging buffers
+  are now mapped, written and unmapped by `webgpu_host.js` on the `GPUBuffer` itself (through
+  emdawnwebgpu's public `WebGPU.getJsObject`), after their first use through `webgpu.h`. The table
+  holds 1 entry (the device-lost future) and the GS worker's heap stays at 1.5–2.3 MB over 10 minutes.
+- **Timed-out waits left callbacks pointing into dead stack frames.** A `WaitAnyOnly` callback whose
+  wait timed out still runs later, at the latest when `wgpuInstanceRelease` completes it as
+  cancelled. Every waited-for result (adapter, device, error scope, pipelines, readback) now lives in
+  a heap `WebGPUHost::RequestResult` that the callback frees when its waiter has given up. Tested
+  with a `requestAdapter` that never answers: the wait timed out after 5 s, the next attempt got a
+  device, and the abandoned callback ran safely at the next instance release.
+- **Timeouts as device loss (§11.4, §13).** A readback that times out (2 s) cancels its map, and it
+  and a pipeline that times out (10 s) set the lost flag; the device is recreated at the next
+  present (tested: a readback that never completes, recovered in 85 ms).
+- **No 2D fallback without JSPI.** With `-sJSPI` the generated JS calls `new WebAssembly.Suspending`
+  unconditionally. `pcsx2-wasm/jspi-fallback.js` (a `--pre-js`) puts pass-through stand-ins in place
+  where the browser lacks JSPI, and `tst_gpu_available()` then reports no WebGPU, so the page runs the
+  2D path (tested with both hidden in the page and every worker; the round-0 build died there).
+- **Canvas larger than the largest texture.** The device presents at most 4096 pixels on a side and
+  never more than `maxTextureDimension2D`, keeping the aspect ratio; the page scales the frame. A
+  17000x12750 canvas presents at 4096x3072 with 0 errors (clamping to 16384 alone gave 800 MB textures
+  that stalled the page).
+- **Blank frames after a GPU-process crash.** Frames are no longer posted once the loss is known.
+  Frames drawn between the crash and Chrome reporting the loss (0.2–0.6 s) are still blank, and they
+  cannot be told apart: on that device, maps still resolve before the loss is reported. Keeping the
+  last good frame on screen is not possible cheaply either: a clone of a pre-crash frame (confirmed
+  by a value read back from the GPU after its present) showed fully transparent after the crash,
+  because its memory was in the crashed process (measured); a CPU copy would cost a readback on the
+  page every few frames, for a 1–2 s event.
+- **A boot that gets no device is no longer a permanent give-up.** That boot uses the 2D path
+  (`WebGPUHost::NoteUnavailable`) and the next boot tries WebGPU again (tested: four refused
+  adapters, then Stop and Boot gave a device). Repeated loss still gives WebGPU up for the page.
+- **The staged upload copied the frame twice.** Rows whose pitch is a multiple of 256 (the SW
+  renderer's 4096-byte rows) are copied into the staging buffer once, padding included, with that
+  pitch as `bytesPerRow`. The device's own wasm time per vsync fell from 0.23–0.29 ms to 0.09–0.10 ms.
+- Smaller fixes: utility passes no longer set the viewport and scissor that a pass starts with;
+  `WindowInfo.h`, `GS.h` and the two `Semaphore.cpp` call sites leave the upstream lines as they were
+  (desktop objects and preprocessed sources identical); the driver-info label names the device
+  actually created; desktop packages leave out `shaders/webgpu/`; a CMake warning when Emscripten is
+  not 6.0.12; the suspending futex wait uses `HEAP32` directly with `addr >>> 2`; a debug assertion
+  (§3.2) that no GS code runs while the GS thread is suspended in a WebGPU wait; dead code removed;
+  `run-app-headless.mjs` fails a run with errors, enables `Log` in workers, samples the GPU process
+  and the GS worker (`--sample-every`), reads the display canvas back (`--display-at`) and no longer
+  hangs on a hung page.
+
+| Exit criterion (round 1) | Result |
+|---|---|
+| 0 uncaptured errors | 0 in every run, including the oversize canvas, OSD, `destroy()` and crash runs and 10 minutes at the menu. |
+| Pixel check | At 1:1 nearest, Weave, Off and Bob: 17 of 17 vsyncs (100–900) identical to the 2D path, snapshot PNGs at vsyncs 300, 450 and 900 byte-identical; also after two `destroy()` recoveries and after the fallback to the 2D path. |
+| Device loss | `destroy()`: 85–164 ms on the GS thread, 219–240 ms to the first frame on the page (at 10 % speed under load). GPU-process crash: 0.76 s alone; 1.55–2.05 s with two crash runs at once on a loaded machine. `?gsidle=block` with the frame limiter at 10x: loss noticed in the bounded turn, recovered. Three losses close together: the page switches to the 2D path with the notice. |
+| Frames = VPS, 10 minutes | 20,080 posted, 20,080 shown, for 20,086 vsyncs; GPU process 209–216 MB, GS worker heap 1.5–2.3 MB, page heap 11–17 MB, wasm 711 MiB, futures table 1 entry. Latency median 0.63 ms, p99 5.0 ms. |
+| JSPI gate (Null renderer, median of 3 pinned pairs) | 41.50 s without JSPI, 41.58 s with it (+0.2 %, the pairs within 0.25 s of each other). The final build adds 4.6 KB of wasm and 6.7 KB of JS for JSPI and the fallback. |
+| GS-thread CPU time | **Not met: about 3x, not 5x.** In CPU profiles, merge + interlace + present took 0.82–0.83 ms per vsync with WebGPU against 2.72–2.80 ms with GSDeviceNull (3.3–3.4x; two pinned, swapped pairs at the menu). A profile's sampled time is not CPU time: the gaps around the GS thread's JSPI suspensions are charged to the last call that ran, so the per-call split measured that way (posting the bitmap, submit, `transferToImageBitmap`, `getCurrentTexture`, the staging writes) is not a CPU breakdown and is withdrawn, and the ratio is taken as about 3x. CPU time is measured from the kernel instead: the on-CPU time of the GS worker's OS thread (`/proc/<pid>/task/<tid>/schedstat`, sampled over the same window), which covers the whole thread rather than one call. Reaching 5x would likely take presenting without posting a bitmap (the transferred canvas, §12.3), a design change. |
+| `pcsx2-headless` | SW and Null: screenshots identical to the round-0 build's (md5), same time (concurrent runs, 61.7–62.8 s for 600 frames). |
+| No WebGPU, no JSPI | `?gpu=0`, `navigator.gpu` hidden, `--disable-features=WebGPU` and no JSPI all run the 2D path; the page logs why. |
 
 ### Step 2: the HW renderer with the TFX paths the BIOS uses (size L; +≈ 2.4k C++, +2.1k WGSL)
 

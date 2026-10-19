@@ -260,6 +260,7 @@ With reduced motion, every duration is 0. The controls still hide.
 - **Hints:**
   - First boot: "Arrows move · K confirms (L on Japanese consoles) · ? shows every key"
   - Once per visit, after 5 s under 50% speed: "Running at 18%. Heavy scenes are slow in the browser for now."
+  - When the GPU fails during play and the picture moves to the 2D canvas (not when WebGPU was never available): "The GPU stopped working, so the picture is drawn without it now."
 - **Keys drawer:**
   - "In the system menus ✕ confirms and △ goes back (○ confirms on Japanese consoles)." The glyphs are SVG.
   - "While the PS2 runs, keys you press light up here."
