@@ -131,6 +131,10 @@ void psxDma6(u32 madr, u32 bcr, u32 chcr)
 
 	if (chcr == 0x11000002)
 	{
+#ifdef ARCH_WASM
+		if (bcr)
+			psxCpu->Clear(madr - (bcr - 1) * 4, bcr); // the JITs' write tracking
+#endif
 		while (bcr--)
 		{
 			*mem-- = (madr - 4) & 0xffffff;

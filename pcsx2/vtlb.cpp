@@ -29,6 +29,10 @@
 
 #include "fmt/format.h"
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 #include "GS/GSVector.h"
 
 #include <bit>
@@ -280,6 +284,9 @@ void vtlb_memWrite(u32 addr, DataType data)
 		}
 
 		*reinterpret_cast<DataType*>(vmv.assumePtr(addr)) = data;
+#ifdef ARCH_WASM
+		CodeWrites::NoteSmall(reinterpret_cast<void*>(vmv.assumePtr(addr)), sizeof(DataType));
+#endif
 	}
 	else
 	{
@@ -307,6 +314,9 @@ void TAKES_R128 vtlb_memWrite128(u32 mem, r128 value)
 		}
 
 		r128_store_unaligned((void*)vmv.assumePtr(mem), value);
+#ifdef ARCH_WASM
+		CodeWrites::NoteSmall(reinterpret_cast<void*>(vmv.assumePtr(mem)), 16);
+#endif
 	}
 	else
 	{
@@ -354,6 +364,9 @@ bool vtlb_ramWrite(u32 addr, const DataType& data)
 		return false;
 
 	std::memcpy(reinterpret_cast<DataType*>(vmv.assumePtr(addr)), &data, sizeof(DataType));
+#ifdef ARCH_WASM
+	CodeWrites::NoteSmall(reinterpret_cast<void*>(vmv.assumePtr(addr)), sizeof(DataType));
+#endif
 	return true;
 }
 
@@ -428,6 +441,9 @@ bool vtlb_memSafeWriteBytes(u32 mem, const void* src, u32 size)
 		const size_t remaining_in_page =
 			std::min(VTLB_PAGE_SIZE - (mem & VTLB_PAGE_MASK), static_cast<u32>(sptr_end - sptr));
 		std::memcpy(reinterpret_cast<void*>(vmv.assumePtr(mem)), sptr, remaining_in_page);
+#ifdef ARCH_WASM
+		CodeWrites::Note(reinterpret_cast<void*>(vmv.assumePtr(mem)), remaining_in_page);
+#endif
 		sptr += remaining_in_page;
 		mem += remaining_in_page;
 	}

@@ -5,6 +5,10 @@
 #include "Cache.h"
 #include "vtlb.h"
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 using namespace R5900;
 using namespace vtlb_private;
 
@@ -119,7 +123,12 @@ namespace
 
 			CACHE_LOG("Write back at %zx", target);
 			if (tag.isValidPFN())
+			{
 				*reinterpret_cast<CacheData*>(target) = data;
+#ifdef ARCH_WASM
+				CodeWrites::NoteSmall(reinterpret_cast<void*>(target), sizeof(data));
+#endif
+			}
 			tag.clearDirty();
 		}
 

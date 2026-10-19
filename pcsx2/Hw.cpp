@@ -13,6 +13,10 @@
 
 #include <deque>
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 using namespace R5900;
 
 const int rdram_devices = 2;	// put 8 for TOOL and 2 for PS2 and PSX
@@ -139,6 +143,15 @@ __ri bool hwMFIFOWrite(u32 addr, const u128* data, uint qwc)
 		const u32 ringsize = (dmacRegs.rbsr.RMSK / 16) + 1;
 		pxAssertMsg( PSM(dmacRegs.rbor.ADDR+ringsize-1) != NULL, "Scratchpad/MFIFO ringbuffer spans into invalid (unmapped) physical memory!" );
 		uint startpos = (addr & dmacRegs.rbsr.RMSK)/16;
+#ifdef ARCH_WASM
+		if (startpos + qwc <= ringsize)
+			CodeWrites::Note(dst + startpos, qwc * 16);
+		else
+		{
+			CodeWrites::Note(dst + startpos, (ringsize - startpos) * 16);
+			CodeWrites::Note(dst, std::min<uint>(qwc - (ringsize - startpos), ringsize) * 16);
+		}
+#endif
 		MemCopy_WrappedDest( data, dst, startpos, ringsize, qwc );
 	}
 	else

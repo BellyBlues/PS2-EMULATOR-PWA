@@ -6,6 +6,10 @@
 #include "IPU/IPUdma.h"
 #include "IPU/IPU_MultiISA.h"
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 IPUDMAStatus IPU1Status;
 
 void ipuDmaReset()
@@ -177,6 +181,9 @@ void IPU0dma()
 
 	readsize = std::min(ipu0ch.qwc, (u32)ipuRegs.ctrl.OFC);
 	ipu_fifo.out.read(pMem, readsize);
+#ifdef ARCH_WASM
+	CodeWrites::Note(pMem, readsize << 4);
+#endif
 
 	ipu0ch.madr += readsize << 4;
 	ipu0ch.qwc -= readsize;

@@ -21,6 +21,10 @@
 #include "VMManager.h"
 #include "VUmicro.h"
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 static const uint EECNT_FUTURE_TARGET = 0x10000000;
 
 uint g_FrameCount = 0;
@@ -488,6 +492,10 @@ static __fi void DoFMVSwitch()
 
 static __fi void VSyncStart(u64 sCycle)
 {
+#ifdef ARCH_WASM
+	CodeWrites::NoteAll(); // the JITs compare all code again once a frame, in case a write was not tracked
+#endif
+
 	// End-of-frame tasks.
 	DoFMVSwitch();
 	VMManager::Internal::VSyncOnCPUThread();

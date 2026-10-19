@@ -10,6 +10,10 @@
 
 #include <cstring>
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 #define DMA_DIRECTION_TO_DEVICE 0
 #define DMA_DIRECTION_FROM_DEVICE 1
 #define ED_LINK_LIMIT 32
@@ -306,6 +310,9 @@ __fi static int put_dwords(u32 addr, u32* buf, u32 num)
 		return 0;
 
 	std::memcpy(iopMem->Main + addr, buf, num * sizeof(u32));
+#ifdef ARCH_WASM
+	CodeWrites::Note(iopMem->Main + addr, num * sizeof(u32));
+#endif
 	return 1;
 }
 
@@ -316,6 +323,9 @@ __fi static int put_words(u32 addr, u16* buf, u32 num)
 		return 0;
 
 	std::memcpy(iopMem->Main + addr, buf, num * sizeof(u16));
+#ifdef ARCH_WASM
+	CodeWrites::Note(iopMem->Main + addr, num * sizeof(u16));
+#endif
 	return 1;
 }
 
@@ -366,7 +376,12 @@ static int ohci_copy_td(OHCIState* ohci, struct ohci_td* td, uint8_t* buf, u32 l
 		return 1;
 
 	if (write)
+	{
 		std::memcpy(iopMem->Main + ptr, buf, len);
+#ifdef ARCH_WASM
+		CodeWrites::Note(iopMem->Main + ptr, len);
+#endif
+	}
 	else
 		std::memcpy(buf, iopMem->Main + ptr, len);
 
@@ -380,7 +395,12 @@ static int ohci_copy_td(OHCIState* ohci, struct ohci_td* td, uint8_t* buf, u32 l
 		return 1;
 
 	if (write)
+	{
 		std::memcpy(iopMem->Main + ptr, buf, len);
+#ifdef ARCH_WASM
+		CodeWrites::Note(iopMem->Main + ptr, len);
+#endif
+	}
 	else
 		std::memcpy(buf, iopMem->Main + ptr, len);
 
@@ -398,7 +418,12 @@ static int ohci_copy_iso_td(OHCIState* ohci, u32 start_addr, u32 end_addr,
 		return 1;
 
 	if (write)
+	{
 		std::memcpy(iopMem->Main + ptr, buf, len);
+#ifdef ARCH_WASM
+		CodeWrites::Note(iopMem->Main + ptr, len);
+#endif
+	}
 	else
 		std::memcpy(buf, iopMem->Main + ptr, len);
 
@@ -412,7 +437,12 @@ static int ohci_copy_iso_td(OHCIState* ohci, u32 start_addr, u32 end_addr,
 		return 1;
 
 	if (write)
+	{
 		std::memcpy(iopMem->Main + ptr, buf, len);
+#ifdef ARCH_WASM
+		CodeWrites::Note(iopMem->Main + ptr, len);
+#endif
+	}
 	else
 		std::memcpy(buf, iopMem->Main + ptr, len);
 
@@ -1106,6 +1136,9 @@ void ohci_frame_boundary(void* opaque)
 	}
 
 	ohci_hcca* hcca = reinterpret_cast<ohci_hcca*>(iopMem->Main + ohci->hcca);
+#ifdef ARCH_WASM
+	CodeWrites::Note(hcca, sizeof(ohci_hcca));
+#endif
 
 	/* Process all the lists at the end of the frame */
 	/* if reset bit was set, don't process possibly invalid descriptors */

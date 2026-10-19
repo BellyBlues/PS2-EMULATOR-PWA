@@ -12,6 +12,7 @@
 #include "IopHw.h"
 
 #ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
 #include "wasm/IopJit.h"
 #endif
 
@@ -426,6 +427,10 @@ static s32 intExecuteBlock( s32 eeCycles )
 }
 
 static void intClear(u32 Addr, u32 Size) {
+#ifdef ARCH_WASM
+	// Writes to IOP RAM by DMA and the HLE BIOS (Size in words), for the JITs' write tracking.
+	CodeWrites::Note(iopPhysMem(Addr), Size * 4);
+#endif
 }
 
 static void intShutdown() {

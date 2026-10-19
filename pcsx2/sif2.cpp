@@ -8,6 +8,10 @@
 #include "Sif.h"
 #include "IopHw.h"
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 _sif sif2;
 
 static bool done = false;
@@ -64,6 +68,9 @@ static __fi bool WriteFifoToEE()
 	}
 
 	sif2.fifo.read((u32*)ptag, readSize << 2);
+#ifdef ARCH_WASM
+	CodeWrites::Note(ptag, readSize << 4);
+#endif
 
 	// Clearing handled by vtlb memory protection and manual blocks.
 	//Cpu->Clear(sif2dma.madr, readSize*4);

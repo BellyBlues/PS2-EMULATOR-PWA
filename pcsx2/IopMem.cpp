@@ -9,6 +9,10 @@
 #include "DEV9/DEV9.h"
 #include "IopHw.h"
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 uptr *psxMemWLUT = nullptr;
 const uptr *psxMemRLUT = nullptr;
 
@@ -286,6 +290,9 @@ void iopMemWrite8(u32 mem, u8 value)
 		{
 			*(u8  *)(p + (mem & 0xffff)) = value;
 			psxCpu->Clear(mem&~3, 1);
+#ifdef ARCH_WASM
+			CodeWrites::NoteSmall(p + (mem & 0xffff), 1);
+#endif
 		}
 		else
 		{
@@ -329,6 +336,9 @@ void iopMemWrite16(u32 mem, u16 value)
 			if( t==0x1D00 ) Console.WriteLn("sw16 [0x%08X]=0x%08X", mem, value);
 			*(u16 *)(p + (mem & 0xffff)) = value;
 			psxCpu->Clear(mem&~3, 1);
+#ifdef ARCH_WASM
+			CodeWrites::NoteSmall(p + (mem & 0xffff), 2);
+#endif
 		}
 		else
 		{
@@ -402,6 +412,9 @@ void iopMemWrite32(u32 mem, u32 value)
 		{
 			*(u32 *)(p + (mem & 0xffff)) = value;
 			psxCpu->Clear(mem&~3, 1);
+#ifdef ARCH_WASM
+			CodeWrites::NoteSmall(p + (mem & 0xffff), 4);
+#endif
 		}
 		else
 		{

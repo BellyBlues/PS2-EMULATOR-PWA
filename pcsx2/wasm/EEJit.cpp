@@ -23,10 +23,10 @@
 // - Dispatch: a block that ends goes on to the next one itself (Leave()): a tail call to the target's function when
 //   it is in the same module, else a lookup of the dispatcher's cache in wasm, so that the C++ dispatcher (Execute())
 //   only runs for compiles, invalidations and the straight-line event test. -eejit-link 0 turns that off.
-// - Self-modifying code: each block checks, on entry, its page's vtlb mapping and its instruction words against the
-//   values it was compiled from, and is recompiled when they differ. That covers stores by the CPU, DMA and TLB
-//   changes without write tracking. Code that changes the rest of its own block while it runs is not detected
-//   (the interpreter would see the new instruction); needs proper testing with games that do that.
+// - Self-modifying code: each block checks, on entry, its page's vtlb mapping (TLB changes) and, after a write to
+//   its page (write tracking, CodeWrites.h), its instruction words against the values it was compiled from, and is
+//   recompiled when they differ. Code that changes the rest of its own block while it runs is not detected (the
+//   interpreter would see the new instruction); needs proper testing with games that do that.
 
 #include "Common.h"
 #include "R5900OpcodeTables.h"
@@ -34,6 +34,7 @@
 #include "VUmicro.h"
 #include "R3000A.h"
 
+#include "wasm/CodeWrites.h"
 #include "wasm/EEJit.h"
 #include "wasm/WasmEmitter.h"
 #include "wasm/WasmJitRuntime.h"
@@ -64,6 +65,46 @@ namespace EEJit
 	u32 g_dbgmask = 0;
 } // namespace EEJit
 
+namespace CodeWrites
+{
+	u32 g_gen[1u << 20];
+
+	namespace
+	{
+		u32 s_counter = 0;
+		std::vector<u32> s_code_pages;
+		u8 s_is_code_page[1u << 20];
+	} // namespace
+
+	u32 Current(u32 page)
+	{
+		if (!g_gen[page])
+		{
+			if (++s_counter == 0)
+				s_counter = 1;
+			g_gen[page] = s_counter;
+		}
+		return g_gen[page];
+	}
+
+	void AddCodePage(u32 page)
+	{
+		if (!s_is_code_page[page])
+		{
+			s_is_code_page[page] = 1;
+			s_code_pages.push_back(page);
+		}
+	}
+
+	void NoteAll()
+	{
+		for (u32 page : s_code_pages)
+			g_gen[page] = 0;
+	}
+
+	u32* Counter() { return &s_counter; }
+} // namespace CodeWrites
+
 namespace
 {
 	using WasmJit::Function;
@@ -80,6 +121,7 @@ namespace
 	struct Group
 	{
 		WasmJit::LoadedFunction first; // module and instance handles
+		std::unique_ptr<u32[]> checked; // per block: the page generation its code was last compared at
 		std::vector<int> slots;
 		int live = 0;
 	};
@@ -229,8 +271,9 @@ namespace
 	class BlockCompiler
 	{
 	public:
-		BlockCompiler(u32 type_v_v, u32 type_i_v, u32 page_vaddr, const u32* host_page, u64 vmap_raw)
-			: m_tvv(type_v_v)
+		BlockCompiler(u32 type_v_v, u32 type_i_v, u32 page_vaddr, const u32* host_page, u64 vmap_raw, u32* checked)
+			: m_checked(checked)
+			, m_tvv(type_v_v)
 			, m_tiv(type_i_v)
 			, m_page(page_vaddr)
 			, m_host(host_page)
@@ -306,9 +349,11 @@ namespace
 			f.i64_const(static_cast<s64>(m_vmap_raw));
 			f.i64_ne();
 			f.br_if(0);
-			// Same code.
 			const u32 host = Addr(m_host) + (start - m_page);
 			const u32 nwords = (end - start) >> 2;
+			// No write to the page since the last compare (CodeWrites.h).
+			const bool tracked = CodeWrites::EmitSkipCompare(f, host, nwords * 4, m_checked, m_a);
+			// Same code.
 			u32 i = 0;
 			for (; i + 2 <= nwords; i += 2)
 			{
@@ -328,11 +373,21 @@ namespace
 				f.i32_ne();
 				f.br_if(0);
 			}
+			if (tracked)
+				CodeWrites::EmitCompared(f, m_checked, m_a);
 			f.br(1);
 			f.end();
 			f.i32_const(1);
 			f.return_();
 			f.end();
+		}
+
+		// After a generated store to the host address in the low half of m_v (aligned: one page).
+		void EmitNoteWrite()
+		{
+			m_fn.local_get(m_v);
+			m_fn.i32_wrap_i64();
+			CodeWrites::EmitNoteWrite(m_fn);
 		}
 
 		// ---- cycles -------------------------------------------------------------------------------------------
@@ -1575,6 +1630,7 @@ namespace
 					f.i32_wrap_i64();
 					LdV(Addr(&VU0.VF[rt]));
 					f.v128_store(0);
+					EmitNoteWrite();
 				}
 			}
 			else
@@ -1664,6 +1720,8 @@ namespace
 				case Kind::SWC1: host(); f.i32_const(0); f.i32_load(Addr(&fpuRegs.fpr[rt].UL)); f.i32_store(0); break;
 				default: break;
 			}
+			if ((d.kind >= Kind::SB && d.kind <= Kind::SQ) || d.kind == Kind::SWC1)
+				EmitNoteWrite();
 			f.br(1);
 			f.end(); // slow
 			StorePcCode(pc, code);
@@ -1876,6 +1934,7 @@ namespace
 		u32 m_page;
 		const u32* m_host;
 		u64 m_vmap_raw;
+		u32* m_checked; // the page generation this block's code was last compared at
 		Function m_fn;
 		u32 m_a, m_j, m_cyc, m_f;
 		u32 m_vloc[8] = {};
@@ -2005,6 +2064,7 @@ namespace
 		m.import_memory("env", "mem", 0, 65536, true);
 		m.import_table("env", "table", 0);
 
+		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxGroupBlocks);
 		std::vector<u32> pcs;
 		std::vector<std::unique_ptr<BlockCompiler>> blocks;
 		std::vector<u32> work{entry};
@@ -2017,7 +2077,7 @@ namespace
 			if (pc != entry && SlotRef(pc) != 0)
 				continue;
 			std::vector<u32> next;
-			blocks.push_back(std::make_unique<BlockCompiler>(t_v_v, t_i_v, page, host, vmv.raw()));
+			blocks.push_back(std::make_unique<BlockCompiler>(t_v_v, t_i_v, page, host, vmv.raw(), &checked[pcs.size()]));
 			blocks.back()->Run(pc, &next);
 			pcs.push_back(pc);
 			for (u32 n : next)
@@ -2044,6 +2104,7 @@ namespace
 		const std::vector<u8> bytes = m.finish();
 		s_wasm_bytes += bytes.size();
 		auto g = std::make_unique<Group>();
+		g->checked = std::move(checked);
 		const int module = wasmjit_compile(bytes.data(), bytes.size());
 		const int instance = module > 0 ? wasmjit_instantiate(module) : 0;
 		if (module <= 0 || instance <= 0)

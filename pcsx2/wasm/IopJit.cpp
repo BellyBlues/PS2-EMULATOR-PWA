@@ -19,15 +19,17 @@
 //   emitted; everything else (divides, unaligned and I/O accesses, GTE, RFE, SYSCALL, BREAK, J to an import stub)
 //   calls the interpreter's function with psxRegs.pc and psxRegs.code as execI() sets them. After such a call, a
 //   changed PC (an exception) leaves the block.
-// - Self-modifying code (module loads): each block checks, on entry, its instruction words against the values it
-//   was compiled from, and is recompiled when they differ. Code that changes the rest of its own block while it
-//   runs is not detected (the interpreter would see the new instruction); needs proper testing with games that do.
+// - Self-modifying code (module loads): each block checks, on entry after a write to its page (write tracking,
+//   CodeWrites.h), its instruction words against the values it was compiled from, and is recompiled when they
+//   differ. Code that changes the rest of its own block while it runs is not detected (the interpreter would see
+//   the new instruction); needs proper testing with games that do.
 
 #include "Common.h"
 #include "Config.h"
 #include "IopMem.h"
 #include "R3000A.h"
 
+#include "wasm/CodeWrites.h"
 #include "wasm/IopJit.h"
 #include "wasm/WasmEmitter.h"
 #include "wasm/WasmJitRuntime.h"
@@ -67,6 +69,7 @@ namespace
 		int module = 0;
 		int instance = 0;
 		int live = 0;
+		std::unique_ptr<u32[]> checked; // per block: the page generation its code was last compared at
 	};
 
 	// Compiled blocks by IOP PC: s_pages[pc >> 12][(pc >> 2) & 1023] is a table slot, 0 when not compiled.
@@ -211,8 +214,9 @@ namespace
 	class BlockCompiler
 	{
 	public:
-		BlockCompiler(u32 type_v_v, u32 type_i_v, u32 page_vaddr, const u32* host_page)
-			: m_tvv(type_v_v)
+		BlockCompiler(u32 type_v_v, u32 type_i_v, u32 page_vaddr, const u32* host_page, u32* checked)
+			: m_checked(checked)
+			, m_tvv(type_v_v)
 			, m_tiv(type_i_v)
 			, m_page(page_vaddr)
 			, m_host(host_page)
@@ -320,6 +324,9 @@ namespace
 			f.block();
 			const u32 host = Addr(m_host) + (start - m_page);
 			const u32 nwords = (end - start) >> 2;
+			// No write to the page since the last compare (CodeWrites.h).
+			const bool tracked = CodeWrites::EmitSkipCompare(f, host, nwords * 4, m_checked, m_a);
+			// Same code.
 			u32 i = 0;
 			for (; i + 2 <= nwords; i += 2)
 			{
@@ -339,6 +346,8 @@ namespace
 				f.i32_ne();
 				f.br_if(0);
 			}
+			if (tracked)
+				CodeWrites::EmitCompared(f, m_checked, m_a);
 			f.br(1);
 			f.end();
 			f.i32_const(1);
@@ -624,6 +633,15 @@ namespace
 						case Kind::SH: f.i32_store16(0, 0); break;
 						default: f.i32_store(0, 0); break;
 					}
+					f.local_get(m_a);
+					CodeWrites::EmitNoteWrite(f);
+					if (k != Kind::SB) // not necessarily aligned
+					{
+						f.local_get(m_a);
+						f.i32_const(k == Kind::SH ? 1 : 3);
+						f.i32_add();
+						CodeWrites::EmitNoteWrite(f);
+					}
 				}
 				else
 				{
@@ -749,6 +767,7 @@ namespace
 			return false;
 		}
 
+		u32* m_checked; // the page generation this block's code was last compared at
 		u32 m_tvv, m_tiv;
 		u32 m_page;
 		const u32* m_host;
@@ -825,6 +844,7 @@ namespace
 		m.import_memory("env", "mem", 0, 65536, true);
 		m.import_table("env", "table", 0);
 
+		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxGroupBlocks);
 		std::vector<u32> pcs;
 		std::vector<u32> work{entry};
 		while (!work.empty() && pcs.size() < kMaxGroupBlocks)
@@ -836,7 +856,7 @@ namespace
 			if (pc != entry && SlotRef(pc) != 0)
 				continue;
 			std::vector<u32> next;
-			BlockCompiler bc(t_v_v, t_i_v, page, host);
+			BlockCompiler bc(t_v_v, t_i_v, page, host, &checked[pcs.size()]);
 			Function& fn = bc.Run(pc, &next);
 			const u32 index = m.add_function(t_v_i, fn);
 			char name[16];
@@ -865,6 +885,7 @@ namespace
 			return false;
 		}
 		auto g = std::make_unique<Group>();
+		g->checked = std::move(checked);
 		g->module = module;
 		g->instance = instance;
 		for (u32 i = 0; i < pcs.size(); i++)

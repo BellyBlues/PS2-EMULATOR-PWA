@@ -2308,6 +2308,9 @@ static void cdvdWrite04(u8 rt)
 			DevCon.WriteLn("CDGetToc Param[0]=%d, Param[1]=%d", cdvd.NCMDParamBuff[0], cdvd.NCMDParamBuff[1]);
 			//}
 			cdvdGetToc(iopPhysMem(HW_DMA3_MADR));
+#ifdef ARCH_WASM
+			psxCpu->Clear(HW_DMA3_MADR, 2048 / 4); // the JITs' write tracking (a TOC is at most 2048 bytes)
+#endif
 			cdvdSetIrq();
 			HW_DMA3_CHCR &= ~0x01000000;
 			psxDmaInterrupt(3);

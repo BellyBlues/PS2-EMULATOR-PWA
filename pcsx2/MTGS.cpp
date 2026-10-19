@@ -18,6 +18,10 @@
 #include <mutex>
 #include <thread>
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 // Uncomment this to enable profiling of the GS RingBufferCopy function.
 //#define PCSX2_GSRING_SAMPLING_STATS
 
@@ -288,12 +292,18 @@ void MTGS::InitAndReadFIFO(u8* mem, u32 qwc)
 			GSReadLocalMemoryUnsync(mem, qwc, vif1.BITBLTBUF._u64, vif1.TRXPOS._u64, vif1.TRXREG._u64);
 		else
 			std::memset(mem, 0, qwc * 16);
+#ifdef ARCH_WASM
+		CodeWrites::Note(mem, qwc * 16);
+#endif
 
 		return;
 	}
 
 	SendPointerPacket(Command::InitAndReadFIFO, qwc, mem);
 	WaitGS(false, false, false);
+#ifdef ARCH_WASM
+	CodeWrites::Note(mem, qwc * 16);
+#endif
 }
 
 union PacketTagType

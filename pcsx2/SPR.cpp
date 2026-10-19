@@ -7,6 +7,10 @@
 #include "VUmicro.h"
 #include "MTVU.h"
 
+#ifdef ARCH_WASM
+#include "wasm/CodeWrites.h"
+#endif
+
 static bool spr0finished = false;
 static bool spr1finished = false;
 static u32 mfifotransferred = 0; // FIXME: Remove next time someone bumps savestates, no longer required.
@@ -72,6 +76,12 @@ static void TestClearVUs(u32 madr, u32 qwc, bool isWrite)
 static void memcpy_to_spr(u32 dst, u8* src, size_t size)
 {
 	dst &= _16kb - 1;
+#ifdef ARCH_WASM
+	if (dst + size > _16kb)
+		CodeWrites::Note(&psSu128(0), _16kb);
+	else
+		CodeWrites::Note(&psSu128(dst), size);
+#endif
 
 	if (dst + size >= _16kb) {
 		size_t end = _16kb - dst;
@@ -86,6 +96,9 @@ static void memcpy_to_spr(u32 dst, u8* src, size_t size)
 
 static void memcpy_from_spr(u8* dst, u32 src, size_t size)
 {
+#ifdef ARCH_WASM
+	CodeWrites::Note(dst, size);
+#endif
 	src &= _16kb - 1;
 
 	if (src + size >= _16kb) {
