@@ -46,6 +46,7 @@
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/wasm/EEJit.h"
 
 #include "WavOutput.h"
 
@@ -348,6 +349,22 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			s_setting_overrides.push_back({std::string(path.substr(0, slash)), std::string(path.substr(slash + 1)),
 				std::string(setting.substr(eq + 1))});
 		}
+		else if (arg == "-eejit" && has_value)
+			EEJit::g_mode = StringUtil::FromChars<int>(argv[++i]).value_or(1);
+		else if (arg == "-eejit-stats")
+			EEJit::g_stats = true;
+		else if (arg == "-eejit-trace" && has_value)
+		{
+			// SHIFT[,FROM,TO]: print the state hash every 2^SHIFT branch tests, and every test in [FROM, TO].
+			const std::vector<std::string_view> parts = StringUtil::SplitString(argv[++i], ',', true);
+			EEJit::g_trace = true;
+			EEJit::g_trace_shift = parts.empty() ? 16 : StringUtil::FromChars<u32>(parts[0]).value_or(16);
+			if (parts.size() >= 3)
+			{
+				EEJit::g_trace_from = StringUtil::FromChars<u64>(parts[1]).value_or(~0ull);
+				EEJit::g_trace_to = StringUtil::FromChars<u64>(parts[2]).value_or(0);
+			}
+		}
 		else if (arg == "-renderer" && has_value)
 		{
 			const std::string_view name = argv[++i];
@@ -369,7 +386,9 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-fastboot | -slowboot] [-memcards] [-input SCRIPT | -input @FILE]\n"
 								 "         [-loadstate FILE] [-savestate FILE] [-unlimited]\n"
 								 "         [-wav FILE.wav [-wav-realtime [-wav-period FRAMES]]]\n"
-								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n", argv[0]);
+								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n"
+								 "         [-eejit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]]\n", argv[0]);
+			std::fprintf(stderr, "  -eejit 0 runs the EE interpreter instead of the EE JIT; -eejit-trace prints EE state hashes to compare runs.\n");
 			std::fprintf(stderr, "  With no disc image the BIOS boots to its menu. -frames 0 runs until stopped.\n");
 			std::fprintf(stderr, "  The screenshot is requested at vsync N (default: 10 before the end) and shows the next frame.\n");
 			std::fprintf(stderr, "  -screenshot-dir saves DIR/frame_NNNNNN.png every N vsyncs or at the listed vsyncs.\n");
@@ -720,6 +739,8 @@ static void CPUThreadMain(std::atomic<int>* ret)
 			while (VMManager::GetState() == VMState::Running)
 				VMManager::Execute();
 			INFO_LOG("Headless: stopped after {} frames", s_frames);
+			EEJit::PrintStats();
+			EEJit::TraceFinish();
 			// The callback only runs on failure, for example when the memory card was written in the last 300
 			// vsyncs (MemcardBusy cancels the save): say so and fail, so no one takes an older file for this run's.
 			bool save_failed = false;

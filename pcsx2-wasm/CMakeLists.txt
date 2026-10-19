@@ -78,7 +78,8 @@ list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_audio
 )
 list(JOIN PCSX2_WASM_EXPORTS "," PCSX2_WASM_EXPORTS)
-set_property(TARGET pcsx2-wasm APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/jspi-fallback.js")
+set_property(TARGET pcsx2-wasm APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/jspi-fallback.js"
+	"${CMAKE_SOURCE_DIR}/pcsx2/wasm/WasmJitRuntime.js")
 
 # main() runs on a worker (PROXY_TO_PTHREAD) so the page's thread never blocks; the pool
 # covers the CPU, GS and software renderer threads without waiting on the page to spawn

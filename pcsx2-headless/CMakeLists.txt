@@ -30,4 +30,5 @@ if(EMSCRIPTEN)
 		# Keep function names so traps give readable stacks.
 		"--profiling-funcs"
 	)
+	set_property(TARGET pcsx2-headless APPEND PROPERTY LINK_DEPENDS "${CMAKE_SOURCE_DIR}/pcsx2/wasm/WasmJitRuntime.js")
 endif()

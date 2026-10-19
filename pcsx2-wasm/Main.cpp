@@ -67,6 +67,7 @@
 #include "pcsx2/MTGS.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/wasm/EEJit.h"
 #include "pcsx2/ps2/BiosTools.h"
 
 namespace
@@ -1157,6 +1158,11 @@ static void ParseArguments(int argc, char* argv[])
 		if (arg == "-gpu" && has_value)
 		{
 			WebGPUHost::SetEnabled(std::string_view(argv[++i]) != "0");
+		}
+		else if (arg == "-eejit" && has_value)
+		{
+			// Tests: "0" runs the EE interpreter instead of the EE JIT.
+			EEJit::g_mode = (std::string_view(argv[++i]) != "0") ? 1 : 0;
 		}
 		else if (arg == "-gs-idle" && has_value)
 		{

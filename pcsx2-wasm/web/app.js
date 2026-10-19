@@ -865,6 +865,8 @@
 			args.push('-surface', TEST_SURFACE[0]);
 		if (params.get('gsidle') === 'block')
 			args.push('-gs-idle', 'block');
+		if (params.get('eejit') === '0')
+			args.push('-eejit', '0');
 		if (GPU_ALLOWED && navigator.gpu && !HAS_JSPI)
 			pageLog('WebGPU needs JSPI, which this browser lacks: drawing through the 2D canvas.', 'warn');
 		window.Module = {

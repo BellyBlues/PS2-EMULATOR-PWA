@@ -170,6 +170,7 @@ Switches for comparisons and tests (all optional):
 | `?set=Section/Key=Value` | Overrides one setting after the defaults (repeatable), e.g. `?set=EmuCore/GS/deinterlace_mode=2` |
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |
+| `?eejit=0` | Runs the EE (main CPU) interpreter instead of the EE JIT, which compiles EE code to WebAssembly at run time |
 | `?gsidle=block` | Keeps the GS thread's idle wait blocking with WebGPU, leaving only the device's bounded event-loop turn |
 
 Frames are identified by the vsync they show, counted from boot, not by how many were presented:

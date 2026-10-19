@@ -11,6 +11,10 @@
 
 #include "common/FastJmp.h"
 
+#ifdef ARCH_WASM
+#include "wasm/EEJit.h"
+#endif
+
 #include <float.h>
 
 using namespace R5900;		// for OPCODE and OpcodeImpl
@@ -45,6 +49,9 @@ static void intTestBiosHooks();
 static __fi void intBranchTest()
 {
 #ifdef ARCH_WASM
+	if (EEJit::g_trace) [[unlikely]]
+		EEJit::TraceStep();
+
 	if (static_cast<s64>(cpuRegs.cycle - cpuRegs.nextEventCycle) >= 0)
 		intEventTest();
 
@@ -248,11 +255,9 @@ static void execI()
 	opcode.interpret();
 }
 
-static __fi void _doBranch_shared(u32 tar)
+// The end of _doBranch_shared(), after the delay slot. Separate so that the WebAssembly EE JIT can share it.
+static __fi void _doBranch_afterDelaySlot(u32 tar)
 {
-	branch2 = cpuRegs.branch = 1;
-	execI();
-
 	// branch being 0 means an exception was thrown, since only the exception
 	// handler should ever clear it.
 
@@ -294,6 +299,13 @@ static __fi void _doBranch_shared(u32 tar)
 		cpuRegs.pc = tar;
 		cpuRegs.branch = 0;
 	}
+}
+
+static __fi void _doBranch_shared(u32 tar)
+{
+	branch2 = cpuRegs.branch = 1;
+	execI();
+	_doBranch_afterDelaySlot(tar);
 }
 
 static void doBranch( u32 target )
@@ -588,6 +600,9 @@ static void intReset()
 {
 	cpuRegs.branch = 0;
 	branch2 = 0;
+#ifdef ARCH_WASM
+	EEJit::RequestFlush();
+#endif
 }
 
 void intEventTest()
@@ -709,11 +724,47 @@ static void intExecute()
 
 	intLoadBiosHooks();
 
+	if (EEJit::g_mode)
+		EEJit::Execute(); // returns only if the JIT had to stop
+
 	while (true)
 	{
 		execI();
 		intTestEventsInStraightLineCode();
 	}
+}
+
+// Entry points for the EE JIT (pcsx2/wasm/EEJit.cpp). Generated code accumulates cycles in cpuBlockCycles like
+// execI() and ends branches with the interpreter's own code, so both run the same events at the same cycles.
+u32* intJitBlockCycles()
+{
+	return &cpuBlockCycles;
+}
+
+// One instruction (a block that cannot be compiled, for example code in hardware register space).
+void intJitExecOne()
+{
+	execI();
+	intTestEventsInStraightLineCode();
+}
+
+// A taken branch after its delay slot: doBranch() without the delay slot.
+void intJitBranchEnd(u32 target)
+{
+	_doBranch_afterDelaySlot(target);
+	intUpdateCPUCycles();
+	intBranchTest();
+}
+
+// The test of BEQ/BNE not taken and of likely branches not taken.
+void intJitBranchTest()
+{
+	intBranchTest();
+}
+
+void intJitStraightLineTest()
+{
+	intTestEventsInStraightLineCode();
 }
 #else
 static void intExecute()
