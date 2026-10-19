@@ -130,6 +130,7 @@
 	const TEST_SURFACE = /^(\d+)x(\d+)$/.exec(params.get('surface') || '');
 	const FRAME_PORT_TIMEOUT_MS = 5000;
 	const LATENCY_SAMPLES = 600;
+	const VU1JIT_PARAM = params.get('vu1jit');
 
 	// ------------------------------------------------------------------ copy
 
@@ -827,6 +828,7 @@
 
 		page.phase = 'ready';
 		pageLog('Runtime ready.');
+		startVu1JitTesting();
 		if (page.pendingBiosBytes && page.bios) {
 			writeBiosToFs(page.bios.name, page.pendingBiosBytes);
 			page.pendingBiosBytes = null;
@@ -840,6 +842,92 @@
 		rafId = requestAnimationFrame(drawLoop);
 		poll();
 		maybeAutoBoot();
+	}
+
+	// ------------------------------------------------------------------ VU1 JIT testing
+
+	// With no interface (pcsx2-wasm/README.md): the VU1 JIT is on by default; ?vu1jit=0 boots with the VU1
+	// interpreter instead; ?vu1jit=1 also prints its counters to the browser console every 10 s; ?vu1jit=fuzz:SEED:COUNT[:timing|jit|both]
+	// runs the JIT's fuzzer on a worker, without a VM, and logs its result.
+	const VU1JIT_STATS_NAMES = ['selftest', 'executes', 'programs', 'compiles', 'entries', 'instructions',
+		'fallbackSteps', 'refused', 'lockstepRuns', 'lockstepDiffs', 'oracleChecked', 'oracleDiffs', 'eeClears'];
+	const VU1JIT_FUZZ_STATES = ['idle', 'running', 'passed', 'differences', 'bad spec'];
+	const vu1jit = { mode: null };
+
+	function vu1jitStats() {
+		const M = window.Module;
+		const buffer = heapBuffer();
+		if (!buffer || !M || typeof M._pcsx2web_vu1jit_stats !== 'function')
+			return null;
+		const words = new Uint32Array(buffer, M._pcsx2web_vu1jit_stats() >>> 0, VU1JIT_STATS_NAMES.length);
+		const out = {};
+		VU1JIT_STATS_NAMES.forEach((name, i) => { out[name] = Atomics.load(words, i); });
+		return out;
+	}
+
+	function vu1jitFuzzStatus() {
+		const M = window.Module;
+		const buffer = heapBuffer();
+		if (!buffer || !M || typeof M._pcsx2web_vu1jit_fuzz_status !== 'function')
+			return null;
+		const ptr = M._pcsx2web_vu1jit_fuzz_status() >>> 0;
+		const words = new Uint32Array(buffer, ptr, 4);
+		const state = Atomics.load(words, 0);
+		// TextDecoder does not take views of shared memory: copy the bytes first.
+		const bytes = new Uint8Array(buffer, ptr + 24, 512).slice();
+		const end = bytes.indexOf(0);
+		return {
+			state: VU1JIT_FUZZ_STATES[state] || String(state),
+			done: Atomics.load(words, 1),
+			total: Atomics.load(words, 2),
+			differences: Atomics.load(words, 3),
+			summary: new TextDecoder().decode(bytes.subarray(0, end < 0 ? bytes.length : end)),
+		};
+	}
+
+	function startVu1JitTesting() {
+		const M = window.Module;
+		if (!VU1JIT_PARAM)
+			return;
+		if (typeof M._pcsx2web_vu1jit_enable !== 'function') {
+			pageLog('?vu1jit= needs a build with the VU1 JIT testing exports.', 'warn');
+			return;
+		}
+		if (VU1JIT_PARAM === '0') {
+			vu1jit.mode = 'off';
+			M._pcsx2web_vu1jit_enable(0);
+			pageLog('VU1 JIT off in this session (?vu1jit=0): VU1 runs on the interpreter.');
+		} else if (VU1JIT_PARAM === '1') {
+			vu1jit.mode = 'on';
+			M._pcsx2web_vu1jit_enable(1);
+			pageLog('VU1 JIT testing: the JIT\'s counters go to the browser console every 10 s (?vu1jit=1).');
+			setInterval(() => console.log('[vu1jit]', JSON.stringify(vu1jitStats())), 10000);
+		} else if (VU1JIT_PARAM.startsWith('fuzz:')) {
+			vu1jit.mode = 'fuzz';
+			const spec = VU1JIT_PARAM.slice(5);
+			// -2: the emulator thread is still setting up (the fuzzer must not race it); try again shortly.
+			const rc = M.ccall('pcsx2web_vu1jit_fuzz', 'number', ['string'], [spec]);
+			if (rc === -2) {
+				setTimeout(startVu1JitTesting, 250);
+				return;
+			}
+			if (rc !== 0) {
+				pageLog(`VU1 JIT fuzzer: could not start '${spec}'.`, 'warn');
+				return;
+			}
+			pageLog(`VU1 JIT fuzzer: running ${spec} on a worker.`);
+			const timer = setInterval(() => {
+				const st = vu1jitFuzzStatus();
+				if (!st || st.state === 'running')
+					return;
+				clearInterval(timer);
+				const line = `VU1 JIT fuzzer, ${st.state}: ${st.summary}`;
+				pageLog(line, st.state === 'passed' ? undefined : 'warn');
+				console.log('[vu1jit]', line);
+			}, 500);
+		} else {
+			pageLog(`Unknown ?vu1jit= value '${VU1JIT_PARAM}' (use 0, 1, or fuzz:SEED:COUNT[:timing|jit|both]).`, 'warn');
+		}
 	}
 
 	function onExit(code) {
@@ -5279,6 +5367,8 @@
 				bin += String.fromCharCode.apply(null, c.rgba.subarray(i, i + 32768));
 			return { requested: n, frame: c.vsync, width: c.width, height: c.height, rgba: btoa(bin) };
 		},
+		// ?vu1jit= testing: the mode, the JIT's counters and the fuzzer's status.
+		vu1jit: () => ({ mode: vu1jit.mode, stats: vu1jitStats(), fuzz: vu1jitFuzzStatus() }),
 	});
 
 	// ------------------------------------------------------------------ start

@@ -1096,10 +1096,30 @@ set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
 )
 
-# WebAssembly (no native recompilers; the EE JIT generates WebAssembly, wasm/EEJit.cpp)
+# WebAssembly (no native recompilers; the EE JIT and the VU1 JIT generate WebAssembly, wasm/EEJit.cpp,
+# docs/web-port/VU1-JIT-DESIGN.md)
 set(pcsx2wasmSources
 	wasm/EEJit.cpp
 	wasm/RecStubs.cpp
+	wasm/VU0Jit.cpp
+	wasm/VU1Jit.cpp
+	wasm/VU1JitAnalysis.cpp
+	wasm/VU1JitEmit.cpp
+	wasm/VU1JitFuzz.cpp
+	wasm/VU1JitHooks.cpp
+	wasm/VU1JitLockstep.cpp
+	)
+
+set(pcsx2wasmHeaders
+	wasm/VU0Jit.h
+	wasm/VU1Jit.h
+	wasm/VU1JitAnalysis.h
+	wasm/VU1JitEmit.h
+	wasm/VU1JitFuzz.h
+	wasm/VU1JitHooks.h
+	wasm/VU1JitLockstep.h
+	wasm/WasmEmitter.h
+	wasm/WasmJitRuntime.h
 	)
 
 set(pcsx2wasmHeaders

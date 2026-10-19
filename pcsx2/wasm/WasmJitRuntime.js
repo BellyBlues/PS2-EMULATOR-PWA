@@ -4,7 +4,7 @@
 // JS side of runtime WebAssembly code generation (--js-library of pcsx2-wasm and pcsx2-headless, see
 // pcsx2/CMakeLists.txt). Every function runs on the thread that calls it: each pthread is a worker with its own
 // copy of this state, its own instance of the main module and its own function table. So a module is compiled,
-// put in the table, called and released on one thread (the EE JIT, pcsx2/wasm/EEJit.cpp). Objects
+// put in the table, called and released on one thread (the EE JIT, pcsx2/wasm/EEJit.cpp; the VU1 JIT, docs/web-port/VU1-JIT-DESIGN.md section 3.5). Objects
 // (modules, instances) are kept under small integer handles that the C++ side holds (pcsx2/wasm/WasmJitRuntime.h).
 // Started from tools/wasm/wasm-jit-spike/jit_runtime.js.
 
@@ -48,15 +48,24 @@ addToLibrary({
 	// Instantiates a module. The import object offers everything generated code may import:
 	//   env.mem     the shared memory (declared shared, min 0, max 65536 pages in the module)
 	//   env.table   this thread's function table: generated code calls C++ helpers and interpreter functions with
-	//               call_indirect, their function pointers (table indices) being constants in the code
+	//               call_indirect, their function pointers (table indices) being constants in the code (EE JIT)
+	//   env.h_selftest   vu1jit_selftest_helper (pcsx2/wasm/VU1Jit.cpp)
+	//   env.h_kick, env.h_upper, env.h_lower, env.h_upper0, env.h_lower0   the VU JITs' helpers
+	//               (pcsx2/wasm/VU1JitEmit.cpp), main module exports called wasm to wasm
 	// Returns an instance handle, 0 on a link error, -1 on RangeError.
-	wasmjit_instantiate__deps: ['$WasmJit', '$wasmMemory', '$wasmTable'],
+	wasmjit_instantiate__deps: ['$WasmJit', '$wasmMemory', '$wasmTable', 'vu1jit_selftest_helper', 'vu1jit_h_kick', 'vu1jit_h_upper', 'vu1jit_h_lower', 'vu1jit_h_upper0', 'vu1jit_h_lower0'],
 	wasmjit_instantiate: (mod) => {
 		try {
 			const imports = {
 				env: {
 					mem: wasmMemory,
 					table: wasmTable,
+					h_selftest: _vu1jit_selftest_helper,
+					h_kick: _vu1jit_h_kick,
+					h_upper: _vu1jit_h_upper,
+					h_lower: _vu1jit_h_lower,
+					h_upper0: _vu1jit_h_upper0,
+					h_lower0: _vu1jit_h_lower0,
 				},
 			};
 			return WasmJit.put(new WebAssembly.Instance(WasmJit.get(mod), imports));

@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +70,8 @@
 #include "pcsx2/VMManager.h"
 #include "pcsx2/wasm/EEJit.h"
 #include "pcsx2/ps2/BiosTools.h"
+#include "pcsx2/wasm/VU1Jit.h"
+#include "pcsx2/wasm/VU1JitFuzz.h"
 
 namespace
 {
@@ -106,6 +109,10 @@ static std::vector<u8> s_roboto_font_data;
 static std::atomic<int> s_state{WEB_STATE_WAITING};
 static std::atomic<bool> s_fatal_error{false};
 static std::atomic<bool> s_stop_requested{false};
+// The VU1 JIT for the next boots: on by default, off with the page's ?vu1jit=0.
+static std::atomic<bool> s_vu1jit_enabled{true};
+// CPUThreadInitialize has finished (it sets up VU memory, which the VU1 JIT fuzzer must not race).
+static std::atomic<bool> s_cpu_thread_ready{false};
 static std::atomic<float> s_speed{0.0f};
 static std::atomic<float> s_vps{0.0f};
 
@@ -248,6 +255,12 @@ struct GameDetails
 };
 static GameDetails s_game_details = {};
 
+// The VU1 JIT fuzzer (pcsx2web_vu1jit_fuzz) uses VU1 itself: no boot while it runs.
+static bool VU1JitFuzzRunning()
+{
+	return VU1Jit::GetFuzzStatus().state.load(std::memory_order_acquire) == 1;
+}
+
 static void ConfigureMemoryCards(SettingsInterface& si)
 {
 	si.SetStringValue("Folders", "MemoryCards", MEMCARD_DIRECTORY);
@@ -322,7 +335,7 @@ extern "C" {
 /// accepted; -1 as pcsx2web_boot(), or if disc_path is not a disc path.
 EMSCRIPTEN_KEEPALIVE int pcsx2web_boot_disc(const char* bios_filename, const char* disc_path, int flags)
 {
-	if (!bios_filename || !disc_path || s_fatal_error.load(std::memory_order_acquire))
+	if (!bios_filename || !disc_path || s_fatal_error.load(std::memory_order_acquire) || VU1JitFuzzRunning())
 		return -1;
 
 	const size_t bios_length = std::strlen(bios_filename);
@@ -1111,6 +1124,12 @@ static bool InitializeConfig()
 	Host::Internal::SetBaseSettingsLayer(&si);
 	VMManager::SetDefaultSettings(si, true, true, true, true, true);
 
+	// The VU1 JIT is on (docs/web-port/VU1-JIT-DESIGN.md); RunVM applies the page's ?vu1jit=0
+	// (pcsx2web_vu1jit_enable).
+	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", true);
+	// The VU0 micro-mode JIT (pcsx2/wasm/VU0Jit.h) is off too.
+	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", false);
+
 	// Software renderer into GSDeviceNull, sound through the page's Web Audio worklet, keyboard
 	// only (the default port 1 keyboard bindings stay), memory card slot 1 only. Hotkeys are
 	// cleared: most of them (pause menu, save states, screenshots) need host support that is not
@@ -1373,6 +1392,7 @@ static void RunVM(const std::string& bios_name)
 	{
 		auto lock = Host::GetSettingsLock();
 		s_settings_interface.SetStringValue("Filenames", "BIOS", bios_name.c_str());
+		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", s_vu1jit_enabled.load(std::memory_order_acquire));
 	}
 	CheckCrispRequest(false);
 	VMManager::ApplySettings();
@@ -1459,6 +1479,7 @@ static void CPUThreadMain()
 		VMManager::Internal::CPUThreadShutdown();
 		return;
 	}
+	s_cpu_thread_ready.store(true, std::memory_order_release);
 
 	for (;;)
 		RunVM(WaitForBootRequest());
@@ -1504,7 +1525,7 @@ extern "C" {
 /// or running, the frontend failed to initialize, or the name is not a plain file name.
 EMSCRIPTEN_KEEPALIVE int pcsx2web_boot(const char* bios_filename)
 {
-	if (!bios_filename || s_fatal_error.load(std::memory_order_acquire))
+	if (!bios_filename || s_fatal_error.load(std::memory_order_acquire) || VU1JitFuzzRunning())
 		return -1;
 
 	const size_t length = std::strlen(bios_filename);
@@ -1642,6 +1663,46 @@ EMSCRIPTEN_KEEPALIVE const unsigned int* pcsx2web_test_capture(unsigned int fram
 		}
 	}
 	return nullptr;
+}
+
+// VU1 JIT testing (the page's ?vu1jit= parameter, pcsx2-wasm/README.md; docs/web-port/VU1-JIT-DESIGN.md section 12).
+
+/// Turns the VU1 JIT on (1) or off (0) for the next boots. On by default.
+EMSCRIPTEN_KEEPALIVE void pcsx2web_vu1jit_enable(int enabled)
+{
+	s_vu1jit_enabled.store(enabled != 0, std::memory_order_release);
+}
+
+/// Runs the VU1 JIT fuzzer ("SEED:COUNT[:timing|jit|both[:hashes]]") on a worker; poll pcsx2web_vu1jit_fuzz_status().
+/// 0 if started; -2 while the CPU thread is still initialising (try again); -1 while a VM is starting or running (the
+/// fuzzer uses VU1 itself), a fuzz run is in progress, or the frontend failed.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_vu1jit_fuzz(const char* spec)
+{
+	const int state = s_state.load(std::memory_order_acquire);
+	if (!spec || state == WEB_STATE_STARTING || state == WEB_STATE_RUNNING || s_fatal_error.load(std::memory_order_acquire))
+		return -1;
+	if (!s_cpu_thread_ready.load(std::memory_order_acquire))
+		return -2;
+	return VU1Jit::StartFuzz(spec) ? 0 : -1;
+}
+
+/// The fuzzer's status: u32 state (0 idle, 1 running, 2 passed, 3 differences found, 4 bad spec), programs done,
+/// programs in total, differences; u64 instructions checked at byte 16; a NUL-terminated summary at byte 24.
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_vu1jit_fuzz_status(void)
+{
+	static_assert(offsetof(VU1Jit::FuzzStatus, done) == 4 && offsetof(VU1Jit::FuzzStatus, total) == 8 &&
+				  offsetof(VU1Jit::FuzzStatus, differences) == 12 && offsetof(VU1Jit::FuzzStatus, instructions) == 16 &&
+				  offsetof(VU1Jit::FuzzStatus, summary) == 24);
+	return &VU1Jit::GetFuzzStatus();
+}
+
+/// The JIT's counters, u32 each in VU1Jit::PublicStats order: self-test (0 not run, 1 passed, 2 failed), executes,
+/// programs alive, compiles, entries into generated code, instructions, of them on the interpreter, refused lookups,
+/// lockstep runs and differences, oracle checks and differences, EE-thread Clears.
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_vu1jit_stats(void)
+{
+	static_assert(sizeof(VU1Jit::PublicStats) == 13 * sizeof(u32));
+	return &VU1Jit::GetPublicStats();
 }
 
 } // extern "C"

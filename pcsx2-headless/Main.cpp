@@ -49,6 +49,13 @@
 #include "pcsx2/wasm/EEJit.h"
 
 #include "WavOutput.h"
+#ifdef __EMSCRIPTEN__
+#include "pcsx2/MTVU.h"
+#include "pcsx2/wasm/VU0Jit.h"
+#include "pcsx2/wasm/VU1Jit.h"
+#include "pcsx2/wasm/VU1JitFuzz.h"
+#include "pcsx2/wasm/VU1JitHooks.h"
+#endif
 
 static MemorySettingsInterface s_settings_interface;
 
@@ -74,6 +81,12 @@ static bool s_disc_check = false;
 static std::string s_wav_path;
 static WavOutput::Clock s_wav_clock = WavOutput::Clock::Emulated;
 static u32 s_wav_period = 0;
+#ifdef __EMSCRIPTEN__
+// VU1 JIT test modes (docs/web-port/VU1-JIT-DESIGN.md section 12).
+static std::string s_vu1jit_fuzz;
+static std::string s_vu1jit_stats_path;
+static bool s_vu1jit_report = false;
+#endif
 
 // Host key names; the key code is the index + 1 (0 would make an all-zero InputBindingKey). Only the keys of
 // PCSX2's default keyboard mapping for pad 1, which the browser frontend also keeps.
@@ -153,6 +166,13 @@ static bool InitializeConfig()
 	MemorySettingsInterface& si = s_settings_interface;
 	Host::Internal::SetBaseSettingsLayer(&si);
 	VMManager::SetDefaultSettings(si, true, true, true, true, true);
+#ifdef __EMSCRIPTEN__
+	// The VU1 JIT is on (docs/web-port/VU1-JIT-DESIGN.md): -set EmuCore/CPU/Recompiler/EnableVU1=false
+	// runs the VU1 interpreter instead.
+	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", true);
+	// The same for the VU0 micro-mode JIT: -set EmuCore/CPU/Recompiler/EnableVU0=true.
+	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", false);
+#endif
 
 	// Headless: no renderer output, no audio. Pad 1 keeps the default keyboard bindings only for an input
 	// script, which feeds those keys like the browser frontend does. Memory cards only on request.
@@ -321,6 +341,33 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			if (!ParseInputScript(argv[++i]))
 				return false;
 		}
+#ifdef __EMSCRIPTEN__
+		else if (arg == "-vu1jit-fuzz" && has_value)
+			s_vu1jit_fuzz = argv[++i];
+		else if (arg == "-vu1jit-oracle")
+		{
+			VU1Jit::SetOracle(true);
+			s_vu1jit_report = true;
+		}
+		else if (arg == "-vu1jit-lockstep")
+		{
+			VU1Jit::SetLockstep(true);
+			s_vu1jit_report = true;
+		}
+		else if (arg == "-vu0jit-lockstep")
+		{
+			VU0Jit::SetLockstep(true);
+			s_vu1jit_report = true;
+		}
+		else if (arg == "-vu1jit-stats" && has_value)
+		{
+			s_vu1jit_stats_path = argv[++i];
+			VU1Jit::SetStats(true);
+			s_vu1jit_report = true;
+		}
+		else if (arg == "-mtvu-sync")
+			VU1JitHooks::mtvu_sync = true;
+#endif
 		else if (arg == "-disc-check")
 		{
 			s_disc_check = true;
@@ -389,6 +436,10 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n"
 								 "         [-eejit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]]\n", argv[0]);
 			std::fprintf(stderr, "  -eejit 0 runs the EE interpreter instead of the EE JIT; -eejit-trace prints EE state hashes to compare runs.\n");
+#ifdef __EMSCRIPTEN__
+			std::fprintf(stderr, "         [-vu1jit-fuzz SEED:COUNT[:timing|jit|both[:hashes]]] [-vu1jit-oracle] [-vu1jit-lockstep] [-vu0jit-lockstep]\n"
+								 "         [-vu1jit-stats FILE] [-mtvu-sync]\n");
+#endif
 			std::fprintf(stderr, "  With no disc image the BIOS boots to its menu. -frames 0 runs until stopped.\n");
 			std::fprintf(stderr, "  The screenshot is requested at vsync N (default: 10 before the end) and shows the next frame.\n");
 			std::fprintf(stderr, "  -screenshot-dir saves DIR/frame_NNNNNN.png every N vsyncs or at the listed vsyncs.\n");
@@ -408,6 +459,16 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         SyncMode, TimeStretch by default; -set SPU2/Output/SyncMode=Disabled turns it off).\n");
 			std::fprintf(stderr, "  -disc-check reads the listed sectors (negative counts from the end) through the CDVD ISO\n"
 								 "         reader, prints an FNV-1a hash of each 2048-byte sector and exits.\n");
+#ifdef __EMSCRIPTEN__
+			std::fprintf(stderr, "  VU1 JIT (WebAssembly; on by default, off with -set EmuCore/CPU/Recompiler/EnableVU1=false):\n"
+								 "  -vu1jit-fuzz runs random VU1 programs without a BIOS or a VM and exits: 'timing' checks the\n"
+								 "         timing model at every instruction, 'jit' compares the interpreter and the JIT, 'both' does both.\n"
+								 "  -vu1jit-oracle checks the timing model at every VU1 instruction the JIT's dispatcher runs.\n"
+								 "  -vu1jit-lockstep runs every VU1 program on the JIT and on the interpreter and compares them.\n"
+								 "  -vu0jit-lockstep does the same for VU0 micro programs (EnableVU0=true).\n"
+								 "  -vu1jit-stats writes per-vsync VU1 statistics (runs, cycles, execute time, PATH1 hash) as CSV.\n"
+								 "  -mtvu-sync makes the EE wait for the VU thread at each check, so whole runs repeat exactly.\n");
+#endif
 			return false;
 		}
 		else if (!arg.empty() && arg[0] != '-')
@@ -741,6 +802,23 @@ static void CPUThreadMain(std::atomic<int>* ret)
 			INFO_LOG("Headless: stopped after {} frames", s_frames);
 			EEJit::PrintStats();
 			EEJit::TraceFinish();
+#ifdef __EMSCRIPTEN__
+			if (s_vu1jit_report)
+			{
+				if (vu1Thread.IsOpen())
+					vu1Thread.WaitVU();
+				VU1Jit::LogReport();
+				if (EmuConfig.Cpu.Recompiler.EnableVU0)
+					VU0Jit::LogReport();
+				if (!s_vu1jit_stats_path.empty())
+				{
+					if (VU1Jit::WriteStats(s_vu1jit_stats_path))
+						INFO_LOG("Headless: VU1 statistics written to '{}'", s_vu1jit_stats_path);
+					else
+						Console.ErrorFmt("Headless: failed to write VU1 statistics to '{}'", s_vu1jit_stats_path);
+				}
+			}
+#endif
 			// The callback only runs on failure, for example when the memory card was written in the last 300
 			// vsyncs (MemcardBusy cancels the save): say so and fail, so no one takes an older file for this run's.
 			bool save_failed = false;
@@ -849,6 +927,15 @@ int main(int argc, char* argv[])
 
 	if (s_disc_check)
 		return RunDiscCheck();
+#ifdef __EMSCRIPTEN__
+
+	// Needs no BIOS, settings or VM: random programs on the VU1 interpreter and the JIT, on their own thread.
+	if (!s_vu1jit_fuzz.empty())
+	{
+		Log::SetConsoleOutputLevel(LOGLEVEL_INFO); // the interpreter's dev warnings would flood the output
+		return VU1Jit::RunFuzz(s_vu1jit_fuzz) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+	}
+#endif
 
 	if (s_wav_path.empty() && (s_wav_clock != WavOutput::Clock::Emulated || s_wav_period != 0))
 	{
@@ -883,6 +970,9 @@ void Host::PumpMessagesOnCPUThread()
 	// Called once per vsync.
 	s_frames++;
 	WavOutput::OnVsync();
+#ifdef __EMSCRIPTEN__
+	VU1Jit::OnVsync();
+#endif
 	const u64 screenshot_frame = s_screenshot_frame ? s_screenshot_frame : (s_max_frames > 10 ? s_max_frames - 10 : 0);
 	if (!s_screenshot_path.empty() && s_frames == screenshot_frame)
 	{

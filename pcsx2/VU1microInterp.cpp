@@ -7,6 +7,9 @@
 #include "GS.h"
 #include "Gif_Unit.h"
 #include "MTVU.h"
+#ifdef ARCH_WASM
+#include "wasm/VU1JitHooks.h"
+#endif
 
 #include <cfenv>
 
@@ -234,6 +237,12 @@ static void _vu1Exec(VURegs* VU)
 			if (THREAD_VU1_INTERP)
 			{
 				// As microVU: a D/T-bit stop is reported as a T-bit, which raises the VU1 interrupt on the EE thread.
+#ifdef ARCH_WASM
+				// The VU1 JIT's lockstep mode and fuzzer take it here (pcsx2/wasm/VU1JitHooks.h).
+				if (VU1JitHooks::interrupt) [[unlikely]]
+					VU1JitHooks::interrupt(s_mtvu_dt_stop ? VU_Thread::InterruptFlagVUTBit : VU_Thread::InterruptFlagVUEBit);
+				else
+#endif
 				vu1Thread.mtvuInterrupts.fetch_or(s_mtvu_dt_stop ? VU_Thread::InterruptFlagVUTBit : VU_Thread::InterruptFlagVUEBit,
 					std::memory_order_release);
 				s_mtvu_dt_stop = false;

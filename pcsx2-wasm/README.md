@@ -171,6 +171,7 @@ Switches for comparisons and tests (all optional):
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |
 | `?eejit=0` | Runs the EE (main CPU) interpreter instead of the EE JIT, which compiles EE code to WebAssembly at run time |
+| `?vu1jit=0` | Runs the VU1 (vector unit 1) interpreter instead of the VU1 JIT, which compiles VU1 micro programs to WebAssembly at run time |
 | `?gsidle=block` | Keeps the GS thread's idle wait blocking with WebGPU, leaving only the device's bounded event-loop turn |
 
 Frames are identified by the vsync they show, counted from boot, not by how many were presented:
@@ -244,6 +245,24 @@ encoding, but `#`, `?`, `&`, `+` and `%` need both.
 `?fastboot=0` boots discs through the BIOS intro instead of fast boot. `window.PCSX2WebDisc.stats()`
 reports the disc (name, size, source, whether it is open), the disc reader's state and read counts,
 the game's title and serial as PCSX2 reported them, and the memory card's last save.
+
+Both JITs are on by default: `?eejit=0` and `?vu1jit=0` switch them off one at a time (the VU0
+micro-mode JIT stays off). VU1 JIT testing (`docs/web-port/VU1-JIT-DESIGN.md`; not a user setting):
+
+- `?vu1jit=0` boots with the VU1 interpreter (`EmuCore/CPU/Recompiler/EnableVU1=false`).
+- `?vu1jit=1` boots with the VU1 JIT, as by default, and its counters (self-test,
+  programs compiled, instructions, of them on the interpreter) go to the browser console every 10 s.
+- `?vu1jit=fuzz:SEED:COUNT[:timing|jit|both]` runs the JIT's fuzzer on a worker, without a BIOS or
+  a VM (boots are refused while it runs), and logs its summary: `timing` checks the timing model at
+  every instruction of COUNT random programs, `jit` runs each one on the interpreter and on the JIT
+  and compares them, `both` does both.
+- `window.PCSX2Web.vu1jit()` returns the mode, the counters and the fuzzer's status.
+
+The headless runner has the same switches and more: `-eejit 0`, `-set EmuCore/CPU/Recompiler/EnableVU1=false`,
+`-vu1jit-fuzz SEED:COUNT[:MODE]`, `-vu1jit-oracle` (the timing model checked at every VU1
+instruction of a real run), `-vu1jit-lockstep` (every VU1 program run on the JIT and on the
+interpreter and compared), `-vu1jit-stats FILE` (per-vsync VU1 statistics as CSV) and `-mtvu-sync`
+(the EE waits for the VU thread at each check, so whole runs repeat exactly).
 
 ## UI assets
 
