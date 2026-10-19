@@ -91,11 +91,11 @@ set_property(TARGET pcsx2-wasm APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOU
 
 # main() runs on a worker (PROXY_TO_PTHREAD) so the page's thread never blocks; the pool
 # covers the CPU, GS and software renderer threads without waiting on the page to spawn
-# workers. Emscripten's 64 KB default stacks are far too small for PCSX2.
+# workers (up to 6 rasterizer threads, Main.cpp). Emscripten's 64 KB default stacks are far too small for PCSX2.
 target_link_options(pcsx2-wasm PRIVATE
 	"-sENVIRONMENT=web,worker"
 	"-sPROXY_TO_PTHREAD=1"
-	"-sPTHREAD_POOL_SIZE=8"
+	"-sPTHREAD_POOL_SIZE=12"
 	"-sEXIT_RUNTIME=0"
 	"-sSTACK_SIZE=4MB"
 	"-sDEFAULT_PTHREAD_STACK_SIZE=2MB"

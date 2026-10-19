@@ -1135,6 +1135,10 @@ static bool InitializeConfig()
 	// cleared: most of them (pause menu, save states, screenshots) need host support that is not
 	// there yet.
 	si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::SW));
+	// The software renderer's rasterizer threads limit 3D scenes with PCSX2's default of 2 (BT3 fight, 16
+	// threads: 30 VPS with 2, 38 with 4, 41 with 6; output identical). Leave about four threads to the EE, VU1,
+	// GS threads and the browser. The thread pool (CMakeLists.txt) covers 6.
+	si.SetIntValue("EmuCore/GS", "extrathreads", std::clamp(emscripten_num_logical_cores() - 4, 2, 6));
 	ConfigureAudio(si);
 	si.SetBoolValue("InputSources", "SDL", false);
 	si.SetBoolValue("InputSources", "XInput", false);
