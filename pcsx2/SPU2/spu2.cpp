@@ -14,6 +14,11 @@
 
 #include "common/Error.h"
 
+#ifdef __EMSCRIPTEN__
+#include <cmath>
+#include <limits>
+#endif
+
 const StereoOut32 StereoOut32::Empty(0, 0);
 
 namespace SPU2
@@ -502,6 +507,16 @@ static void DCFilter(float *input)
 	float output[2];
 	output[0] = (input[0] - DCFilterIn[0] + ((0.995f * DCFilterOut[0])));
 	output[1] = (input[1] - DCFilterIn[1] + ((0.995f * DCFilterOut[1])));
+
+#ifdef __EMSCRIPTEN__
+	// WebAssembly has no flush-to-zero mode (desktop PCSX2 runs this thread with DaZ/FTZ): in silence the filter
+	// would decay into denormals and stay there, which are slow on many CPUs, here and in the time-stretcher.
+	for (float& v : output)
+	{
+		if (std::fabs(v) < std::numeric_limits<float>::min())
+			v = 0.0f;
+	}
+#endif
 
 	DCFilterIn[0] = input[0];
 	DCFilterIn[1] = input[1];

@@ -834,6 +834,7 @@
 		renderProgress();
 		feedSurfaceSize(0, 0, 0);
 		api.setCrisp(els.body.dataset.crisp === 'on');
+		audioStart(); // the context exists already when a boot was queued while the runtime loaded
 		frame.lastPollTime = performance.now();
 		pollTimer = setInterval(poll, POLL_MS);
 		rafId = requestAnimationFrame(drawLoop);
@@ -883,6 +884,7 @@
 			onExit,
 			preRun: [mountMemoryCards],
 			postRun: [onRuntimeReadyForDiscs],
+			arguments: audioModuleArguments(),
 		};
 
 		const script = document.createElement('script');
@@ -1233,6 +1235,7 @@
 	// The Boot button and Enter on the screen. While the runtime is still loading this queues the
 	// boot, and pressing again cancels it.
 	function boot() {
+		audioUnlock(); // inside the gesture: the browser lets sound start
 		page.error = '';
 		// Queued (the runtime is still loading, or the ?bios= file is still on its way): pressing
 		// again cancels the boot, and pressing once more queues it again.
@@ -1268,6 +1271,7 @@
 	function startVm(checked = false) {
 		if (!canBoot())
 			return;
+		audioUnlock(); // a boot without a gesture (?bios=) makes the context too; it waits for a key or click
 		if (!checked && discNeedsCheck()) {
 			checkDiscThenBoot();
 			return;
@@ -1320,6 +1324,7 @@
 		if (!canStop())
 			return;
 		releaseAllKeys(true);
+		audioFadeOut(); // before the PS2 stops and its sound ends
 		try {
 			api.stop();
 		} catch (err) {
@@ -3226,6 +3231,536 @@
 		}),
 	});
 
+	// ------------------------------------------------------------------ audio (UI-SPEC.md §11)
+	// The PS2's sound (docs/web-port/AUDIO-DESIGN.md). pcsx2web_audio_start() loads the emulator's module into the
+	// AudioContext's worklet scope and makes one node for the page's lifetime. Its callback reads PCSX2's audio stream
+	// on the browser's audio thread; the CPU thread attaches the stream while the context renders and drains it
+	// otherwise. This thread owns only the context (made in a user gesture, at 48 kHz), the gain (volume and mute) and
+	// what the Sound control shows: no sample passes through it.
+
+	const AUDIO_RATE = 48000;
+	const AUDIO_GAIN_TIME = 0.015; // s, time constant of gain changes, so they never click
+	const AUDIO_STOP_FADE = 0.03; // s, the fade before the context is suspended after Stop
+	const AUDIO_HELD_AFTER_MS = 300; // a resume() still pending this long means the browser holds the sound
+	const PREF_VOLUME = 'pcsx2web.volume';
+	const PREF_MUTED = 'pcsx2web.muted';
+	const AUDIO_TAP_FILE = 'audio-tap.js';
+	const AUDIO_TAP_NAME = 'tabstationtoo-tap';
+	// pcsx2web_audio(): the audio block's words (AUDIO-DESIGN.md 4.5).
+	const AUDIO_BLOCK = ['magic', 'version', 'worklet', 'streamRate', 'attached', 'heartbeat', 'frames', 'shortQuanta',
+		'drained', 'contextRate', 'bufferMs', 'fill', 'attaches', 'steps', 'streams', 'reserved'];
+	const AUDIO_BLOCK_MAGIC = 0x44554154; // "TAUD"
+	const AUDIO_WORKLET_STATES = ['none', 'starting', 'running', 'failed'];
+
+	const SOUND_COPY = {
+		percent: (v) => `${v}%`,
+		valueText: (v) => `${v} percent`,
+		// The button's accessible name: its label, then the state.
+		name: {
+			on: (v) => `Sound, ${v} percent`,
+			muted: 'Sound, muted',
+			held: 'Sound, waiting for a key or click',
+			unavailable: 'Sound, unavailable',
+		},
+		off: 'Sound off.',
+		on: 'Sound on.',
+		heldHint: 'Press a key or click to turn the sound on.',
+		heldNote: 'The browser holds the sound until you press a key or click.',
+		unavailable: 'This browser can’t play the emulator’s sound.',
+	};
+
+	const soundEls = {
+		btn: $('btn-sound'),
+		icon: $('btn-sound-icon'),
+		menu: $('sound-menu'),
+		volume: $('sound-volume'),
+		value: $('sound-value'),
+		mute: $('sound-mute'),
+		note: $('sound-note'),
+	};
+
+	// Test switches (UI-SPEC.md §11): ?mute=1, ?audio=null, ?audiotap=SECONDS, ?audiorate=HZ (the context's rate,
+	// to exercise the emulator's resampling as PS1 mode would; 24000 to 384000, what it accepts for 48 kHz).
+	const audioTapSeconds = (() => {
+		const v = Number(params.get('audiotap'));
+		return Number.isFinite(v) && v > 0 ? Math.min(v, 3600) : 0;
+	})();
+	const audioRate = (() => {
+		const v = Number(params.get('audiorate'));
+		return Number.isInteger(v) && v >= 24000 && v <= 384000 ? v : AUDIO_RATE;
+	})();
+
+	const audio = {
+		off: params.get('audio') === 'null', // the emulator runs with PCSX2's Null backend: no sound at all
+		testMute: params.get('mute') === '1',
+		ctx: null,
+		gain: null,
+		node: null,
+		tap: null,
+		tapReady: null, // the tap's addModule() promise
+		blockPtr: 0,
+		volume: 100,
+		muted: false,
+		wanted: false, // queued, starting or running: sound should play
+		started: false, // pcsx2web_audio_start() was called
+		startAt: 0,
+		failed: '', // why sound is unavailable
+		resumeAt: 0, // performance.now() of the last resume() asked for
+		resumeTried: false, // the one resume() without a gesture after the browser suspended the context
+		suspendTimer: 0,
+		renderTimer: 0,
+		firstFrameSaid: false, // the held or unavailable subtitle, once per visit
+		heldHintToken: 0, // the held subtitle's token while it may still show
+		capture: { blocks: [], frames: 0, stored: 0, dropped: 0, next: -1, gaps: 0, firstAt: -1 },
+	};
+
+	function audioSupported() {
+		return typeof AudioContext === 'function' && typeof AudioWorkletNode === 'function' && !!window.isSecureContext;
+	}
+
+	// Calls arriving from the emulator's callbacks (inside wasm) must never throw back into it.
+	function audioGuard(fn) {
+		return (...args) => {
+			try {
+				fn(...args);
+			} catch (err) {
+				pageLog(`Sound: ${errorText(err)}`, 'warn');
+			}
+		};
+	}
+
+	function audioGainTarget() {
+		return audio.muted || audio.volume === 0 ? 0 : (audio.volume / 100) ** 2;
+	}
+
+	function applyAudioGain() {
+		if (!audio.gain)
+			return;
+		const g = audio.gain.gain;
+		const t = audio.ctx.currentTime;
+		g.cancelScheduledValues(t);
+		g.setTargetAtTime(audio.testMute ? 0 : audioGainTarget(), t, AUDIO_GAIN_TIME);
+	}
+
+	function audioFail(why) {
+		if (audio.failed)
+			return;
+		audio.failed = why;
+		pageLog(`Sound is unavailable: ${why}`, 'warn');
+		if (audio.node) {
+			try {
+				audio.node.disconnect();
+			} catch {
+				// already disconnected
+			}
+		}
+		renderSound();
+		if (pageState() === 'running')
+			audioFirstFrameHint();
+	}
+
+	// The test switch ?audio=null: main() keeps PCSX2's Null backend (Module.arguments).
+	function audioModuleArguments() {
+		return audio.off ? ['-audio-null'] : [];
+	}
+
+	// Inside a user gesture (Boot, a queued boot's press), or for a boot without one (?bios=): makes the context
+	// once and asks it to run. A context made without a gesture stays suspended until the first key or click.
+	function audioUnlock() {
+		if (audio.off || audio.failed)
+			return;
+		if (!audio.ctx) {
+			if (!audioSupported()) {
+				audioFail('this browser has no AudioWorklet (or the page is not a secure context).');
+				return;
+			}
+			try {
+				audio.ctx = new AudioContext({ sampleRate: audioRate, latencyHint: 'interactive' });
+			} catch (err) {
+				pageLog(`Sound: no ${audioRate} Hz AudioContext (${errorText(err)}); using the device's rate.`, 'warn');
+				try {
+					audio.ctx = new AudioContext({ latencyHint: 'interactive' });
+				} catch (err2) {
+					audioFail(`the AudioContext could not be made (${errorText(err2)}).`);
+					return;
+				}
+			}
+			audio.gain = audio.ctx.createGain();
+			audio.gain.gain.value = audio.testMute ? 0 : audioGainTarget();
+			audio.gain.connect(audio.ctx.destination);
+			audio.ctx.addEventListener('statechange', onAudioStateChange);
+			if (audioTapSeconds) {
+				audio.tapReady = audio.ctx.audioWorklet.addModule(AUDIO_TAP_FILE).then(() => true, (err) => {
+					pageLog(`Sound: the test tap did not load (${errorText(err)}).`, 'warn');
+					return false;
+				});
+			}
+			pageLog(`Sound: AudioContext at ${audio.ctx.sampleRate} Hz, ${audio.ctx.state}.`);
+			audioStart();
+		}
+		audioResume();
+	}
+
+	function audioResume() {
+		const ctx = audio.ctx;
+		if (!ctx || ctx.state === 'running' || ctx.state === 'closed')
+			return;
+		clearTimeout(audio.suspendTimer);
+		audio.suspendTimer = 0;
+		audio.resumeAt = performance.now();
+		ctx.resume().catch(() => {}); // stays pending while the browser holds the sound
+		clearTimeout(audio.renderTimer);
+		audio.renderTimer = setTimeout(renderSound, AUDIO_HELD_AFTER_MS + 20);
+	}
+
+	// Once per page, once the runtime is ready and a context exists.
+	function audioStart() {
+		if (audio.started || audio.failed || !audio.ctx || !api)
+			return;
+		const M = window.Module;
+		if (typeof M._pcsx2web_audio_start !== 'function' || typeof M._pcsx2web_audio !== 'function') {
+			audioFail('this build of the emulator has no audio exports.');
+			return;
+		}
+		audio.started = true;
+		audio.startAt = performance.now();
+		audio.blockPtr = M._pcsx2web_audio() >>> 0;
+		M.pcsx2webAudioContext = audio.ctx;
+		M.pcsx2webAudioReady = audioGuard(onAudioNode);
+		let result;
+		try {
+			result = M._pcsx2web_audio_start();
+		} catch (err) {
+			audioFail(`pcsx2web_audio_start failed (${errorText(err)}).`);
+			return;
+		}
+		if (result !== 0)
+			audioFail(`pcsx2web_audio_start returned ${result}.`);
+	}
+
+	// From the emulator, once its worklet node exists (or null when it could not start).
+	function onAudioNode(node) {
+		if (!node) {
+			audioFail('the audio worklet did not start.');
+			return;
+		}
+		audio.node = node;
+		node.addEventListener('processorerror', () => {
+			markAudioWorkletFailed();
+			audioFail('the audio worklet stopped with an error.');
+		});
+		pageLog(`Sound: worklet running ${Math.round(performance.now() - audio.startAt)} ms after its start.`);
+		if (audio.tapReady)
+			audio.tapReady.then(audioGuard(connectAudioTap));
+		else
+			node.connect(audio.gain);
+		renderSound();
+	}
+
+	// ?audiotap: the worklet's output goes through a recording tap (audio-tap.js) before the gain.
+	function connectAudioTap(loaded) {
+		if (!loaded || audio.failed) {
+			if (!audio.failed)
+				audio.node.connect(audio.gain);
+			return;
+		}
+		audio.tap = new AudioWorkletNode(audio.ctx, AUDIO_TAP_NAME, {
+			numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2], channelCount: 2, channelCountMode: 'explicit',
+		});
+		audio.tap.port.onmessage = (e) => onAudioTapBlock(e.data);
+		audio.node.connect(audio.tap);
+		audio.tap.connect(audio.gain);
+		pageLog(`Sound: test tap recording up to ${audioTapSeconds} s.`);
+	}
+
+	function onAudioTapBlock(b) {
+		const c = audio.capture;
+		if (c.next >= 0 && b.at !== c.next)
+			c.gaps++;
+		c.next = b.at + b.l.length;
+		c.frames += b.l.length;
+		if (c.firstAt < 0)
+			c.firstAt = b.at;
+		if (c.stored + b.l.length > audioTapSeconds * audio.ctx.sampleRate) {
+			c.dropped += b.l.length;
+			return;
+		}
+		c.blocks.push(b);
+		c.stored += b.l.length;
+	}
+
+	// The recorded frames since the last call, interleaved float32 little-endian, as base64.
+	function takeAudioCapture() {
+		const c = audio.capture;
+		const frames = c.blocks.reduce((n, b) => n + b.l.length, 0);
+		const out = new Float32Array(frames * 2);
+		let i = 0;
+		for (const b of c.blocks) {
+			for (let k = 0; k < b.l.length; k++) {
+				out[i++] = b.l[k];
+				out[i++] = b.r[k];
+			}
+		}
+		const firstAt = c.blocks.length ? c.blocks[0].at : -1;
+		c.blocks = [];
+		const bytes = new Uint8Array(out.buffer);
+		let bin = '';
+		for (let k = 0; k < bytes.length; k += 0x8000)
+			bin += String.fromCharCode.apply(null, bytes.subarray(k, k + 0x8000));
+		return { frames, firstAt, rate: audio.ctx ? audio.ctx.sampleRate : 0, data: btoa(bin),
+			total: c.frames, dropped: c.dropped, gaps: c.gaps };
+	}
+
+	function readAudioBlock() {
+		const p = audio.blockPtr;
+		const buf = p ? heapBuffer() : null;
+		if (!buf || p + AUDIO_BLOCK.length * 4 > buf.byteLength)
+			return null;
+		const view = new Uint32Array(buf, p, AUDIO_BLOCK.length);
+		if (Atomics.load(view, 0) !== AUDIO_BLOCK_MAGIC)
+			return null;
+		const out = {};
+		AUDIO_BLOCK.forEach((name, i) => { out[name] = Atomics.load(view, i); });
+		out.worklet = AUDIO_WORKLET_STATES[out.worklet] || String(out.worklet);
+		return out;
+	}
+
+	// A worklet that threw inside its callback never runs again, and may have left the emulator's "in the callback"
+	// flag set: the failed state lets the CPU thread stop waiting for it (WebAudioStream::Detach()).
+	function markAudioWorkletFailed() {
+		const p = audio.blockPtr;
+		const buf = p ? heapBuffer() : null;
+		if (!buf || p + AUDIO_BLOCK.length * 4 > buf.byteLength)
+			return;
+		const view = new Uint32Array(buf, p, AUDIO_BLOCK.length);
+		if (Atomics.load(view, 0) === AUDIO_BLOCK_MAGIC)
+			Atomics.store(view, AUDIO_BLOCK.indexOf('worklet'), AUDIO_WORKLET_STATES.indexOf('failed'));
+	}
+
+	// Called from render(): sound plays while the PS2 is queued, starting or running. Otherwise the gain fades and the
+	// context is suspended, so a stopped page costs no audio work; the next Boot resumes it.
+	function audioSync(state) {
+		const wanted = state === 'queued' || state === 'starting' || state === 'running';
+		if (wanted === audio.wanted)
+			return;
+		audio.wanted = wanted;
+		if (!audio.ctx)
+			return;
+		if (wanted) {
+			applyAudioGain();
+			audioResume();
+			return;
+		}
+		audioFadeOut();
+		clearTimeout(audio.suspendTimer);
+		audio.suspendTimer = setTimeout(() => {
+			audio.suspendTimer = 0;
+			if (!audio.wanted && audio.ctx.state === 'running')
+				audio.ctx.suspend().catch(() => {});
+		}, AUDIO_STOP_FADE * 1000 + 20);
+	}
+
+	function audioFadeOut() {
+		if (!audio.gain)
+			return;
+		const g = audio.gain.gain;
+		const t = audio.ctx.currentTime;
+		g.cancelScheduledValues(t);
+		g.setValueAtTime(g.value, t);
+		g.linearRampToValueAtTime(0, t + AUDIO_STOP_FADE);
+	}
+
+	function onAudioStateChange() {
+		const s = audio.ctx.state;
+		pageLog(`Sound: the AudioContext is ${s}.`);
+		if (s === 'running') {
+			audio.resumeTried = false;
+			// The sound is on: the hint asking for a key or click has done its job.
+			if (audio.heldHintToken && audio.heldHintToken === subtitleToken && subtitleOpen)
+				endSubtitle();
+			audio.heldHintToken = 0;
+		} else if (audio.wanted && !audio.resumeTried && s !== 'closed') {
+			// Suspended or interrupted by the browser: one try now; the next key press or click tries again.
+			audio.resumeTried = true;
+			audioResume();
+		}
+		renderSound();
+	}
+
+	// Capture phase, before anything else sees the event; it is never consumed.
+	function onAudioGesture() {
+		if (audio.wanted && audio.ctx && audio.ctx.state !== 'running')
+			audioResume();
+	}
+
+	function soundView() {
+		if (audio.off || audio.failed)
+			return 'unavailable';
+		if (audio.wanted && audio.ctx && audio.ctx.state !== 'running' &&
+			performance.now() - audio.resumeAt >= AUDIO_HELD_AFTER_MS)
+			return 'held';
+		return audio.muted || audio.volume === 0 ? 'muted' : 'on';
+	}
+
+	function renderSound() {
+		const view = soundView();
+		const iconName = view === 'held' || view === 'unavailable' ? 'speaker-slash' : view === 'muted' ? 'speaker-x' :
+			audio.volume >= 50 ? 'speaker-high' : 'speaker-low';
+		if (soundEls.icon.getAttribute('href') !== icon(iconName))
+			soundEls.icon.setAttribute('href', icon(iconName));
+		const name = view === 'on' || (view === 'muted' && !audio.muted) ? SOUND_COPY.name.on(audio.volume) : SOUND_COPY.name[view];
+		if (soundEls.btn.getAttribute('aria-label') !== name)
+			soundEls.btn.setAttribute('aria-label', name);
+		soundEls.mute.setAttribute('aria-pressed', audio.muted ? 'true' : 'false');
+		if (Number(soundEls.volume.value) !== audio.volume)
+			soundEls.volume.value = String(audio.volume);
+		soundEls.volume.setAttribute('aria-valuetext', SOUND_COPY.valueText(audio.volume));
+		soundEls.volume.style.setProperty('--fill', `${audio.volume}%`);
+		setText(soundEls.value, SOUND_COPY.percent(audio.volume));
+		const note = view === 'held' ? SOUND_COPY.heldNote : view === 'unavailable' && !audio.off ? SOUND_COPY.unavailable : '';
+		setText(soundEls.note, note);
+		soundEls.note.hidden = !note;
+		setData('sound', view);
+	}
+
+	// With the first frame: the browser holds the sound, or the page cannot play it. Returns true when it said so
+	// (the first-boot hint then waits for the next boot).
+	function audioFirstFrameHint() {
+		if (audio.firstFrameSaid || audio.off)
+			return false;
+		const view = soundView();
+		const held = audio.wanted && audio.ctx && audio.ctx.state !== 'running' && !audio.muted;
+		if (view !== 'unavailable' && !held)
+			return false;
+		audio.firstFrameSaid = true;
+		subtitle(view === 'unavailable' ? SOUND_COPY.unavailable : SOUND_COPY.heldHint, HINT_MS);
+		audio.heldHintToken = view === 'unavailable' ? 0 : subtitleToken;
+		return true;
+	}
+
+	function setVolume(v) {
+		audio.volume = Math.max(0, Math.min(100, Math.round(v / 5) * 5));
+		if (audio.muted) {
+			audio.muted = false; // moving the slider unmutes
+			writePref(PREF_MUTED, '0');
+		}
+		applyAudioGain();
+		renderSound();
+	}
+
+	function setMuted(muted, say) {
+		audio.muted = muted;
+		writePref(PREF_MUTED, muted ? '1' : '0');
+		applyAudioGain();
+		renderSound();
+		if (say)
+			subtitle(muted ? SOUND_COPY.off : SOUND_COPY.on);
+	}
+
+	// M: the key labelled M on any layout, unless it is one of the pad's keys there.
+	function isMuteKey(e) {
+		return (e.key === 'm' || e.key === 'M') && !e.shiftKey && !e.altKey && !PAD_CODES.has(e.code);
+	}
+
+	function soundMenuOpen() {
+		try {
+			return soundEls.menu.matches(':popover-open');
+		} catch {
+			return false;
+		}
+	}
+
+	function hideSoundMenu() {
+		if (soundMenuOpen())
+			soundEls.menu.hidePopover();
+	}
+
+	// Opens upward, right-aligned to its trigger.
+	function placeSoundMenu() {
+		const r = soundEls.btn.getBoundingClientRect();
+		const width = Math.min(296, window.innerWidth - 32);
+		const right = Math.max(16, Math.min(window.innerWidth - r.right, window.innerWidth - width - 16));
+		soundEls.menu.style.right = `${Math.round(right)}px`;
+		soundEls.menu.style.bottom = `${Math.round(Math.max(8, window.innerHeight - r.top + 8))}px`;
+	}
+
+	function loadSoundPrefs() {
+		const v = Number(readPref(PREF_VOLUME));
+		audio.volume = readPref(PREF_VOLUME) !== null && Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v / 5) * 5)) : 100;
+		audio.muted = readPref(PREF_MUTED) === '1';
+	}
+
+	function wireSoundUi() {
+		loadSoundPrefs();
+		// Touch grants the activation on release, so pointerup too.
+		for (const type of ['keydown', 'pointerdown', 'pointerup'])
+			window.addEventListener(type, onAudioGesture, true);
+
+		soundEls.volume.addEventListener('input', () => setVolume(Number(soundEls.volume.value)));
+		soundEls.volume.addEventListener('change', () => writePref(PREF_VOLUME, String(audio.volume)));
+		soundEls.mute.addEventListener('click', () => setMuted(!audio.muted, false));
+
+		soundEls.menu.addEventListener('beforetoggle', (e) => {
+			if (e.newState === 'open') {
+				renderSound();
+				placeSoundMenu();
+			}
+		});
+		soundEls.menu.addEventListener('toggle', (e) => {
+			const open = e.newState === 'open';
+			soundEls.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+			if (open) {
+				soundEls.volume.focus({ preventScroll: true });
+			} else {
+				const a = document.activeElement;
+				if (!a || a === document.body || soundEls.menu.contains(a))
+					soundEls.btn.focus({ preventScroll: true });
+			}
+			updateChrome();
+		});
+		// Like the BIOS menu: Tab (or anything else) taking focus out of it closes it.
+		soundEls.menu.addEventListener('focusout', (e) => {
+			const to = e.relatedTarget;
+			if (to && !soundEls.menu.contains(to) && to !== soundEls.btn)
+				hideSoundMenu();
+		});
+		window.addEventListener('resize', () => {
+			if (soundMenuOpen())
+				placeSoundMenu();
+		});
+		document.addEventListener('fullscreenchange', () => {
+			if (soundMenuOpen())
+				placeSoundMenu();
+		});
+		renderSound();
+	}
+
+	// Hooks for automated tests, next to window.PCSX2Web: stats() only reads. With ?audiotap, takeCapture() hands over
+	// (and so removes) what the tap recorded, and interrupt() suspends the context as the browser would.
+	window.PCSX2WebAudio = Object.freeze({
+		stats: () => ({
+			supported: audioSupported(),
+			off: audio.off,
+			failed: audio.failed,
+			view: soundView(),
+			wanted: audio.wanted,
+			volume: audio.volume,
+			muted: audio.muted,
+			testMute: audio.testMute,
+			gainTarget: audioGainTarget(),
+			gain: audio.gain ? audio.gain.gain.value : null,
+			context: audio.ctx ? { state: audio.ctx.state, sampleRate: audio.ctx.sampleRate, currentTime: audio.ctx.currentTime,
+				baseLatency: audio.ctx.baseLatency, outputLatency: audio.ctx.outputLatency } : null,
+			node: !!audio.node,
+			tap: audio.tap ? { frames: audio.capture.frames, stored: audio.capture.stored, dropped: audio.capture.dropped,
+				gaps: audio.capture.gaps, firstAt: audio.capture.firstAt } : null,
+			block: readAudioBlock(),
+		}),
+		takeCapture: () => (audio.tap ? takeAudioCapture() : null),
+		// The browser suspending the context by itself (an interruption), for tests of the recovery.
+		interrupt: () => (audioTapSeconds && audio.ctx ? audio.ctx.suspend().then(() => audio.ctx.state) : null),
+	});
+
 	// ------------------------------------------------------------------ keyboard
 
 	function resolveKeyCodes() {
@@ -3273,7 +3808,7 @@
 		const a = document.activeElement;
 		if (!a || a === document.body || a === document.documentElement)
 			return captureActive();
-		if (els.biosMenu.contains(a) || discEls.menu.contains(a) || els.about.contains(a))
+		if (els.biosMenu.contains(a) || discEls.menu.contains(a) || soundEls.menu.contains(a) || els.about.contains(a))
 			return false;
 		return els.theatre.contains(a);
 	}
@@ -3298,6 +3833,8 @@
 			action = () => toggleDrawer('keys');
 		} else if (e.code === 'Backquote' && !e.shiftKey && inShortcutScope()) {
 			action = () => toggleDrawer('log');
+		} else if (isMuteKey(e) && (inShortcutScope() || soundEls.menu.contains(document.activeElement))) {
+			action = () => setMuted(!audio.muted, true);
 		}
 		if (!action)
 			return false;
@@ -3317,7 +3854,7 @@
 
 	// Esc: native dialog/popover close first, then a drawer, then the keyboard.
 	function onEscape(e) {
-		if (els.about.open || menuOpen() || discMenuOpen())
+		if (els.about.open || menuOpen() || discMenuOpen() || soundMenuOpen())
 			return;
 		dismissTips();
 		const a = document.activeElement;
@@ -3654,7 +4191,7 @@
 
 	function chromeMayHide() {
 		return pageState() === 'running' && captureActive() && document.hasFocus() &&
-			!page.drawer && !menuOpen() && !discMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
+			!page.drawer && !menuOpen() && !discMenuOpen() && !soundMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
 			!pointerOverChrome && !page.keepChrome && hoverQuery.matches;
 	}
 
@@ -4299,6 +4836,8 @@
 		renderReadout(state);
 		renderBiosMenu();
 		renderDiscMenu();
+		audioSync(state);
+		renderSound();
 		els.btnFs.hidden = !fullscreenSupported();
 		if (state === 'starting')
 			announceStartingNotice();
@@ -4338,7 +4877,8 @@
 				els.screen.focus({ preventScroll: true });
 			renderCapture();
 			announce(captureActive() ? COPY.announce.running : COPY.announce.runningReleased);
-			maybeFirstBootHint();
+			if (!audioFirstFrameHint())
+				maybeFirstBootHint();
 			break;
 		case 'stopped':
 			page.ranMs = prev === 'running' && page.runStartedAt ? performance.now() - page.runStartedAt : 0;
@@ -4755,6 +5295,7 @@
 		wireUi();
 		wireDiscUi();
 		observeCanvasSize();
+		wireSoundUi();
 		setCrisp(readPref(PREF_CRISP) === '1');
 		page.keepChrome = readPref(PREF_KEEP_CHROME) === '1';
 		els.keepChrome.checked = page.keepChrome;

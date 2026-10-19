@@ -7,14 +7,14 @@ game (or the BIOS menu) renders in a `<canvas>`, driven from the keyboard. It ru
 (no JIT on wasm) with the software renderer. Where the browser offers WebGPU, the GS merges,
 deinterlaces and presents that renderer's output on the GPU and posts each frame to the page as an
 `ImageBitmap` (the WebGPU device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise the output is copied
-to the page as plain RGBA pixels and drawn on a 2D canvas. Memory card slot 1 is kept in the
-browser. There is no audio and there are no save states yet.
+to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio worklet.
+Memory card slot 1 is kept in the browser. There are no save states yet.
 
 - `Main.cpp`: the frontend (Host callbacks, settings, CPU thread loop, `pcsx2web_*` exports)
-- `web/`: the page (`index.html`, `app.js`, `disc-worker.js`, `style.css`, `icons.svg`,
-  `favicon.svg`, `fonts/`, `icons/`, and `isolation.js` with `coi-serviceworker.js` for hosts
-  without isolation headers), copied next to the build output. The design is
-  `docs/web-port/UI-SPEC.md` (§10 for discs).
+- `web/`: the page (`index.html`, `app.js`, `disc-worker.js`, `audio-tap.js`, `style.css`,
+  `icons.svg`, `favicon.svg`, `fonts/`, `icons/`, and `isolation.js` with `coi-serviceworker.js`
+  for hosts without isolation headers), copied next to the build output. The design is
+  `docs/web-port/UI-SPEC.md` (§10 for discs, §11 for sound).
 - `../pcsx2/CDVD/Emscripten/WebDisc.*`, `WebDiscFileReader.*`: the emulator's side of the disc
   reader; `web/disc-worker.js` is the page's side (`docs/web-port/DISC-DESIGN.md`).
 - `../tools/wasm/serve.py`: local dev server with the headers the page needs
@@ -36,6 +36,9 @@ ninja -C build-wasm pcsx2-wasm
 ```
 
 Use `-DCMAKE_BUILD_TYPE=Devel` (for example in `build-wasm-dbg`) for a build with assertions.
+The target links with `-sAUDIO_WORKLET -sWASM_WORKERS` (sound, below): the module's JS is also
+loaded into the AudioContext's worklet scope, so it must never touch `window` or `document` when it
+loads (keep page code in `app.js`).
 The target writes `pcsx2-wasm.js`, `pcsx2-wasm.wasm` and `pcsx2-wasm.data` (the resources) to
 `<build>/bin/`, and copies `web/` there too, so `<build>/bin/` is the web root.
 
@@ -99,7 +102,9 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    on the PS2. Browser shortcuts (Ctrl/Cmd/Alt combinations, F5, F11, F12) keep working. The controls fade after 2.5 s without
    pointer activity; **Keep controls visible** in the Keys drawer turns that off.
 5. Under the screen: **Stop** shuts the VM down (then **Boot again**); the BIOS menu shows where the
-   BIOS is stored and has **Choose another file…** and **Forget this BIOS**; **Crisp** switches
+   BIOS is stored and has **Choose another file…** and **Forget this BIOS**; **Sound** opens the
+   volume slider and **Mute** (M mutes and unmutes from the screen too; both are remembered in this
+   browser); **Crisp** switches
    between sharp and smooth scaling; **Keys** (`?`) and **Log** (`` ` ``, ² on AZERTY) open the
    drawers; **Fullscreen** (Alt+Enter, or a double-click on the picture) fills the display. The
    single-key shortcuts only work while focus is on the screen or the controls under it.
@@ -200,6 +205,25 @@ readback after 2 s, a pipeline after 10 s) is handled as a device loss. Frames d
 GPU-process crash and the moment Chrome reports the loss (0.2–0.6 s) are blank, and a frame the
 page already shows does not survive the crash either (its memory was in the crashed process), so
 the canvas stays blank until the recovered device's first frame.
+
+Sound in automated runs (never let a test play through speakers: headless Chrome takes
+`--mute-audio`, and the page takes `?mute=1`):
+
+- `?bios=` boots without a user gesture, so the browser holds the sound until the first key press or
+  click (Chrome's `--autoplay-policy=no-user-gesture-required` lifts that for tests).
+- `?mute=1` forces the output gain to 0 for the visit; the stored volume and mute are untouched.
+- `?audio=null` runs the emulator with PCSX2's Null audio backend (passed to `main()` as
+  `-audio-null` through `Module.arguments`) and makes no AudioContext: a baseline for cost
+  measurements.
+- `?audiotap=SECONDS` routes the worklet's output through `audio-tap.js`, a pass-through
+  AudioWorkletProcessor that records it before the gain, up to SECONDS in all.
+  `window.PCSX2WebAudio.takeCapture()` returns what was recorded since the last call (interleaved
+  float32 stereo, base64, with the context frame it starts at) and `interrupt()` suspends the
+  context as a browser interruption would.
+- `?audiorate=HZ` makes the AudioContext at HZ instead of 48000, which exercises the worklet's
+  resampling (as PS1 mode's 44.1 kHz stream does in a 48 kHz context).
+- `window.PCSX2WebAudio.stats()` reports the context (state, rate, `baseLatency`, `outputLatency`),
+  volume, mute, gain, the Sound control's state, and the audio block (below).
 
 Discs:
 
@@ -370,6 +394,8 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_surface_size(w, h, scale)` | the display canvas's backing size and device pixel ratio (WebGPU presents at it) |
 | `pcsx2web_set_crisp(on)` | nearest (1) or bilinear (0) presentation, applied at the next vsync |
 | `pcsx2web_vsync_count()` | vsyncs emulated since the module started |
+| `pcsx2web_audio_start()` | start the sound worklet in `Module.pcsx2webAudioContext` (an AudioContext the page made); it calls `Module.pcsx2webAudioReady(node)` when the node exists, or with `null` if it failed; 0 if started, -1 if a start already ran or there is no context |
+| `pcsx2web_audio()` | address of the audio block: 16 u32 words (see Sound) |
 
 On the 2D path, each animation frame the page reads `seq` with `Atomics.load`; when it changed, it copies
 `width * height * 4` bytes of RGBA from `pixels` into an `ImageData` (which cannot use shared
@@ -394,9 +420,59 @@ on reading it; after three restarts, or when a new worker cannot start, it stops
 so that what is waiting fails at once. A disc being opened when its worker died is opened again by
 the next one.
 
+## Sound
+
+The design and its measurements are in `docs/web-port/AUDIO-DESIGN.md`. In short:
+
+- PCSX2's SPU2 mixes on the CPU thread (the EE thread) and writes 64-frame chunks to an
+  `AudioStream`, time-stretching them on the way. Here that stream is `WebAudioStream` (`Main.cpp`,
+  "Audio"), registered for `AudioBackend::Frontend` with `AudioStream::SetFrontendStreamFactory()`.
+- The page makes an `AudioContext` at 48 kHz inside the Boot gesture (or, for `?bios=`, without one,
+  and it then waits for the first key press or click) and calls `pcsx2web_audio_start()`. That loads
+  this module into the context's worklet scope (Emscripten's Wasm Audio Worklet) and creates one
+  `AudioWorkletNode` for the page's lifetime, connected to the page's `GainNode` (volume and mute).
+- Its callback runs on the browser's audio thread: each 128-frame render quantum it reads the
+  attached stream with `ReadFrames()` (lock-free, no allocation), resampling linearly when the
+  stream's rate differs (PS1 mode, 44.1 kHz), and smooths the edges into and out of silence.
+- Once per vsync the CPU thread attaches the stream while the worklet's heartbeat moves; otherwise
+  (a suspended context, autoplay, Stop) it detaches it and drains it at the real-time rate, so the
+  stream never builds up a backlog. A seq_cst gate makes sure only one side calls `ReadFrames()`.
+- Settings (`InitializeConfig()`): `SPU2/Output` `Backend=Frontend`, `SyncMode=TimeStretch`,
+  `StretchUseQuickSeek=true` (a quarter of the stretcher's default cost), `ExpansionMode=Disabled`
+  (stereo), `BufferMS=50`.
+- Below full speed, the stretcher needs more buffer to stay continuous, so the frontend steps
+  `BufferMS` by the measured speed: 50 ms at 75 % and faster, 100 ms from 50 %, 200 ms from 28 %,
+  400 ms from 14 %, 800 ms below. It steps up after 1 s below a step's range, and down after 10 s
+  well inside a faster step's range (1.5 times its lower bound, at most 15 points more: 90 % for
+  50 ms). A step keeps the stream: it is made with the
+  largest buffer and only its target changes, so nothing buffered is lost; a step down lowers the
+  target gradually (100 ms per second) and the stretcher plays the excess out slightly faster.
+- Stop fades the gain out over 30 ms and suspends the context; Boot again resumes it. A hidden tab
+  keeps playing.
+
+The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`):
+
+| Word | Name | Meaning |
+| --- | --- | --- |
+| 0, 1 | magic, version | `0x44554154` ("TAUD"), 1 |
+| 2 | worklet | 0 not started, 1 starting, 2 running, 3 failed |
+| 3 | stream rate | 0 without a stream, else 48000 (44100 in PS1 mode) |
+| 4 | attached | 1 while the worklet reads the stream |
+| 5 | heartbeat | render quanta seen |
+| 6 | frames | frames the worklet read |
+| 7 | short quanta | quanta that could not be filled from the stream (underruns) |
+| 8 | drained | frames discarded while detached |
+| 9 | context rate | the AudioContext's sample rate |
+| 10 | buffer ms | the stream's `BufferMS` step |
+| 11 | fill | frames buffered in the stream at the last vsync |
+| 12, 13, 14 | attaches, steps, streams | counts |
+
 ## Current limitations
 
-- No audio, save states, gamepads or touch controls yet; fixed key layout. One memory card (slot 1).
+- No save states, gamepads or touch controls yet; fixed key layout. One memory card (slot 1).
+- Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
+  continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
+  Safari is untested.
 - Discs: uncompressed single-file images only (no CHD, CSO/ZSO, GZ, blockdump or multi-file
   BIN/CUE), and no disc swap or eject while a game runs.
 - Interpreters only, so most content runs below full speed: game menus mostly run at 60–100 %,

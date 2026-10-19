@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-// Headless runner: boots the VM with no window and no audio, and logs what the
-// BIOS/game prints. Input comes from an optional script. Used to bring up the
-// WebAssembly build under Node before there is a browser frontend. Also builds natively.
+// Headless runner: boots the VM with no window and no audio (or audio to a WAV file
+// with -wav), and logs what the BIOS/game prints. Input comes from an optional script.
+// Used to bring up the WebAssembly build under Node before there is a browser
+// frontend. Also builds natively.
 
 #include <algorithm>
 #include <atomic>
@@ -46,6 +47,8 @@
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/VMManager.h"
 
+#include "WavOutput.h"
+
 static MemorySettingsInterface s_settings_interface;
 
 static std::string s_app_root;
@@ -67,6 +70,9 @@ static std::vector<s64> s_disc_check_lsns;
 static std::string s_load_state_path;
 static std::string s_save_state_path;
 static bool s_disc_check = false;
+static std::string s_wav_path;
+static WavOutput::Clock s_wav_clock = WavOutput::Clock::Emulated;
+static u32 s_wav_period = 0;
 
 // Host key names; the key code is the index + 1 (0 would make an all-zero InputBindingKey). Only the keys of
 // PCSX2's default keyboard mapping for pad 1, which the browser frontend also keeps.
@@ -153,6 +159,7 @@ static bool InitializeConfig()
 	si.SetIntValue("EmuCore/GS", "ScreenshotFormat", static_cast<int>(GSScreenshotFormat::PNG));
 	// The legacy "OutputModule" key is no longer read; without "Backend" Cubeb fails and falls back to null.
 	si.SetStringValue("SPU2/Output", "Backend", AudioStream::GetBackendName(AudioBackend::Null));
+	WavOutput::ApplySettings(si);
 	si.SetBoolValue("InputSources", "SDL", false);
 	si.SetBoolValue("InputSources", "XInput", false);
 	if (s_input_events.empty())
@@ -298,6 +305,12 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			s_memory_cards = true;
 		else if (arg == "-unlimited")
 			s_unlimited = true;
+		else if (arg == "-wav" && has_value)
+			s_wav_path = argv[++i];
+		else if (arg == "-wav-realtime")
+			s_wav_clock = WavOutput::Clock::Realtime;
+		else if (arg == "-wav-period" && has_value)
+			s_wav_period = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
 		else if (arg == "-loadstate" && has_value)
 			s_load_state_path = argv[++i];
 		else if (arg == "-savestate" && has_value)
@@ -355,6 +368,7 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-screenshot-dir DIR (-screenshot-every N | -screenshot-frames N,N,...)]\n"
 								 "         [-fastboot | -slowboot] [-memcards] [-input SCRIPT | -input @FILE]\n"
 								 "         [-loadstate FILE] [-savestate FILE] [-unlimited]\n"
+								 "         [-wav FILE.wav [-wav-realtime [-wav-period FRAMES]]]\n"
 								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n", argv[0]);
 			std::fprintf(stderr, "  With no disc image the BIOS boots to its menu. -frames 0 runs until stopped.\n");
 			std::fprintf(stderr, "  The screenshot is requested at vsync N (default: 10 before the end) and shows the next frame.\n");
@@ -368,6 +382,11 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			std::fprintf(stderr, "  -unlimited turns the frame limiter off, to measure speed above 100%%.\n");
 			std::fprintf(stderr, "  -loadstate boots and loads FILE; -savestate saves FILE when the run ends. Vsyncs count from 0 again.\n");
 			std::fprintf(stderr, "  -set overrides a setting after the defaults, e.g. -set EmuCore/GS/extrathreads=4.\n");
+			std::fprintf(stderr, "  -wav records what the audio stream hands to a device (32-bit float, 48 kHz stereo; WebAssembly only).\n"
+								 "         By default the device reads at every vsync: the SPU2 mix in emulated time, before\n"
+								 "         time-stretching. -wav-realtime reads one period (default: OutputLatencyMS, 20 ms) per\n"
+								 "         period of wall-clock time: what a listener hears, after time-stretching (SPU2/Output\n"
+								 "         SyncMode, TimeStretch by default; -set SPU2/Output/SyncMode=Disabled turns it off).\n");
 			std::fprintf(stderr, "  -disc-check reads the listed sectors (negative counts from the end) through the CDVD ISO\n"
 								 "         reader, prints an FNV-1a hash of each 2048-byte sector and exits.\n");
 			return false;
@@ -810,6 +829,21 @@ int main(int argc, char* argv[])
 	if (s_disc_check)
 		return RunDiscCheck();
 
+	if (s_wav_path.empty() && (s_wav_clock != WavOutput::Clock::Emulated || s_wav_period != 0))
+	{
+		Console.Error("-wav-realtime and -wav-period need -wav FILE.");
+		return EXIT_FAILURE;
+	}
+	if (!s_wav_path.empty())
+	{
+		Error error;
+		if (!WavOutput::Enable(s_wav_path, s_wav_clock, s_wav_period, &error))
+		{
+			Console.ErrorFmt("Failed to open '{}': {}", s_wav_path, error.GetDescription());
+			return EXIT_FAILURE;
+		}
+	}
+
 	if (!InitializeConfig())
 	{
 		Console.Error("Failed to initialize config.");
@@ -819,6 +853,7 @@ int main(int argc, char* argv[])
 	std::atomic<int> thread_ret;
 	std::thread cputhread(CPUThreadMain, &thread_ret);
 	cputhread.join();
+	WavOutput::Finish();
 	return thread_ret.load();
 }
 
@@ -826,6 +861,7 @@ void Host::PumpMessagesOnCPUThread()
 {
 	// Called once per vsync.
 	s_frames++;
+	WavOutput::OnVsync();
 	const u64 screenshot_frame = s_screenshot_frame ? s_screenshot_frame : (s_max_frames > 10 ? s_max_frames - 10 : 0);
 	if (!s_screenshot_path.empty() && s_frames == screenshot_frame)
 	{

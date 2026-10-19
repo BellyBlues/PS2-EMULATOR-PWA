@@ -23,13 +23,17 @@ Early and experimental.
   its language menu through the title and menus into a battle, driven from the keyboard, and its
   save on memory card slot 1 is kept in the browser and loaded again after a reload.
 - The BIOS still boots on its own: the start-up animation, the console's menus and its settings.
+- Sound plays: PCSX2's sound chip emulation (SPU2) through a Web Audio worklet, with a Sound control
+  for volume and mute (M). Below full speed the sound is time-stretched, as in PCSX2 on the desktop:
+  continuous and at the right pitch, but slowed down with the picture, so a battle at 10–20 % sounds
+  smeared. Browsers only start sound after a key press or click on the page; pressing Boot counts.
 - Speed: the emulated CPU is the limit, because a browser cannot run PCSX2's faster recompilers
   (see below). Measured in that game in Chrome on a Ryzen 7 PRO 7840U laptop, with other jobs
   running: title screen and logos 100 % of full speed, menus 60–100 %, character select 60–95 %,
   movies 20–70 %, and battles 10–16 % (5–8 of the PS2's 50 frames per second), which is not
   playable yet. Drawing is not what slows it down.
-- Not there yet: audio, save states, gamepads, compressed disc images (CHD, CSO, GZ), and swapping
-  discs while a game runs.
+- Not there yet: save states, gamepads, compressed disc images (CHD, CSO, GZ), and swapping discs
+  while a game runs.
 - Desktop Chrome and Edge are the targets. Other browsers may work; phones are not supported yet.
 
 ## How it works
@@ -39,6 +43,9 @@ Early and experimental.
   which a browser cannot run), on threads backed by `SharedArrayBuffer`.
 - The PS2's graphics are drawn by PCSX2's software renderer and shown in a `<canvas>`. A WebGPU
   renderer is planned.
+- The PS2's sound is mixed by PCSX2 on the emulated CPU's thread and played by an Emscripten Wasm
+  Audio Worklet, which reads PCSX2's audio stream on the browser's audio thread
+  ([docs/web-port/AUDIO-DESIGN.md](docs/web-port/AUDIO-DESIGN.md)).
 - The page (`pcsx2-wasm/web/`) is plain HTML, CSS and JavaScript with no build step and no
   third-party requests. The BIOS you pick stays in your browser (IndexedDB).
 - A disc image is never copied: a worker reads the parts the game asks for from your file and

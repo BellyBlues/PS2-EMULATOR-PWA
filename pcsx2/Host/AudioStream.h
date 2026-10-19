@@ -96,6 +96,20 @@ public:
 		const char* driver_name, const char* device_name, bool stretch_enabled, Error* error = nullptr);
 	static std::unique_ptr<AudioStream> CreateNullStream(u32 sample_rate, u32 buffer_ms);
 
+#ifdef __EMSCRIPTEN__
+	/// WebAssembly: an output the frontend supplies (the headless runner's WAV writer, the page's Web Audio stream),
+	/// as a subclass that calls ReadFrames(). CreateStream() uses this factory for AudioBackend::Frontend. Register it
+	/// before the VM starts.
+	using FrontendStreamFactory = std::unique_ptr<AudioStream> (*)(u32 sample_rate,
+		const AudioStreamParameters& parameters, bool stretch_enabled, Error* error);
+	static void SetFrontendStreamFactory(FrontendStreamFactory factory);
+
+	/// WebAssembly: changes the buffer the stream aims for (BufferMS) in place, up to the buffer_ms it was created
+	/// with: the time-stretcher then works towards the new fill, and an underrun refills to its share of it. Unlike a
+	/// new stream, nothing buffered is lost. Writer's thread.
+	void SetTargetBufferMS(u32 buffer_ms);
+#endif
+
 protected:
 	enum ReadChannel : u8
 	{
@@ -174,6 +188,9 @@ private:
 
 	u32 m_target_buffer_size = 0;
 	u32 m_stretch_reset = STRETCH_RESET_THRESHOLD;
+#ifdef __EMSCRIPTEN__
+	std::atomic<u32> m_fill_reference_size{0}; // what ReadFrames() refills against: m_buffer_size at the target
+#endif
 
 	u32 m_stretch_ok_count = 0;
 	float m_nominal_rate = 1.0f;

@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 
 #include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
+#include <emscripten/webaudio.h>
 
 #include <SDL3/SDL_hints.h>
 
@@ -42,6 +44,7 @@
 #include "common/ProgressCallback.h"
 #include "common/SettingsWrapper.h"
 #include "common/StringUtil.h"
+#include "common/Timer.h"
 
 #include "pcsx2/PrecompiledHeader.h"
 
@@ -366,6 +369,688 @@ EMSCRIPTEN_KEEPALIVE const void* pcsx2web_game(void)
 
 } // extern "C"
 
+//////////////////////////////////////////////////////////////////////////
+// Audio
+//////////////////////////////////////////////////////////////////////////
+
+// Sound plays through an Emscripten Wasm Audio Worklet (docs/web-port/AUDIO-DESIGN.md). The page makes an
+// AudioContext in a user gesture and calls pcsx2web_audio_start(), which loads this module into the context's
+// worklet scope and creates one processor node for the page's lifetime. Its callback, AudioRender(), runs on the
+// browser's audio rendering thread and reads the attached WebAudioStream with AudioStream::ReadFrames(), one render
+// quantum (128 frames) at a time.
+//
+// SPU2 writes the stream on the CPU thread, time-stretching included. The CPU thread alone attaches and detaches the
+// stream, once per vsync (UpdateAudioOutput()): attached while the worklet's heartbeat moves, otherwise detached and
+// drained at the real-time rate, so a context that does not run (autoplay, after Stop, an interruption) leaves no
+// backlog. ReadFrames() so always has exactly one caller. Nothing on the audio thread may block or allocate. Below
+// full speed the stream's target buffer steps up, in place, so that time-stretching keeps the sound continuous.
+
+namespace
+{
+	// Words of the audio block, pcsx2web_audio() (AUDIO-DESIGN.md 4.5).
+	enum AudioBlockWord : u32
+	{
+		AUDIO_MAGIC,
+		AUDIO_VERSION,
+		AUDIO_WORKLET, // AudioWorkletState, written on the page's thread
+		AUDIO_STREAM_RATE, // the stream's rate (48000, 44100 in PS1 mode), 0 while there is no stream
+		AUDIO_ATTACHED, // 1 while the worklet reads the stream
+		AUDIO_HEARTBEAT, // render quanta seen (audio thread)
+		AUDIO_FRAMES, // frames the worklet read from streams
+		AUDIO_SHORT_QUANTA, // quanta that could not be filled from the stream (an underrun, or refilling after one)
+		AUDIO_DRAINED, // frames read and discarded while detached
+		AUDIO_CONTEXT_RATE, // the AudioContext's rate
+		AUDIO_BUFFER_MS, // the stream's BufferMS (the slow-scene step)
+		AUDIO_FILL, // frames buffered in the stream at the last vsync
+		AUDIO_ATTACHES, // times a stream was attached
+		AUDIO_STEPS, // BufferMS steps applied
+		AUDIO_STREAMS, // streams created
+		AUDIO_RESERVED,
+		AUDIO_BLOCK_WORDS,
+	};
+
+	enum AudioWorkletState : u32
+	{
+		AUDIO_WORKLET_NONE,
+		AUDIO_WORKLET_STARTING,
+		AUDIO_WORKLET_RUNNING,
+		AUDIO_WORKLET_FAILED,
+	};
+
+	class WebAudioStream;
+} // namespace
+
+static constexpr u32 AUDIO_BLOCK_MAGIC = 0x44554154u; // "TAUD"
+static constexpr u32 AUDIO_BLOCK_VERSION = 1;
+static constexpr const char* AUDIO_PROCESSOR_NAME = "tabstationtoo-audio";
+// Frames per render quantum the callback serves (Web Audio 1.0 renders 128), and the resampling ratio it accepts:
+// together they bound the frames one ReadFrames() call reads, and so its alloca() on the worklet's 64 KB stack. The
+// ratio is the stream's rate over the context's: 48 kHz plays into contexts from 24 kHz to 384 kHz.
+static constexpr u32 AUDIO_MAX_QUANTUM = 512;
+static constexpr double AUDIO_MIN_STEP = 0.125;
+static constexpr double AUDIO_MAX_STEP = 2.0;
+static constexpr u32 AUDIO_DRAIN_CHUNK = 1024;
+static constexpr double AUDIO_HEARTBEAT_TIMEOUT = 0.1; // s without a render quantum: detach and drain
+static constexpr double AUDIO_MAX_DRAIN = 1.0; // s drained at most at one vsync
+static constexpr double AUDIO_DETACH_WARN = 1.0; // s waiting for the audio thread to leave its callback: logged
+
+alignas(64) static std::atomic<u32> s_audio_block[AUDIO_BLOCK_WORDS] = {AUDIO_BLOCK_MAGIC, AUDIO_BLOCK_VERSION};
+alignas(16) static u8 s_audio_worklet_stack[64 * 1024];
+
+// The gate (AUDIO-DESIGN.md 4.2): the stream the worklet reads, or null. Only the CPU thread changes it. Both sides
+// use seq_cst with s_audio_in_callback, as in Dekker's algorithm: once WebAudioStream::Detach() returns, the worklet is
+// out of ReadFrames() and will not enter it again.
+static std::atomic<WebAudioStream*> s_audio_reader{nullptr};
+static std::atomic<bool> s_audio_in_callback{false};
+
+// CPU thread.
+static WebAudioStream* s_audio_stream = nullptr; // the stream SPU2 writes
+static u32 s_audio_heartbeat_seen = 0;
+static Common::Timer::Value s_audio_heartbeat_moved = 0; // 0: never
+static bool s_audio_null = false; // -audio-null: PCSX2's Null backend (for cost comparisons)
+
+// The buffer for slow scenes (AUDIO-DESIGN.md 4.4): stretched sound is continuous once the target buffer x speed is
+// about 50-60 ms. Each step is for speeds (percent) from its minimum up, which keeps that product at 50 ms or more
+// below full speed. Every stream is made with the largest step's buffer and aims for the current step's
+// (AudioStream::SetTargetBufferMS()), so a step keeps everything buffered. A bigger step applies at once, once the
+// speed has called for it for 1 s. A smaller one needs the speed well beyond its boundary (AudioStepDownSpeed()) for
+// 10 s, since games swing between fast and slow scenes within seconds, and is then reached gradually: the target
+// falls by AUDIO_STEP_DOWN_RATE, so the stretcher plays the excess out a little faster (a tempo of about 1.1)
+// instead of skipping it or leaving the smaller buffer short.
+static constexpr std::array<u16, 5> AUDIO_BUFFER_STEPS = {50, 100, 200, 400, 800};
+static constexpr std::array<float, 5> AUDIO_STEP_MIN_SPEED = {75.0f, 50.0f, 28.0f, 14.0f, 0.0f};
+static constexpr double AUDIO_STEP_UP_AFTER = 1.0; // s
+static constexpr double AUDIO_STEP_DOWN_AFTER = 10.0; // s
+static constexpr double AUDIO_STEP_DOWN_RATE = 100.0; // ms of target per s
+static u32 s_audio_step = 0; // CPU thread
+static double s_audio_target_ms = AUDIO_BUFFER_STEPS[0]; // what the stream aims for: the step's, or above it
+static Common::Timer::Value s_audio_step_up_since = 0;
+static Common::Timer::Value s_audio_step_down_since = 0;
+static Common::Timer::Value s_audio_target_updated = 0; // 0: not while running
+
+static bool AudioRender(int num_inputs, const AudioSampleFrame* inputs, int num_outputs, AudioSampleFrame* outputs,
+	int num_params, const AudioParamFrame* params, void* user_data);
+
+// The worklet scope evaluates this module's JS too; these come from Emscripten's library (libwebaudio.js).
+EM_JS_DEPS(pcsx2web_audio, "$emscriptenRegisterAudioObject,$emscriptenGetAudioObject");
+
+namespace
+{
+	class WebAudioStream final : public AudioStream
+	{
+	public:
+		WebAudioStream(u32 sample_rate, const AudioStreamParameters& parameters);
+		~WebAudioStream() override;
+
+		/// AudioBackend::Frontend's factory (AudioStream::SetFrontendStreamFactory()), on the CPU thread.
+		static std::unique_ptr<AudioStream> Create(u32 sample_rate, const AudioStreamParameters& parameters,
+			bool stretch_enabled, Error* error);
+
+		/// A paused device stops pulling: detach, and do not drain.
+		void SetPaused(bool paused) override;
+
+		/// CPU thread, once per vsync: attached while the worklet runs, otherwise played to nowhere at the
+		/// real-time rate, as a device would, so the stream's fill and time-stretching stay what playback leaves.
+		void Service(Common::Timer::Value now, bool worklet_alive);
+
+		/// Audio thread, through the gate: one render quantum, planar.
+		void Render(float* left, float* right, u32 frames);
+
+	private:
+		void Attach();
+		void Detach();
+		void Drain(Common::Timer::Value now);
+		void RenderResampled(float* left, float* right, u32 frames);
+
+		// Interleaved frames for Render(): a quantum at the widest step, plus the frames carried between quanta.
+		static constexpr u32 RENDER_BUFFER_FRAMES = static_cast<u32>(AUDIO_MAX_QUANTUM * AUDIO_MAX_STEP) + 4;
+
+		std::unique_ptr<SampleType[]> m_render_buffer;
+		std::unique_ptr<SampleType[]> m_drain_buffer;
+		double m_drain_time = 0.0; // s, Common::Timer: the stream has been drained up to here
+
+		// Linear resampling when the stream's rate is not the context's (PS1 mode: 44.1 kHz into 48 kHz). The
+		// buffer starts with m_carry frames already read; the next output frame sits m_position frames after its
+		// first one. m_skip frames are still to be dropped before the next read (only for steps above 1).
+		double m_step = 1.0; // stream frames per output frame
+		double m_position = 0.0;
+		u32 m_carry = 0;
+		u32 m_skip = 0;
+	};
+
+	WebAudioStream::WebAudioStream(u32 sample_rate, const AudioStreamParameters& parameters)
+		: AudioStream(sample_rate, parameters)
+		, m_render_buffer(std::make_unique<SampleType[]>(RENDER_BUFFER_FRAMES * NUM_INPUT_CHANNELS))
+		, m_drain_buffer(std::make_unique<SampleType[]>(AUDIO_DRAIN_CHUNK * NUM_INPUT_CHANNELS))
+	{
+	}
+
+	WebAudioStream::~WebAudioStream()
+	{
+		if (s_audio_reader.load(std::memory_order_relaxed) == this)
+			Detach();
+		if (s_audio_stream == this)
+		{
+			s_audio_stream = nullptr;
+			s_audio_block[AUDIO_STREAM_RATE].store(0, std::memory_order_relaxed);
+			s_audio_block[AUDIO_FILL].store(0, std::memory_order_relaxed);
+		}
+	}
+
+	void WebAudioStream::SetPaused(bool paused)
+	{
+		m_paused = paused;
+		if (paused)
+		{
+			if (s_audio_reader.load(std::memory_order_relaxed) == this)
+				Detach();
+		}
+		else
+		{
+			// The next vsync attaches, or drains from now on.
+			m_drain_time = Common::Timer::ConvertValueToSeconds(Common::Timer::GetCurrentValue());
+		}
+	}
+
+	void WebAudioStream::Attach()
+	{
+		const u32 context_rate = s_audio_block[AUDIO_CONTEXT_RATE].load(std::memory_order_relaxed);
+		m_step = (context_rate == 0 || context_rate == m_sample_rate) ?
+					 1.0 :
+					 std::clamp(static_cast<double>(m_sample_rate) / context_rate, AUDIO_MIN_STEP, AUDIO_MAX_STEP);
+		m_position = 0.0;
+		m_carry = 1; // starts from a silent frame
+		m_skip = 0;
+		std::fill_n(m_render_buffer.get(), NUM_INPUT_CHANNELS, 0.0f);
+
+		// Publishes the fields above to the audio thread.
+		s_audio_reader.store(this, std::memory_order_seq_cst);
+		s_audio_block[AUDIO_ATTACHED].store(1, std::memory_order_relaxed);
+		s_audio_block[AUDIO_ATTACHES].fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void WebAudioStream::Detach()
+	{
+		s_audio_reader.store(nullptr, std::memory_order_seq_cst);
+		// At most the rest of one quantum's work: microseconds, unless the audio thread is preempted. A callback that
+		// trapped never clears its flag; the page then marks the worklet failed (its processorerror event), and the
+		// audio thread never runs again. Until then this must wait: the stream may be freed next.
+		const Common::Timer::Value start = Common::Timer::GetCurrentValue();
+		bool warned = false;
+		while (s_audio_in_callback.load(std::memory_order_seq_cst))
+		{
+			if (s_audio_block[AUDIO_WORKLET].load(std::memory_order_acquire) == AUDIO_WORKLET_FAILED)
+				break;
+			if (!warned &&
+				Common::Timer::ConvertValueToSeconds(Common::Timer::GetCurrentValue() - start) >= AUDIO_DETACH_WARN)
+			{
+				warned = true;
+				Console.Warning("pcsx2-wasm: still waiting for the audio thread to leave its callback");
+			}
+			std::this_thread::yield();
+		}
+		s_audio_block[AUDIO_ATTACHED].store(0, std::memory_order_relaxed);
+	}
+
+	void WebAudioStream::Service(Common::Timer::Value now, bool worklet_alive)
+	{
+		if (m_paused)
+			return;
+
+		const bool attached = (s_audio_reader.load(std::memory_order_relaxed) == this);
+		if (worklet_alive)
+		{
+			if (!attached)
+				Attach();
+		}
+		else
+		{
+			if (attached)
+			{
+				Detach();
+				m_drain_time = Common::Timer::ConvertValueToSeconds(now);
+			}
+			Drain(now);
+		}
+		s_audio_block[AUDIO_FILL].store(GetBufferedFramesRelaxed(), std::memory_order_relaxed);
+	}
+
+	void WebAudioStream::Drain(Common::Timer::Value now)
+	{
+		const double t = Common::Timer::ConvertValueToSeconds(now);
+		u32 frames;
+		if (t - m_drain_time > AUDIO_MAX_DRAIN)
+		{
+			// The CPU thread was held up: what is older than that is not played.
+			frames = static_cast<u32>(AUDIO_MAX_DRAIN * m_sample_rate);
+			m_drain_time = t;
+		}
+		else
+		{
+			frames = static_cast<u32>(std::max(0.0, t - m_drain_time) * m_sample_rate);
+			m_drain_time += static_cast<double>(frames) / m_sample_rate;
+		}
+
+		s_audio_block[AUDIO_DRAINED].fetch_add(frames, std::memory_order_relaxed);
+		while (frames > 0)
+		{
+			const u32 count = std::min(frames, AUDIO_DRAIN_CHUNK);
+			ReadFrames(m_drain_buffer.get(), count);
+			frames -= count;
+		}
+	}
+
+	void WebAudioStream::Render(float* left, float* right, u32 frames)
+	{
+		if (m_step == 1.0)
+		{
+			SampleType* const buffer = m_render_buffer.get();
+			ReadFrames(buffer, frames);
+			for (u32 i = 0; i < frames; i++)
+			{
+				left[i] = buffer[i * 2];
+				right[i] = buffer[i * 2 + 1];
+			}
+			s_audio_block[AUDIO_FRAMES].fetch_add(frames, std::memory_order_relaxed);
+		}
+		else
+		{
+			RenderResampled(left, right, frames);
+		}
+
+		// ReadFrames() stays in its filling state from an underrun until the buffer holds enough again; meanwhile
+		// it plays silence, or what little it has spread over the quantum.
+		if (m_filling)
+			s_audio_block[AUDIO_SHORT_QUANTA].fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void WebAudioStream::RenderResampled(float* left, float* right, u32 frames)
+	{
+		SampleType* const buffer = m_render_buffer.get();
+		const bool was_filling = m_filling;
+		u32 read = 0;
+		if (m_skip > 0)
+		{
+			// m_carry is 0: the skipped frames land where the read below overwrites them.
+			ReadFrames(buffer, m_skip);
+			read += m_skip;
+			m_skip = 0;
+		}
+
+		// Output frame i sits at m_position + i * m_step in the buffer, between two frames read.
+		const double last = m_position + (frames - 1) * m_step;
+		const u32 total = static_cast<u32>(last) + 2;
+		ReadFrames(buffer + m_carry * NUM_INPUT_CHANNELS, total - m_carry);
+		read += total - m_carry;
+		if (was_filling && m_filling)
+		{
+			// Refilling after an underrun: ReadFrames() gave only silence. The frames carried from before the
+			// underrun go too, so the quantum is all silence and SmoothAudioEdges() ramps out of the sound, instead of
+			// the carried frames stepping down to zero within the quantum. The sound comes back faded in.
+			std::fill_n(buffer, total * NUM_INPUT_CHANNELS, 0.0f);
+		}
+		for (u32 i = 0; i < frames; i++)
+		{
+			const double x = m_position + i * m_step;
+			const u32 index = static_cast<u32>(x);
+			const float frac = static_cast<float>(x - index);
+			const SampleType* const a = buffer + index * NUM_INPUT_CHANNELS;
+			left[i] = a[0] + (a[2] - a[0]) * frac;
+			right[i] = a[1] + (a[3] - a[1]) * frac;
+		}
+
+		const double next = m_position + frames * m_step;
+		const u32 first = static_cast<u32>(next);
+		m_position = next - first;
+		if (first < total)
+		{
+			m_carry = total - first;
+			std::memmove(buffer, buffer + first * NUM_INPUT_CHANNELS, m_carry * NUM_INPUT_CHANNELS * sizeof(SampleType));
+		}
+		else
+		{
+			m_carry = 0;
+			m_skip = first - total;
+		}
+		s_audio_block[AUDIO_FRAMES].fetch_add(read, std::memory_order_relaxed);
+	}
+} // namespace
+
+// CPU thread: whether the worklet rendered a quantum in the last AUDIO_HEARTBEAT_TIMEOUT (as far as the CPU thread's
+// looks can tell: at 15 % speed it looks every 111 ms).
+static bool IsAudioWorkletAlive(Common::Timer::Value now)
+{
+	const u32 heartbeat = s_audio_block[AUDIO_HEARTBEAT].load(std::memory_order_relaxed);
+	if (heartbeat != s_audio_heartbeat_seen)
+	{
+		s_audio_heartbeat_seen = heartbeat;
+		s_audio_heartbeat_moved = now;
+		return true;
+	}
+	return s_audio_heartbeat_moved != 0 &&
+		   Common::Timer::ConvertValueToSeconds(now - s_audio_heartbeat_moved) < AUDIO_HEARTBEAT_TIMEOUT;
+}
+
+std::unique_ptr<AudioStream> WebAudioStream::Create(u32 sample_rate, const AudioStreamParameters& parameters,
+	bool stretch_enabled, Error* error)
+{
+	// Stereo only, what SPU2 mixes: no surround expansion (AUDIO-DESIGN.md 5).
+	AudioStreamParameters params = parameters;
+	params.expansion_mode = AudioExpansionMode::Disabled;
+
+	// The largest step's buffer, aiming for the current target (the buffer steps never recreate the stream).
+	params.buffer_ms = AUDIO_BUFFER_STEPS.back();
+
+	std::unique_ptr<WebAudioStream> stream = std::make_unique<WebAudioStream>(sample_rate, params);
+	stream->BaseInitialize(&StereoSampleReaderImpl, stretch_enabled);
+	const u32 target_ms = static_cast<u32>(std::lround(s_audio_target_ms));
+	stream->SetTargetBufferMS(target_ms);
+	const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+	stream->m_drain_time = Common::Timer::ConvertValueToSeconds(now);
+	s_audio_stream = stream.get();
+	s_audio_block[AUDIO_STREAM_RATE].store(sample_rate, std::memory_order_relaxed);
+	s_audio_block[AUDIO_BUFFER_MS].store(target_ms, std::memory_order_relaxed);
+	s_audio_block[AUDIO_STREAMS].fetch_add(1, std::memory_order_relaxed);
+	// A stream that replaces another (PS1 mode) plays at once.
+	if (IsAudioWorkletAlive(now))
+		stream->Attach();
+	return stream;
+}
+
+// Audio thread: the output's edges into and out of digital silence (no stream, an underrun's silence, a stream that
+// starts) become 64-frame ramps instead of steps, which would click.
+static constexpr u32 AUDIO_RAMP_FRAMES = 64;
+static float s_audio_last_output[2] = {}; // the last frame played
+static bool s_audio_output_silent = true; // the last quantum was all zeros
+
+static void SmoothAudioEdges(float* left, float* right, u32 frames)
+{
+	bool silent = true;
+	for (u32 i = 0; i < frames && silent; i++)
+		silent = (left[i] == 0.0f && right[i] == 0.0f);
+
+	const u32 ramp = std::min(frames, AUDIO_RAMP_FRAMES);
+	if (silent)
+	{
+		// Out of the sound: from the last frame played down to zero.
+		const float l = s_audio_last_output[0], r = s_audio_last_output[1];
+		if (l != 0.0f || r != 0.0f)
+		{
+			for (u32 i = 0; i < ramp; i++)
+			{
+				const float f = static_cast<float>(ramp - 1 - i) / ramp;
+				left[i] = l * f;
+				right[i] = r * f;
+			}
+		}
+	}
+	else if (s_audio_output_silent)
+	{
+		// Into the sound: faded in.
+		for (u32 i = 0; i < ramp; i++)
+		{
+			const float f = static_cast<float>(i) / ramp;
+			left[i] *= f;
+			right[i] *= f;
+		}
+	}
+	s_audio_output_silent = silent;
+	s_audio_last_output[0] = left[frames - 1];
+	s_audio_last_output[1] = right[frames - 1];
+}
+
+// Audio thread, every render quantum.
+static bool AudioRender(int num_inputs, const AudioSampleFrame* inputs, int num_outputs, AudioSampleFrame* outputs,
+	int num_params, const AudioParamFrame* params, void* user_data)
+{
+	s_audio_block[AUDIO_HEARTBEAT].fetch_add(1, std::memory_order_relaxed);
+	if (num_outputs < 1)
+		return true;
+
+	AudioSampleFrame& out = outputs[0];
+	const u32 frames = static_cast<u32>(out.samplesPerChannel);
+	const u32 channels = static_cast<u32>(out.numberOfChannels);
+	s_audio_in_callback.store(true, std::memory_order_seq_cst);
+	WebAudioStream* const stream = s_audio_reader.load(std::memory_order_seq_cst);
+	if (stream && channels >= 2 && frames <= AUDIO_MAX_QUANTUM)
+	{
+		stream->Render(out.data, out.data + frames, frames);
+		if (channels > 2)
+			std::memset(out.data + frames * 2, 0, (channels - 2) * frames * sizeof(float));
+	}
+	else
+	{
+		std::memset(out.data, 0, channels * frames * sizeof(float));
+	}
+	s_audio_in_callback.store(false, std::memory_order_release);
+	if (channels >= 2 && frames > 0)
+		SmoothAudioEdges(out.data, out.data + frames, frames);
+	return true; // keeps the processor alive
+}
+
+// Page thread (the worklet's start callbacks): hands the node to the page, or null when sound cannot start.
+static void NotifyAudioReady(EMSCRIPTEN_WEBAUDIO_T node)
+{
+	// clang-format off
+	EM_ASM({
+		const ready = Module['pcsx2webAudioReady'];
+		if (ready)
+			ready($0 ? emscriptenGetAudioObject($0) : null);
+	}, node);
+	// clang-format on
+}
+
+static void OnAudioProcessorCreated(EMSCRIPTEN_WEBAUDIO_T context, bool success, void* user_data)
+{
+	EMSCRIPTEN_WEBAUDIO_T node = 0;
+	if (success)
+	{
+		static int output_channels[1] = {2};
+		EmscriptenAudioWorkletNodeCreateOptions options = {};
+		options.numberOfInputs = 0;
+		options.numberOfOutputs = 1;
+		options.outputChannelCounts = output_channels;
+		node = emscripten_create_wasm_audio_worklet_node(context, AUDIO_PROCESSOR_NAME, &options, &AudioRender, nullptr);
+	}
+	s_audio_block[AUDIO_WORKLET].store(node ? AUDIO_WORKLET_RUNNING : AUDIO_WORKLET_FAILED, std::memory_order_release);
+	NotifyAudioReady(node);
+}
+
+static void OnAudioWorkletStarted(EMSCRIPTEN_WEBAUDIO_T context, bool success, void* user_data)
+{
+	if (!success)
+	{
+		s_audio_block[AUDIO_WORKLET].store(AUDIO_WORKLET_FAILED, std::memory_order_release);
+		NotifyAudioReady(0);
+		return;
+	}
+
+	WebAudioWorkletProcessorCreateOptions options = {};
+	options.name = AUDIO_PROCESSOR_NAME;
+	emscripten_create_wasm_audio_worklet_processor_async(context, &options, &OnAudioProcessorCreated, nullptr);
+}
+
+// main(), before InitializeConfig(). -audio-null (Module.arguments; the page's ?audio=null test switch) keeps PCSX2's
+// Null backend, so the cost of sound can be measured against no sound.
+static void ParseAudioArguments(int argc, char* argv[])
+{
+	for (int i = 1; i < argc; i++)
+	{
+		if (std::strcmp(argv[i], "-audio-null") == 0)
+			s_audio_null = true;
+	}
+}
+
+// InitializeConfig() (AUDIO-DESIGN.md 5), and the factory, before the CPU thread starts.
+static void ConfigureAudio(SettingsInterface& si)
+{
+	AudioStream::SetFrontendStreamFactory(&WebAudioStream::Create);
+
+	// The legacy "OutputModule" key is no longer read; without Backend, Cubeb (not built here) would fail and fall back.
+	si.SetStringValue("SPU2/Output", "Backend",
+		AudioStream::GetBackendName(s_audio_null ? AudioBackend::Null : AudioBackend::Frontend));
+	si.SetStringValue("SPU2/Output", "SyncMode",
+		Pcsx2Config::SPU2Options::GetSyncModeName(Pcsx2Config::SPU2Options::SPU2SyncMode::TimeStretch));
+	si.SetBoolValue("SPU2/Output", "StretchUseQuickSeek", true);
+	si.SetStringValue("SPU2/Output", "ExpansionMode", AudioStream::GetExpansionModeName(AudioExpansionMode::Disabled));
+	si.SetIntValue("SPU2/Output", "BufferMS", AUDIO_BUFFER_STEPS[0]); // WebAudioStream::Create() sizes its own
+	if (s_audio_null)
+		Console.WriteLn("pcsx2-wasm: -audio-null: no sound (PCSX2's Null audio backend)");
+}
+
+// RunVM(), at every boot: it starts at the full-speed buffer.
+static void ResetAudioBufferStep()
+{
+	s_audio_step = 0;
+	s_audio_target_ms = AUDIO_BUFFER_STEPS[0];
+	s_audio_step_up_since = 0;
+	s_audio_step_down_since = 0;
+	s_audio_target_updated = 0;
+}
+
+// The speed it takes to step down to a step: half as fast again as its minimum, at most 15 points more (90 % for the
+// full-speed step).
+static float AudioStepDownSpeed(float min_speed)
+{
+	return std::min(min_speed * 1.5f, min_speed + 15.0f);
+}
+
+static u32 AudioStepForSpeed(float speed, bool stepping_down)
+{
+	for (u32 i = 0; i < AUDIO_STEP_MIN_SPEED.size(); i++)
+	{
+		if (speed >= (stepping_down ? AudioStepDownSpeed(AUDIO_STEP_MIN_SPEED[i]) : AUDIO_STEP_MIN_SPEED[i]))
+			return i;
+	}
+	return static_cast<u32>(AUDIO_STEP_MIN_SPEED.size() - 1);
+}
+
+// The stream's target, in place (no new stream, no settings change: PCSX2's BufferMS setting stays at the first step).
+static void SetAudioTarget(double target_ms)
+{
+	s_audio_target_ms = target_ms;
+	const u32 ms = static_cast<u32>(std::lround(target_ms));
+	if (s_audio_stream)
+		s_audio_stream->SetTargetBufferMS(ms);
+	s_audio_block[AUDIO_BUFFER_MS].store(ms, std::memory_order_relaxed);
+}
+
+// A bigger step applies at once; a smaller one is reached by UpdateAudioTarget().
+static void ApplyAudioBufferStep(u32 step, float speed)
+{
+	const u16 buffer_ms = AUDIO_BUFFER_STEPS[step];
+	s_audio_step = step;
+	s_audio_step_up_since = 0;
+	s_audio_step_down_since = 0;
+	if (buffer_ms > s_audio_target_ms)
+		SetAudioTarget(buffer_ms);
+	s_audio_block[AUDIO_STEPS].fetch_add(1, std::memory_order_relaxed);
+	Console.WriteLnFmt("pcsx2-wasm: audio buffer {} ms at {:.0f}% speed", buffer_ms, speed);
+}
+
+// Down towards the step's buffer at AUDIO_STEP_DOWN_RATE.
+static void UpdateAudioTarget(Common::Timer::Value now)
+{
+	const double wanted = AUDIO_BUFFER_STEPS[s_audio_step];
+	if (s_audio_target_ms > wanted && s_audio_target_updated != 0)
+	{
+		const double elapsed = std::min(Common::Timer::ConvertValueToSeconds(now - s_audio_target_updated), 0.1);
+		const double target = std::max(wanted, s_audio_target_ms - AUDIO_STEP_DOWN_RATE * elapsed);
+		if (std::lround(target) != std::lround(s_audio_target_ms))
+			SetAudioTarget(target);
+		else
+			s_audio_target_ms = target;
+	}
+	s_audio_target_updated = now;
+}
+
+static void UpdateAudioBufferStep(Common::Timer::Value now)
+{
+	const float speed = s_speed.load(std::memory_order_relaxed);
+	if (!s_audio_stream || speed <= 0.0f || VMManager::GetState() != VMState::Running)
+	{
+		s_audio_step_up_since = 0;
+		s_audio_step_down_since = 0;
+		s_audio_target_updated = 0;
+		return;
+	}
+
+	const auto held_for = [now](Common::Timer::Value& since) {
+		if (since == 0)
+			since = now;
+		return Common::Timer::ConvertValueToSeconds(now - since);
+	};
+	const u32 slower = AudioStepForSpeed(speed, false);
+	const u32 faster = AudioStepForSpeed(speed, true);
+	if (slower > s_audio_step)
+	{
+		s_audio_step_down_since = 0;
+		if (held_for(s_audio_step_up_since) >= AUDIO_STEP_UP_AFTER)
+			ApplyAudioBufferStep(slower, speed);
+	}
+	else if (faster < s_audio_step)
+	{
+		s_audio_step_up_since = 0;
+		if (held_for(s_audio_step_down_since) >= AUDIO_STEP_DOWN_AFTER)
+			ApplyAudioBufferStep(faster, speed);
+	}
+	else
+	{
+		s_audio_step_up_since = 0;
+		s_audio_step_down_since = 0;
+	}
+	UpdateAudioTarget(now);
+}
+
+// CPU thread, once per vsync (and every 10 ms while paused).
+static void UpdateAudioOutput()
+{
+	const Common::Timer::Value now = Common::Timer::GetCurrentValue();
+	const bool alive = IsAudioWorkletAlive(now);
+	if (s_audio_stream)
+		s_audio_stream->Service(now, alive);
+	UpdateAudioBufferStep(now);
+}
+
+extern "C" {
+
+/// Starts the page's sound, on the page's thread (AUDIO-DESIGN.md 4.2): loads this module into the worklet scope of
+/// Module.pcsx2webAudioContext (an AudioContext the page made) and creates the processor node, then calls
+/// Module.pcsx2webAudioReady(node), or Module.pcsx2webAudioReady(null) when that failed. 0 if started; -1 if a start
+/// already ran or there is no context. Never blocks.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_audio_start(void)
+{
+	u32 expected = AUDIO_WORKLET_NONE;
+	if (!s_audio_block[AUDIO_WORKLET].compare_exchange_strong(expected, AUDIO_WORKLET_STARTING, std::memory_order_acq_rel))
+		return -1;
+
+	// clang-format off
+	const EMSCRIPTEN_WEBAUDIO_T context = EM_ASM_INT({
+		const ctx = Module['pcsx2webAudioContext'];
+		return ctx ? emscriptenRegisterAudioObject(ctx) : 0;
+	});
+	// clang-format on
+	if (!context)
+	{
+		s_audio_block[AUDIO_WORKLET].store(AUDIO_WORKLET_FAILED, std::memory_order_release);
+		return -1;
+	}
+
+	s_audio_block[AUDIO_CONTEXT_RATE].store(static_cast<u32>(emscripten_audio_context_sample_rate(context)),
+		std::memory_order_relaxed);
+	emscripten_start_wasm_audio_worklet_thread_async(context, s_audio_worklet_stack, sizeof(s_audio_worklet_stack),
+		&OnAudioWorkletStarted, nullptr);
+	return 0;
+}
+
+/// The audio block: 16 little-endian u32 words (AUDIO-DESIGN.md 4.5). Read them with Atomics.
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_audio(void)
+{
+	return s_audio_block;
+}
+
+} // extern "C"
+
 static bool InitializeConfig()
 {
 	// Resources are preloaded at /resources (see CMakeLists.txt); the data root is in MEMFS.
@@ -425,12 +1110,12 @@ static bool InitializeConfig()
 	Host::Internal::SetBaseSettingsLayer(&si);
 	VMManager::SetDefaultSettings(si, true, true, true, true, true);
 
-	// Software renderer into GSDeviceNull, no audio, keyboard only (the default port 1
-	// keyboard bindings stay), memory card slot 1 only. Hotkeys are cleared: most of them
-	// (pause menu, save states, screenshots) need host support that is not there yet.
+	// Software renderer into GSDeviceNull, sound through the page's Web Audio worklet, keyboard
+	// only (the default port 1 keyboard bindings stay), memory card slot 1 only. Hotkeys are
+	// cleared: most of them (pause menu, save states, screenshots) need host support that is not
+	// there yet.
 	si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::SW));
-	// The legacy "OutputModule" key is no longer read; without this Cubeb fails and falls back.
-	si.SetStringValue("SPU2/Output", "Backend", AudioStream::GetBackendName(AudioBackend::Null));
+	ConfigureAudio(si);
 	si.SetBoolValue("InputSources", "SDL", false);
 	si.SetBoolValue("InputSources", "XInput", false);
 	si.ClearSection("Hotkeys");
@@ -677,6 +1362,7 @@ static void RunVM(const std::string& bios_name)
 {
 	DiscardKeyEvents();
 	const BootDisc disc = TakeBootDisc();
+	ResetAudioBufferStep();
 
 	{
 		auto lock = Host::GetSettingsLock();
@@ -737,6 +1423,7 @@ static void RunVM(const std::string& bios_name)
 			ProcessKeyEvents();
 			RunCPUThreadQueue();
 			CheckStopRequest();
+			UpdateAudioOutput();
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
 		else
@@ -775,6 +1462,7 @@ int main(int argc, char* argv[])
 {
 	CrashHandler::Install();
 	Log::SetConsoleOutputLevel(LOGLEVEL_DEV);
+	ParseAudioArguments(argc, argv);
 
 	// The module is linked with -sJSPI, so emscripten_has_asyncify() is nonzero and SDL_Delay() (and
 	// what waits through it) would suspend the calling thread's stack with emscripten_sleep(). A
@@ -974,6 +1662,8 @@ void Host::PumpMessagesOnCPUThread()
 		FileSystem::EnsureDirectoryExists(SNAPSHOT_DIRECTORY, false, &error);
 		MTGS::RunOnGSThread([path = fmt::format("{}/frame-{}.png", SNAPSHOT_DIRECTORY, snapshot)]() { GSQueueSnapshot(path); });
 	}
+
+	UpdateAudioOutput();
 }
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false */)

@@ -72,6 +72,11 @@ list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_disc_block
 	_pcsx2web_game
 )
+# Audio (Main.cpp, "Audio").
+list(APPEND PCSX2_WASM_EXPORTS
+	_pcsx2web_audio_start
+	_pcsx2web_audio
+)
 list(JOIN PCSX2_WASM_EXPORTS "," PCSX2_WASM_EXPORTS)
 set_property(TARGET pcsx2-wasm APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/jspi-fallback.js")
 
@@ -117,3 +122,8 @@ add_dependencies(pcsx2-wasm pcsx2-wasm-web)
 
 # The page mounts IndexedDB (IDBFS) on /memcards, so memory cards outlive a reload.
 target_link_options(pcsx2-wasm PRIVATE "-lidbfs.js")
+
+# Audio (Main.cpp, "Audio"; docs/web-port/AUDIO-DESIGN.md): an Emscripten Wasm Audio Worklet runs
+# AudioStream::ReadFrames() on the browser's audio rendering thread. The module's JS is evaluated in
+# the AudioWorkletGlobalScope too, so the glue must never touch window or document at load.
+target_link_options(pcsx2-wasm PRIVATE "-sAUDIO_WORKLET=1" "-sWASM_WORKERS=1")

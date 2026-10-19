@@ -104,6 +104,15 @@ std::vector<AudioStream::DeviceInfo> AudioStream::GetOutputDevices(AudioBackend 
 	return ret;
 }
 
+#ifdef __EMSCRIPTEN__
+static AudioStream::FrontendStreamFactory s_frontend_stream_factory = nullptr;
+
+void AudioStream::SetFrontendStreamFactory(FrontendStreamFactory factory)
+{
+	s_frontend_stream_factory = factory;
+}
+#endif
+
 std::unique_ptr<AudioStream> AudioStream::CreateStream(AudioBackend backend, u32 sample_rate, const AudioStreamParameters& parameters,
 	const char* driver_name, const char* device_name, bool stretch_enabled, Error* error)
 {
@@ -121,6 +130,16 @@ std::unique_ptr<AudioStream> AudioStream::CreateStream(AudioBackend backend, u32
 
 		case AudioBackend::Null:
 			return CreateNullStream(sample_rate, parameters.buffer_ms);
+
+#ifdef __EMSCRIPTEN__
+		case AudioBackend::Frontend:
+			if (!s_frontend_stream_factory)
+			{
+				Error::SetStringView(error, "This frontend has no audio output.");
+				return nullptr;
+			}
+			return s_frontend_stream_factory(sample_rate, parameters, stretch_enabled, error);
+#endif
 
 		default:
 			Error::SetStringView(error, "Unknown audio backend.");
@@ -149,12 +168,22 @@ static constexpr const std::array s_backend_names = {
 	"Null",
 	"Cubeb",
 	"SDL",
+#ifdef __EMSCRIPTEN__
+	"Frontend",
+#endif
 };
 static constexpr const std::array s_backend_display_names = {
 	TRANSLATE_NOOP("AudioStream", "Null (No Output)"),
 	TRANSLATE_NOOP("AudioStream", "Cubeb"),
 	TRANSLATE_NOOP("AudioStream", "SDL"),
+#ifdef __EMSCRIPTEN__
+	TRANSLATE_NOOP("AudioStream", "Frontend"),
+#endif
 };
+#ifdef __EMSCRIPTEN__
+static_assert(s_backend_names.size() == static_cast<size_t>(AudioBackend::Count) &&
+			  s_backend_display_names.size() == static_cast<size_t>(AudioBackend::Count));
+#endif
 
 std::optional<AudioBackend> AudioStream::ParseBackendName(const char* str)
 {
@@ -235,7 +264,11 @@ void AudioStream::ReadFrames(SampleType* samples, u32 num_frames)
 
 	if (m_filling)
 	{
+#ifdef __EMSCRIPTEN__
+		u32 toFill = m_fill_reference_size.load(std::memory_order_relaxed) / (IsStretchEnabled() ? 32 : 400);
+#else
 		u32 toFill = m_buffer_size / (IsStretchEnabled() ? 32 : 400);
+#endif
 		toFill = GetAlignedBufferSize(toFill);
 
 		if (available_frames < toFill)
@@ -398,6 +431,9 @@ void AudioStream::AllocateBuffer()
 	const u32 multiplier = IsStretchEnabled() ? 16 : 1;
 	m_buffer_size = GetAlignedBufferSize(((m_parameters.buffer_ms * multiplier) * m_sample_rate) / 1000);
 	m_target_buffer_size = GetAlignedBufferSize((m_sample_rate * m_parameters.buffer_ms) / 1000u);
+#ifdef __EMSCRIPTEN__
+	m_fill_reference_size.store(m_buffer_size, std::memory_order_relaxed);
+#endif
 
 	m_buffer = std::make_unique<float[]>(m_buffer_size * m_internal_channels);
 	m_staging_buffer = std::make_unique<float[]>(CHUNK_SIZE * m_internal_channels);
@@ -439,6 +475,18 @@ void AudioStream::EmptyBuffer()
 
 	m_wpos.store(m_rpos.load(std::memory_order_acquire), std::memory_order_release);
 }
+
+#ifdef __EMSCRIPTEN__
+void AudioStream::SetTargetBufferMS(u32 buffer_ms)
+{
+	// The sizes AllocateBuffer() gives a stream of that BufferMS, within this one's buffer.
+	const u32 multiplier = IsStretchEnabled() ? 16 : 1;
+	m_target_buffer_size = std::min(GetAlignedBufferSize((m_sample_rate * buffer_ms) / 1000u), m_buffer_size);
+	m_fill_reference_size.store(
+		std::min(GetAlignedBufferSize(((buffer_ms * multiplier) * m_sample_rate) / 1000), m_buffer_size),
+		std::memory_order_relaxed);
+}
+#endif
 
 void AudioStream::SetNominalRate(float tempo)
 {
