@@ -131,6 +131,9 @@
 	const FRAME_PORT_TIMEOUT_MS = 5000;
 	const LATENCY_SAMPLES = 600;
 	const VU1JIT_PARAM = params.get('vu1jit');
+	// ?renderer=hw draws with PCSX2's hardware renderer on the WebGPU device, ?renderer=sw with the software
+	// renderer (the default). Without WebGPU the GS falls back to the software renderer either way.
+	const RENDERER_PARAM = params.get('renderer');
 
 	// ------------------------------------------------------------------ copy
 
@@ -945,6 +948,12 @@
 		const args = [];
 		if (!GPU_ALLOWED)
 			args.push('-gpu', '0');
+		if (RENDERER_PARAM === 'hw' && GPU_ALLOWED)
+			args.push('-set', 'EmuCore/GS/Renderer=32');
+		else if (RENDERER_PARAM === 'sw')
+			args.push('-set', 'EmuCore/GS/Renderer=13');
+		else if (RENDERER_PARAM)
+			pageLog(`Unknown ?renderer= value '${RENDERER_PARAM}' (use hw or sw).`, 'warn');
 		for (const setting of params.getAll('set'))
 			args.push('-set', setting);
 		if (CAPTURE_FRAMES.length)
@@ -957,6 +966,7 @@
 			args.push('-eejit', '0');
 		if (GPU_ALLOWED && navigator.gpu && !HAS_JSPI)
 			pageLog('WebGPU needs JSPI, which this browser lacks: drawing through the 2D canvas.', 'warn');
+		args.push(...audioModuleArguments());
 		window.Module = {
 			arguments: args,
 			tstFramePort: onFramePort,
@@ -974,7 +984,6 @@
 			onExit,
 			preRun: [mountMemoryCards],
 			postRun: [onRuntimeReadyForDiscs],
-			arguments: audioModuleArguments(),
 		};
 
 		const script = document.createElement('script');

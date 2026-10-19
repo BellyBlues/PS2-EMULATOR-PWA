@@ -91,6 +91,8 @@ static RenderAPI GetAPIForRenderer(GSRendererType renderer)
 		return WebGPUHost::IsAvailable() ? RenderAPI::WebGPU : RenderAPI::None;
 	if (renderer == GSRendererType::Null)
 		return RenderAPI::None;
+	if (renderer == GSRendererType::WebGPU)
+		return WebGPUHost::IsAvailable() ? RenderAPI::WebGPU : RenderAPI::None;
 #endif
 
 	switch (renderer)
@@ -264,6 +266,16 @@ static void GSClampUpscaleMultiplier(Pcsx2Config::GSOptions& config)
 
 static bool OpenGSRenderer(GSRendererType renderer, u8* basemem)
 {
+#ifdef __EMSCRIPTEN__
+	// The HW renderer needs the WebGPU device; without one (no adapter, no dual-source blending) the GS
+	// draws with the SW renderer on whatever device it got.
+	if (renderer == GSRendererType::WebGPU && g_gs_device->GetRenderAPI() != RenderAPI::WebGPU)
+	{
+		Console.Warning("GS: no WebGPU device for the hardware renderer, using the software renderer.");
+		renderer = GSRendererType::SW;
+	}
+#endif
+
 	// Must be done first, initialization routines in GSState use GSIsHardwareRenderer().
 	GSCurrentRenderer = renderer;
 

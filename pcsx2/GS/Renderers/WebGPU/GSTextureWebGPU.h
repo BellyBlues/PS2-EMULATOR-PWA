@@ -50,6 +50,8 @@ public:
 
 	__fi WGPUTexture GetTexture() const { return m_texture; }
 	__fi WGPUTextureView GetRTView() const { return m_rt_view; }
+	/// Sampling view (every level; the depth aspect of depth formats).
+	__fi WGPUTextureView GetView() const { return m_view; }
 	__fi WGPUTextureFormat GetNativeFormat() const { return m_native_format; }
 	__fi u64 GetUseSerial() const { return m_use_serial; }
 	__fi void SetUseSerial(u64 serial) { m_use_serial = serial; }

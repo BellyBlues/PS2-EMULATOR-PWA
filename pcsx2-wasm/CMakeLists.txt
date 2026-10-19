@@ -36,6 +36,7 @@ set(PCSX2_WASM_RESOURCES
 	shaders/webgpu/merge.wgsl
 	shaders/webgpu/present.wgsl
 	shaders/webgpu/shadeboost.wgsl
+	shaders/webgpu/tfx.wgsl
 )
 set(PCSX2_WASM_PRELOAD_OPTIONS)
 set(PCSX2_WASM_PRELOAD_FILES)

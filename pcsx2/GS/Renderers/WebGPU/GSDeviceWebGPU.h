@@ -12,6 +12,7 @@
 #include <webgpu/webgpu.h>
 
 #include <array>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -149,7 +150,10 @@ private:
 		u8 blend; ///< UtilityBlend
 		u16 entry; ///< index into m_entry_names
 		u16 constants; ///< bit 0: HAS_BILN
-		WGPUTextureFormat color_format;
+		WGPUTextureFormat color_format; ///< Undefined: no colour target
+		WGPUTextureFormat ds_format; ///< Undefined: no depth-stencil attachment
+		u8 ds_mode; ///< UtilityDepthMode
+		u8 pad[3];
 
 		bool operator==(const UtilityPipelineKey& rhs) const;
 	};
@@ -167,6 +171,14 @@ private:
 		MODULE_SHADEBOOST,
 		MODULE_IMGUI,
 		MODULE_COUNT
+	};
+
+	enum UtilityDepthMode : u8
+	{
+		DS_NONE, ///< no depth-stencil state
+		DS_WRITE_DEPTH, ///< frag_depth output, compare always, depth written (the convert *_ds entry points)
+		DS_WRITE_STENCIL, ///< DATM: no colour, stencil replaced with 1 where the fragment is kept
+		DS_IGNORE, ///< depth-stencil attachment present but neither tested nor written
 	};
 
 	enum UtilityBlend : u8
@@ -213,7 +225,8 @@ private:
 	/// The pipeline for a key, created (and waited for) on first use. Null if creation failed.
 	WGPURenderPipeline GetUtilityPipeline(const UtilityPipelineKey& key);
 	UtilityPipelineKey MakeKey(UtilityModule module, const char* entry, WGPUTextureFormat format,
-		TexLayout layout = TexLayout::Float, u8 write_mask = 0xf, UtilityBlend blend = BLEND_NONE, u16 constants = 0);
+		TexLayout layout = TexLayout::Float, u8 write_mask = 0xf, UtilityBlend blend = BLEND_NONE, u16 constants = 0,
+		WGPUTextureFormat ds_format = WGPUTextureFormat_Undefined, UtilityDepthMode ds_mode = DS_NONE);
 	/// Convert pipeline key, or a key with module MODULE_COUNT for selectors step 1 does not draw.
 	UtilityPipelineKey ConvertPipelineKey(ShaderConvertSelector shader, WGPUTextureFormat format);
 	u16 EntryIndex(const char* name);
@@ -221,6 +234,13 @@ private:
 	// Recording
 	WGPULoadOp LoadOpFor(GSTextureWebGPU* tex, GSVector4* clear_color) const;
 	void BeginRenderPass(GSTextureWebGPU* rt, WGPULoadOp load_op, const GSVector4& clear_color);
+	/// A pass with an optional colour and an optional depth-stencil attachment, load ops from their
+	/// clear state (§6.2). stencil_clear >= 0 clears the stencil to that value; colour_load_override
+	/// replaces the colour load op when not Undefined.
+	void BeginAttachmentPass(GSTextureWebGPU* rt, GSTextureWebGPU* ds, int stencil_clear = -1,
+		WGPULoadOp colour_load_override = WGPULoadOp_Undefined);
+	/// True when the open pass draws exactly into rt with no depth attachment (utility passes reuse it).
+	bool IsColorOnlyPass(GSTextureWebGPU* rt) const { return m_pass && !m_pass_is_present && m_pass_rt == rt && !m_pass_ds; }
 	void BeginPresentPass(WGPULoadOp load_op);
 	void EnsurePresentPass();
 	void InvalidatePassState();
@@ -236,6 +256,60 @@ private:
 	void DoUtilityStretchRect(GSTextureWebGPU* sTex, const GSVector4& sRect, GSTextureWebGPU* dTex,
 		const GSVector4& dRect, WGPURenderPipeline pipeline, BindGroupKind kind, bool allow_discard);
 	void RenderImGui();
+
+	// HW renderer (GSDeviceWebGPUHW.cpp)
+	struct TFXPipelineKey
+	{
+		GSHWDrawConfig::PSSelector ps;
+		u32 blend; ///< BlendState key
+		u8 vs; ///< VSSelector key
+		u8 dss; ///< DepthStencilSelector key
+		u8 cms; ///< ColorMaskSelector key
+		u8 topology;
+		WGPUTextureFormat rt_format;
+		WGPUTextureFormat ds_format;
+		u32 pad;
+
+		TFXPipelineKey() { std::memset(static_cast<void*>(this), 0, sizeof(*this)); }
+		bool operator==(const TFXPipelineKey& rhs) const { return std::memcmp(this, &rhs, sizeof(*this)) == 0; }
+	};
+	struct TFXPipelineKeyHash
+	{
+		size_t operator()(const TFXPipelineKey& k) const;
+	};
+	struct TFXGroupKey
+	{
+		WGPUTextureView views[3];
+		WGPUSampler sampler;
+		bool operator==(const TFXGroupKey& rhs) const { return std::memcmp(this, &rhs, sizeof(*this)) == 0; }
+	};
+	struct TFXGroupKeyHash
+	{
+		size_t operator()(const TFXGroupKey& k) const;
+	};
+
+	bool CreateHWResources();
+	void DestroyHWResources();
+	WGPUShaderModule GetTFXVertexModule(GSHWDrawConfig::VSSelector sel);
+	WGPUShaderModule GetTFXFragmentModule(const GSHWDrawConfig::PSSelector& sel);
+	WGPURenderPipeline GetTFXPipeline(const TFXPipelineKey& key);
+	WGPURenderPipeline CreateTFXPipeline(const TFXPipelineKey& key);
+	WGPUBindGroup GetTFXGroup(u32 group, const TFXGroupKey& key);
+	void DropTFXGroupsUsing(std::initializer_list<WGPUTextureView> views);
+	void SetupDATE(GSTextureWebGPU* rt, GSTextureWebGPU* ds, SetDATM datm, const GSVector4i& bbox);
+	/// Binds pipeline, groups, buffers and uniforms for a TFX draw in the open pass.
+	bool ApplyTFXState(WGPURenderPipeline pipeline, const GSHWDrawConfig& config, WGPUBindGroup group1, WGPUBindGroup group2);
+	void DrawTFX(const GSHWDrawConfig& config, u32 offset, u32 count);
+	void SendHWDraw(GSHWDrawConfig& config, WGPURenderPipeline pipeline, GSTextureWebGPU* draw_rt, GSTextureWebGPU* draw_ds,
+		GSTextureWebGPU* rt_clone, GSTextureWebGPU* ds_clone, bool one_barrier, bool full_barrier, int stencil_clear);
+	void FeedbackCopy(const GSHWDrawConfig& config, GSTextureWebGPU* rt, GSTextureWebGPU* rt_clone, GSTextureWebGPU* ds,
+		GSTextureWebGPU* ds_clone, const GSVector4i& area);
+	TFXPipelineKey MakeTFXKey(const GSHWDrawConfig& config, const GSHWDrawConfig::PSSelector& ps,
+		GSHWDrawConfig::BlendState bs, GSHWDrawConfig::ColorMaskSelector cms, GSHWDrawConfig::DepthStencilSelector dss,
+		GSTextureWebGPU* rt, GSTextureWebGPU* ds) const;
+	WGPUBindGroup MakeTFXGroup1(const GSHWDrawConfig& config, GSTextureWebGPU* tex);
+	/// Replaces the open pass's bind state caches after a utility draw in the same pass (and back).
+	void InvalidateBindState();
 
 	// Device loss and errors
 	void ReportPendingErrors();
@@ -311,4 +385,36 @@ private:
 	u32 m_want_uniform_size = 0;
 
 	double m_last_event_loop_turn = 0.0;
+
+	// HW renderer state
+	GSTextureWebGPU* m_pass_ds = nullptr;
+	int m_pass_stencil_clear = -1;
+	WGPUBindGroup m_pass_tfx_groups[3] = {};
+	u32 m_pass_tfx_offsets[2] = {UINT32_MAX, UINT32_MAX};
+	WGPUBuffer m_pass_index_buffer = nullptr;
+	int m_pass_blend_constant = -1;
+	u32 m_pass_stencil_ref = UINT32_MAX;
+	bool m_has_dual_source = false;
+	std::string m_tfx_source;
+	WGPUBindGroupLayout m_tfx_bgl[3] = {};
+	WGPUPipelineLayout m_tfx_layout = nullptr;
+	WGPUBindGroup m_tfx_group0 = nullptr;
+	WGPUBuffer m_expand_ib = nullptr;
+	WGPUTexture m_null_texture = nullptr;
+	WGPUTextureView m_null_view = nullptr;
+	WGPUBindGroup m_null_group2 = nullptr;
+	std::unordered_map<u8, WGPUShaderModule> m_tfx_vs_modules;
+	std::unordered_map<GSHWDrawConfig::PSSelector, WGPUShaderModule, GSHWDrawConfig::PSSelectorHash> m_tfx_fs_modules;
+	std::unordered_map<TFXPipelineKey, WGPURenderPipeline, TFXPipelineKeyHash> m_tfx_pipelines;
+	std::unordered_map<TFXGroupKey, WGPUBindGroup, TFXGroupKeyHash> m_tfx_groups[3];
+	GSHWDrawConfig::VSConstantBuffer m_vs_cb_cache;
+	GSHWDrawConfig::PSConstantBuffer m_ps_cb_cache;
+	u32 m_vs_cb_offset = UINT32_MAX;
+	u32 m_ps_cb_offset = UINT32_MAX;
+	u64 m_cb_serial = 0;
+	u32 m_vertex_start = 0;
+	u32 m_index_start = 0;
+	u32 m_skipped_draws = 0;
+	u64 m_hw_draws = 0;
+	u32 m_presents = 0;
 };

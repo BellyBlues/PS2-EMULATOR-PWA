@@ -682,10 +682,12 @@ if(EMSCRIPTEN)
 	# The WebGPU device (docs/web-port/WEBGPU-DESIGN.md), on emdawnwebgpu's webgpu.h.
 	list(APPEND pcsx2GSSources
 		GS/Renderers/WebGPU/GSDeviceWebGPU.cpp
+		GS/Renderers/WebGPU/GSDeviceWebGPUHW.cpp
 		GS/Renderers/WebGPU/GSTextureWebGPU.cpp
 		GS/Renderers/WebGPU/WebGPUCaches.cpp
 		GS/Renderers/WebGPU/WebGPUHost.cpp
 		GS/Renderers/WebGPU/WebGPUStreamBuffer.cpp
+		GS/Renderers/WebGPU/WGSLPreprocessor.cpp
 	)
 	list(APPEND pcsx2GSHeaders
 		GS/Renderers/WebGPU/GSDeviceWebGPU.h
@@ -693,6 +695,7 @@ if(EMSCRIPTEN)
 		GS/Renderers/WebGPU/WebGPUCaches.h
 		GS/Renderers/WebGPU/WebGPUHost.h
 		GS/Renderers/WebGPU/WebGPUStreamBuffer.h
+		GS/Renderers/WebGPU/WGSLPreprocessor.h
 	)
 endif()
 

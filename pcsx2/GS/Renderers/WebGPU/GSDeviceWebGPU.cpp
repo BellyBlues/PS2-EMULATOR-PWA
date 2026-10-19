@@ -39,9 +39,10 @@ namespace
 	constexpr u32 UNIFORM_SLOT_SIZE = 256;
 	constexpr u32 UNIFORM_BINDING_SIZE = 96;
 
-	constexpr u32 VERTEX_BUFFER_SIZE = 4 * 1024 * 1024;
-	constexpr u32 INDEX_BUFFER_SIZE = 1 * 1024 * 1024;
-	constexpr u32 UNIFORM_BUFFER_SIZE = 1 * 1024 * 1024;
+	// The HW renderer's draws go through the same rings (a submit when one is full).
+	constexpr u32 VERTEX_BUFFER_SIZE = 16 * 1024 * 1024;
+	constexpr u32 INDEX_BUFFER_SIZE = 4 * 1024 * 1024;
+	constexpr u32 UNIFORM_BUFFER_SIZE = 4 * 1024 * 1024;
 	constexpr u32 UPLOAD_BUFFER_SIZE = 16 * 1024 * 1024;
 
 	// Uploads at least this big go through mapped staging buffers (UploadTextureStaged()): Chrome's
@@ -147,13 +148,15 @@ namespace
 bool GSDeviceWebGPU::UtilityPipelineKey::operator==(const UtilityPipelineKey& rhs) const
 {
 	return module == rhs.module && layout == rhs.layout && write_mask == rhs.write_mask && blend == rhs.blend &&
-		   entry == rhs.entry && constants == rhs.constants && color_format == rhs.color_format;
+		   entry == rhs.entry && constants == rhs.constants && color_format == rhs.color_format &&
+		   ds_format == rhs.ds_format && ds_mode == rhs.ds_mode;
 }
 
 size_t GSDeviceWebGPU::UtilityPipelineKeyHash::operator()(const UtilityPipelineKey& k) const
 {
 	size_t h = 0;
-	HashCombine(h, k.module, k.layout, k.write_mask, k.blend, k.entry, k.constants, static_cast<u32>(k.color_format));
+	HashCombine(h, k.module, k.layout, k.write_mask, k.blend, k.entry, k.constants, static_cast<u32>(k.color_format),
+		static_cast<u32>(k.ds_format), k.ds_mode);
 	return h;
 }
 
@@ -169,7 +172,7 @@ u16 GSDeviceWebGPU::EntryIndex(const char* name)
 }
 
 GSDeviceWebGPU::UtilityPipelineKey GSDeviceWebGPU::MakeKey(UtilityModule module, const char* entry, WGPUTextureFormat format,
-	TexLayout layout, u8 write_mask, UtilityBlend blend, u16 constants)
+	TexLayout layout, u8 write_mask, UtilityBlend blend, u16 constants, WGPUTextureFormat ds_format, UtilityDepthMode ds_mode)
 {
 	UtilityPipelineKey key = {};
 	key.module = module;
@@ -179,15 +182,22 @@ GSDeviceWebGPU::UtilityPipelineKey GSDeviceWebGPU::MakeKey(UtilityModule module,
 	key.entry = EntryIndex(entry);
 	key.constants = constants;
 	key.color_format = format;
+	key.ds_format = ds_format;
+	key.ds_mode = ds_mode;
 	return key;
 }
 
 GSDeviceWebGPU::UtilityPipelineKey GSDeviceWebGPU::ConvertPipelineKey(ShaderConvertSelector shader, WGPUTextureFormat format)
 {
-	// Step 1 draws every convert shader with a colour, integer or r32float target. Depth and stencil
-	// outputs (frag_depth, DATM) come with the HW renderer (step 2).
-	if (shader.DepthOutput() || shader.StencilOutput())
-		return MakeKey(MODULE_COUNT, "", WGPUTextureFormat_Undefined);
+	// Depth outputs write frag_depth into a depth attachment (the "_ds" entry points), DATM writes the
+	// stencil only (§8.4); format is then the depth-stencil format.
+	const TexLayout layout = shader.Float32Input() ? TexLayout::Unfilterable : TexLayout::Float;
+	if (shader.StencilOutput())
+		return MakeKey(MODULE_CONVERT, shader.EntryPoint(), WGPUTextureFormat_Undefined, layout, 0, BLEND_NONE, 0, format,
+			DS_WRITE_STENCIL);
+	if (shader.DepthOutput())
+		return MakeKey(MODULE_CONVERT, fmt::format("{}_ds", shader.EntryPoint()).c_str(), WGPUTextureFormat_Undefined, layout,
+			0, BLEND_NONE, 0, format, DS_WRITE_DEPTH);
 
 	return MakeKey(MODULE_CONVERT, shader.EntryPoint(), format,
 		shader.Float32Input() ? TexLayout::Unfilterable : TexLayout::Float, shader.Mask(), BLEND_NONE,
@@ -242,7 +252,8 @@ bool GSDeviceWebGPU::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 
 	// Everything below must validate; a validation error fails Create() (§4 step 6).
 	wgpuDevicePushErrorScope(m_device, WGPUErrorFilter_Validation);
-	bool ok = CreateBuffers() && CreateLayoutsAndSamplers() && LoadShaderModules() && CreateSurfaceForWindow();
+	bool ok = CreateBuffers() && CreateLayoutsAndSamplers() && LoadShaderModules() && CreateHWResources() &&
+			  CreateSurfaceForWindow();
 	const double t_setup = WebGPUHost::Now();
 	ok = ok && CompileUtilityPipelines();
 	const double t_pipelines = WebGPUHost::Now();
@@ -437,9 +448,32 @@ bool GSDeviceWebGPU::CreateInstanceAndDevice()
 
 bool GSDeviceWebGPU::CheckFeatures()
 {
-	// Step 1 drives the SW renderer only: no HW-renderer features (§4, §15 part 6).
+	// §4: the DX11 feature profile (feedback through copies), with depth feedback through full depth copies
+	// (DepthFeedbackMode Depth, so there is no DS-as-RT target) and no primitive ID, ROV or AA1 yet.
 	m_features = FeatureSupport();
 	m_features.prefer_new_textures = true;
+	m_features.vs_expand = !GSConfig.DisableVertexShaderExpand;
+	m_features.multidraw_fb_copy = GSConfig.OverrideTextureBarriers != 0;
+	m_features.texture_barrier = false;
+	m_features.provoking_vertex_last = false;
+	m_features.point_expand = false;
+	m_features.line_expand = false;
+	m_features.dxt_textures = m_has_bc;
+	m_features.bptc_textures = m_has_bc;
+	m_features.framebuffer_fetch = false;
+	m_features.stencil_buffer = m_has_depth32_stencil8;
+	m_features.test_and_sample_depth = false;
+	m_features.depth_feedback = m_features.multidraw_fb_copy;
+	m_features.primitive_id = false;
+	m_features.aa1 = false;
+	m_features.rov = false;
+	m_has_dual_source = wgpuDeviceHasFeature(m_device, WGPUFeatureName_DualSourceBlending);
+	if (GSConfig.Renderer == GSRendererType::WebGPU && !m_has_dual_source)
+	{
+		// The HW renderer needs SRC1 blend factors (§10.5): the GS falls back to the SW renderer.
+		Console.Error("WebGPU: this adapter has no dual-source blending, which the hardware renderer needs.");
+		return false;
+	}
 
 	// Every format the utility passes render to must be renderable and sampleable; the core
 	// formats used here always are (spec), the optional ones are resolved in LookupNativeFormat().
@@ -487,7 +521,7 @@ WGPUTextureFormat GSDeviceWebGPU::LookupNativeFormat(GSTexture::Format format) c
 
 bool GSDeviceWebGPU::CreateBuffers()
 {
-	if (!m_vertex_buffer.Create(m_device, WGPUBufferUsage_Vertex, VERTEX_BUFFER_SIZE, "vertex stream buffer") ||
+	if (!m_vertex_buffer.Create(m_device, WGPUBufferUsage_Vertex | WGPUBufferUsage_Storage, VERTEX_BUFFER_SIZE, "vertex stream buffer") ||
 		!m_index_buffer.Create(m_device, WGPUBufferUsage_Index, INDEX_BUFFER_SIZE, "index stream buffer") ||
 		!m_uniform_buffer.Create(m_device, WGPUBufferUsage_Uniform, UNIFORM_BUFFER_SIZE, "uniform stream buffer") ||
 		!m_upload_buffer.Create(m_device, WGPUBufferUsage_CopySrc, UPLOAD_BUFFER_SIZE, "texture upload buffer"))
@@ -621,6 +655,26 @@ GSDeviceWebGPU::PendingPipeline GSDeviceWebGPU::CreatePipelineAsync(const Utilit
 	target.writeMask = key.write_mask;
 	target.blend = (key.blend != BLEND_NONE) ? &blend : nullptr;
 
+	WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
+	ds.format = key.ds_format;
+	ds.depthWriteEnabled = (key.ds_mode == DS_WRITE_DEPTH) ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+	ds.depthCompare = WGPUCompareFunction_Always;
+	if (key.ds_mode == DS_WRITE_STENCIL)
+	{
+		// GSDeviceVK's DATE setup: stencil 1 where the DATM shader keeps the fragment.
+		ds.stencilFront.compare = WGPUCompareFunction_Always;
+		ds.stencilFront.passOp = WGPUStencilOperation_Replace;
+		ds.stencilFront.failOp = WGPUStencilOperation_Keep;
+		ds.stencilFront.depthFailOp = WGPUStencilOperation_Keep;
+		ds.stencilBack = ds.stencilFront;
+		ds.stencilReadMask = 0xff;
+		ds.stencilWriteMask = 0xff;
+	}
+	else if (key.ds_format == WGPUTextureFormat_Depth32FloatStencil8)
+	{
+		ds.stencilWriteMask = 0;
+	}
+
 	WGPUConstantEntry constant = WGPU_CONSTANT_ENTRY_INIT;
 	constant.key = SV("HAS_BILN");
 	constant.value = 1.0;
@@ -628,7 +682,7 @@ GSDeviceWebGPU::PendingPipeline GSDeviceWebGPU::CreatePipelineAsync(const Utilit
 	WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
 	fs.module = m_modules[key.module];
 	fs.entryPoint = SV(m_entry_names[key.entry].c_str());
-	fs.targetCount = 1;
+	fs.targetCount = (key.color_format != WGPUTextureFormat_Undefined) ? 1 : 0;
 	fs.targets = &target;
 	fs.constantCount = (key.constants & 1) ? 1 : 0;
 	fs.constants = &constant;
@@ -645,6 +699,7 @@ GSDeviceWebGPU::PendingPipeline GSDeviceWebGPU::CreatePipelineAsync(const Utilit
 	d.primitive.topology = imgui ? WGPUPrimitiveTopology_TriangleList : WGPUPrimitiveTopology_TriangleStrip;
 	d.primitive.cullMode = WGPUCullMode_None;
 	d.fragment = &fs;
+	d.depthStencil = (key.ds_format != WGPUTextureFormat_Undefined) ? &ds : nullptr;
 
 	PipelineRequest* const req = new PipelineRequest();
 	WGPUCreateRenderPipelineAsyncCallbackInfo cb = WGPU_CREATE_RENDER_PIPELINE_ASYNC_CALLBACK_INFO_INIT;
@@ -880,6 +935,8 @@ void GSDeviceWebGPU::Destroy()
 
 void GSDeviceWebGPU::DestroyResources()
 {
+	DestroyHWResources();
+
 	for (auto& it : m_pipelines)
 	{
 		if (it.second)
@@ -1071,6 +1128,19 @@ void GSDeviceWebGPU::InvalidatePassState()
 	// what the utility draws use: they need no setViewport/setScissorRect calls.
 	m_pass_viewport = m_pass ? GSVector4i(0, 0, m_pass_size.x, m_pass_size.y) : GSVector4i::zero();
 	m_pass_scissor = m_pass_viewport;
+	InvalidateBindState();
+	m_pass_index_buffer = nullptr;
+	m_pass_blend_constant = -1;
+	m_pass_stencil_ref = UINT32_MAX;
+}
+
+void GSDeviceWebGPU::InvalidateBindState()
+{
+	m_pass_texture_group = nullptr;
+	m_pass_uniform_offset = UINT32_MAX;
+	for (WGPUBindGroup& g : m_pass_tfx_groups)
+		g = nullptr;
+	m_pass_tfx_offsets[0] = m_pass_tfx_offsets[1] = UINT32_MAX;
 }
 
 void GSDeviceWebGPU::EndRenderPass()
@@ -1082,6 +1152,8 @@ void GSDeviceWebGPU::EndRenderPass()
 	wgpuRenderPassEncoderRelease(m_pass);
 	m_pass = nullptr;
 	m_pass_rt = nullptr;
+	m_pass_ds = nullptr;
+	m_pass_stencil_clear = -1;
 	m_pass_is_present = false;
 	InvalidatePassState();
 }
@@ -1118,6 +1190,7 @@ void GSDeviceWebGPU::BeginRenderPass(GSTextureWebGPU* rt, WGPULoadOp load_op, co
 	rp.colorAttachments = &ca;
 	m_pass = wgpuCommandEncoderBeginRenderPass(GetCommandEncoder(), &rp);
 	m_pass_rt = rt;
+	m_pass_ds = nullptr;
 	m_pass_is_present = false;
 	m_pass_size = rt->GetSize();
 	rt->SetUseSerial(m_encoder_serial);
@@ -1159,15 +1232,11 @@ void GSDeviceWebGPU::CommitClear(GSTextureWebGPU* tex)
 	if (tex->GetState() != GSTexture::State::Cleared)
 		return;
 
-	if (tex->IsDepthStencil())
-	{
-		// Depth targets only come with the HW renderer (step 2); drop the clear there.
-		tex->SetState(GSTexture::State::Dirty);
-		return;
-	}
-
 	const bool was_present = m_pass && m_pass_is_present;
-	BeginRenderPass(tex, WGPULoadOp_Clear, tex->GetUNormClearColor());
+	if (tex->IsDepthStencil())
+		BeginAttachmentPass(nullptr, tex);
+	else
+		BeginRenderPass(tex, WGPULoadOp_Clear, tex->GetUNormClearColor());
 	EndRenderPass();
 	if (was_present)
 		EnsurePresentPass();
@@ -1223,8 +1292,9 @@ void GSDeviceWebGPU::OnTextureDestroyed(GSTextureWebGPU* tex, WGPUTexture textur
 {
 	if (m_want_texture == tex)
 		m_want_texture = nullptr;
-	if (m_pass_rt == tex)
+	if (m_pass_rt == tex || m_pass_ds == tex)
 		EndRenderPass();
+	DropTFXGroupsUsing(views);
 	for (WGPUBindGroup g : groups)
 	{
 		if (g && g == m_pass_texture_group)
@@ -1313,12 +1383,13 @@ bool GSDeviceWebGPU::ApplyUtilityState(u32 vertex_bytes, u32 vertex_stride, u32 
 	if (!fits)
 	{
 		GSTextureWebGPU* const rt = m_pass_rt;
+		GSTextureWebGPU* const ds = m_pass_ds;
 		const bool present = m_pass_is_present;
 		ExecuteCommandBuffer("stream buffer full");
 		if (present)
 			BeginPresentPass(WGPULoadOp_Load);
 		else
-			BeginRenderPass(rt, WGPULoadOp_Load, GSVector4::zero());
+			BeginAttachmentPass(rt, ds);
 		if (!m_vertex_buffer.ReserveMemory(vertex_bytes, vertex_stride) ||
 			!m_uniform_buffer.ReserveMemory(UNIFORM_SLOT_SIZE, UNIFORM_SLOT_SIZE) ||
 			(index_bytes != 0 && !m_index_buffer.ReserveMemory(index_bytes, 4)))
@@ -1342,6 +1413,8 @@ bool GSDeviceWebGPU::ApplyUtilityState(u32 vertex_bytes, u32 vertex_stride, u32 
 	{
 		wgpuRenderPassEncoderSetBindGroup(m_pass, 0, m_utility_cb_bg, 1, &uniform_offset);
 		m_pass_uniform_offset = uniform_offset;
+		m_pass_tfx_groups[0] = nullptr;
+		m_pass_tfx_offsets[0] = m_pass_tfx_offsets[1] = UINT32_MAX;
 	}
 
 	WGPUBindGroup group = m_want_texture->GetUtilityBindGroup(m_want_kind);
@@ -1350,6 +1423,7 @@ bool GSDeviceWebGPU::ApplyUtilityState(u32 vertex_bytes, u32 vertex_stride, u32 
 	{
 		wgpuRenderPassEncoderSetBindGroup(m_pass, 1, group, 0, nullptr);
 		m_pass_texture_group = group;
+		m_pass_tfx_groups[1] = nullptr;
 	}
 
 	if (!m_pass_vertex_bound)
@@ -1357,11 +1431,16 @@ bool GSDeviceWebGPU::ApplyUtilityState(u32 vertex_bytes, u32 vertex_stride, u32 
 		wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, m_vertex_buffer.GetBuffer(), 0, m_vertex_buffer.GetSize());
 		m_pass_vertex_bound = true;
 	}
-	if (index_bytes != 0 && !m_pass_index_bound)
+	if (m_pass_ds && m_pass_ds->GetNativeFormat() == WGPUTextureFormat_Depth32FloatStencil8 && m_pass_stencil_ref != 1)
+	{
+		wgpuRenderPassEncoderSetStencilReference(m_pass, 1); // the DATM shaders write 1
+		m_pass_stencil_ref = 1;
+	}
+	if (index_bytes != 0 && m_pass_index_buffer != m_index_buffer.GetBuffer())
 	{
 		wgpuRenderPassEncoderSetIndexBuffer(m_pass, m_index_buffer.GetBuffer(), WGPUIndexFormat_Uint16, 0,
 			m_index_buffer.GetSize());
-		m_pass_index_bound = true;
+		m_pass_index_buffer = m_index_buffer.GetBuffer();
 	}
 
 	return true;
@@ -1430,7 +1509,18 @@ void GSDeviceWebGPU::DoUtilityStretchRect(GSTextureWebGPU* sTex, const GSVector4
 
 	const GSVector4i dtex_rc = dTex->GetRect();
 	const GSVector4i dst_rc = GSVector4i(dRect).rintersect(dtex_rc);
-	if (!m_pass || m_pass_rt != dTex || dTex->GetState() != GSTexture::State::Dirty)
+	if (dTex->IsDepthStencil())
+	{
+		// Depth or stencil output: a pass on the depth attachment alone. A draw over the whole target
+		// needs nothing loaded.
+		if (!m_pass || m_pass_rt || m_pass_ds != dTex || dTex->GetState() != GSTexture::State::Dirty || m_pass_stencil_clear >= 0)
+		{
+			if (allow_discard && dst_rc.eq(dtex_rc))
+				dTex->SetState(GSTexture::State::Invalidated);
+			BeginAttachmentPass(nullptr, dTex);
+		}
+	}
+	else if (!IsColorOnlyPass(dTex) || dTex->GetState() != GSTexture::State::Dirty)
 	{
 		GSVector4 clear_color = GSVector4::zero();
 		const WGPULoadOp load_op = (allow_discard && dst_rc.eq(dtex_rc)) ? WGPULoadOp_Clear : LoadOpFor(dTex, &clear_color);
@@ -1616,15 +1706,21 @@ void GSDeviceWebGPU::CopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i
 	const GSVector4i dst_rect(0, 0, d->GetWidth(), d->GetHeight());
 	const bool full_draw_copy = dst_rect.eq(r) && destX == 0 && destY == 0;
 
-	// Depth copies must cover whole subresources (§2); the partial ones come with step 2.
+	// Depth copies must cover whole subresources (§2): a partial one is a DEPTH_COPY draw instead.
 	if ((s->IsDepthStencil() || d->IsDepthStencil()) && !(full_draw_copy && s->GetSize() == d->GetSize()))
 	{
-		static bool warned = false;
-		if (!warned)
+		if (!s->IsDepthStencil() || !d->IsDepthStencil() || s == d)
 		{
-			Console.Warning("WebGPU: partial depth copies are not implemented yet.");
-			warned = true;
+			static bool warned = false;
+			if (!std::exchange(warned, true))
+				Console.Warning("WebGPU: a copy between depth and colour (or within one depth texture) was skipped.");
+			return;
 		}
+		const GSVector4 src_rect = GSVector4(r) / GSVector4(s->GetSize()).xyxy();
+		const GSVector4 dst_rect = GSVector4(GSVector4i(destX, destY, destX + r.width(), destY + r.height()));
+		if (d->GetState() == GSTexture::State::Cleared)
+			d->CommitClear();
+		StretchRect(sTex, src_rect, dTex, dst_rect, ShaderConvert::DEPTH_COPY, Nearest);
 		return;
 	}
 
@@ -1671,13 +1767,16 @@ void GSDeviceWebGPU::DoStretchRect(GSTexture* sTex, const GSVector4& sRect, GSTe
 {
 	pxAssert(dTex);
 	GSTextureWebGPU* const d = static_cast<GSTextureWebGPU*>(dTex);
+	// Callers name depth-like shaders without the depth-output flag; a depth target means frag_depth.
+	if (d->IsDepthStencil() && shader.Float32Output())
+		shader = shader.SetDepthOutput(true);
 	const UtilityPipelineKey key = ConvertPipelineKey(shader, d->GetNativeFormat());
-	if (key.module >= MODULE_COUNT || d->IsDepthStencil())
+	if (d->IsDepthStencil() != (shader.DepthOutput() || shader.StencilOutput()))
 	{
 		static bool warned = false;
 		if (!warned)
 		{
-			Console.WarningFmt("WebGPU: {} into a depth or stencil target is not implemented yet.", shader.Name());
+			Console.WarningFmt("WebGPU: {} does not match its target's kind (depth or colour); skipped.", shader.Name());
 			warned = true;
 		}
 		return;
@@ -1888,51 +1987,6 @@ bool GSDeviceWebGPU::DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only,
 }
 
 // ----------------------------------------------------------------------------
-// HW renderer paths (step 2): the HW renderer cannot select this device yet
-// ----------------------------------------------------------------------------
-
-static void WarnNotImplemented(const char* what)
-{
-	Console.ErrorFmt("WebGPU: {} is not implemented yet (HW renderer, step 2).", what);
-}
-
-void GSDeviceWebGPU::UpdateCLUTTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, GSTexture* dTex,
-	u32 dOffset, u32 dSize)
-{
-	static bool warned = false;
-	if (!std::exchange(warned, true))
-		WarnNotImplemented("UpdateCLUTTexture");
-}
-
-void GSDeviceWebGPU::ConvertToIndexedTexture(GSTexture* sTex, float sScale, u32 offsetX, u32 offsetY, u32 SBW,
-	u32 SPSM, GSTexture* dTex, u32 DBW, u32 DPSM)
-{
-	static bool warned = false;
-	if (!std::exchange(warned, true))
-		WarnNotImplemented("ConvertToIndexedTexture");
-}
-
-void GSDeviceWebGPU::FilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex, u32 downsample_factor,
-	const GSVector2i& clamp_min, const GSVector4& dRect)
-{
-	static bool warned = false;
-	if (!std::exchange(warned, true))
-		WarnNotImplemented("FilteredDownsampleTexture");
-}
-
-void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
-{
-	static bool warned = false;
-	if (!std::exchange(warned, true))
-		WarnNotImplemented("RenderHW");
-}
-
-void GSDeviceWebGPU::ClearSamplerCache()
-{
-	// Only the HW renderer's samplers change; the utility point and linear samplers stay.
-}
-
-// ----------------------------------------------------------------------------
 // Presenting
 // ----------------------------------------------------------------------------
 
@@ -2032,6 +2086,15 @@ void GSDeviceWebGPU::EndPresent()
 		WebGPUHost::PostFrame(static_cast<u32>(PerformanceMetrics::GetFrameNumber()) + 1);
 
 	KeepEventLoopTurning();
+
+	// HW renderer statistics every 600 presents (step 2's per-frame counters, §15).
+	if (m_hw_draws && (++m_presents % 600) == 0)
+	{
+		Console.WriteLnFmt("WebGPU HW: {} draws so far, {} TFX pipelines, {} vertex and {} fragment modules, {} skipped draws, "
+						   "{} bind groups.",
+			m_hw_draws, m_tfx_pipelines.size(), m_tfx_vs_modules.size(), m_tfx_fs_modules.size(), m_skipped_draws,
+			m_tfx_groups[1].size() + m_tfx_groups[2].size());
+	}
 }
 
 void GSDeviceWebGPU::KeepEventLoopTurning()

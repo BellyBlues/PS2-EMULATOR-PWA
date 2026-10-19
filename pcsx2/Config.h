@@ -278,6 +278,10 @@ enum class GSRendererType : s8
 	VK = 14,
 	Metal = 17,
 	DX12 = 15,
+#ifdef __EMSCRIPTEN__
+	// TabStationToo: the HW renderer on the WebGPU device; clear of upstream's numbers.
+	WebGPU = 32,
+#endif
 };
 
 enum class GSVSyncMode : u8

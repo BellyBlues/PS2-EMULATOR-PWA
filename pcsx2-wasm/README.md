@@ -167,6 +167,7 @@ Switches for comparisons and tests (all optional):
 | Query | Effect |
 | --- | --- |
 | `?gpu=0` | No WebGPU: the GS presents through its in-memory device and the page draws on a 2D canvas |
+| `?renderer=hw` | Draws with PCSX2's hardware renderer on the WebGPU device (`?renderer=sw`: the software renderer, the default). Without a WebGPU device the GS uses the software renderer |
 | `?set=Section/Key=Value` | Overrides one setting after the defaults (repeatable), e.g. `?set=EmuCore/GS/deinterlace_mode=2` |
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |

@@ -696,6 +696,9 @@ const char* Pcsx2Config::GSOptions::GetRendererName(GSRendererType type)
 		case GSRendererType::VK:    return "Vulkan";
 		case GSRendererType::SW:    return "Software";
 		case GSRendererType::Null:  return "Null";
+#ifdef __EMSCRIPTEN__
+		case GSRendererType::WebGPU: return "WebGPU";
+#endif
 		default:                    return "";
 			// clang-format on
 	}
