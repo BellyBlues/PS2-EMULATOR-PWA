@@ -512,6 +512,8 @@ The PS2 has two pad ports. Each device the page can play with (the keyboard, and
 
 **Which port.** The first two gamepads that connect take Player 1 and Player 2 (a first gamepad starts on the port saved as `pcsx2web.padFirst`, the second on the other one); a third and later one is not used. The keyboard starts on the port saved as `pcsx2web.padKeyboard` (default Player 1). Defaults: keyboard Player 1, first gamepad Player 1, second gamepad Player 2. A gamepad that was unplugged and plugged in again takes its port back within the visit. Per-device memory is not kept: two identical gamepads share one `id`.
 
+**Looking at a gamepad.** The Gamepad API has no button events, so the page looks at each gamepad's state 125 times a second (every 8 ms), not once per animation frame, and a button seen pressed counts as pressed for at least 50 ms, so that a tap shorter than one look still shows in the Gamepad tab and reaches the PS2. Sticks and triggers follow the gamepad as it moves.
+
 **When it plays.** A gamepad plays while the PS2 runs, the page has focus and is visible, whatever the state of the keyboard capture (Esc, Tab and a focus on the drawer release only the keyboard). It lets go of everything on blur, a hidden tab, a disconnect, a stop, and when its player changes (what was held then has to be released and pressed again).
 
 **Keys drawer.** Two tabs (`role="tablist"`; Left and Right, Home and End move between them; focus ring as everywhere).

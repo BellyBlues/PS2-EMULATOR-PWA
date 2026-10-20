@@ -4190,6 +4190,14 @@
 	const TRIGGER_DEAD_ZONE = 0.05;
 	const STICK_STEPS = 127; // sticks change in steps of 1/127, so noise does not flood the queue
 	const MAX_GAMEPADS = 2;
+	// The Gamepad API has no button events: the page looks at the state. Once per animation frame can miss
+	// a quick tap (and a busy page draws fewer frames than the display has), so it looks 125 times a second,
+	// and a button seen pressed stays pressed for at least GAMEPAD_TAP_MS, so that even a tap shorter than
+	// one look shows in the Gamepad tab and reaches the PS2.
+	const GAMEPAD_POLL_MS = 8;
+	const GAMEPAD_TAP_MS = 50;
+	const PAD_BUTTON_COUNT = 17; // the PAD_INPUTS before the stick halves
+	const VIEW_REFRESH_MS = 16;
 
 	const players = {
 		keyboard: readPref(PREF_PAD_KEYBOARD) === '2' ? 2 : 1, // PS2 port 1 or 2
@@ -4340,6 +4348,9 @@
 				state: new Float32Array(PAD_INPUTS.length), // what the PS2 gets
 				raw: new Float32Array(PAD_INPUTS.length), // what the gamepad holds
 				needsNeutral: true,
+				latch: new Float32Array(PAD_INPUTS.length), // the value a button was last seen at ...
+				latchUntil: new Float64Array(PAD_INPUTS.length), // ... and until when it counts as pressed
+				viewAt: 0,
 				view: null,
 			};
 			gamepads.set(gp.index, g);
@@ -4380,9 +4391,10 @@
 	}
 
 	function pollGamepads() {
-		gamepadLoop = 0;
-		if (!navigator.getGamepads)
+		if (!navigator.getGamepads) {
+			stopGamepadLoop();
 			return;
+		}
 		const list = navigator.getGamepads();
 		const live = gamepadsLive();
 		for (const gp of list) {
@@ -4402,10 +4414,21 @@
 			any = true;
 			const raw = g.raw;
 			readGamepad(gp, raw, g);
+			const now = performance.now();
+			for (let i = 0; i < PAD_BUTTON_COUNT; i++) {
+				if (raw[i] > 0) {
+					g.latch[i] = raw[i];
+					g.latchUntil[i] = now + GAMEPAD_TAP_MS;
+				} else if (now < g.latchUntil[i]) {
+					raw[i] = g.latch[i];
+				}
+			}
 			if (g.mapper)
-				mapperFrame(g, gp, performance.now());
-			if (g.view)
+				mapperFrame(g, gp, now);
+			if (g.view && now - g.viewAt >= VIEW_REFRESH_MS) {
+				g.viewAt = now;
 				updateGamepadView(g);
+			}
 			const idle = !raw.some((v) => v > 0);
 			if (idle)
 				g.needsNeutral = false;
@@ -4418,18 +4441,18 @@
 		}
 		if (changed)
 			syncPads();
-		if (any)
-			startGamepadLoop();
+		if (!any)
+			stopGamepadLoop(); // the next gamepadconnected event starts it again
 	}
 
 	function startGamepadLoop() {
 		if (!gamepadLoop && document.visibilityState === 'visible')
-			gamepadLoop = requestAnimationFrame(pollGamepads);
+			gamepadLoop = setInterval(pollGamepads, GAMEPAD_POLL_MS);
 	}
 
 	function stopGamepadLoop() {
 		if (gamepadLoop) {
-			cancelAnimationFrame(gamepadLoop);
+			clearInterval(gamepadLoop);
 			gamepadLoop = 0;
 		}
 	}

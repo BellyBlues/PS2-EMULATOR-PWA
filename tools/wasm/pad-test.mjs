@@ -78,6 +78,18 @@ const TEST = `(async () => {
 	set(gps[0], 0, 0); set(gps[0], 6, 0); gps[0].axes = [0, 0, 0, 0];
 	await wait(500);
 	r['gamepad: released'] = only(state(0), {});
+	// A tap shorter than a display frame: the page looks 125 times a second and holds a press for 50 ms.
+	set(gps[0], 0, 1);
+	await wait(20);
+	set(gps[0], 0, 0);
+	let tapSeen = false;
+	for (let t = 0; t < 400 && !tapSeen; t += 4) {
+		tapSeen = !!state(0).Cross;
+		await wait(4);
+	}
+	r['a 20 ms tap on a gamepad reaches the PS2'] = tapSeen;
+	await wait(300);
+	r['the tap lets go again'] = only(state(0), {});
 
 	key('keydown', 'KeyK', 'k'); key('keydown', 'KeyW', 'w');
 	await wait(400);
