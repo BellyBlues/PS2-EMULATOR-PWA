@@ -22,6 +22,13 @@
 #include "wasm/CodeWrites.h"
 #endif
 
+#ifdef __EMSCRIPTEN__
+// How long MTGS spins for a VU1 program's XGKICK before it sleeps (see Command::MTVUGSPacket).
+static constexpr int XGKICK_SPIN_MIN = 256;
+static constexpr int XGKICK_SPIN_MAX = 32768;
+static int s_xgkick_spins = XGKICK_SPIN_MAX;
+#endif
+
 // Uncomment this to enable profiling of the GS RingBufferCopy function.
 //#define PCSX2_GSRING_SAMPLING_STATS
 
@@ -473,8 +480,22 @@ void MTGS::MainLoop()
 					if (!vu1Thread.semaXGkick.TryWait())
 					{
 						mtvu_lock.unlock();
+						bool kicked = false;
+#ifdef __EMSCRIPTEN__
+						// A VU1 program usually ends within microseconds, and waking a sleeping MTGS costs the
+						// VU thread a call to JS (Atomics.notify) per program, 13 % of its time in the crowd
+						// benchmark: spin first, so its Post() finds no sleeper (100 figures in Chrome: 102-104 %
+						// -> 104-110 %). The spin grows while it catches kicks and halves when it ends up
+						// sleeping anyway, so long VU1 programs or a busy machine do not cost a spinning core.
+						int spins = s_xgkick_spins;
+						while (spins > 0 && !(kicked = vu1Thread.semaXGkick.TryWait()))
+							spins--;
+						s_xgkick_spins = kicked ? std::min(XGKICK_SPIN_MAX, s_xgkick_spins + s_xgkick_spins / 8 + 64) :
+						                          std::max(XGKICK_SPIN_MIN, s_xgkick_spins / 2);
+#endif
 						// Wait for MTVU to complete vu1 program
-						vu1Thread.semaXGkick.Wait();
+						if (!kicked)
+							vu1Thread.semaXGkick.Wait();
 						mtvu_lock.lock();
 					}
 					Gif_Path& path = gifUnit.gifPath[GIF_PATH_1];
