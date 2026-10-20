@@ -2326,6 +2326,12 @@ void VMManager::Internal::Throttle(bool vsync_start)
 		return;
 	}
 
+#ifdef __EMSCRIPTEN__
+	// Waiting for the frame's time is not work: keep it out of the CPU thread's usage (thread usage on
+	// wasm is wall time minus waits, see Threading::ScopedWaitTimer).
+	Threading::ScopedWaitTimer limiter_wait;
+#endif
+
 	// Conversion of delta from CPU ticks (microseconds) to milliseconds
 	const s32 msec = static_cast<s32>((sDeltaTime * -1000) / static_cast<s64>(GetTickFrequency()));
 

@@ -147,6 +147,9 @@
 	// surface size.
 	const CAPTURE_FRAMES = (params.get('capture') || '').split(',').map(Number).filter((n) => n > 0);
 	const TEST_SURFACE = /^(\d+)x(\d+)$/.exec(params.get('surface') || '');
+	// Developers: ?threads=1 adds how busy the EE, GS and VU1 threads are to the readout, so the limiting
+	// thread can be read without the browser's developer tools (opening them slows WebAssembly down).
+	const SHOW_THREADS = params.get('threads') === '1';
 	const FRAME_PORT_TIMEOUT_MS = 5000;
 	const LATENCY_SAMPLES = 600;
 	const VU1JIT_PARAM = params.get('vu1jit');
@@ -296,6 +299,7 @@
 		rRest: $('r-rest'),
 		rVps: $('r-vps'),
 		rFps: $('r-fps'),
+		rThreads: $('r-threads'),
 		rFrame: $('r-frame'),
 		transport: $('transport'),
 		btnStop: $('btn-stop'),
@@ -832,6 +836,7 @@
 			state: () => M._pcsx2web_state(),
 			speed: () => M._pcsx2web_speed(),
 			vps: () => M._pcsx2web_vps(),
+			threadUsage: (i) => (M._pcsx2web_thread_usage ? M._pcsx2web_thread_usage(i) : 0),
 			keyCode: (name) => M.ccall('pcsx2web_key_code', 'number', ['string'], [name]),
 			key: (code, pressed) => M._pcsx2web_key(code, pressed ? 1 : 0),
 			padInput: (name) => M.ccall('pcsx2web_pad_input', 'number', ['string'], [name]),
@@ -1359,6 +1364,8 @@
 
 		page.speed = Number.isFinite(speed) ? speed : 0;
 		page.vps = Number.isFinite(vps) ? vps : 0;
+		if (SHOW_THREADS)
+			page.threads = [0, 1, 2].map((i) => api.threadUsage(i));
 
 		const prev = page.vmState;
 		if (state !== prev)
@@ -7382,6 +7389,9 @@
 		setText(els.rSpeed, `${Math.round(page.speed)}%`);
 		setText(els.rVps, page.vps.toFixed(1));
 		setText(els.rFps, page.displayFps.toFixed(0));
+		els.rThreads.hidden = !SHOW_THREADS;
+		if (SHOW_THREADS && page.threads)
+			setText(els.rThreads, `  EE ${page.threads[0].toFixed(0)}%  GS ${page.threads[1].toFixed(0)}%  VU ${page.threads[2].toFixed(0)}% busy`);
 		setText(els.rFrame, frame.width ? `, frame ${frame.width} by ${frame.height}` : '');
 	}
 

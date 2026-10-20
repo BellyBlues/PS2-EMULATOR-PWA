@@ -185,6 +185,7 @@ Switches for comparisons and tests (all optional):
 | `?renderer=sw` | Draws with PCSX2's software renderer instead of the hardware renderer on the WebGPU device (the default, `?renderer=hw`). Without a WebGPU device the GS uses the software renderer |
 | `?set=Section/Key=Value` | Overrides one setting after the defaults (repeatable), e.g. `?set=EmuCore/GS/deinterlace_mode=2` |
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
+| `?threads=1` | Adds how busy the EE, GS and VU1 threads are to the speed readout (`pcsx2web_thread_usage()`), to see which one limits a game without the developer tools, which slow WebAssembly down a lot while open |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |
 | `?eejit=0` | Runs the EE (main CPU) interpreter instead of the EE JIT, which compiles EE code to WebAssembly at run time |
 | `?iopjit=0` | Runs the IOP (I/O processor) interpreter instead of the IOP JIT, which compiles IOP code to WebAssembly at run time |
