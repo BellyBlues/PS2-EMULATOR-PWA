@@ -4,20 +4,25 @@
 games load it: no menu, no input, always the same frames. It draws a crowd of animated figures
 on a floor, each the way a game draws a character, with the work games do around them:
 
-- the EE runs per-figure game logic (24 dust particles, two path searches on a 32 x 32 grid),
+- the EE runs per-figure game logic (24 dust particles, a path search on a 16 x 16 grid),
   poses a 15-bone skeleton per figure (matrix products in VU0 macro mode) and builds one VIF1
   DMA chain per frame;
 - VU1 (`bench_vu1.vsm`) transforms, lights and projects every vertex and sends it to the GS
   with XGKICK: textured, Gouraud-shaded, Z-buffered triangle strips, with a see-through shadow
-  under each figure. A figure is about 2,900 triangles; the floor is 512;
+  under each figure. A figure is about 1,100 triangles (72 per limb, like a crowd character); the
+  floor is 512. The VU1 code is paired and software-pipelined like a game's, so 100 figures still
+  fit in one frame on a PS2;
 - each figure switches to its own palette of an 8-bit texture (a CLUT load) through PATH2, and its
   dust is drawn as sprites the EE positioned;
 - the texture and its four palettes are uploaded again every frame through PATH3;
 - a glow pass renders the frame into a half-size target, blurs it twice and adds it back
   (render-to-texture, as games do for glow and blur).
 
-The number of figures steps through 1, 2, 4, 8 and 16, 400 frames each, then starts again. At each
-step the program prints `BENCH phase N=<figures> frame=<frame>`. It draws at most one frame per
+The number of figures steps through 1, 25, 50, 75 and 100, 300 frames each, then starts again. At
+each step the program prints `BENCH phase N=<figures> frame=<frame>`, and at the end of a phase
+`BENCH load ...`: how many vsyncs a frame took and how the EE's time split between building
+frames, waiting for VU1 and the GS, and waiting for vsync (from its cycle counter). One vsync per
+frame means a PS2 keeps up; the emulator then has to do all of the phase's work every vsync. It draws at most one frame per
 vsync and sleeps on interrupts while it waits, like a game, so with the frame limiter off the
 emulator's speed shows how much faster than a PS2 it runs; with it on, anything under 100 % is
 what a player would see as slowdown.

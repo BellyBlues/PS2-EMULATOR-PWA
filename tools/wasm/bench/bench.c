@@ -43,14 +43,14 @@ extern u32 BenchVU1_CodeEnd __attribute__((section(".vudata")));
 #define GLOW_H 256
 #define OFFSET_X (2048 - SCREEN_W / 2)
 #define OFFSET_Y (2048 - SCREEN_H / 2)
-#define MAX_FIGURES 16
-#define PHASE_FRAMES 400
-static const int PHASE_COUNTS[] = {1, 2, 4, 8, 16};
+#define MAX_FIGURES 100
+#define PHASE_FRAMES 300
+static const int PHASE_COUNTS[] = {1, 25, 50, 75, 100};
 #define PHASE_TOTAL ((int)(sizeof(PHASE_COUNTS) / sizeof(PHASE_COUNTS[0])))
 
-// VU1 memory: two buffers of 496 quadwords from address 8. A batch needs 9 header quadwords,
-// 3 per input vertex, 1 for the GIF tag and 3 per output vertex.
-#define VU_HEADER_QW 9
+// VU1 memory: two buffers of 496 quadwords from address 8. A batch needs 11 header quadwords,
+// 3 per input vertex, a 3-quadword gap, 1 for the GIF tag and 3 per output vertex.
+#define VU_HEADER_QW 11
 #define MAX_BATCH_VERTS 80
 #define MAX_BATCHES 16
 
@@ -61,7 +61,7 @@ static const int PHASE_COUNTS[] = {1, 2, 4, 8, 16};
 #define FOCAL_Y 591.0f // PAL pixels are taller than wide
 
 #define PARTICLES 24
-#define GRID 32
+#define GRID 16
 
 typedef struct
 {
@@ -111,8 +111,9 @@ static const bone_t SKELETON[] = {
 static const int PALETTE_HUES[4][3] = {{255, 140, 70}, {80, 170, 255}, {230, 220, 90}, {190, 100, 240}};
 
 // Per-frame data the DMA chain points at, one set per frame in flight.
-// Each block: colour, light, screen offset, matrix (7 quadwords, VU1 addresses 2 to 8).
-#define BLOCK_QW 7
+// Each block: ambient colour, three light rows, screen offset, matrix (9 quadwords, VU1
+// addresses 2 to 10).
+#define BLOCK_QW 9
 #define MAX_BLOCKS (MAX_FIGURES * (BONES + 1) + 1)
 // Per figure, GIF packets sent through PATH2: the texture switch (3 quadwords) and the dust.
 #define DIRECT_QW_PER_FIGURE (3 + 1 + 3 * PARTICLES)
@@ -269,10 +270,10 @@ static void mesh_finish(mesh_t* m)
 	FlushCache(0);
 }
 
-// A unit sphere as 8 latitude strips of 12 segments: 192 triangles.
+// A unit sphere as 4 latitude strips of 9 segments: 72 triangles, 80 vertices (one VU1 batch).
 static void build_ellipsoid(void)
 {
-	const int bands = 8, segments = 12;
+	const int bands = 4, segments = 9;
 	mesh_builder_t b;
 	mesh_begin(&b, &s_ellipsoid);
 	for (int band = 0; band < bands; band++)
@@ -296,7 +297,7 @@ static void build_ellipsoid(void)
 static void build_floor(void)
 {
 	const int tiles = 16;
-	const float x0 = -4.5f, x1 = 4.5f, z0 = -2.5f, z1 = 7.5f;
+	const float x0 = -6.0f, x1 = 6.0f, z0 = -3.0f, z1 = 11.0f;
 	mesh_builder_t b;
 	mesh_begin(&b, &s_floor);
 	for (int row = 0; row < tiles; row++)
@@ -341,9 +342,9 @@ static void matrix_rotation_xy(MATRIX m, float ax, float ay, const float* transl
 
 static void build_view_screen(void)
 {
-	// Camera at (0, 1.9, -5) looking at (0, 0.9, 3).
-	const float eye[3] = {0.0f, 1.9f, -5.0f};
-	const float pitch = atan2f(1.0f, 8.0f);
+	// Camera at (0, 1.9, -6.5) looking at (0, 0.9, 4).
+	const float eye[3] = {0.0f, 1.9f, -6.5f};
+	const float pitch = atan2f(1.0f, 10.5f);
 	MATRIX translate, rotate, screen, view;
 	matrix_unit(translate);
 	translate[12] = -eye[0];
@@ -425,7 +426,7 @@ static void particles_step(int figure, const float* pos)
 
 static int grid_cell(float x, float z)
 {
-	int gx = (int)((x + 4.5f) / 9.0f * GRID), gz = (int)((z + 2.5f) / 10.0f * GRID);
+	int gx = (int)((x + 6.0f) / 12.0f * GRID), gz = (int)((z + 3.0f) / 14.0f * GRID);
 	gx = gx < 0 ? 0 : (gx >= GRID ? GRID - 1 : gx);
 	gz = gz < 0 ? 0 : (gz >= GRID ? GRID - 1 : gz);
 	return gz * GRID + gx;
@@ -477,26 +478,25 @@ static void block_crowd(int figures, int frame)
 static void block_fill(qword_t* q, const float* colour, float alpha, const MATRIX bone_world, const MATRIX local_screen, float ambient)
 {
 	float* f = (float*)q;
-	f[0] = colour[0];
-	f[1] = colour[1];
-	f[2] = colour[2];
+	for (int c = 0; c < 3; c++)
+		f[c] = colour[c] * ambient;
 	f[3] = alpha;
-	if (bone_world)
+	// The light in the bone's space (rows of the bone's rotation dotted with the light), each
+	// component times the base colour: VU1 adds them up per vertex, weighted by the normal.
+	for (int i = 0; i < 3; i++)
 	{
-		// The light in the bone's space: rows of the bone's rotation dotted with the light.
-		for (int i = 0; i < 3; i++)
-			f[4 + i] = bone_world[4 * i] * s_light[0] + bone_world[4 * i + 1] * s_light[1] + bone_world[4 * i + 2] * s_light[2];
+		const float l = bone_world ? bone_world[4 * i] * s_light[0] + bone_world[4 * i + 1] * s_light[1] +
+										 bone_world[4 * i + 2] * s_light[2] :
+									 0.0f;
+		for (int c = 0; c < 3; c++)
+			f[4 + 4 * i + c] = colour[c] * l;
+		f[4 + 4 * i + 3] = 0.0f;
 	}
-	else
-	{
-		f[4] = f[5] = f[6] = 0.0f;
-	}
-	f[7] = ambient;
-	f[8] = 2048.0f;
-	f[9] = 2048.0f;
-	f[10] = 0.0f;
-	f[11] = 0.0f;
-	memcpy(f + 12, local_screen, sizeof(MATRIX));
+	f[16] = 2048.0f;
+	f[17] = 2048.0f;
+	f[18] = 0.0f;
+	f[19] = 0.0f;
+	memcpy(f + 20, local_screen, sizeof(MATRIX));
 }
 
 static void chain_mesh(packet2_t* chain, const mesh_t* mesh, int kind, qword_t* block)
@@ -504,7 +504,7 @@ static void chain_mesh(packet2_t* chain, const mesh_t* mesh, int kind, qword_t* 
 	for (int i = 0; i < mesh->batches; i++)
 	{
 		packet2_utils_vu_add_unpack_data(chain, 0, mesh->tags[kind] + 2 * i, 2, 1);
-		packet2_utils_vu_add_unpack_data(chain, 2, block, 7, 1);
+		packet2_utils_vu_add_unpack_data(chain, 2, block, BLOCK_QW, 1);
 		packet2_utils_vu_add_unpack_data(chain, VU_HEADER_QW, mesh->data[i], 3 * mesh->verts[i], 1);
 		packet2_chain_open_cnt(chain, 0, 0, 0);
 		packet2_vif_nop(chain, 0);
@@ -526,14 +526,14 @@ static void chain_direct(packet2_t* chain, qword_t* data, int qwc)
 	packet2_vif_close_direct_manual(chain, qwc);
 }
 
-// Figure slots: a 4 x 4 crowd, filled front row first, middle columns first.
+// Figure slots: a 10 x 10 crowd, filled front row first, middle columns first.
 static void figure_position(int index, float* out)
 {
-	static const int column_order[4] = {1, 2, 0, 3};
-	const int row = index / 4, col = column_order[index % 4];
-	out[0] = (col - 1.5f) * 1.3f;
+	static const int column_order[10] = {4, 5, 3, 6, 2, 7, 1, 8, 0, 9};
+	const int row = index / 10, col = column_order[index % 10];
+	out[0] = (col - 4.5f) * 0.62f;
 	out[1] = 0.0f;
-	out[2] = row * 1.6f;
+	out[2] = row * 0.9f;
 }
 
 static qword_t* figure_texture(qword_t* q, int figure)
@@ -611,12 +611,11 @@ static void build_frame(int ctx, int frame, int figures, int target)
 		figure_position(f, pos);
 		const float phase = f * 0.83f;
 
-		// Game logic: dust, and two path searches that nudge where the figure looks.
+		// Game logic: dust, and a path search that nudges where the figure looks.
 		particles_step(f, pos);
 		const int here = grid_cell(pos[0], pos[2]);
-		const int a = path_length(here, (frame * 7 + f * 131) % (GRID * GRID));
-		const int b = path_length(here, (GRID * GRID - 1) - (frame * 3 + f * 17) % (GRID * GRID));
-		const float facing = 3.1415927f + 0.6f * sinf(t * 0.7f + phase) + 0.002f * (float)((a + b) & 15);
+		const int steps = path_length(here, (frame * 7 + f * 131) % (GRID * GRID));
+		const float facing = 3.1415927f + 0.6f * sinf(t * 0.7f + phase) + 0.002f * (float)(steps & 15);
 
 		qword_t* texture_switch = direct;
 		direct = figure_texture(direct, f);
@@ -920,9 +919,11 @@ static void begin_gs_frame(int draw)
 // that the vblank and VIF1 DMA-end handlers signal, so the kernel's idle loop runs meanwhile.
 static int s_vsync_sema = -1;
 static int s_vif1_sema = -1;
+static volatile u32 s_vsyncs;
 
 static s32 vsync_handler(s32 cause)
 {
+	s_vsyncs++;
 	iSignalSema(s_vsync_sema);
 	ExitHandler();
 	return 0;
@@ -977,6 +978,35 @@ static void send_chain(packet2_t* chain)
 	dma_channel_send_packet2(chain, DMA_CHANNEL_VIF1, 0);
 }
 
+// The EE's cycle counter (COP0 Count), 294.912 MHz.
+static inline u32 ee_cycles(void)
+{
+	u32 c;
+	__asm__ __volatile__("mfc0 %0, $9" : "=r"(c));
+	return c;
+}
+
+// Where the EE's time went during a phase, printed when the phase ends: building frames (game
+// logic, skeletons, the DMA chain), waiting for VU1 and the GS to finish the previous frame, and
+// waiting for vsync. No vsync wait and more than one vsync per frame mean the phase asks more
+// than a PS2 can draw at 50 frames a second.
+typedef struct
+{
+	u32 frames, vsync_start;
+	u64 build, draw_wait, vsync_wait;
+} phase_load_t;
+
+static void print_load(int figures, const phase_load_t* load)
+{
+	const u32 vsyncs = s_vsyncs - load->vsync_start;
+	const u64 total = (u64)vsyncs * (294912000u / 50u);
+	if (!load->frames || !total)
+		return;
+	printf("BENCH load N=%d frames=%u vsyncs=%u (%u.%02u per frame) EE: build %u%%, waiting for VU1/GS %u%%, for vsync %u%%\n",
+		figures, load->frames, vsyncs, vsyncs / load->frames, (vsyncs * 100u / load->frames) % 100u,
+		(u32)(load->build * 100 / total), (u32)(load->draw_wait * 100 / total), (u32)(load->vsync_wait * 100 / total));
+}
+
 int main(int argc, char* argv[])
 {
 	printf("BENCH start: TabStationToo crowd benchmark, %d bones per figure\n", BONES);
@@ -1009,23 +1039,36 @@ int main(int argc, char* argv[])
 	FlushCache(0);
 
 	int ctx = 0, draw = 0, last_figures = 0;
+	phase_load_t load = {0};
 	for (int frame = 0;; frame++)
 	{
 		const int figures = PHASE_COUNTS[(frame / PHASE_FRAMES) % PHASE_TOTAL];
 		if (figures != last_figures)
 		{
+			if (last_figures)
+				print_load(last_figures, &load);
 			printf("BENCH phase N=%d frame=%d\n", figures, frame);
 			last_figures = figures;
+			memset(&load, 0, sizeof(load));
+			load.vsync_start = s_vsyncs;
 		}
 
 		// Build this frame while VU1 and the GS still draw the previous one.
+		const u32 c0 = ee_cycles();
 		build_frame(ctx, frame, figures, draw ^ 1);
 		update_palettes(frame);
 		FlushCache(0);
 
+		const u32 c1 = ee_cycles();
 		if (frame > 0)
 			wait_vif1_idle();
+		const u32 c2 = ee_cycles();
 		wait_vsync();
+		const u32 c3 = ee_cycles();
+		load.frames++;
+		load.build += c1 - c0;
+		load.draw_wait += c2 - c1;
+		load.vsync_wait += c3 - c2;
 		if (frame > 0)
 			graph_set_framebuffer_filtered(s_frame[draw].address, SCREEN_W, GS_PSM_32, 0, 0);
 		draw ^= 1;
