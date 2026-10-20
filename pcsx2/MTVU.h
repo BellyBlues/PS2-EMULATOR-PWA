@@ -24,6 +24,11 @@ class VU_Thread final {
 	alignas(__cachelinesize) std::atomic<int> m_ato_read_pos; // Only modified by VU thread
 	alignas(__cachelinesize) std::atomic<int> m_ato_write_pos;    // Only modified by EE thread
 	alignas(__cachelinesize) int  m_read_pos; // temporary read pos (local to the VU thread)
+#ifdef ARCH_WASM
+	// Not on m_read_pos's line: the VU thread writes that one at every Read(), the EE thread this one at every
+	// Write() and semaEvent at every KickStart(). (Would help desktop builds too; untested there.)
+	alignas(__cachelinesize)
+#endif
 	int  m_write_pos; // temporary write pos (local to the EE thread)
 	Threading::WorkSema semaEvent;
 	std::atomic_bool m_shutdown_flag{false};
@@ -46,6 +51,11 @@ public:
 		InterruptFlagVUTBit = 1 << 4,
 	};
 
+#ifdef ARCH_WASM
+	// Not on the line of vuCycles, vuCycleIdx and vuFBRST, which the VU thread writes for every program: the EE
+	// thread reads this at every event test (Get_MTVUChanges()).
+	alignas(__cachelinesize)
+#endif
 	std::atomic<u32> mtvuInterrupts; // Used for GS Signal, Finish etc, plus VU End/T-Bit
 	std::atomic<u64> gsLabel; // Used for GS Label command
 	std::atomic<u64> gsSignal; // Used for GS Signal command

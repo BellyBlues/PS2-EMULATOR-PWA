@@ -57,7 +57,9 @@ static constexpr bool IsDebugBuild = false;
 #endif
 #if defined(OVERRIDE_HOST_CACHE_LINE_SIZE)
 	static constexpr unsigned int __cachelinesize = OVERRIDE_HOST_CACHE_LINE_SIZE;
-#elif defined(ARCH_ARM64)
+#elif defined(ARCH_ARM64) || defined(ARCH_WASM)
+	// WebAssembly: the host may be an ARM64 machine with 128 byte lines (Apple Silicon); on x86 the adjacent line
+	// prefetcher pairs 64 byte lines, so 128 keeps threads apart there too.
 	static constexpr unsigned int __cachelinesize = 128;
 #else
 	static constexpr unsigned int __cachelinesize = 64;
