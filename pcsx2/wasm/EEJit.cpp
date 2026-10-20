@@ -12,9 +12,10 @@
 // - Cycles: every instruction adds its opcode table cycles times the Config.DIE factor to cpuBlockCycles before it
 //   runs, as execI() does. The sum is kept at compile time and written before anything that can read it.
 // - Branches: the delay slot runs with cpuRegs.branch set, then intJitBranchEnd() runs the interpreter's own branch
-//   end (wait loop skip, intUpdateCPUCycles(), the event test and the BIOS hooks); its usual case is inline, calling
-//   the event test only when an event is due (EmitBranchEnd()). Branches not taken run the interpreter's event test
-//   where it does (BEQ/BNE and the likely branches), also only when it has something to do.
+//   end (wait loop skip, intUpdateCPUCycles(), the event test and the BIOS hooks). Each module does its usual case
+//   in wasm and calls the event test only when an event is due (EmitBranchEndFunction()). Branches not taken run the
+//   interpreter's event test where it does (BEQ/BNE and the likely branches), also only when it has something to do.
+//   (Inline at each branch, the branch end made the code 45% larger and SpiderMonkey 20% slower.)
 // - Other instructions: ALU, shifts, HI/LO moves, multiplies, the aligned loads and stores of RAM/ROM/scratchpad and
 //   LDL/LDR/SDL/SDR there, and with VU0 idle the common COP2 ops (FMAC ops with their flags, moves, LQC2/SQC2,
 //   QMFC2/QMTC2, CFC2/CTC2) the FPU's moves, compares, BC1x branches and arithmetic (FPU.cpp's clamping and flags;
@@ -118,6 +119,12 @@ namespace
 
 	using BlockFn = int (*)();
 	constexpr u32 kAnyPc = 1; // Leave(): an exit to whatever cpuRegs.pc is
+
+	// Each module's first functions: the branch end and branch test (EmitBranchEndFunction() and
+	// EmitBranchTestFunction()), then its blocks, then the lookup (EmitLookup()).
+	constexpr u32 kFnBranchEnd = 0;
+	constexpr u32 kFnBranchTest = 1;
+	constexpr u32 kFnFirstBlock = 2;
 
 	struct Group
 	{
@@ -288,7 +295,6 @@ namespace
 			m_f = m_fn.local(ValType::I32);
 			m_v = m_fn.local(ValType::I64);
 			m_k = m_fn.local(ValType::I64);
-			m_w = m_fn.local(ValType::I32);
 		}
 
 		u32 m_next_pc = 0;
@@ -1833,164 +1839,18 @@ namespace
 			EmitInstruction(pc, code, d, true);
 		}
 
-		// intUpdateCPUCycles() with an EE cycle rate of 0: cpuRegs.cycle += max(cpuBlockCycles >> 3, 1), and
-		// cpuBlockCycles keeps its low 3 bits.
-		void EmitUpdateCycles()
-		{
-			Function& f = m_fn;
-			const u32 bc = Addr(intJitBlockCycles());
-			f.i32_const(0);
-			f.i32_const(0);
-			f.i64_load(Addr(&cpuRegs.cycle));
-			f.i32_const(0);
-			f.i32_load(bc);
-			f.i32_const(3);
-			f.i32_shr_u();
-			f.local_tee(m_w);
-			f.i32_const(1);
-			f.local_get(m_w);
-			f.select();
-			f.i64_extend_i32_u();
-			f.i64_add();
-			f.i64_store(Addr(&cpuRegs.cycle));
-			f.i32_const(0);
-			f.i32_const(0);
-			f.i32_load(bc);
-			f.i32_const(7);
-			f.i32_and();
-			f.i32_store(bc);
-		}
+		// intBranchTest() where the interpreter runs it (EmitBranchTestFunction()).
+		void EmitBranchTest() { m_fn.call(kFnBranchTest); }
 
-		// intBranchTest() (intJitBranchTest()), called only when it has something to do: the trace, an event due,
-		// or the BIOS hooks.
-		void EmitBranchTest()
+		// A taken branch after its delay slot, with cpuBlockCycles written: intJitBranchEnd(target)
+		// (EmitBranchEndFunction()). `target` is the branch target, or kAnyPc for m_j's.
+		void EmitBranchEnd(u32 target)
 		{
-			Function& f = m_fn;
-			f.i32_const(0);
-			f.i32_load8_u(Addr(&EEJit::g_trace));
-			f.i32_const(0);
-			f.i32_load8_u(Addr(intJitBiosHooksActive()));
-			f.i32_or();
-			f.i32_const(0);
-			f.i64_load(Addr(&cpuRegs.cycle));
-			f.i32_const(0);
-			f.i64_load(Addr(&cpuRegs.nextEventCycle));
-			f.i64_sub();
-			f.i64_const(0);
-			f.i64_ge_s();
-			f.i32_or();
-			f.if_();
-			CallVoid(FnIndex(&intJitBranchTest));
-			f.end();
-		}
-
-		// A taken branch after its delay slot (cpuBlockCycles written): intJitBranchEnd(target), inline in its usual
-		// case, the same steps in the same order. `target` is the branch target, or kAnyPc for m_j's; `pc_after` is
-		// cpuRegs.pc after the delay slot. intJitBranchEnd() itself runs when the delay slot took an exception
-		// (cpuRegs.branch is 0), with an EE cycle rate other than 0, with the BIOS hooks active, and on a wait loop
-		// (_doBranch_afterDelaySlot(): the same target as the last branch, with the WaitLoop speedhack) that may be
-		// skipped. The JIT only runs from intExecute(), so Cpu is the interpreter there.
-		void EmitBranchEnd(u32 target, u32 pc_after)
-		{
-			Function& f = m_fn;
-			const bool known = target != kAnyPc;
-			auto push_target = [&] {
-				if (known)
-					f.i32_const(static_cast<s32>(target));
-				else
-					f.local_get(m_j);
-			};
-			// A wait loop at a known target, inline when it cannot be skipped: a loop of more than 10 instructions,
-			// or whose first word has a physical pointer (PSM(target) != 0); not the BIOS idle loop at 0x81fc0.
-			const u32 span = pc_after - target;
-			const bool wait_inline = known && target != 0x81fc0 && span != 0;
-			const bool wait_psm = wait_inline && span < 4 * 10;
-			const u32 paddr = target & 0x1fffffff;
-
-			f.block(); // done
-			f.block(); // slow
-			f.i32_const(0);
-			f.i32_load(Addr(&cpuRegs.branch));
-			f.i32_eqz();
-			f.i32_const(0);
-			f.i32_load8_s(Addr(&EmuConfig.Speedhacks.EECycleRate));
-			f.i32_or();
-			f.i32_const(0);
-			f.i32_load8_u(Addr(intJitBiosHooksActive()));
-			f.i32_or();
-			f.br_if(0);
-			// m_w: the wait loop test (intLastBranchTo == target && WaitLoop).
-			f.i32_const(0);
-			f.i32_load(Addr(intJitLastBranchTo()));
-			push_target();
-			f.i32_eq();
-			f.i32_const(0);
-			f.i32_load(Addr(&EmuConfig.Speedhacks.bitset));
-			f.i32_const(static_cast<s32>(WaitLoopBit()));
-			f.i32_and();
-			f.i32_const(0);
-			f.i32_ne();
-			f.i32_and();
-			f.local_tee(m_w);
-			if (!wait_inline)
-				f.br_if(0);
+			if (target != kAnyPc)
+				m_fn.i32_const(static_cast<s32>(target));
 			else
-			{
-				f.if_();
-				if (wait_psm)
-				{
-					// PSM(target) == 0 (vtlb_GetPhyPtr()): a handler, or a null pointer.
-					if (paddr >= VTLB_PMAP_SZ)
-						f.br(1);
-					else
-					{
-						f.i32_const(0);
-						f.i64_load(Addr(&vtlbdata.pmap[paddr >> VTLB_PAGE_BITS]));
-						f.local_tee(m_v);
-						f.i64_const(0);
-						f.i64_lt_s();
-						f.local_get(m_v);
-						f.i32_wrap_i64();
-						f.i32_const(static_cast<s32>(paddr & VTLB_PAGE_MASK));
-						f.i32_add();
-						f.i32_eqz();
-						f.i32_or();
-						f.br_if(1);
-					}
-				}
-				// Not skipped: _doBranch_afterDelaySlot() still updates the cycles.
-				EmitUpdateCycles();
-				f.end();
-			}
-			// intLastBranchTo = cpuRegs.pc = target; cpuRegs.branch = 0.
-			f.i32_const(0);
-			push_target();
-			f.i32_store(Addr(intJitLastBranchTo()));
-			f.i32_const(0);
-			push_target();
-			f.i32_store(Addr(&cpuRegs.pc));
-			f.i32_const(0);
-			f.i32_const(0);
-			f.i32_store(Addr(&cpuRegs.branch));
-			EmitUpdateCycles();
-			EmitBranchTest();
-			f.br(1);
-			f.end(); // slow
-			push_target();
-			f.i32_const(static_cast<s32>(FnIndex(&intJitBranchEnd)));
-			f.call_indirect(m_tiv, 0);
-			f.end(); // done
-		}
-
-		static u32 WaitLoopBit()
-		{
-			static const u32 bit = [] {
-				Pcsx2Config::SpeedhackOptions o;
-				o.bitset = 0;
-				o.WaitLoop = true;
-				return o.bitset;
-			}();
-			return bit;
+				m_fn.local_get(m_j);
+			m_fn.call(kFnBranchEnd);
 		}
 
 		// Emits the branch at pc. Returns true if the block goes on (at m_next_pc) after the branch not taken.
@@ -2016,7 +1876,7 @@ namespace
 				const bool saved_dirty = m_cyc_dirty;
 				EmitDelaySlot(pc + 4);
 				FlushCycles();
-				EmitBranchEnd(target, pc + 8);
+				EmitBranchEnd(target);
 				Leave(target, false);
 				m_pending = saved_pending;
 				m_cyc_dirty = saved_dirty;
@@ -2185,7 +2045,7 @@ namespace
 		bool m_iloc_ok[4] = {};
 		bool m_t_ok = false;
 		bool m_vloc_ok[8] = {};
-		u32 m_v, m_k, m_w;
+		u32 m_v, m_k;
 		u32 m_pending = 0; // cycles not yet written, before the Config factor
 		bool m_cyc_dirty = false; // m_cyc may be non-zero
 	};
@@ -2241,6 +2101,173 @@ namespace
 		}
 		s_groups.clear();
 		s_flushes++;
+	}
+
+	// intUpdateCPUCycles() with an EE cycle rate of 0: cpuRegs.cycle += max(cpuBlockCycles >> 3, 1), and
+	// cpuBlockCycles keeps its low 3 bits. `tmp`: an i32 local.
+	void EmitUpdateCycles(Function& f, u32 tmp)
+	{
+		const u32 bc = Addr(intJitBlockCycles());
+		f.i32_const(0);
+		f.i32_const(0);
+		f.i64_load(Addr(&cpuRegs.cycle));
+		f.i32_const(0);
+		f.i32_load(bc);
+		f.i32_const(3);
+		f.i32_shr_u();
+		f.local_tee(tmp);
+		f.i32_const(1);
+		f.local_get(tmp);
+		f.select();
+		f.i64_extend_i32_u();
+		f.i64_add();
+		f.i64_store(Addr(&cpuRegs.cycle));
+		f.i32_const(0);
+		f.i32_const(0);
+		f.i32_load(bc);
+		f.i32_const(7);
+		f.i32_and();
+		f.i32_store(bc);
+	}
+
+	// intBranchTest(), as intJitBranchTest(): called only when it has something to do (the trace, an event due, or
+	// the BIOS hooks). () -> ().
+	Function EmitBranchTestFunction(u32 type_v_v)
+	{
+		Function f(0);
+		f.i32_const(0);
+		f.i32_load8_u(Addr(&EEJit::g_trace));
+		f.i32_const(0);
+		f.i32_load8_u(Addr(intJitBiosHooksActive()));
+		f.i32_or();
+		f.i32_const(0);
+		f.i64_load(Addr(&cpuRegs.cycle));
+		f.i32_const(0);
+		f.i64_load(Addr(&cpuRegs.nextEventCycle));
+		f.i64_sub();
+		f.i64_const(0);
+		f.i64_ge_s();
+		f.i32_or();
+		f.if_();
+		f.i32_const(static_cast<s32>(FnIndex(&intJitBranchTest)));
+		f.call_indirect(type_v_v, 0);
+		f.end();
+		return f;
+	}
+
+	u32 WaitLoopBit()
+	{
+		static const u32 bit = [] {
+			Pcsx2Config::SpeedhackOptions o;
+			o.bitset = 0;
+			o.WaitLoop = true;
+			return o.bitset;
+		}();
+		return bit;
+	}
+
+	// intJitBranchEnd(target) after a taken branch's delay slot: its usual case here, the same steps in the same
+	// order (_doBranch_afterDelaySlot(), intUpdateCPUCycles(), intBranchTest()), and intJitBranchEnd() itself when
+	// the delay slot took an exception (cpuRegs.branch is 0), with an EE cycle rate other than 0, with the BIOS hooks
+	// active, or on a wait loop (the same target as the last branch, with the WaitLoop speedhack) that may be
+	// skipped: the BIOS idle loop at 0x81fc0, a branch to the word after its delay slot, or a loop of up to 10
+	// words whose first one has no physical pointer (PSM(target) == 0, vtlb_GetPhyPtr()). The JIT only runs from
+	// intExecute(), so Cpu is the interpreter there. (target) -> ().
+	Function EmitBranchEndFunction(u32 type_v_v, u32 type_i_v)
+	{
+		Function f(1);
+		const u32 target = 0;
+		const u32 t = f.local(ValType::I32);
+		const u32 v = f.local(ValType::I64);
+		f.block(); // slow
+		f.i32_const(0);
+		f.i32_load(Addr(&cpuRegs.branch));
+		f.i32_eqz();
+		f.i32_const(0);
+		f.i32_load8_s(Addr(&EmuConfig.Speedhacks.EECycleRate));
+		f.i32_or();
+		f.i32_const(0);
+		f.i32_load8_u(Addr(intJitBiosHooksActive()));
+		f.i32_or();
+		f.br_if(0);
+		// The wait loop test: intLastBranchTo == target && WaitLoop.
+		f.i32_const(0);
+		f.i32_load(Addr(intJitLastBranchTo()));
+		f.local_get(target);
+		f.i32_eq();
+		f.i32_const(0);
+		f.i32_load(Addr(&EmuConfig.Speedhacks.bitset));
+		f.i32_const(static_cast<s32>(WaitLoopBit()));
+		f.i32_and();
+		f.i32_const(0);
+		f.i32_ne();
+		f.i32_and();
+		f.if_();
+		{
+			f.local_get(target);
+			f.i32_const(0x81fc0);
+			f.i32_eq();
+			f.br_if(1);
+			// t = cpuRegs.pc - target (cpuRegs.pc: after the delay slot)
+			f.i32_const(0);
+			f.i32_load(Addr(&cpuRegs.pc));
+			f.local_get(target);
+			f.i32_sub();
+			f.local_tee(t);
+			f.i32_eqz();
+			f.br_if(1);
+			f.local_get(t);
+			f.i32_const(4 * 10);
+			f.i32_lt_u();
+			f.if_();
+			{
+				// PSM(target) == 0: a handler, or a null pointer. (target & 0x1fffffff) < VTLB_PMAP_SZ.
+				static_assert(VTLB_PMAP_SZ == 0x20000000);
+				f.local_get(target);
+				f.i32_const(0x1fffffff);
+				f.i32_and();
+				f.local_tee(t);
+				f.i32_const(VTLB_PAGE_BITS);
+				f.i32_shr_u();
+				f.i32_const(3);
+				f.i32_shl();
+				f.i64_load(Addr(&vtlbdata.pmap[0]));
+				f.local_tee(v);
+				f.i64_const(0);
+				f.i64_lt_s();
+				f.local_get(v);
+				f.i32_wrap_i64();
+				f.local_get(t);
+				f.i32_const(VTLB_PAGE_MASK);
+				f.i32_and();
+				f.i32_add();
+				f.i32_eqz();
+				f.i32_or();
+				f.br_if(2);
+			}
+			f.end();
+			// Not skipped: _doBranch_afterDelaySlot() still updates the cycles.
+			EmitUpdateCycles(f, t);
+		}
+		f.end();
+		// intLastBranchTo = cpuRegs.pc = target; cpuRegs.branch = 0.
+		f.i32_const(0);
+		f.local_get(target);
+		f.i32_store(Addr(intJitLastBranchTo()));
+		f.i32_const(0);
+		f.local_get(target);
+		f.i32_store(Addr(&cpuRegs.pc));
+		f.i32_const(0);
+		f.i32_const(0);
+		f.i32_store(Addr(&cpuRegs.branch));
+		EmitUpdateCycles(f, t);
+		f.call(kFnBranchTest);
+		f.return_();
+		f.end(); // slow
+		f.local_get(target);
+		f.i32_const(static_cast<s32>(FnIndex(&intJitBranchEnd)));
+		f.call_indirect(type_i_v, 0);
+		return f;
 	}
 
 	// The dispatcher's lookup in wasm (Execute()), for linked exits: tail-calls the compiled block at cpuRegs.pc,
@@ -2325,15 +2352,18 @@ namespace
 			for (u32 n : next)
 				work.push_back(n);
 		}
-		// Block i is function i; function pcs.size() returns 0 (links to blocks outside the module).
+		// Block i is function kFnFirstBlock + i; the next one returns 0 (links to blocks outside the module).
 		const u32 nblocks = static_cast<u32>(pcs.size());
+		m.add_function(t_i_v, EmitBranchEndFunction(t_v_v, t_i_v));
+		m.add_function(t_v_v, EmitBranchTestFunction(t_v_v));
 		for (u32 i = 0; i < nblocks; i++)
 		{
 			Function& fn = blocks[i]->Body();
 			for (const auto& [at, target] : blocks[i]->m_links)
 			{
 				const auto it = std::find(pcs.begin(), pcs.end(), target);
-				fn.patch_func(at, static_cast<u32>(it - pcs.begin())); // nblocks (the lookup) when not found
+				// kFnFirstBlock + nblocks (the lookup) when not found
+				fn.patch_func(at, kFnFirstBlock + static_cast<u32>(it - pcs.begin()));
 			}
 			const u32 index = m.add_function(t_v_i, fn);
 			char name[16];
