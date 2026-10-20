@@ -54,11 +54,30 @@ addToLibrary({
   // memory, which makes it start a major collection; the buffer is never touched, so no memory is
   // committed for it. Needs checking in other browsers. When the allocation fails (RangeError: the
   // address space or the engine's limit is short) that nudge is skipped, and logged once.
+  //
+  // Firefox (155, and Zen on it) unconfigures the canvas's WebGPU context when transferToImageBitmap()
+  // takes its frame: getConfiguration() is null afterwards and the next getCurrentTexture() throws
+  // "Canvas not configured", so the GS skipped every frame after the first. The spec only replaces the
+  // drawing buffer; Chrome keeps the configuration. Workaround: the first transfer checks whether the
+  // configuration survived; where it did not, every transfer configures the context again with the
+  // configuration it had (about 10 µs).
   tst_post_frame__deps: ['$tstGs'],
   tst_post_frame: (frame, device, vsync) => {
     if (!tstGs.canvas || !tstGs.port) return -1;
     const t0 = performance.now();
+    const context = tstGs.reconfigure !== false ? tstGs.canvas.getContext('webgpu') : null;
+    const config = context && context.getConfiguration ? context.getConfiguration() : null;
     const bitmap = tstGs.canvas.transferToImageBitmap();
+    if (config) {
+      if (context.getConfiguration()) {
+        tstGs.reconfigure = false;
+      } else {
+        if (tstGs.reconfigure === undefined)
+          out('WebGPU: this browser unconfigures the canvas when it hands over a frame; configuring it again after each one.');
+        tstGs.reconfigure = true;
+        context.configure(config);
+      }
+    }
     tstGs.port.postMessage({ type: 'frame', frame, device, vsync, bitmap, postedAt: performance.timeOrigin + t0 }, [bitmap]);
     if (++tstGs.frames % 300 === 0) {
       try {

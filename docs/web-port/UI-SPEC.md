@@ -497,7 +497,7 @@ The picture comes one of three ways, and the page says which. **GPU renderer**: 
 
 **Phone (under 640 px).** The tools row is Sound, Graphics, Crisp, Keys, Log, Fullscreen; on touch each tool is at least 56 px wide so the six fit in 358 px. The menu is at most the width between the gutters and scrolls if taller than the screen.
 
-**Firefox.** Under Auto, Firefox (Zen and other Gecko browsers, matched by `Firefox/` in the user agent) uses the 2D canvas: with the WebGPU display its first frame shows, then the GS posts no more and the picture stays black (measured in Zen 1.22, Firefox 155, on macOS, with the hardware and the software renderer alike; the design never tested Firefox). The Now line reads "Software on a 2D canvas" with "Because Firefox does not show the GPU picture yet (choose GPU to try it)." Choosing GPU, or `?gpu=1` / `?renderer=hw`, still tries WebGPU there.
+**Firefox.** Auto tries WebGPU in Firefox (Zen and other Gecko browsers) as in the others. Firefox drops the GS canvas's WebGPU configuration each time it hands a frame over, so the GS configures it again after every frame (`docs/web-port/WEBGPU-DESIGN.md` §12.1); without that only the first frame showed.
 
 **Microcopy:** "Graphics" · "Now" · "Not started yet" · "GPU renderer" · "GPU display, software drawing" · "Software on a 2D canvas" · "Because …" · "Renderer" · "Auto" · "GPU" · "Software" · "Check WebGPU" · "Checking…".
 

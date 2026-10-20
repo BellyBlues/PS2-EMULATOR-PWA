@@ -1046,6 +1046,14 @@ pcsx2web_surface_size()  --- atomics -->   read in BeginPresent, resize the canv
   sleeps between them and no yield, the page saw 59–60 distinct frames, and the transfer and post took
   0.075–0.09 ms per frame (measured, core and compatibility adapters). A frame posted just before a
   1 s blocking wait was on screen during the wait (measured).
+- **Firefox unconfigures the context on transfer.** In Firefox 155 (Zen 1.22, macOS),
+  `transferToImageBitmap()` on a WebGPU OffscreenCanvas leaves its context unconfigured:
+  `getConfiguration()` returns null and the next `getCurrentTexture()` throws "Canvas not configured"
+  (measured, also in a two-file page without the emulator). The spec only replaces the drawing buffer,
+  and Chrome keeps the configuration. Through the port that throw is a `wgpuSurfaceGetCurrentTexture`
+  error, so the GS skipped every frame after the first and the page showed one frame. `tst_post_frame`
+  checks the configuration on its first transfer; where it was dropped, it configures the context again
+  with the configuration it had after every transfer (10 µs a frame in that page).
 - **The frame port.** The spike posts every frame through Emscripten's internal worker command
   `CMD_CALL_HANDLER` (9 in 6.0.12, `src/lib/libpthread.js:42, 348-349`), which calls `Module[handler]`
   on the page. The device uses it **once**: `WebGPUHost` creates a `MessageChannel`, sends one port to

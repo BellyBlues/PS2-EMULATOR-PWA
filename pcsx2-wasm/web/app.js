@@ -135,12 +135,10 @@
 	const URL_GRAPHICS = params.has('gpu') || params.has('renderer');
 	// ?gpu=0 keeps the GS on its in-memory device and this page on the 2D canvas (README), and so does
 	// the Graphics menu's Software choice when the address has neither switch.
-	// Firefox (and Zen) pick the 2D canvas under Auto: with WebGPU its first frame shows and the GS posts no
-	// more (measured in Zen 1.22 on macOS; the design never tested Firefox), so the picture stays black.
-	// Choosing GPU in the Graphics menu, or ?gpu=1 / ?renderer=, still tries it.
+	// Auto tries WebGPU in every browser. (Firefox and Zen showed only the first WebGPU frame until the GS
+	// configured the canvas again after each frame it hands over: see tst_post_frame in webgpu_host.js.)
 	const IS_FIREFOX = /\bFirefox\//.test(navigator.userAgent);
-	const GPU_ALLOWED = URL_GRAPHICS ? params.get('gpu') !== '0' :
-		RENDERER_CHOICE === 'gpu' ? true : RENDERER_CHOICE === 'sw' ? false : !IS_FIREFOX;
+	const GPU_ALLOWED = URL_GRAPHICS ? params.get('gpu') !== '0' : RENDERER_CHOICE !== 'sw';
 	// The WebGPU device needs JSPI (the GS thread suspends while it waits for the GPU). Without it the
 	// module still starts (pcsx2-wasm/jspi-fallback.js) and draws through the 2D canvas.
 	const HAS_JSPI = typeof WebAssembly === 'object' && typeof WebAssembly.Suspending === 'function' &&
@@ -6418,8 +6416,7 @@
 		if (mode.reason)
 			return mode.reason;
 		if (!GPU_ALLOWED)
-			return URL_GRAPHICS ? 'the address has ?gpu=0' : RENDERER_CHOICE === 'sw' ? 'you chose Software' :
-				'Firefox does not show the GPU picture yet (choose GPU to try it)';
+			return URL_GRAPHICS ? 'the address has ?gpu=0' : 'you chose Software';
 		if (!navigator.gpu)
 			return 'this browser has no WebGPU';
 		if (!HAS_JSPI)
