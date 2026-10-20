@@ -9,8 +9,11 @@
 //   figure's skeleton (VU0 macro-mode matrix products) and builds one VIF1 DMA chain;
 // - VU1 (bench_vu1.vsm) transforms, lights and projects the figures and the floor and kicks them
 //   to the GS: textured, Gouraud-shaded, Z-buffered triangle strips, see-through shadows;
-// - each figure switches to its own palette (an 8-bit texture with a CLUT load) through PATH2,
-//   and its dust is drawn as sprites the EE positioned;
+// - each figure uses its own palette (an 8-bit texture with a CLUT load): every VU1 batch sends
+//   its TEX0 ahead of its primitives, as games switch textures inside their VU1 packets;
+// - near figures kick up dust, drawn as sprites the EE positioned, in one PATH2 packet;
+// - far figures use simpler limbs (level of detail), and path searches are spread over 8 frames,
+//   so 300 figures still fit in one frame on a PS2;
 // - the texture and its four palettes are uploaded again every frame through PATH3;
 // - a glow pass renders the frame into a half-size target, blurs it twice and adds it back.
 //
@@ -43,14 +46,16 @@ extern u32 BenchVU1_CodeEnd __attribute__((section(".vudata")));
 #define GLOW_H 256
 #define OFFSET_X (2048 - SCREEN_W / 2)
 #define OFFSET_Y (2048 - SCREEN_H / 2)
-#define MAX_FIGURES 100
+#define MAX_FIGURES 300
+#define NEAR_FIGURES 50 // full detail and dust; the rest of the crowd uses simpler limbs
 #define PHASE_FRAMES 300
-static const int PHASE_COUNTS[] = {1, 25, 50, 75, 100};
+static const int PHASE_COUNTS[] = {1, 100, 200, 300};
 #define PHASE_TOTAL ((int)(sizeof(PHASE_COUNTS) / sizeof(PHASE_COUNTS[0])))
 
-// VU1 memory: two buffers of 496 quadwords from address 8. A batch needs 11 header quadwords,
-// 3 per input vertex, a 3-quadword gap, 1 for the GIF tag and 3 per output vertex.
-#define VU_HEADER_QW 11
+// VU1 memory: two buffers of 496 quadwords from address 8. A batch needs 13 header quadwords,
+// 3 per input vertex, 2 for the TEX0 packet, 1 for the GIF tag and 3 per output vertex
+// (bench_vu1.vsm).
+#define VU_HEADER_QW 13
 #define MAX_BATCH_VERTS 80
 #define MAX_BATCHES 16
 
@@ -111,12 +116,12 @@ static const bone_t SKELETON[] = {
 static const int PALETTE_HUES[4][3] = {{255, 140, 70}, {80, 170, 255}, {230, 220, 90}, {190, 100, 240}};
 
 // Per-frame data the DMA chain points at, one set per frame in flight.
-// Each block: ambient colour, three light rows, screen offset, matrix (9 quadwords, VU1
-// addresses 2 to 10).
-#define BLOCK_QW 9
+// Each block: ambient colour, three light rows, screen offset, matrix, the TEX0 packet (11
+// quadwords, VU1 addresses 2 to 12).
+#define BLOCK_QW 11
 #define MAX_BLOCKS (MAX_FIGURES * (BONES + 1) + 1)
-// Per figure, GIF packets sent through PATH2: the texture switch (3 quadwords) and the dust.
-#define DIRECT_QW_PER_FIGURE (3 + 1 + 3 * PARTICLES)
+// The dust of the near figures, one GIF packet sent through PATH2.
+#define DIRECT_QW (1 + 3 * PARTICLES * NEAR_FIGURES)
 static qword_t* s_blocks[2];
 static qword_t* s_direct[2];
 static packet2_t* s_chain[2];
@@ -126,6 +131,7 @@ static qword_t* s_post[2]; // the glow pass for each draw buffer
 static int s_post_qw;
 
 static mesh_t s_ellipsoid;
+static mesh_t s_ellipsoid_far;
 static mesh_t s_floor;
 static MATRIX s_view_screen;
 static float s_light[3];
@@ -270,12 +276,12 @@ static void mesh_finish(mesh_t* m)
 	FlushCache(0);
 }
 
-// A unit sphere as 4 latitude strips of 9 segments: 72 triangles, 80 vertices (one VU1 batch).
-static void build_ellipsoid(void)
+// A unit sphere as latitude strips: 4 x 9 segments (72 triangles, 80 vertices: one VU1 batch)
+// for near figures, 2 x 6 (24 triangles, 28 vertices) for far ones.
+static void build_sphere(mesh_t* mesh, int bands, int segments)
 {
-	const int bands = 4, segments = 9;
 	mesh_builder_t b;
-	mesh_begin(&b, &s_ellipsoid);
+	mesh_begin(&b, mesh);
 	for (int band = 0; band < bands; band++)
 	{
 		mesh_strip(&b, 2 * (segments + 1));
@@ -290,14 +296,20 @@ static void build_ellipsoid(void)
 			}
 		}
 	}
-	mesh_finish(&s_ellipsoid);
+	mesh_finish(mesh);
+}
+
+static void build_ellipsoid(void)
+{
+	build_sphere(&s_ellipsoid, 4, 9);
+	build_sphere(&s_ellipsoid_far, 2, 6);
 }
 
 // The floor: 16 x 16 tiles, 512 triangles.
 static void build_floor(void)
 {
 	const int tiles = 16;
-	const float x0 = -6.0f, x1 = 6.0f, z0 = -3.0f, z1 = 11.0f;
+	const float x0 = -7.5f, x1 = 7.5f, z0 = -4.0f, z1 = 13.0f;
 	mesh_builder_t b;
 	mesh_begin(&b, &s_floor);
 	for (int row = 0; row < tiles; row++)
@@ -318,9 +330,29 @@ static void build_floor(void)
 
 // ------------------------------------------------------------------ matrices (row vectors: v * M)
 
+// A sine table, as games use for animation instead of calling sinf() per bone.
+#define SINE_STEPS 1024
+static float s_sine[SINE_STEPS];
+
+static void build_sine(void)
+{
+	for (int i = 0; i < SINE_STEPS; i++)
+		s_sine[i] = sinf(6.2831853f * i / SINE_STEPS);
+}
+
+static inline float fast_sin(float a)
+{
+	return s_sine[(int)(a * (SINE_STEPS / 6.2831853f) + SINE_STEPS * 64) & (SINE_STEPS - 1)];
+}
+
+static inline float fast_cos(float a)
+{
+	return fast_sin(a + 1.5707963f);
+}
+
 static void matrix_rotation_xy(MATRIX m, float ax, float ay, const float* translate)
 {
-	const float cx = cosf(ax), sx = sinf(ax), cy = cosf(ay), sy = sinf(ay);
+	const float cx = fast_cos(ax), sx = fast_sin(ax), cy = fast_cos(ay), sy = fast_sin(ay);
 	// RotX(ax) * RotY(ay), then the translation in row 3.
 	m[0] = cy;
 	m[1] = 0.0f;
@@ -342,9 +374,9 @@ static void matrix_rotation_xy(MATRIX m, float ax, float ay, const float* transl
 
 static void build_view_screen(void)
 {
-	// Camera at (0, 1.9, -6.5) looking at (0, 0.9, 4).
-	const float eye[3] = {0.0f, 1.9f, -6.5f};
-	const float pitch = atan2f(1.0f, 10.5f);
+	// Camera at (0, 3, -9.5) looking at (0, 0.8, 5).
+	const float eye[3] = {0.0f, 3.0f, -9.5f};
+	const float pitch = atan2f(2.2f, 14.5f);
 	MATRIX translate, rotate, screen, view;
 	matrix_unit(translate);
 	translate[12] = -eye[0];
@@ -381,6 +413,7 @@ static u32 s_random = 12345;
 static s16 s_dist[GRID * GRID];
 static s16 s_queue[GRID * GRID];
 static u8 s_blocked[GRID * GRID];
+static int s_steps[MAX_FIGURES];
 
 static float random_unit(void)
 {
@@ -426,7 +459,7 @@ static void particles_step(int figure, const float* pos)
 
 static int grid_cell(float x, float z)
 {
-	int gx = (int)((x + 6.0f) / 12.0f * GRID), gz = (int)((z + 3.0f) / 14.0f * GRID);
+	int gx = (int)((x + 7.5f) / 15.0f * GRID), gz = (int)((z + 4.0f) / 17.0f * GRID);
 	gx = gx < 0 ? 0 : (gx >= GRID ? GRID - 1 : gx);
 	gz = gz < 0 ? 0 : (gz >= GRID ? GRID - 1 : gz);
 	return gz * GRID + gx;
@@ -475,7 +508,7 @@ static void block_crowd(int figures, int frame)
 
 // ------------------------------------------------------------------ frame building
 
-static void block_fill(qword_t* q, const float* colour, float alpha, const MATRIX bone_world, const MATRIX local_screen, float ambient)
+static void block_fill(qword_t* q, const float* colour, float alpha, const MATRIX bone_world, const MATRIX local_screen, float ambient, u64 tex0)
 {
 	float* f = (float*)q;
 	for (int c = 0; c < 3; c++)
@@ -497,6 +530,10 @@ static void block_fill(qword_t* q, const float* colour, float alpha, const MATRI
 	f[18] = 0.0f;
 	f[19] = 0.0f;
 	memcpy(f + 20, local_screen, sizeof(MATRIX));
+	q[9].dw[0] = GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1);
+	q[9].dw[1] = GIF_REG_AD;
+	q[10].dw[0] = tex0;
+	q[10].dw[1] = GS_REG_TEX0;
 }
 
 static void chain_mesh(packet2_t* chain, const mesh_t* mesh, int kind, qword_t* block)
@@ -526,31 +563,29 @@ static void chain_direct(packet2_t* chain, qword_t* data, int qwc)
 	packet2_vif_close_direct_manual(chain, qwc);
 }
 
-// Figure slots: a 10 x 10 crowd, filled front row first, middle columns first.
+// Figure slots: a 20 x 15 crowd, filled front row first, middle columns first.
 static void figure_position(int index, float* out)
 {
-	static const int column_order[10] = {4, 5, 3, 6, 2, 7, 1, 8, 0, 9};
-	const int row = index / 10, col = column_order[index % 10];
-	out[0] = (col - 4.5f) * 0.62f;
+	const int row = index / 20, k = index % 20;
+	const int col = (k & 1) ? 10 + k / 2 : 9 - k / 2;
+	out[0] = (col - 9.5f) * 0.55f;
 	out[1] = 0.0f;
-	out[2] = row * 0.9f;
+	out[2] = row * 0.75f;
 }
 
-static qword_t* figure_texture(qword_t* q, int figure)
+static u64 figure_tex0(int figure)
 {
-	q = gif_ad_tag(q, 2, 1);
-	q = gif_ad(q, GS_REG_TEX0, GS_SET_TEX0(s_figure_tex >> 6, 128 >> 6, GS_PSM_8, 7, 7, 1, TEXTURE_FUNCTION_MODULATE,
-								   s_clut[figure % 4] >> 6, GS_PSM_32, 0, 0, 1));
-	q = gif_ad(q, GS_REG_TEXFLUSH, 1);
-	return q;
+	return GS_SET_TEX0(s_figure_tex >> 6, 128 >> 6, GS_PSM_8, 7, 7, 1, TEXTURE_FUNCTION_MODULATE, s_clut[figure % 4] >> 6,
+		GS_PSM_32, 0, 0, 1);
+}
+
+static u64 floor_tex0(void)
+{
+	return GS_SET_TEX0(s_floor_tex.address >> 6, 64 >> 6, GS_PSM_32, 6, 6, 1, TEXTURE_FUNCTION_MODULATE, 0, 0, 0, 0, 0);
 }
 
 static qword_t* figure_dust(qword_t* q, int figure)
 {
-	const u64 prim = GS_SET_PRIM(PRIM_SPRITE, 0, 0, 0, 1, 0, 0, 0, 0);
-	q->dw[0] = GIF_SET_TAG(PARTICLES, 1, 1, prim, GIF_FLG_PACKED, 3);
-	q->dw[1] = ((u64)GIF_REG_RGBAQ) | ((u64)GIF_REG_XYZ2 << 4) | ((u64)GIF_REG_XYZ2 << 8);
-	q++;
 	const float* m = s_view_screen;
 	for (int i = 0; i < PARTICLES; i++)
 	{
@@ -600,26 +635,30 @@ static void build_frame(int ctx, int frame, int figures, int target)
 	{
 		MATRIX identity;
 		matrix_unit(identity);
-		block_fill(&blocks[BLOCK_QW * used], grey, 128.0f, identity, s_view_screen, 0.35f);
+		block_fill(&blocks[BLOCK_QW * used], grey, 128.0f, identity, s_view_screen, 0.35f, floor_tex0());
 		chain_mesh(chain, &s_floor, KIND_LIT_TEXTURED, &blocks[BLOCK_QW * used]);
 		used++;
 	}
+
+	// The near figures' dust, one GIF packet: its tag first, NLOOP filled in at the end.
+	qword_t* dust_tag = direct++;
 
 	for (int f = 0; f < figures; f++)
 	{
 		float pos[3];
 		figure_position(f, pos);
 		const float phase = f * 0.83f;
+		const int near = f < NEAR_FIGURES;
+		const mesh_t* limb = near ? &s_ellipsoid : &s_ellipsoid_far;
+		const u64 tex0 = figure_tex0(f);
 
-		// Game logic: dust, and a path search that nudges where the figure looks.
-		particles_step(f, pos);
-		const int here = grid_cell(pos[0], pos[2]);
-		const int steps = path_length(here, (frame * 7 + f * 131) % (GRID * GRID));
-		const float facing = 3.1415927f + 0.6f * sinf(t * 0.7f + phase) + 0.002f * (float)(steps & 15);
-
-		qword_t* texture_switch = direct;
-		direct = figure_texture(direct, f);
-		chain_direct(chain, texture_switch, 3);
+		// Game logic: dust for near figures, and a path search (each figure every 8 frames, as games
+		// spread their AI) that nudges where the figure looks.
+		if (near)
+			particles_step(f, pos);
+		if (((f + frame) & 7) == 0)
+			s_steps[f] = path_length(grid_cell(pos[0], pos[2]), (frame * 7 + f * 131) % (GRID * GRID));
+		const float facing = 3.1415927f + 0.6f * fast_sin(t * 0.7f + phase) + 0.002f * (float)(s_steps[f] & 15);
 
 		MATRIX world[BONES];
 		for (int bone_index = 0; bone_index < BONES; bone_index++)
@@ -628,13 +667,13 @@ static void build_frame(int ctx, int frame, int figures, int target)
 			MATRIX local;
 			if (bone->parent < 0)
 			{
-				const float root[3] = {pos[0] + bone->offset[0], pos[1] + bone->offset[1] + 0.03f * sinf(t * 6.0f + phase), pos[2] + bone->offset[2]};
-				matrix_rotation_xy(local, bone->swing * sinf(t * 3.0f + phase), facing, root);
+				const float root[3] = {pos[0] + bone->offset[0], pos[1] + bone->offset[1] + 0.03f * fast_sin(t * 6.0f + phase), pos[2] + bone->offset[2]};
+				matrix_rotation_xy(local, bone->swing * fast_sin(t * 3.0f + phase), facing, root);
 				memcpy(world[bone_index], local, sizeof(MATRIX));
 			}
 			else
 			{
-				matrix_rotation_xy(local, bone->swing * sinf(t * 3.0f + phase + bone->phase), 0.0f, bone->offset);
+				matrix_rotation_xy(local, bone->swing * fast_sin(t * 3.0f + phase + bone->phase), 0.0f, bone->offset);
 				matrix_multiply(world[bone_index], local, world[bone->parent]);
 			}
 
@@ -649,8 +688,8 @@ static void build_frame(int ctx, int frame, int figures, int target)
 			matrix_multiply(bone_screen, world[bone_index], s_view_screen);
 			matrix_multiply(local_screen, mesh_local, bone_screen);
 
-			block_fill(&blocks[BLOCK_QW * used], grey, 128.0f, world[bone_index], local_screen, 0.3f);
-			chain_mesh(chain, &s_ellipsoid, KIND_LIT_TEXTURED, &blocks[BLOCK_QW * used]);
+			block_fill(&blocks[BLOCK_QW * used], grey, 128.0f, world[bone_index], local_screen, 0.3f, tex0);
+			chain_mesh(chain, limb, KIND_LIT_TEXTURED, &blocks[BLOCK_QW * used]);
 			used++;
 		}
 
@@ -665,14 +704,23 @@ static void build_frame(int ctx, int frame, int figures, int target)
 			shadow[13] = 0.02f;
 			shadow[14] = pos[2];
 			matrix_multiply(shadow_screen, shadow, s_view_screen);
-			block_fill(&blocks[BLOCK_QW * used], black, 72.0f, NULL, shadow_screen, 1.0f);
-			chain_mesh(chain, &s_ellipsoid, KIND_SHADOW, &blocks[BLOCK_QW * used]);
+			block_fill(&blocks[BLOCK_QW * used], black, 72.0f, NULL, shadow_screen, 1.0f, tex0);
+			chain_mesh(chain, &s_ellipsoid_far, KIND_SHADOW, &blocks[BLOCK_QW * used]);
 			used++;
 		}
 
-		qword_t* dust = direct;
-		direct = figure_dust(direct, f);
-		chain_direct(chain, dust, (int)(direct - dust));
+		if (near)
+			direct = figure_dust(direct, f);
+	}
+
+	// The dust, once VU1 has drawn the crowd.
+	const int dust_sprites = (int)(direct - dust_tag - 1) / 3;
+	if (dust_sprites > 0)
+	{
+		const u64 prim = GS_SET_PRIM(PRIM_SPRITE, 0, 0, 0, 1, 0, 0, 0, 0);
+		dust_tag->dw[0] = GIF_SET_TAG(dust_sprites, 1, 1, prim, GIF_FLG_PACKED, 3);
+		dust_tag->dw[1] = ((u64)GIF_REG_RGBAQ) | ((u64)GIF_REG_XYZ2 << 4) | ((u64)GIF_REG_XYZ2 << 8);
+		chain_direct(chain, dust_tag, (int)(direct - dust_tag));
 	}
 
 	// The glow pass, after everything else is drawn.
@@ -1019,6 +1067,7 @@ int main(int argc, char* argv[])
 	init_interrupts();
 	upload_floor_texture();
 	init_figure_texture();
+	build_sine();
 	build_ellipsoid();
 	build_floor();
 	build_view_screen();
@@ -1028,7 +1077,7 @@ int main(int argc, char* argv[])
 	for (int i = 0; i < 2; i++)
 	{
 		s_blocks[i] = (qword_t*)memalign(64, sizeof(qword_t) * BLOCK_QW * MAX_BLOCKS);
-		s_direct[i] = (qword_t*)memalign(64, sizeof(qword_t) * DIRECT_QW_PER_FIGURE * MAX_FIGURES);
+		s_direct[i] = (qword_t*)memalign(64, sizeof(qword_t) * DIRECT_QW);
 		s_chain[i] = packet2_create(4 * max_batches + 6 * MAX_FIGURES + 8, P2_TYPE_NORMAL, P2_MODE_CHAIN, 1);
 		s_post[i] = (qword_t*)memalign(64, sizeof(qword_t) * 128);
 	}

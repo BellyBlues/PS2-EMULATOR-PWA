@@ -4,21 +4,23 @@
 games load it: no menu, no input, always the same frames. It draws a crowd of animated figures
 on a floor, each the way a game draws a character, with the work games do around them:
 
-- the EE runs per-figure game logic (24 dust particles, a path search on a 16 x 16 grid),
+- the EE runs per-figure game logic (24 dust particles for near figures, a path search on a
+  16 x 16 grid every 8 frames per figure, as games spread their AI),
   poses a 15-bone skeleton per figure (matrix products in VU0 macro mode) and builds one VIF1
   DMA chain per frame;
 - VU1 (`bench_vu1.vsm`) transforms, lights and projects every vertex and sends it to the GS
   with XGKICK: textured, Gouraud-shaded, Z-buffered triangle strips, with a see-through shadow
-  under each figure. A figure is about 1,100 triangles (72 per limb, like a crowd character); the
-  floor is 512. The VU1 code is paired and software-pipelined like a game's, so 100 figures still
-  fit in one frame on a PS2;
-- each figure switches to its own palette of an 8-bit texture (a CLUT load) through PATH2, and its
-  dust is drawn as sprites the EE positioned;
+  under each figure. The 50 nearest figures have 72 triangles per limb, the others 24 (level of
+  detail); the floor is 512. The VU1 code is paired and software-pipelined like a game's, so 300
+  figures still fit in one frame on a PS2;
+- each figure uses its own palette of an 8-bit texture (a CLUT load): every VU1 batch sends its
+  TEX0 ahead of its primitives, as games switch textures inside their VU1 packets; the near
+  figures' dust is drawn as sprites the EE positioned, in one PATH2 packet;
 - the texture and its four palettes are uploaded again every frame through PATH3;
 - a glow pass renders the frame into a half-size target, blurs it twice and adds it back
   (render-to-texture, as games do for glow and blur).
 
-The number of figures steps through 1, 25, 50, 75 and 100, 300 frames each, then starts again. At
+The number of figures steps through 1, 100, 200 and 300, 300 frames each, then starts again. At
 each step the program prints `BENCH phase N=<figures> frame=<frame>`, and at the end of a phase
 `BENCH load ...`: how many vsyncs a frame took and how the EE's time split between building
 frames, waiting for VU1 and the GS, and waiting for vsync (from its cycle counter). One vsync per
