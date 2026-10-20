@@ -14,6 +14,50 @@ rest. BT3 fight: 0 lockstep differences over 1000 vsyncs (3.1 M programs), 0 dif
 (Liftoff and TurboFan), 100% of VU1 instructions in generated code, VU1 execute time about 5x lower. The same code
 generator also runs VU0 micro mode (`pcsx2/wasm/VU0Jit.cpp`, `EnableVU0`, off by default).
 
+**Status (2026-10-21).** Cheaper per instruction on game-like code (the crowd benchmark, `tools/wasm/bench/`, whose
+VU1 program is a paired, software-pipelined vertex loop):
+
+- **Loops stay in generated code.** A block whose branch goes back to its own entry with the entry's signature (a
+  vertex loop) does the dispatcher's work itself: its budget test, the next pass's base (`g_block_base`) and the ring
+  rotation of the flag snapshots, then branches back inside a wasm `loop` (`EmitLoopBack`). The pipes' timing
+  fields are written once, by the exit that finally leaves, for the last pass (`EmitLoopState`); this needs a loop
+  exit with no pipe entry left from the pass's entry, which is a condition for looping. `VU1JIT_NOLOOP` turns it off.
+  Blocks are still one module each and do not call each other: a loop made of several blocks still goes through the
+  dispatcher at each block (structured control flow, §5.7, is not done).
+- **Registers and flags in locals** (§5.4): VF, ACC and VI0–VI15 as a block's native code uses them, the pending and
+  committed MAC, status and clip flags and the FMAC entries' flag snapshots live in wasm locals; memory gets them at
+  every exit and around calls to op bodies, which reload them after. Each block is emitted twice, the first time to
+  record the registers it uses. With the values in locals, TurboFan drops the flag work that nothing observes.
+- **Clean operands** (§13, step 3): operand clamps are skipped for lanes known to be clamped already (results of FMAC
+  ops, MAX/MINI and ABS of such values), clamped copies are reused until their register is written, and in a loop the
+  clamps of registers the block never writes are made once, before the loop.
+- **More native ops:** MAX/MINI (all forms), DIV/SQRT/RSQRT, WAITQ/WAITP, XTOP/XITOP, ILW/ILWR, ISW/ISWR,
+  MFIR/MTIR, MFP, RINIT/RGET/RNEXT/RXOR, FSAND/FSEQ/FSOR/FSSET, FMAND/FMEQ/FMOR, FCSET and XGKICK's kick start.
+  Op bodies are left for EFU ops, OPMULA/OPMSUB, ADDi with `VuAddSubHack`, and on VU0 for memory ops and XTOP/XITOP.
+
+Measured on the 100-figure phase, on a Mac shared with other jobs (Node 22.21 with V8 12.4, Chrome 155; ±10%
+between runs):
+
+| | Before | After |
+| --- | --- | --- |
+| VU1 execute time (Node, `-vu1jit-stats`, median of 150 vsyncs) | 29.4 ms per vsync, 13.7 ns per instruction | 15.2 ms, 6.4 ns |
+| Benchmark, headless Node (`-renderer null`), N = 25 / 50 / 75 / 100, median of 3 | 330 / 166 / 112 / 83% | 467 / 278 / 199 / 173% |
+| Benchmark, Chrome (`run-bench.mjs`, WebGPU), N = 25 / 50 / 75 / 100, median of 3 | 403 / 202 / 135 / 101% | 564 / 334 / 249 / 220% |
+| VU thread in Chrome's profile: generated code, dispatcher with `ApplyExit`, op bodies, idle | 44%, 14%, 10%, 0% | 50%, 1.6%, under 0.5%, 23% |
+
+The speeds come from the `BENCH load` timestamps (300 vsyncs per phase, first pass through the phases). Step by step,
+the VU1 execute time went 29.4 → 22.9 ms (loops, MAX/MINI, DIV) → 18.1 (flags in locals) → 15.9 (registers in
+locals) → 15.4 (clean operands) → 15.2 (the other native ops). In Chrome the VU thread now waits for the EE thread,
+which is 100% busy at 100 figures. Every step: the fuzzer at 0 differences (10^5 programs with the timing oracle,
+3 × 10^4 under `--no-liftoff`, 2 × 10^4 on VU0; it now also writes counted loops, some leaving in the middle of a pass
+at a busy kick), lockstep at 0 differences on the benchmark (1.2 M runs over 1500 frames) and the BIOS boot, the
+benchmark's frame 1400 (`-renderer sw -mtvu-sync`) and the BIOS boot screenshots byte-identical to before.
+
+Not done: linking blocks to each other (above); calls to op bodies store and reload all of a block's registers, which
+per-op register sets would avoid (it matters for EFU-heavy code); flag liveness is left to TurboFan, so Liftoff code
+still computes every flag; a loop whose exit carries an entry from the pass's entry (a short loop with FDIV or EFU
+latencies longer than a pass) still goes through the dispatcher at every pass.
+
 **How to read this.** "Verified" means read in this tree at `a65e4ea5cd`; paths are relative to the
 repository root and line numbers are those of that commit. "Measured" means observed by the spike (Node
 24.19.0 with V8 13.6, and Chrome 155, on a Ryzen 7 PRO 7840U shared with other jobs, so ±30% between

@@ -4,12 +4,12 @@
 // VU1 JIT code generation (docs/web-port/VU1-JIT-DESIGN.md sections 4, 5, 7). One block per module: a straight run
 // of instructions from an entry (PC, pipeline signature) to a branch's delay slot, the program end, or the first
 // instruction generated code does not run. The timing model decides every stall, write-back and pipe entry at
-// compile time; generated code does only the data work, on the interpreter's own state in VURegs (VF, VI, ACC, the
-// pending flags and the pipe entries' value snapshots stay in memory), so that ops without native code call the
-// interpreter's op bodies directly and every exit leaves a state the interpreter continues from. The timing
-// fields of the pipes are written at the exit, from the model (ApplyExit). A block whose branch goes back to its own
-// entry with the entry's signature (a vertex loop) does ApplyExit's and the dispatcher's work for that exit itself
-// and runs again without leaving generated code.
+// compile time; generated code does only the data work. It keeps the registers it uses (VF, ACC, VI0-VI15), the
+// pending and committed flags and the pipe entries' flag snapshots in locals, and writes them to the interpreter's
+// own state in VURegs at every exit and before calling an op body without native code (which it reloads after), so
+// every exit leaves a state the interpreter continues from. The timing fields of the pipes are written at the exit,
+// from the model (ApplyExit). A block whose branch goes back to its own entry with the entry's signature (a vertex
+// loop) does the dispatcher's work for that exit itself and runs again without leaving generated code.
 
 #pragma once
 
