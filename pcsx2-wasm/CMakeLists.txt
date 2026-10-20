@@ -76,6 +76,8 @@ list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_boot_disc
 	_pcsx2web_disc_block
 	_pcsx2web_game
+	_pcsx2web_memcard
+	_pcsx2web_memcard_status
 )
 # Audio (Main.cpp, "Audio").
 list(APPEND PCSX2_WASM_EXPORTS
@@ -132,9 +134,6 @@ add_custom_target(pcsx2-wasm-web
 	VERBATIM
 )
 add_dependencies(pcsx2-wasm pcsx2-wasm-web)
-
-# The page mounts IndexedDB (IDBFS) on /memcards, so memory cards outlive a reload.
-target_link_options(pcsx2-wasm PRIVATE "-lidbfs.js")
 
 # Audio (Main.cpp, "Audio"; docs/web-port/AUDIO-DESIGN.md): an Emscripten Wasm Audio Worklet runs
 # AudioStream::ReadFrames() on the browser's audio rendering thread. The module's JS is evaluated in

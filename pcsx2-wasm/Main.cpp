@@ -69,6 +69,7 @@
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/SIO/Pad/PadBase.h"
+#include "pcsx2/SIO/Sio.h"
 #include "pcsx2/VMManager.h"
 #include "pcsx2/wasm/EEJit.h"
 #include "pcsx2/wasm/IopJit.h"
@@ -268,9 +269,10 @@ static std::atomic<u32> s_pad_snapshot[NUM_PAD_PORTS][PAD_SNAPSHOT_WORDS];
 // a 0-byte placeholder at /disc/<name> and boots that path with pcsx2web_boot_disc(); the ISO reader
 // then reads the disc through WebDiscFileReader (docs/web-port/DISC-DESIGN.md).
 //
-// Memory cards: slot 1 holds Mcd001.ps2 in /memcards, which the page mounts as IDBFS before main()
-// runs and copies to IndexedDB after the card is written and when the VM stops (app.js, "memory
-// cards"). Slot 2 stays empty.
+// Memory cards: both slots start empty. The page keeps a library of cards in IndexedDB, writes the ones it
+// plugs in to /memcards (MEMFS) and names them with pcsx2web_memcard(); it copies a card back to IndexedDB
+// after the game writes to it (app.js, "memory cards"). The CPU thread applies a change at the next vsync, or
+// at boot: PCSX2 then reports the slot empty for a moment (AutoEject), so the game sees the card change.
 
 static constexpr const char* DISC_DIRECTORY = "/disc";
 static constexpr const char* MEMCARD_DIRECTORY = "/memcards";
@@ -302,6 +304,29 @@ struct GameDetails
 };
 static GameDetails s_game_details = {};
 
+// One request per slot, handed from the page to the CPU thread without a lock: the page writes only a FREE or
+// READY request (one the CPU thread has not taken yet is replaced), the CPU thread takes only a READY one.
+static constexpr int NUM_MEMCARD_SLOTS = 2;
+enum : int
+{
+	MEMCARD_REQUEST_FREE,
+	MEMCARD_REQUEST_WRITING, // the page is writing it
+	MEMCARD_REQUEST_READY,
+	MEMCARD_REQUEST_TAKING, // the CPU thread is reading it
+};
+struct MemcardRequest
+{
+	std::atomic<int> state{MEMCARD_REQUEST_FREE};
+	u32 id = 0;
+	char file[64] = {}; // a name inside /memcards; empty: unplug
+};
+static MemcardRequest s_memcard_requests[NUM_MEMCARD_SLOTS];
+
+// For pcsx2web_memcard_status(): {flags, the id of the last request applied in slot 1, in slot 2}. Flag 1: the
+// game wrote to a card in the last 300 vsyncs (MemcardBusy), so pulling a card now could cut a save short.
+static constexpr u32 MEMCARD_STATUS_BUSY = 1;
+static std::atomic<u32> s_memcard_status[1 + NUM_MEMCARD_SLOTS];
+
 // The VU1 JIT fuzzer (pcsx2web_vu1jit_fuzz) uses VU1 itself: no boot while it runs.
 static bool VU1JitFuzzRunning()
 {
@@ -311,9 +336,45 @@ static bool VU1JitFuzzRunning()
 static void ConfigureMemoryCards(SettingsInterface& si)
 {
 	si.SetStringValue("Folders", "MemoryCards", MEMCARD_DIRECTORY);
-	si.SetBoolValue("MemoryCards", "Slot1_Enable", true);
-	si.SetStringValue("MemoryCards", "Slot1_Filename", "Mcd001.ps2");
-	si.SetBoolValue("MemoryCards", "Slot2_Enable", false);
+	for (int slot = 0; slot < NUM_MEMCARD_SLOTS; slot++)
+	{
+		si.SetBoolValue("MemoryCards", fmt::format("Slot{}_Enable", slot + 1).c_str(), false);
+		si.SetStringValue("MemoryCards", fmt::format("Slot{}_Filename", slot + 1).c_str(), "");
+	}
+}
+
+// CPU thread: takes the page's card requests into the settings, applied now (a running VM ejects and reopens the
+// cards that changed) or by the caller (a boot).
+static void CheckMemcardRequests(bool apply_now)
+{
+	u32 applied[NUM_MEMCARD_SLOTS] = {};
+	for (int slot = 0; slot < NUM_MEMCARD_SLOTS; slot++)
+	{
+		MemcardRequest& r = s_memcard_requests[slot];
+		int expected = MEMCARD_REQUEST_READY;
+		if (!r.state.compare_exchange_strong(expected, MEMCARD_REQUEST_TAKING, std::memory_order_acquire))
+			continue;
+		const u32 id = r.id;
+		const std::string file = r.file;
+		r.state.store(MEMCARD_REQUEST_FREE, std::memory_order_release);
+
+		auto lock = Host::GetSettingsLock();
+		s_settings_interface.SetBoolValue("MemoryCards", fmt::format("Slot{}_Enable", slot + 1).c_str(), !file.empty());
+		s_settings_interface.SetStringValue("MemoryCards", fmt::format("Slot{}_Filename", slot + 1).c_str(), file.c_str());
+		applied[slot] = id;
+		Console.WriteLnFmt("pcsx2-wasm: memory card slot {}: {}", slot + 1, file.empty() ? "empty" : file);
+	}
+
+	bool changed = false;
+	for (u32 id : applied)
+		changed |= (id != 0);
+	if (changed && apply_now && VMManager::HasValidVM())
+		VMManager::ApplySettings();
+	for (int slot = 0; slot < NUM_MEMCARD_SLOTS; slot++)
+	{
+		if (applied[slot] != 0)
+			s_memcard_status[1 + slot].store(applied[slot], std::memory_order_release);
+	}
 }
 
 static bool EnsureDiscAndMemoryCardFolders()
@@ -426,6 +487,39 @@ EMSCRIPTEN_KEEPALIVE const void* pcsx2web_disc_block(void)
 EMSCRIPTEN_KEEPALIVE const void* pcsx2web_game(void)
 {
 	return &s_game_details;
+}
+
+/// Plugs the card file (a plain name inside /memcards) into slot (0 or 1), or empties the slot when file is "".
+/// Applied by the CPU thread at the next vsync, or at the next boot; id (not 0) then shows in
+/// pcsx2web_memcard_status(). A request the CPU thread has not taken yet is replaced. 0 if accepted; 1 if the CPU
+/// thread is reading the last one (call again); -1 if an argument is wrong.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_memcard(int slot, const char* file, unsigned int id)
+{
+	if (slot < 0 || slot >= NUM_MEMCARD_SLOTS || !file || id == 0)
+		return -1;
+	MemcardRequest& r = s_memcard_requests[slot];
+	const size_t length = std::strlen(file);
+	if (length >= sizeof(r.file) || std::strchr(file, '/') || std::strcmp(file, ".") == 0 || std::strcmp(file, "..") == 0)
+		return -1;
+
+	int state = r.state.load(std::memory_order_acquire);
+	do
+	{
+		if (state != MEMCARD_REQUEST_FREE && state != MEMCARD_REQUEST_READY)
+			return 1;
+	} while (!r.state.compare_exchange_weak(state, MEMCARD_REQUEST_WRITING, std::memory_order_acquire));
+	r.id = id;
+	std::memcpy(r.file, file, length + 1);
+	r.state.store(MEMCARD_REQUEST_READY, std::memory_order_release);
+	return 0;
+}
+
+/// {flags, id applied in slot 1, id applied in slot 2}; flags bit 0: the game wrote to a card in the last
+/// 300 vsyncs (cleared when the VM stops).
+EMSCRIPTEN_KEEPALIVE const unsigned int* pcsx2web_memcard_status(void)
+{
+	static_assert(sizeof(s_memcard_status) == (1 + NUM_MEMCARD_SLOTS) * sizeof(u32));
+	return reinterpret_cast<const unsigned int*>(s_memcard_status);
 }
 
 } // extern "C"
@@ -1226,9 +1320,8 @@ static bool InitializeConfig()
 
 	// The hardware renderer on the WebGPU device (without WebGPU the GS falls back to the software
 	// renderer into GSDeviceNull; the page's ?renderer=sw picks the software renderer), sound through
-	// the page's Web Audio worklet, two DualShock 2 pads fed by the page (ConfigurePads), memory
-	// card slot 1 only. Hotkeys are
-	// cleared: most of them (pause menu, save states, screenshots) need host support that is not
+	// the page's Web Audio worklet, two DualShock 2 pads fed by the page (ConfigurePads), two memory
+	// card slots that start empty (the page plugs cards in). Hotkeys are cleared: most of them (pause menu, save states, screenshots) need host support that is not
 	// there yet.
 	si.SetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::WebGPU));
 	// The software renderer's rasterizer threads limit 3D scenes with PCSX2's default of 2 (BT3 fight, 16
@@ -1601,6 +1694,7 @@ static void RunVM(const std::string& bios_name)
 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", s_vu1jit_enabled.load(std::memory_order_acquire));
 	}
 	CheckCrispRequest(false);
+	CheckMemcardRequests(false);
 	VMManager::ApplySettings();
 
 	if (s_stop_requested.load(std::memory_order_acquire))
@@ -1665,6 +1759,7 @@ static void RunVM(const std::string& bios_name)
 	}
 
 	VMManager::Shutdown(false);
+	s_memcard_status[0].store(0, std::memory_order_release);
 	s_speed.store(0.0f, std::memory_order_relaxed);
 	s_vps.store(0.0f, std::memory_order_relaxed);
 	s_state.store(WEB_STATE_STOPPED, std::memory_order_release);
@@ -1971,6 +2066,8 @@ void Host::PumpMessagesOnCPUThread()
 	RunCPUThreadQueue();
 	CheckStopRequest();
 	CheckCrispRequest(true);
+	CheckMemcardRequests(true);
+	s_memcard_status[0].store(MemcardBusy::IsBusy() ? MEMCARD_STATUS_BUSY : 0, std::memory_order_release);
 
 	const u32 snapshot = s_snapshot_vsync.load(std::memory_order_acquire);
 	if (snapshot != 0 && vsync >= snapshot)
