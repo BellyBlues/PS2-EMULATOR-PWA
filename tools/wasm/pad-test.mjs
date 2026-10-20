@@ -129,6 +129,59 @@ const TEST = `(async () => {
 	gps.pop();
 	await wait(500);
 	r['unplugging lets go'] = only(state(0), {}) && /Second Pad/.test(document.getElementById('announce').textContent) === true;
+	// A gamepad that is not laid out in the standard way, like an 8BitDo Ultimate in D mode in Firefox:
+	// a hat D-pad on axis 0 (rest 3.29), triggers on axes 5 and 6 (rest -1) and on buttons 8 and 9.
+	gps.length = 0;
+	await wait(500);
+	const nm = mk(0, '2dc8-3013-8BitDo Ultimate wireless Controller for PC');
+	nm.mapping = '';
+	nm.buttons = Array.from({ length: 28 }, () => ({ pressed: false, touched: false, value: 0 }));
+	nm.axes = [3.2857, 0, 0, 0, 0, -1, -1];
+	gps.push(nm);
+	window.dispatchEvent(Object.assign(new Event('gamepadconnected'), { gamepad: nm }));
+	await wait(500);
+	r['an unmapped gamepad is announced as needing a mapping'] = /map its controls/.test(document.getElementById('announce').textContent);
+	set(nm, 3, 1);
+	await wait(300);
+	const both = () => { const a = state(0), b = state(1), o = { connected: true }; for (const k of NAMES) { if (a[k] || b[k]) o[k] = a[k] || b[k]; } return o; };
+	r['an unmapped gamepad plays nothing'] = only(both(), {});
+	set(nm, 3, 0);
+	const startBtn = document.querySelector('#gp-list .gp-map-start');
+	r['the Map controls button is shown'] = !!startBtn && !startBtn.closest('.gp-map').hidden;
+	startBtn.click();
+	const press = async (apply, release) => { await wait(450); apply(); await wait(450); release(); await wait(200); };
+	const btn = (i) => [() => set(nm, i, 1), () => set(nm, i, 0)];
+	const axis = (i, v, rest) => [() => { nm.axes[i] = v; }, () => { nm.axes[i] = rest; }];
+	const both2 = (a, b) => [() => { a[0](); b[0](); }, () => { a[1](); b[1](); }];
+	const run = [btn(3), btn(1), btn(4), btn(0), btn(6), btn(7),
+		both2(axis(6, 1, -1), btn(8)), both2(axis(5, 1, -1), btn(9)), btn(10), btn(11),
+		axis(0, -1, 3.2857), // D-pad Up on the hat: the other three directions are skipped
+		btn(13), btn(14), axis(1, 1, 0), axis(2, -1, 0), axis(3, 1, 0), axis(4, -1, 0), btn(12)];
+	for (const [apply, release] of run) await press(apply, release);
+	await wait(300);
+	const saved = JSON.parse(localStorage.getItem('pcsx2web.padMaps') || '{}');
+	const map = Object.values(saved)[0] || {};
+	r['the mapping is saved'] = !!map.buttons && map.buttons.Cross && map.buttons.Cross.i === 3 && map.buttons.Up && map.buttons.Up.k === 'h' && map.buttons.Left.k === 'h' &&
+		map.buttons.L2 && map.buttons.L2.k === 'a' && map.buttons.L2.i === 6 && map.sticks.L.y.s === 1;
+	r['mapping ended and says so'] = /is mapped/.test(document.getElementById('announce').textContent) && document.querySelector('#gp-list .gp-map-run').hidden;
+	const check = async (label, apply, undo, expected) => { apply(); await wait(350); r[label] = only(both(), expected); undo(); await wait(250); };
+	await check('mapped: bottom face button is Cross', () => set(nm, 3, 1), () => set(nm, 3, 0), { Cross: 255 });
+	await check('mapped: Triangle, L1 and Start', () => { set(nm, 0, 1); set(nm, 6, 1); set(nm, 11, 1); }, () => { set(nm, 0, 0); set(nm, 6, 0); set(nm, 11, 0); }, { Triangle: 255, L1: 255, Start: 255 });
+	await check('mapped: the hat is the D-pad (right)', () => { nm.axes[0] = -3 / 7; }, () => { nm.axes[0] = 3.2857; }, { Right: 255 });
+	await check('mapped: the hat is the D-pad (down-left)', () => { nm.axes[0] = 3 / 7; }, () => { nm.axes[0] = 3.2857; }, { Down: 255, Left: 255 });
+	await check('mapped: a trigger on an axis passes its pressure', () => { nm.axes[6] = 0; }, () => { nm.axes[6] = -1; }, { L2: 127 });
+	await check('mapped: left stick right and right stick up', () => { nm.axes[1] = 1; nm.axes[4] = -1; }, () => { nm.axes[1] = 0; nm.axes[4] = 0; }, { LRight: 255, RUp: 255 });
+	await check('mapped: left stick up and right stick right', () => { nm.axes[2] = -1; nm.axes[3] = 1; }, () => { nm.axes[2] = 0; nm.axes[3] = 0; }, { LUp: 255, RRight: 255 });
+	await check('mapped: the center button is Analog', () => set(nm, 12, 1), () => set(nm, 12, 0), { Analog: 255 });
+	await check('a trigger at rest plays nothing', () => {}, () => {}, {});
+	document.querySelector('#gp-list .gp-map-clear').click();
+	set(nm, 3, 1);
+	await wait(350);
+	r['clearing the mapping stops it playing'] = only(both(), {});
+	set(nm, 3, 0);
+	gps.length = 0;
+	await wait(300);
+	localStorage.removeItem('pcsx2web.padMaps');
 	document.querySelector('input[name="kb-player"][value="1"]').click();
 	localStorage.removeItem('pcsx2web.padFirst'); localStorage.removeItem('pcsx2web.padKeyboard');
 	return r;

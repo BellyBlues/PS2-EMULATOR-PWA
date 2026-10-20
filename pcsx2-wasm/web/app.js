@@ -135,7 +135,12 @@
 	const URL_GRAPHICS = params.has('gpu') || params.has('renderer');
 	// ?gpu=0 keeps the GS on its in-memory device and this page on the 2D canvas (README), and so does
 	// the Graphics menu's Software choice when the address has neither switch.
-	const GPU_ALLOWED = URL_GRAPHICS ? params.get('gpu') !== '0' : RENDERER_CHOICE !== 'sw';
+	// Firefox (and Zen) pick the 2D canvas under Auto: with WebGPU its first frame shows and the GS posts no
+	// more (measured in Zen 1.22 on macOS; the design never tested Firefox), so the picture stays black.
+	// Choosing GPU in the Graphics menu, or ?gpu=1 / ?renderer=, still tries it.
+	const IS_FIREFOX = /\bFirefox\//.test(navigator.userAgent);
+	const GPU_ALLOWED = URL_GRAPHICS ? params.get('gpu') !== '0' :
+		RENDERER_CHOICE === 'gpu' ? true : RENDERER_CHOICE === 'sw' ? false : !IS_FIREFOX;
 	// The WebGPU device needs JSPI (the GS thread suspends while it waits for the GPU). Without it the
 	// module still starts (pcsx2-wasm/jspi-fallback.js) and draws through the 2D canvas.
 	const HAS_JSPI = typeof WebAssembly === 'object' && typeof WebAssembly.Suspending === 'function' &&
@@ -228,6 +233,10 @@
 			runningReleased: 'Running. Click the screen to play.',
 			released: 'Keyboard released.',
 			gamepadConnected: (name, port) => `Gamepad connected: ${name}, Player ${port}.`,
+			gamepadNeedsMap: (name, port) => `Gamepad connected: ${name}, Player ${port}. Its layout is not standard: open Keys, then Gamepad, to map its controls.`,
+			gamepadMapped: (name) => `${name} is mapped. Press its controls to check them.`,
+			gamepadMapCancelled: 'Mapping cancelled.',
+			gamepadMapCleared: (name) => `The mapping of ${name} is cleared.`,
 			gamepadUnused: (name) => `Gamepad connected: ${name}. Only two gamepads play, so it is not used.`,
 			gamepadDisconnected: (name) => `Gamepad disconnected: ${name}.`,
 			gamepadPlayer: (name, port) => `${name} plays as Player ${port}.`,
@@ -4287,7 +4296,11 @@
 		return [x * k, y * k];
 	}
 
-	function readGamepad(gp, out) {
+	function readGamepad(gp, out, g) {
+		if (g && g.custom) {
+			readCustom(gp, out, g);
+			return;
+		}
 		out.fill(0);
 		for (const [i, name] of Object.entries(GAMEPAD_BUTTONS)) {
 			const b = gp.buttons[i];
@@ -4331,10 +4344,18 @@
 			};
 			gamepads.set(gp.index, g);
 		}
+		// A gamepad that is not laid out in the standard way plays through the mapping its owner made.
+		g.custom = gp.mapping !== 'standard';
+		g.key = padMapKey(gp);
+		g.map = g.custom ? (padMaps[g.key] || null) : null;
+		g.seen = [];
+		g.mapper = null;
 		padDevices.set('pad:' + g.index, g.state);
 		renderGamepads();
-		announce(g.port ? COPY.announce.gamepadConnected(g.name, g.port) : COPY.announce.gamepadUnused(g.name));
-		pageLog(`Gamepad connected: ${g.name}${g.port ? ` (Player ${g.port})` : ' (not used)'}.`);
+		const needsMap = g.custom && !g.map;
+		announce(!g.port ? COPY.announce.gamepadUnused(g.name) :
+			needsMap ? COPY.announce.gamepadNeedsMap(g.name, g.port) : COPY.announce.gamepadConnected(g.name, g.port));
+		pageLog(`Gamepad connected: ${g.name}${g.port ? ` (Player ${g.port})` : ' (not used)'}${needsMap ? '; its layout is not standard: map its controls in Keys, Gamepad' : ''}.`);
 		startGamepadLoop();
 	}
 
@@ -4365,7 +4386,7 @@
 		const list = navigator.getGamepads();
 		const live = gamepadsLive();
 		for (const gp of list) {
-			if (gp && gp.connected && gp.mapping === 'standard' && !(gamepads.get(gp.index) || {}).connected)
+			if (gp && gp.connected && gp.buttons.length && !(gamepads.get(gp.index) || {}).connected)
 				registerGamepad(gp);
 		}
 		let any = false;
@@ -4380,14 +4401,16 @@
 			}
 			any = true;
 			const raw = g.raw;
-			readGamepad(gp, raw);
+			readGamepad(gp, raw, g);
+			if (g.mapper)
+				mapperFrame(g, gp, performance.now());
 			if (g.view)
 				updateGamepadView(g);
 			const idle = !raw.some((v) => v > 0);
 			if (idle)
 				g.needsNeutral = false;
 			// After a change of player or a pause in play, the inputs held must be let go once.
-			if (live && !g.needsNeutral)
+			if (live && !g.needsNeutral && !g.mapper)
 				g.state.set(raw);
 			else
 				g.state.fill(0);
@@ -4455,6 +4478,334 @@
 		announce(COPY.announce.keyboardPlayer(port));
 	}
 
+	// ---- gamepads the browser does not lay out in the standard way: the user maps them
+
+	const PREF_PAD_MAPS = 'pcsx2web.padMaps';
+	// A D-pad on one axis (a hat switch): eight positions clockwise from Up, 2/7 apart; at rest the axis
+	// reads something above 1 (3.29 on an 8BitDo in D mode).
+	const HAT_VALUES = [-1, -5 / 7, -3 / 7, -1 / 7, 1 / 7, 3 / 7, 5 / 7, 1];
+	const HAT_DIRS = [['Up'], ['Up', 'Right'], ['Right'], ['Down', 'Right'], ['Down'], ['Down', 'Left'], ['Left'], ['Up', 'Left']];
+	const MAP_HOLD_MS = 350; // after a prompt appears, or the last control was let go, nothing counts
+	const MAP_CAPTURE_MS = 300; // from the first sign of a press, what moves is collected
+	const MAP_RELEASE_MS = 2500; // longest wait for the control to be let go
+	// The prompts, in order. kind: button, trigger (an axis or a button), dpad (buttons, or a hat for all four),
+	// stickx and sticky (an axis; Y is asked pushed up).
+	const MAP_PROMPTS = [
+		{ id: 'Cross', kind: 'button', text: 'Press the bottom face button (Cross).' },
+		{ id: 'Circle', kind: 'button', text: 'Press the right face button (Circle).' },
+		{ id: 'Square', kind: 'button', text: 'Press the left face button (Square).' },
+		{ id: 'Triangle', kind: 'button', text: 'Press the top face button (Triangle).' },
+		{ id: 'L1', kind: 'button', text: 'Press the left bumper (L1).' },
+		{ id: 'R1', kind: 'button', text: 'Press the right bumper (R1).' },
+		{ id: 'L2', kind: 'trigger', text: 'Press the left trigger (L2) all the way.' },
+		{ id: 'R2', kind: 'trigger', text: 'Press the right trigger (R2) all the way.' },
+		{ id: 'Select', kind: 'button', text: 'Press Select (Back, View or Share).' },
+		{ id: 'Start', kind: 'button', text: 'Press Start (Menu or Options).' },
+		{ id: 'Up', kind: 'dpad', text: 'Press D-pad Up.' },
+		{ id: 'Right', kind: 'dpad', text: 'Press D-pad Right.' },
+		{ id: 'Down', kind: 'dpad', text: 'Press D-pad Down.' },
+		{ id: 'Left', kind: 'dpad', text: 'Press D-pad Left.' },
+		{ id: 'L3', kind: 'button', text: 'Click the left stick in (L3).' },
+		{ id: 'R3', kind: 'button', text: 'Click the right stick in (R3).' },
+		{ id: 'LX', kind: 'stickx', side: 'L', text: 'Push the left stick all the way right.' },
+		{ id: 'LY', kind: 'sticky', side: 'L', text: 'Push the left stick all the way up.' },
+		{ id: 'RX', kind: 'stickx', side: 'R', text: 'Push the right stick all the way right.' },
+		{ id: 'RY', kind: 'sticky', side: 'R', text: 'Push the right stick all the way up.' },
+		{ id: 'Analog', kind: 'button', text: 'Press the center button (Analog). Skip it if the gamepad has none.' },
+	];
+
+	const padMaps = (() => {
+		try {
+			const m = JSON.parse(readPref(PREF_PAD_MAPS) || '{}');
+			return m && typeof m === 'object' ? m : {};
+		} catch {
+			return {};
+		}
+	})();
+	// The numbering of buttons and axes depends on the browser as well as the gamepad: the counts tell them apart.
+	const padMapKey = (gp) => `${gp.id}|${gp.buttons.length}|${gp.axes.length}`;
+	const savePadMaps = () => writePref(PREF_PAD_MAPS, JSON.stringify(padMaps));
+
+	function hatDirs(v) {
+		for (let k = 0; k < 8; k++) {
+			if (Math.abs(v - HAT_VALUES[k]) < 0.05)
+				return HAT_DIRS[k];
+		}
+		return null;
+	}
+
+	// Reads a gamepad through the mapping the user made (g.map).
+	function readCustom(gp, out, g) {
+		out.fill(0);
+		const m = g.map;
+		if (!m)
+			return;
+		const put = (name, v) => {
+			const i = PAD_INDEX[name];
+			if (v > out[i])
+				out[i] = v;
+		};
+		// How far an axis is from its rest towards its pressed value, 0 to 1.
+		const reach = (b) => {
+			const a = gp.axes[b.i];
+			if (a === undefined)
+				return 0;
+			if (!g.seen[b.i]) { // some browsers report 0 until the axis first changes: wait for the rest value
+				if (Math.abs(a - b.rest) < 0.15)
+					g.seen[b.i] = true;
+				else
+					return 0;
+			}
+			const t = (a - b.rest) / (b.act - b.rest);
+			return t > 0 ? Math.min(1, t) : 0;
+		};
+		for (const [name, b] of Object.entries(m.buttons || {})) {
+			const analog = name === 'L2' || name === 'R2';
+			if (b.k === 'b') {
+				const x = gp.buttons[b.i];
+				if (x)
+					put(name, analog ? (x.value > TRIGGER_DEAD_ZONE ? x.value : x.pressed ? 1 : 0) : (x.pressed ? 1 : 0));
+			} else if (b.k === 'a') {
+				const t = reach(b);
+				put(name, analog ? (t > TRIGGER_DEAD_ZONE ? t : 0) : (t > 0.5 ? 1 : 0));
+			} else if (b.k === 'h') {
+				const dirs = hatDirs(gp.axes[b.i]);
+				if (dirs && dirs.includes(name))
+					put(name, 1);
+			}
+		}
+		const q = (v) => Math.round(Math.min(1, Math.abs(v)) * STICK_STEPS) / STICK_STEPS;
+		for (const [side, up, down, left, right] of [['L', 'LUp', 'LDown', 'LLeft', 'LRight'], ['R', 'RUp', 'RDown', 'RLeft', 'RRight']]) {
+			const st = m.sticks && m.sticks[side];
+			if (!st)
+				continue;
+			const [sx, sy] = stickValue(st.x ? (gp.axes[st.x.i] || 0) * st.x.s : 0, st.y ? (gp.axes[st.y.i] || 0) * st.y.s : 0);
+			put(sy < 0 ? up : down, q(sy));
+			put(sx < 0 ? left : right, q(sx));
+		}
+	}
+
+	// What is pressed or moved now that was not at the start of the prompt.
+	function mapActivity(kind, gp, snap) {
+		const found = [];
+		if (kind !== 'stickx' && kind !== 'sticky') {
+			gp.buttons.forEach((b, i) => {
+				if ((b.pressed || b.value > 0.5) && !snap.buttons[i])
+					found.push({ k: 'b', i });
+			});
+		}
+		const threshold = kind === 'dpad' ? 0.3 : 0.5;
+		gp.axes.forEach((a, i) => {
+			if (Math.abs(a) > 1.05) // a hat's resting value
+				return;
+			if (Math.abs(a - snap.axes[i]) > threshold || (kind === 'dpad' && Math.abs(snap.axes[i]) > 1.05 && hatDirs(a)))
+				found.push({ k: 'a', i, v: a });
+		});
+		return found;
+	}
+
+	function bindingFrom(step, cap, snap) {
+		const axes = [...cap.axes.entries()].sort((x, y) => Math.abs(y[1] - snap.axes[y[0]]) - Math.abs(x[1] - snap.axes[x[0]]));
+		const button = cap.buttons.size ? [...cap.buttons.keys()][0] : null;
+		const axis = axes.length ? { i: axes[0][0], rest: snap.axes[axes[0][0]], act: axes[0][1] } : null;
+		switch (step.kind) {
+		case 'trigger':
+			return axis ? { k: 'a', ...axis } : button !== null ? { k: 'b', i: button } : null;
+		case 'dpad': {
+			if (button !== null)
+				return { k: 'b', i: button };
+			if (!axis)
+				return null;
+			const hat = Math.abs(axis.rest) > 1.05 || [1, 2, 3, 4, 5, 6].some((k) => Math.abs(axis.act - HAT_VALUES[k]) < 0.05);
+			return hat ? { k: 'h', i: axis.i } : { k: 'a', ...axis };
+		}
+		case 'stickx':
+		case 'sticky':
+			if (!axis)
+				return null;
+			return { i: axis.i, s: Math.sign(axis.act - axis.rest) * (step.kind === 'sticky' ? -1 : 1) || 1 };
+		default:
+			return button !== null ? { k: 'b', i: button } : axis ? { k: 'a', ...axis } : null;
+		}
+	}
+
+	function describeBinding(b) {
+		if (!b)
+			return 'nothing seen';
+		if (b.k === 'b')
+			return `button ${b.i}`;
+		if (b.k === 'h')
+			return `hat on axis ${b.i}`;
+		if (b.k === 'a')
+			return `axis ${b.i}`;
+		return `axis ${b.i}`;
+	}
+
+	function startMapping(g, ids) {
+		const steps = MAP_PROMPTS.filter((p) => !ids || ids.includes(p.id));
+		if (!steps.length || g.mapper)
+			return;
+		const draft = g.map ? JSON.parse(JSON.stringify(g.map)) : { buttons: {}, sticks: {} };
+		draft.buttons = draft.buttons || {};
+		draft.sticks = draft.sticks || {};
+		g.mapper = { steps, i: 0, draft, phase: 'hold', until: performance.now() + MAP_HOLD_MS, snap: null, cap: null, skip: new Set(), last: '' };
+		g.state.fill(0);
+		syncPads();
+		renderMapUi(g);
+	}
+
+	function mapperAdvance(g, to) {
+		const m = g.mapper;
+		m.i = to;
+		while (m.i < m.steps.length && m.skip.has(m.steps[m.i].id))
+			m.i++;
+		m.phase = 'hold';
+		m.until = performance.now() + MAP_HOLD_MS;
+		m.cap = null;
+		if (m.i >= m.steps.length) {
+			g.map = m.draft;
+			padMaps[g.key] = g.map;
+			savePadMaps();
+			g.mapper = null;
+			g.seen = [];
+			g.needsNeutral = true;
+			announce(COPY.announce.gamepadMapped(g.name));
+			pageLog(`Gamepad mapped: ${g.name}.`);
+		}
+		renderMapUi(g);
+	}
+
+	function mapperStore(g, step, binding) {
+		const d = g.mapper.draft;
+		if (step.kind === 'stickx' || step.kind === 'sticky') {
+			d.sticks[step.side] = d.sticks[step.side] || {};
+			if (binding)
+				d.sticks[step.side][step.kind === 'stickx' ? 'x' : 'y'] = binding;
+			else
+				delete d.sticks[step.side][step.kind === 'stickx' ? 'x' : 'y'];
+		} else if (binding) {
+			d.buttons[step.id] = binding;
+			if (binding.k === 'h') { // a hat is all four directions
+				for (const dir of ['Up', 'Right', 'Down', 'Left']) {
+					d.buttons[dir] = binding;
+					g.mapper.skip.add(dir);
+				}
+			}
+		} else {
+			delete d.buttons[step.id];
+		}
+	}
+
+	// One animation frame of a gamepad's mapping run.
+	function mapperFrame(g, gp, now) {
+		const m = g.mapper;
+		const step = m.steps[m.i];
+		if (m.phase === 'hold') {
+			if (now < m.until)
+				return;
+			m.snap = { buttons: gp.buttons.map((b) => b.pressed || b.value > 0.5), axes: [...gp.axes] };
+			m.phase = 'wait';
+		}
+		const found = mapActivity(step.kind, gp, m.snap);
+		if (m.phase === 'wait') {
+			if (!found.length)
+				return;
+			m.phase = 'capture';
+			m.until = now + MAP_CAPTURE_MS;
+			m.cap = { buttons: new Map(), axes: new Map() };
+		}
+		if (m.phase === 'capture') {
+			for (const f of found) {
+				if (f.k === 'b') {
+					m.cap.buttons.set(f.i, true);
+				} else {
+					const prev = m.cap.axes.get(f.i);
+					if (prev === undefined || Math.abs(f.v - m.snap.axes[f.i]) > Math.abs(prev - m.snap.axes[f.i]))
+						m.cap.axes.set(f.i, f.v);
+				}
+			}
+			if (now < m.until)
+				return;
+			const binding = bindingFrom(step, m.cap, m.snap);
+			mapperStore(g, step, binding);
+			m.last = `${step.id}: ${describeBinding(binding)}`;
+			m.phase = 'release';
+			m.until = now + MAP_RELEASE_MS;
+			renderMapUi(g);
+			return;
+		}
+		if (m.phase === 'release' && (!found.length || now >= m.until))
+			mapperAdvance(g, m.i + 1);
+	}
+
+	function mapperSkip(g) {
+		const m = g.mapper;
+		if (!m)
+			return;
+		mapperStore(g, m.steps[m.i], null);
+		mapperAdvance(g, m.i + 1);
+	}
+
+	function mapperBack(g) {
+		const m = g.mapper;
+		if (!m)
+			return;
+		m.skip.clear();
+		m.last = '';
+		mapperAdvance(g, Math.max(0, m.i - 1));
+	}
+
+	function mapperCancel(g) {
+		if (!g.mapper)
+			return;
+		g.mapper = null;
+		g.needsNeutral = true;
+		renderMapUi(g);
+		announce(COPY.announce.gamepadMapCancelled);
+	}
+
+	function clearMapping(g) {
+		delete padMaps[g.key];
+		savePadMaps();
+		g.map = null;
+		g.seen = [];
+		g.state.fill(0);
+		renderMapUi(g);
+		syncPads();
+		announce(COPY.announce.gamepadMapCleared(g.name));
+	}
+
+	function renderMapUi(g) {
+		const v = g.view;
+		if (!v)
+			return;
+		const ui = v.map;
+		ui.el.hidden = !g.custom;
+		v.el.classList.toggle('gp-mappable', g.custom && !g.mapper);
+		const m = g.mapper;
+		const step = m ? m.steps[m.i] : null;
+		for (const [i, cap] of v.caps)
+			cap.classList.toggle('target', !!step && step.id === PAD_INPUTS[i]);
+		for (const s of v.sticks)
+			s.el.classList.toggle('target', !!step && step.side === (s.left ? 'L' : 'R'));
+		if (!g.custom)
+			return;
+		ui.idle.hidden = !!m;
+		ui.run.hidden = !m;
+		ui.note.hidden = !!m;
+		ui.note.textContent = g.map ?
+			'You mapped this gamepad. Press its controls to check that the right ones light up, or click one in the picture to map it again.' :
+			'This gamepad does not report a standard layout, so the page cannot tell which control is which. Map it once: press each control when asked. It is remembered for this gamepad in this browser.';
+		ui.start.textContent = g.map ? 'Map again' : 'Map controls';
+		ui.clear.hidden = !g.map;
+		if (m) {
+			const done = m.i >= m.steps.length;
+			ui.step.textContent = done ? '' : `Step ${m.i + 1} of ${m.steps.length}${m.last ? ` · Last: ${m.last}` : ''}`;
+			ui.prompt.textContent = done ? '' : step.text;
+			ui.back.disabled = m.i === 0;
+		}
+	}
+
 	// ---- Keys drawer: the Gamepad tab
 
 	function renderGamepads() {
@@ -4476,6 +4827,7 @@
 			g.view.unused.hidden = !!g.port;
 			for (const r of g.view.radios)
 				r.checked = Number(r.value) === g.port;
+			renderMapUi(g);
 			els.gpList.append(g.view.el); // in order
 		}
 	}
@@ -4493,7 +4845,7 @@
 		const caps = new Map();
 		for (const c of el.querySelectorAll('.cap[data-input]'))
 			caps.set(PAD_INDEX[c.dataset.input], c);
-		return {
+		const view = {
 			el,
 			name: el.querySelector('.gp-name'),
 			legend: el.querySelector('legend'),
@@ -4502,7 +4854,40 @@
 			radios,
 			caps,
 			sticks: [...el.querySelectorAll('.stick')].map((s) => ({ el: s, left: s.dataset.stick === 'L' })),
+			map: {
+				el: el.querySelector('.gp-map'),
+				note: el.querySelector('.gp-map-note'),
+				idle: el.querySelector('.gp-map-idle'),
+				run: el.querySelector('.gp-map-run'),
+				step: el.querySelector('.gp-map-step'),
+				prompt: el.querySelector('.gp-map-prompt'),
+				start: el.querySelector('.gp-map-start'),
+				clear: el.querySelector('.gp-map-clear'),
+				back: el.querySelector('.gp-map-back'),
+			},
 		};
+		view.map.start.addEventListener('click', () => startMapping(g));
+		view.map.clear.addEventListener('click', () => clearMapping(g));
+		el.querySelector('.gp-map-skip').addEventListener('click', () => mapperSkip(g));
+		el.querySelector('.gp-map-back').addEventListener('click', () => mapperBack(g));
+		el.querySelector('.gp-map-cancel').addEventListener('click', () => mapperCancel(g));
+		// With a mapping run not going, a click on a control in the picture maps just that one (a D-pad
+		// button maps the whole D-pad, a stick both its axes).
+		for (const cap of el.querySelectorAll('.cap[data-input]')) {
+			cap.addEventListener('click', () => {
+				if (!g.custom || g.mapper)
+					return;
+				const name = cap.dataset.input;
+				startMapping(g, ['Up', 'Right', 'Down', 'Left'].includes(name) ? ['Up', 'Right', 'Down', 'Left'] : [name]);
+			});
+		}
+		for (const s of el.querySelectorAll('.stick')) {
+			s.addEventListener('click', () => {
+				if (g.custom && !g.mapper)
+					startMapping(g, [s.dataset.stick + 'X', s.dataset.stick + 'Y']);
+			});
+		}
+		return view;
 	}
 
 	function updateGamepadView(g) {
@@ -4563,12 +4948,7 @@
 			});
 		}
 		els.gpSwap.addEventListener('click', swapGamepads);
-		window.addEventListener('gamepadconnected', (e) => {
-			if (e.gamepad.mapping === 'standard')
-				startGamepadLoop();
-			else
-				pageLog(`Gamepad not used: ${gamepadName(e.gamepad)} does not report the standard layout.`, 'warn');
-		});
+		window.addEventListener('gamepadconnected', startGamepadLoop);
 		window.addEventListener('gamepaddisconnected', startGamepadLoop);
 		// A gamepad that was connected before the page opened shows up after its first button press;
 		// look once in case the browser already lists it.
@@ -4630,7 +5010,8 @@
 		if (mode.reason)
 			return mode.reason;
 		if (!GPU_ALLOWED)
-			return URL_GRAPHICS ? 'the address has ?gpu=0' : 'you chose Software';
+			return URL_GRAPHICS ? 'the address has ?gpu=0' : RENDERER_CHOICE === 'sw' ? 'you chose Software' :
+				'Firefox does not show the GPU picture yet (choose GPU to try it)';
 		if (!navigator.gpu)
 			return 'this browser has no WebGPU';
 		if (!HAS_JSPI)

@@ -106,7 +106,9 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    PS2's Analog button. It plays while the PS2 runs and the page has focus, whatever the keyboard's
    state. In the **Keys** drawer, the **Gamepad** tab shows a live picture of each gamepad and lets
    each device (the keyboard on its own tab, every gamepad) play as Player 1 or Player 2; two
-   gamepads can be swapped. The choices are remembered in this browser.
+   gamepads can be swapped. The choices are remembered in this browser. A gamepad that the browser
+   does not lay out in the standard way (an 8BitDo in D mode on a Mac, for one) shows **Map controls**
+   in that tab: press each control when asked and the mapping is kept in this browser.
 5. Under the screen: **Stop** shuts the VM down (then **Boot again**); the BIOS menu shows where the
    BIOS is stored and has **Choose another file…** and **Forget this BIOS**; **Sound** opens the
    volume slider and **Mute** (M mutes and unmutes from the screen too; both are remembered in this
@@ -189,6 +191,8 @@ pad through `pcsx2web_test_pad_state`:
 ```sh
 node tools/wasm/pad-test.mjs --bios-dir DIR --bios FILE   # [--root build-wasm/bin] [--chrome PATH]
 ```
+
+In Firefox (and Zen) the page draws through the 2D canvas under Auto, because the WebGPU display stops after its first frame there (measured in Zen 1.22 on macOS); choosing GPU in the Graphics menu, or `?gpu=1`, still tries WebGPU.
 
 Frames are identified by the vsync they show, counted from boot, not by how many were presented:
 PCSX2 skips presenting duplicate frames (`SkipDuplicateFrames`) based on a wall-clock measure, so
