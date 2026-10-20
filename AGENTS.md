@@ -53,7 +53,11 @@ Every change must be verified, not assumed.
 - Headless (Node), with a BIOS the user provides:
   `node build-wasm/bin/pcsx2-headless.js -approot "$PWD/bin" -dataroot "$PWD/build-wasm/data" -bios <bios file> -frames 600 [-renderer sw|null] [-screenshot out.png]`.
   Use it to check that the BIOS still reaches its menu and to measure speed (median of several
-  runs; report the numbers honestly).
+  runs; report the numbers honestly). Run it with Emscripten's Node 24 (on `PATH` after
+  `source ~/emsdk/emsdk_env.sh`): Node 22's V8 copies the function table into every module the JITs
+  generate, and a game then exhausts the heap within minutes.
+- Performance: measure with the crowd benchmark (`tools/wasm/bench/README.md`); `?threads=1` on the
+  page shows which emulator thread limits a game.
 - Browser: `python3 tools/wasm/serve.py [--port N] [--bios-dir DIR] [web root]`, then open
   `index.html` (or `index.html?bios=dev-bios/<file>` with `--bios-dir`). Test UI changes in a
   real browser at desktop and phone widths, with the keyboard.
