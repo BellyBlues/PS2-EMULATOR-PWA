@@ -80,7 +80,10 @@ addToLibrary({
   tst_post_fallback: (reason, permanent) => {
     const message = { type: 'fallback', reason: UTF8ToString(reason), permanent: !!permanent };
     if (tstGs.port) tstGs.port.postMessage(message);
+#if ENVIRONMENT_MAY_BE_WEB
+    // Only the page defines the handlers; pcsx2-headless (Node) has none, and calling a missing one throws.
     else postMessage({ cmd: {{{ CMD_CALL_HANDLER }}}, handler: 'tstGpuFallback', args: [message.reason, message.permanent] });
+#endif
   },
 
   // Tells the page which renderer the GS opened and on which display path (see WebGPUHost::NoteRenderer).
@@ -88,7 +91,9 @@ addToLibrary({
   tst_post_mode: (hw, webgpu, reason) => {
     const message = { type: 'mode', hw: !!hw, webgpu: !!webgpu, reason: UTF8ToString(reason) };
     if (tstGs.port && webgpu) tstGs.port.postMessage(message);
+#if ENVIRONMENT_MAY_BE_WEB
     else postMessage({ cmd: {{{ CMD_CALL_HANDLER }}}, handler: 'tstGpuMode', args: [message] });
+#endif
   },
 
   // A sleep that suspends the calling thread's stack (JSPI) instead of blocking its worker, so the
