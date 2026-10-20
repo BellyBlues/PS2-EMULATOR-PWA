@@ -741,6 +741,17 @@ u32* intJitBlockCycles()
 	return &cpuBlockCycles;
 }
 
+// For the JIT's inline copy of intJitBranchEnd()'s common case.
+u32* intJitLastBranchTo()
+{
+	return &intLastBranchTo;
+}
+
+bool* intJitBiosHooksActive()
+{
+	return &intBiosHooksActive;
+}
+
 // One instruction (a block that cannot be compiled, for example code in hardware register space).
 void intJitExecOne()
 {

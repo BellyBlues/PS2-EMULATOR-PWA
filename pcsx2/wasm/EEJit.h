@@ -42,6 +42,8 @@ namespace EEJit
 
 // Interpreter entry points used by the JIT (pcsx2/Interpreter.cpp).
 u32* intJitBlockCycles();
+u32* intJitLastBranchTo();
+bool* intJitBiosHooksActive();
 void intJitExecOne();
 void intJitBranchEnd(u32 target);
 void intJitBranchTest();

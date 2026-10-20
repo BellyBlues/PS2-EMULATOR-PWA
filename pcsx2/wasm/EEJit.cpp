@@ -12,13 +12,14 @@
 // - Cycles: every instruction adds its opcode table cycles times the Config.DIE factor to cpuBlockCycles before it
 //   runs, as execI() does. The sum is kept at compile time and written before anything that can read it.
 // - Branches: the delay slot runs with cpuRegs.branch set, then intJitBranchEnd() runs the interpreter's own branch
-//   end (wait loop skip, intUpdateCPUCycles(), the event test and the BIOS hooks). Branches not taken run the
-//   interpreter's event test where it does (BEQ/BNE and the likely branches).
-// - Other instructions: ALU, shifts, HI/LO moves, multiplies, the aligned loads and stores of RAM/ROM/scratchpad,
-//   and with VU0 idle the common COP2 ops (FMAC ops with their flags, moves, LQC2/SQC2, QMFC2/QMTC2, CFC2/CTC2)
-//   the FPU's moves, compares, BC1x branches and arithmetic (FPU.cpp's clamping and flags; not DIV, SQRT, RSQRT)
-//   are emitted; everything else (COP0, other FPU and COP2 ops, MMI, divides, unaligned and I/O accesses, traps,
-//   syscalls) calls the interpreter's function for that opcode with cpuRegs.pc and cpuRegs.code set as execI() sets
+//   end (wait loop skip, intUpdateCPUCycles(), the event test and the BIOS hooks); its usual case is inline, calling
+//   the event test only when an event is due (EmitBranchEnd()). Branches not taken run the interpreter's event test
+//   where it does (BEQ/BNE and the likely branches), also only when it has something to do.
+// - Other instructions: ALU, shifts, HI/LO moves, multiplies, the aligned loads and stores of RAM/ROM/scratchpad and
+//   LDL/LDR/SDL/SDR there, and with VU0 idle the common COP2 ops (FMAC ops with their flags, moves, LQC2/SQC2,
+//   QMFC2/QMTC2, CFC2/CTC2) the FPU's moves, compares, BC1x branches and arithmetic (FPU.cpp's clamping and flags;
+//   not DIV, SQRT, RSQRT) are emitted; everything else (COP0, other FPU and COP2 ops, MMI, divides, other unaligned
+//   and I/O accesses, traps, syscalls) calls the interpreter's function for that opcode with cpuRegs.pc and cpuRegs.code set as execI() sets
 //   them. After such a call, a changed PC (an exception) leaves the block.
 // - Dispatch: a block that ends goes on to the next one itself (Leave()): a tail call to the target's function when
 //   it is in the same module, else a lookup of the dispatcher's cache in wasm, so that the C++ dispatcher (Execute())
@@ -183,7 +184,7 @@ namespace
 		// rt = rs op imm.
 		ADDIU, DADDIU, SLTI, SLTIU, ANDI, ORI, XORI, LUI,
 		// Memory.
-		LB, LBU, LH, LHU, LW, LWU, LD, LQ, SB, SH, SW, SD, SQ, LWC1, SWC1, LQC2, SQC2,
+		LB, LBU, LH, LHU, LW, LWU, LD, LQ, SB, SH, SW, SD, SQ, LWC1, SWC1, LDL, LDR, SDL, SDR, LQC2, SQC2,
 		// COP2: VU0 macro mode (the ops EmitCop2() knows; the rest call the interpreter).
 		COP2,
 		// COP1 (FPU.cpp).
@@ -222,7 +223,8 @@ namespace
 			{ANDI, Kind::ANDI}, {ORI, Kind::ORI}, {XORI, Kind::XORI}, {LUI, Kind::LUI},
 			{LB, Kind::LB}, {LBU, Kind::LBU}, {LH, Kind::LH}, {LHU, Kind::LHU}, {LW, Kind::LW}, {LWU, Kind::LWU},
 			{LD, Kind::LD}, {LQ, Kind::LQ}, {SB, Kind::SB}, {SH, Kind::SH}, {SW, Kind::SW}, {SD, Kind::SD},
-			{SQ, Kind::SQ}, {LWC1, Kind::LWC1}, {SWC1, Kind::SWC1},
+			{SQ, Kind::SQ}, {LWC1, Kind::LWC1}, {SWC1, Kind::SWC1}, {LDL, Kind::LDL}, {LDR, Kind::LDR},
+			{SDL, Kind::SDL}, {SDR, Kind::SDR},
 			{LQC2, Kind::LQC2}, {SQC2, Kind::SQC2}, {COP2, Kind::COP2},
 			{COP1::MFC1, Kind::MFC1}, {COP1::MTC1, Kind::MTC1}, {COP1::CFC1, Kind::CFC1}, {COP1::CTC1, Kind::CTC1},
 			{COP1::ADD_S, Kind::ADD_S}, {COP1::SUB_S, Kind::SUB_S}, {COP1::MUL_S, Kind::MUL_S},
@@ -285,6 +287,8 @@ namespace
 			m_cyc = m_fn.local(ValType::I32);
 			m_f = m_fn.local(ValType::I32);
 			m_v = m_fn.local(ValType::I64);
+			m_k = m_fn.local(ValType::I64);
+			m_w = m_fn.local(ValType::I32);
 		}
 
 		u32 m_next_pc = 0;
@@ -791,10 +795,12 @@ namespace
 					break;
 
 				case Kind::LB: case Kind::LBU: case Kind::LH: case Kind::LHU: case Kind::LW: case Kind::LWU:
-				case Kind::LD: case Kind::LQ: case Kind::LWC1:
+				case Kind::LD: case Kind::LQ: case Kind::LWC1: case Kind::LDL: case Kind::LDR:
 				case Kind::SB: case Kind::SH: case Kind::SW: case Kind::SD: case Kind::SQ: case Kind::SWC1:
+				case Kind::SDL: case Kind::SDR:
 					if (rt == 0 && d.kind != Kind::SB && d.kind != Kind::SH && d.kind != Kind::SW && d.kind != Kind::SD &&
-						d.kind != Kind::SQ && d.kind != Kind::LWC1 && d.kind != Kind::SWC1)
+						d.kind != Kind::SQ && d.kind != Kind::LWC1 && d.kind != Kind::SWC1 && d.kind != Kind::SDL &&
+						d.kind != Kind::SDR)
 					{
 						EmitFallback(pc, code, d, in_delay_slot);
 						return;
@@ -1648,8 +1654,80 @@ namespace
 			return true;
 		}
 
-		// An aligned access to directly mapped memory inline; anything else calls the interpreter's function, which
-		// redoes the whole instruction (nothing has been written yet).
+		// LDL/LDR/SDL/SDR on the aligned doubleword at the host address in m_v, for the guest address in m_a.
+		void EmitUnaligned64(Kind kind, u32 rt)
+		{
+			Function& f = m_fn;
+			auto host = [&] { f.local_get(m_v); f.i32_wrap_i64(); };
+			// m_k: LDL_SHIFT/SDL_SHIFT[addr & 7] (56 - 8 * (addr & 7)) or LDR_SHIFT/SDR_SHIFT (8 * (addr & 7)). The
+			// masks are LDL_MASK = SDR_MASK = ~(~0 << m_k) and LDR_MASK = SDL_MASK = ~(~0 >> m_k).
+			const bool left = kind == Kind::LDL || kind == Kind::SDL;
+			f.local_get(m_a);
+			if (left)
+			{
+				f.i32_const(7);
+				f.i32_xor();
+			}
+			f.i32_const(7);
+			f.i32_and();
+			f.i32_const(3);
+			f.i32_shl();
+			f.i64_extend_i32_u();
+			f.local_set(m_k);
+			auto mask = [&](bool shl) {
+				f.i64_const(-1);
+				f.local_get(m_k);
+				if (shl)
+					f.i64_shl();
+				else
+					f.i64_shr_u();
+				f.i64_const(-1);
+				f.i64_xor();
+			};
+			auto mem = [&] {
+				host();
+				f.i64_load(0);
+			};
+			switch (kind)
+			{
+				case Kind::LDL: // rt = (rt & LDL_MASK) | (mem << LDL_SHIFT)
+				case Kind::LDR: // rt = (rt & LDR_MASK) | (mem >> LDR_SHIFT)
+					f.i32_const(0);
+					LoadGPR64(rt);
+					mask(kind == Kind::LDL);
+					f.i64_and();
+					mem();
+					f.local_get(m_k);
+					if (kind == Kind::LDL)
+						f.i64_shl();
+					else
+						f.i64_shr_u();
+					f.i64_or();
+					f.i64_store(GPR(rt));
+					break;
+				case Kind::SDL: // mem = (rt >> SDL_SHIFT) | (mem & SDL_MASK)
+				case Kind::SDR: // mem = (rt << SDR_SHIFT) | (mem & SDR_MASK)
+					host();
+					LoadGPR64(rt);
+					f.local_get(m_k);
+					if (kind == Kind::SDL)
+						f.i64_shr_u();
+					else
+						f.i64_shl();
+					mem();
+					mask(kind == Kind::SDR);
+					f.i64_and();
+					f.i64_or();
+					f.i64_store(0);
+					break;
+				default:
+					break;
+			}
+		}
+
+		// An aligned access to directly mapped memory inline, and the unaligned LDL/LDR/SDL/SDR (the aligned
+		// doubleword they read or modify, with R5900OpcodeImpl.cpp's masks and shifts); anything else calls the
+		// interpreter's function, which redoes the whole instruction (nothing has been written yet).
 		void EmitMemory(u32 pc, u32 code, const Decoded& d, bool in_delay_slot)
 		{
 			Function& f = m_fn;
@@ -1659,6 +1737,7 @@ namespace
 
 			u32 align_mask = 0;
 			bool quad = false;
+			const bool unaligned = d.kind == Kind::LDL || d.kind == Kind::LDR || d.kind == Kind::SDL || d.kind == Kind::SDR;
 			switch (d.kind)
 			{
 				case Kind::LH: case Kind::LHU: case Kind::SH: align_mask = 1; break;
@@ -1693,6 +1772,11 @@ namespace
 			f.i32_shl();
 			f.i64_load(static_cast<u32>(s_vmap_base));
 			f.local_get(m_a);
+			if (unaligned)
+			{
+				f.i32_const(~7);
+				f.i32_and();
+			}
 			f.i64_extend_i32_u();
 			f.i64_add();
 			f.local_tee(m_v);
@@ -1718,9 +1802,11 @@ namespace
 				case Kind::SD: host(); LoadGPR64(rt); f.i64_store(0); break;
 				case Kind::SQ: host(); f.i32_const(0); f.v128_load(GPR(rt)); f.v128_store(0); break;
 				case Kind::SWC1: host(); f.i32_const(0); f.i32_load(Addr(&fpuRegs.fpr[rt].UL)); f.i32_store(0); break;
+				case Kind::LDL: case Kind::LDR: case Kind::SDL: case Kind::SDR: EmitUnaligned64(d.kind, rt); break;
 				default: break;
 			}
-			if ((d.kind >= Kind::SB && d.kind <= Kind::SQ) || d.kind == Kind::SWC1)
+			if ((d.kind >= Kind::SB && d.kind <= Kind::SQ) || d.kind == Kind::SWC1 || d.kind == Kind::SDL ||
+				d.kind == Kind::SDR)
 				EmitNoteWrite();
 			f.br(1);
 			f.end(); // slow
@@ -1747,6 +1833,166 @@ namespace
 			EmitInstruction(pc, code, d, true);
 		}
 
+		// intUpdateCPUCycles() with an EE cycle rate of 0: cpuRegs.cycle += max(cpuBlockCycles >> 3, 1), and
+		// cpuBlockCycles keeps its low 3 bits.
+		void EmitUpdateCycles()
+		{
+			Function& f = m_fn;
+			const u32 bc = Addr(intJitBlockCycles());
+			f.i32_const(0);
+			f.i32_const(0);
+			f.i64_load(Addr(&cpuRegs.cycle));
+			f.i32_const(0);
+			f.i32_load(bc);
+			f.i32_const(3);
+			f.i32_shr_u();
+			f.local_tee(m_w);
+			f.i32_const(1);
+			f.local_get(m_w);
+			f.select();
+			f.i64_extend_i32_u();
+			f.i64_add();
+			f.i64_store(Addr(&cpuRegs.cycle));
+			f.i32_const(0);
+			f.i32_const(0);
+			f.i32_load(bc);
+			f.i32_const(7);
+			f.i32_and();
+			f.i32_store(bc);
+		}
+
+		// intBranchTest() (intJitBranchTest()), called only when it has something to do: the trace, an event due,
+		// or the BIOS hooks.
+		void EmitBranchTest()
+		{
+			Function& f = m_fn;
+			f.i32_const(0);
+			f.i32_load8_u(Addr(&EEJit::g_trace));
+			f.i32_const(0);
+			f.i32_load8_u(Addr(intJitBiosHooksActive()));
+			f.i32_or();
+			f.i32_const(0);
+			f.i64_load(Addr(&cpuRegs.cycle));
+			f.i32_const(0);
+			f.i64_load(Addr(&cpuRegs.nextEventCycle));
+			f.i64_sub();
+			f.i64_const(0);
+			f.i64_ge_s();
+			f.i32_or();
+			f.if_();
+			CallVoid(FnIndex(&intJitBranchTest));
+			f.end();
+		}
+
+		// A taken branch after its delay slot (cpuBlockCycles written): intJitBranchEnd(target), inline in its usual
+		// case, the same steps in the same order. `target` is the branch target, or kAnyPc for m_j's; `pc_after` is
+		// cpuRegs.pc after the delay slot. intJitBranchEnd() itself runs when the delay slot took an exception
+		// (cpuRegs.branch is 0), with an EE cycle rate other than 0, with the BIOS hooks active, and on a wait loop
+		// (_doBranch_afterDelaySlot(): the same target as the last branch, with the WaitLoop speedhack) that may be
+		// skipped. The JIT only runs from intExecute(), so Cpu is the interpreter there.
+		void EmitBranchEnd(u32 target, u32 pc_after)
+		{
+			Function& f = m_fn;
+			const bool known = target != kAnyPc;
+			auto push_target = [&] {
+				if (known)
+					f.i32_const(static_cast<s32>(target));
+				else
+					f.local_get(m_j);
+			};
+			// A wait loop at a known target, inline when it cannot be skipped: a loop of more than 10 instructions,
+			// or whose first word has a physical pointer (PSM(target) != 0); not the BIOS idle loop at 0x81fc0.
+			const u32 span = pc_after - target;
+			const bool wait_inline = known && target != 0x81fc0 && span != 0;
+			const bool wait_psm = wait_inline && span < 4 * 10;
+			const u32 paddr = target & 0x1fffffff;
+
+			f.block(); // done
+			f.block(); // slow
+			f.i32_const(0);
+			f.i32_load(Addr(&cpuRegs.branch));
+			f.i32_eqz();
+			f.i32_const(0);
+			f.i32_load8_s(Addr(&EmuConfig.Speedhacks.EECycleRate));
+			f.i32_or();
+			f.i32_const(0);
+			f.i32_load8_u(Addr(intJitBiosHooksActive()));
+			f.i32_or();
+			f.br_if(0);
+			// m_w: the wait loop test (intLastBranchTo == target && WaitLoop).
+			f.i32_const(0);
+			f.i32_load(Addr(intJitLastBranchTo()));
+			push_target();
+			f.i32_eq();
+			f.i32_const(0);
+			f.i32_load(Addr(&EmuConfig.Speedhacks.bitset));
+			f.i32_const(static_cast<s32>(WaitLoopBit()));
+			f.i32_and();
+			f.i32_const(0);
+			f.i32_ne();
+			f.i32_and();
+			f.local_tee(m_w);
+			if (!wait_inline)
+				f.br_if(0);
+			else
+			{
+				f.if_();
+				if (wait_psm)
+				{
+					// PSM(target) == 0 (vtlb_GetPhyPtr()): a handler, or a null pointer.
+					if (paddr >= VTLB_PMAP_SZ)
+						f.br(1);
+					else
+					{
+						f.i32_const(0);
+						f.i64_load(Addr(&vtlbdata.pmap[paddr >> VTLB_PAGE_BITS]));
+						f.local_tee(m_v);
+						f.i64_const(0);
+						f.i64_lt_s();
+						f.local_get(m_v);
+						f.i32_wrap_i64();
+						f.i32_const(static_cast<s32>(paddr & VTLB_PAGE_MASK));
+						f.i32_add();
+						f.i32_eqz();
+						f.i32_or();
+						f.br_if(1);
+					}
+				}
+				// Not skipped: _doBranch_afterDelaySlot() still updates the cycles.
+				EmitUpdateCycles();
+				f.end();
+			}
+			// intLastBranchTo = cpuRegs.pc = target; cpuRegs.branch = 0.
+			f.i32_const(0);
+			push_target();
+			f.i32_store(Addr(intJitLastBranchTo()));
+			f.i32_const(0);
+			push_target();
+			f.i32_store(Addr(&cpuRegs.pc));
+			f.i32_const(0);
+			f.i32_const(0);
+			f.i32_store(Addr(&cpuRegs.branch));
+			EmitUpdateCycles();
+			EmitBranchTest();
+			f.br(1);
+			f.end(); // slow
+			push_target();
+			f.i32_const(static_cast<s32>(FnIndex(&intJitBranchEnd)));
+			f.call_indirect(m_tiv, 0);
+			f.end(); // done
+		}
+
+		static u32 WaitLoopBit()
+		{
+			static const u32 bit = [] {
+				Pcsx2Config::SpeedhackOptions o;
+				o.bitset = 0;
+				o.WaitLoop = true;
+				return o.bitset;
+			}();
+			return bit;
+		}
+
 		// Emits the branch at pc. Returns true if the block goes on (at m_next_pc) after the branch not taken.
 		bool EmitBranch(u32 pc, u32 code, const Decoded& d, std::vector<u32>* next)
 		{
@@ -1763,18 +2009,14 @@ namespace
 				f.i64_const(static_cast<s64>(static_cast<u64>(pc + 8)));
 				f.i64_store(GPR(r));
 			};
-			// Taken: delay slot, then the interpreter's branch end, then leave.
-			auto taken = [&](bool from_local, u32 target) {
+			// Taken: delay slot, then the interpreter's branch end, then leave. `target`: btarget, jtarget (also in
+			// m_j), or kAnyPc for m_j's.
+			auto taken = [&](u32 target) {
 				const u32 saved_pending = m_pending;
 				const bool saved_dirty = m_cyc_dirty;
 				EmitDelaySlot(pc + 4);
 				FlushCycles();
-				if (from_local)
-					f.local_get(m_j);
-				else
-					f.i32_const(static_cast<s32>(btarget));
-				f.i32_const(static_cast<s32>(FnIndex(&intJitBranchEnd)));
-				f.call_indirect(m_tiv, 0);
+				EmitBranchEnd(target, pc + 8);
 				Leave(target, false);
 				m_pending = saved_pending;
 				m_cyc_dirty = saved_dirty;
@@ -1788,7 +2030,7 @@ namespace
 						link(31);
 					f.i32_const(static_cast<s32>(jtarget));
 					f.local_set(m_j);
-					taken(true, jtarget);
+					taken(jtarget);
 					if (in_page(jtarget))
 						next->push_back(jtarget);
 					if (in_page(pc + 8))
@@ -1800,7 +2042,7 @@ namespace
 					f.local_set(m_j);
 					if (d.kind == Kind::JALR && rd)
 						link(rd);
-					taken(true, kAnyPc);
+					taken(kAnyPc);
 					if (in_page(pc + 8))
 						next->push_back(pc + 8);
 					return false;
@@ -1842,7 +2084,7 @@ namespace
 			}
 			}
 			f.if_();
-			taken(false, btarget);
+			taken(btarget);
 			f.end();
 			if (in_page(btarget))
 				next->push_back(btarget);
@@ -1860,7 +2102,7 @@ namespace
 				f.i32_const(static_cast<s32>(code));
 				f.i32_store(Addr(&cpuRegs.code));
 				FlushCycles();
-				CallVoid(FnIndex(&intJitBranchTest));
+				EmitBranchTest();
 				CheckPc(resume);
 			}
 			m_next_pc = resume;
@@ -1943,7 +2185,7 @@ namespace
 		bool m_iloc_ok[4] = {};
 		bool m_t_ok = false;
 		bool m_vloc_ok[8] = {};
-		u32 m_v;
+		u32 m_v, m_k, m_w;
 		u32 m_pending = 0; // cycles not yet written, before the Config factor
 		bool m_cyc_dirty = false; // m_cyc may be non-zero
 	};
