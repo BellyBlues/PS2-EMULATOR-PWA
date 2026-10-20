@@ -5464,13 +5464,15 @@
 	// shows there too: holding it for the PS2 would merge quick taps into one press when mashing.
 	const GAMEPAD_POLL_MS = 0;
 	const GAMEPAD_SHOW_MS = 50;
-	// Firefox (and browsers built on it, such as Zen) can hand a page a quick tap's press and release
-	// together, so that no look ever sees the button down. With dom.gamepad.non_standard_events.enabled
-	// (about:config; on in Nightly, off in release builds) it also fires gamepadbuttondown and
-	// gamepadaxismove for every change, in order: a press or a move between two looks then counts in the
-	// next look, so no tap is lost. Other browsers have neither the events nor the problem.
+	// Firefox (and browsers built on it, such as Zen) hands a page gamepad changes late and in bursts while
+	// the emulator runs: a quick tap's press and release, or a release and the next press when mashing,
+	// can arrive together, so that no look sees them. With dom.gamepad.non_standard_events.enabled
+	// (about:config; on in Nightly, off in release builds) it also fires gamepadbuttondown,
+	// gamepadbuttonup and gamepadaxismove for every change, in order: the page plays each one as it comes,
+	// so no tap is lost. Other browsers have neither the events nor the problem.
 	const GAMEPAD_EVENTS = typeof window.GamepadButtonEvent === 'function';
-	const TAPPED_BUTTON = Object.freeze({ pressed: true, touched: true, value: 1 });
+	const PRESSED_BUTTON = Object.freeze({ pressed: true, touched: true, value: 1 });
+	const RELEASED_BUTTON = Object.freeze({ pressed: false, touched: false, value: 0 });
 	const PAD_BUTTON_COUNT = 17; // the PAD_INPUTS before the stick halves
 	const VIEW_REFRESH_MS = 16;
 
@@ -5626,8 +5628,6 @@
 				needsNeutral: true,
 				latch: new Float32Array(PAD_INPUTS.length), // the value a button was last seen at ...
 				latchUntil: new Float64Array(PAD_INPUTS.length), // ... and until when the picture shows it
-				tapped: new Set(), // buttons pressed since the last look (gamepadbuttondown)
-				moved: new Map(), // axis -> the values it took since the last look (gamepadaxismove)
 				viewAt: 0,
 				view: null,
 			};
@@ -5690,33 +5690,7 @@
 				continue;
 			}
 			any = true;
-			const raw = g.raw;
-			const seen = withChanges(gp, g);
-			readGamepad(seen, raw, g);
-			const now = performance.now();
-			g.shown.set(raw);
-			for (let i = 0; i < PAD_BUTTON_COUNT; i++) {
-				if (raw[i] > 0) {
-					g.latch[i] = raw[i];
-					g.latchUntil[i] = now + GAMEPAD_SHOW_MS;
-				} else if (now < g.latchUntil[i]) {
-					g.shown[i] = g.latch[i];
-				}
-			}
-			if (g.mapper)
-				mapperFrame(g, seen, now);
-			if (g.view && now - g.viewAt >= VIEW_REFRESH_MS) {
-				g.viewAt = now;
-				updateGamepadView(g);
-			}
-			const idle = !raw.some((v) => v > 0);
-			if (idle)
-				g.needsNeutral = false;
-			// After a change of player or a pause in play, the inputs held must be let go once.
-			if (live && !g.needsNeutral && !g.mapper)
-				g.state.set(raw);
-			else
-				g.state.fill(0);
+			playGamepad(g, gp, live);
 			changed = true;
 		}
 		if (changed)
@@ -5725,44 +5699,61 @@
 			stopGamepadLoop(); // the next gamepadconnected event starts it again
 	}
 
-	// The gamepad as of this look, plus what the events say happened since the last one: a button pressed
-	// since then counts as down, and an axis takes the value farthest from where it is now. The next look
-	// sees the release, and the emulator holds the press long enough for the game.
-	function withChanges(gp, g) {
-		if (!g.tapped.size && !g.moved.size)
-			return gp;
-		const buttons = Array.from(gp.buttons, (b, i) => (g.tapped.has(i) && !b.pressed ? TAPPED_BUTTON : b));
-		const axes = Array.from(gp.axes, (a, i) => {
-			const vals = g.moved.get(i);
-			if (!vals)
-				return a;
-			let far = a;
-			for (const v of vals) {
-				if (Math.abs(v - a) > Math.abs(far - a))
-					far = v;
+	// Plays one state of a gamepad: what the PS2 gets (sent by the caller's syncPads), the Gamepad tab's
+	// picture and a mapping run.
+	function playGamepad(g, seen, live) {
+		const raw = g.raw;
+		readGamepad(seen, raw, g);
+		const now = performance.now();
+		g.shown.set(raw);
+		for (let i = 0; i < PAD_BUTTON_COUNT; i++) {
+			if (raw[i] > 0) {
+				g.latch[i] = raw[i];
+				g.latchUntil[i] = now + GAMEPAD_SHOW_MS;
+			} else if (now < g.latchUntil[i]) {
+				g.shown[i] = g.latch[i];
 			}
-			return far;
-		});
-		g.tapped.clear();
-		g.moved.clear();
-		return { id: gp.id, index: gp.index, mapping: gp.mapping, connected: gp.connected, timestamp: gp.timestamp, buttons, axes };
-	}
-
-	function onGamepadButtonDown(e) {
-		const g = e.gamepad && gamepads.get(e.gamepad.index);
-		if (g && g.connected)
-			g.tapped.add(e.button);
-	}
-
-	function onGamepadAxisMove(e) {
-		const g = e.gamepad && gamepads.get(e.gamepad.index);
-		if (!g || !g.connected)
-			return;
-		const vals = g.moved.get(e.axis);
-		if (vals)
-			vals.push(e.value);
+		}
+		if (g.mapper)
+			mapperFrame(g, seen, now);
+		if (g.view && now - g.viewAt >= VIEW_REFRESH_MS) {
+			g.viewAt = now;
+			updateGamepadView(g);
+		}
+		const idle = !raw.some((v) => v > 0);
+		if (idle)
+			g.needsNeutral = false;
+		// After a change of player or a pause in play, the inputs held must be let go once.
+		if (live && !g.needsNeutral && !g.mapper)
+			g.state.set(raw);
 		else
-			g.moved.set(e.axis, [e.value]);
+			g.state.fill(0);
+	}
+
+	// Firefox's gamepad events, in order: each one plays the gamepad as it is now with that change on top
+	// (the gamepad can already show a later one), so every press and release reaches the PS2 as an edge,
+	// even when a burst brings a whole tap, or a release and the next press, at once. The emulator keeps
+	// each press long enough for the game.
+	function onGamepadEvent(e) {
+		const g = e.gamepad && gamepads.get(e.gamepad.index);
+		const gp = g && g.connected && navigator.getGamepads()[g.index];
+		if (!gp || !gp.connected)
+			return;
+		let buttons = gp.buttons;
+		let axes = gp.axes;
+		if (e.type === 'gamepadaxismove') {
+			axes = Array.from(gp.axes);
+			axes[e.axis] = e.value;
+		} else {
+			const down = e.type === 'gamepadbuttondown';
+			const b = gp.buttons[e.button];
+			if (b && b.pressed !== down) {
+				buttons = Array.from(gp.buttons);
+				buttons[e.button] = down ? PRESSED_BUTTON : RELEASED_BUTTON;
+			}
+		}
+		playGamepad(g, { id: gp.id, index: gp.index, mapping: gp.mapping, connected: true, buttons, axes }, gamepadsLive());
+		syncPads();
 	}
 
 	function startGamepadLoop() {
@@ -6293,8 +6284,9 @@
 		els.gpSwap.addEventListener('click', swapGamepads);
 		window.addEventListener('gamepadconnected', startGamepadLoop);
 		if (GAMEPAD_EVENTS) {
-			window.addEventListener('gamepadbuttondown', onGamepadButtonDown);
-			window.addEventListener('gamepadaxismove', onGamepadAxisMove);
+			window.addEventListener('gamepadbuttondown', onGamepadEvent);
+			window.addEventListener('gamepadbuttonup', onGamepadEvent);
+			window.addEventListener('gamepadaxismove', onGamepadEvent);
 		}
 		els.gpTaps.hidden = !IS_FIREFOX || GAMEPAD_EVENTS;
 		window.addEventListener('gamepaddisconnected', startGamepadLoop);

@@ -241,7 +241,9 @@ static constexpr u32 NUM_PAD_PORTS = 2;
 static_assert(NUM_PAD_INPUTS <= 32);
 
 // A button keeps the key rules above (a tap lasts at least MIN_KEY_HOLD_POLLS, mashing drops taps);
-// a stick half applies its latest value.
+// a stick half applies its latest value. A gamepad's edges can arrive in bursts (Firefox can hand the
+// page a few taps at once), so a button keeps two whole taps pending before it drops one.
+static constexpr u8 MAX_PENDING_PAD_EDGES = 5;
 struct PadSlot
 {
 	float target; // the last value (of a button: the last pressed value)
@@ -1536,7 +1538,7 @@ static void ProcessPadEvents()
 		if (pressed == target)
 			continue; // duplicate edge, or a new pressure
 
-		if (++slot.pending > MAX_PENDING_KEY_EDGES)
+		if (++slot.pending > MAX_PENDING_PAD_EDGES)
 			slot.pending -= 2; // drop one whole tap, keep the parity
 	}
 	s_pad_queue_tail.store(tail, std::memory_order_release);
