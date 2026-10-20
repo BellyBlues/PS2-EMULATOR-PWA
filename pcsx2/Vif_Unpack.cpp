@@ -486,13 +486,19 @@ __ri void _nVifUnpackLoop(const u8* data)
 	// VIFfuncTable (call_indirect on wasm), with the same address wrap and the same final state.
 	if (!doMode && !isFill && !(vif.cmd & 0x10) && upkNum == 0x0C && vifRegs.cycle.cl == vifRegs.cycle.wl)
 	{
+		// In at most two contiguous pieces: VU memory only wraps at its end (getVUptr()'s mask).
 		const uint wl = vifRegs.cycle.wl ? vifRegs.cycle.wl : 256;
 		const uint num = vifRegs.num;
-		for (uint i = 0; i < num; i++)
+		const u32 mem_size = idx ? 0x4000 : 0x1000;
+		u32 remaining = num * 16;
+		while (remaining > 0)
 		{
-			std::memcpy(getVUptr(idx, vif.tag.addr), data, 16);
-			vif.tag.addr += 16;
-			data += 16;
+			const u32 offset = vif.tag.addr & (mem_size - 16);
+			const u32 piece = std::min(remaining, mem_size - offset);
+			std::memcpy(vuRegs[idx].Mem + offset, data, piece);
+			vif.tag.addr += piece;
+			data += piece;
+			remaining -= piece;
 		}
 		vif.cl = num % wl;
 		vifRegs.num = 0;
