@@ -60,6 +60,9 @@ set(PCSX2_WASM_EXPORTS
 	_pcsx2web_vps
 	_pcsx2web_key_code
 	_pcsx2web_key
+	_pcsx2web_pad_input
+	_pcsx2web_pad
+	_pcsx2web_test_pad_state
 	_pcsx2web_frame
 	_pcsx2web_surface_size
 	_pcsx2web_set_crisp

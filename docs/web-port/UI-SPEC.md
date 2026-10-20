@@ -28,7 +28,6 @@ There is also a BIOS-menu popover, a Sound popover (§11) and an About dialog. B
 Space reserved for later, with no controls today:
 - memory-card and save-state slots, left of the disc menu (the disc slot is in use, see §10)
 - Settings, as a third drawer
-- a Gamepad tab in Keys
 
 **Flows:**
 - **First run:** the runtime starts downloading on load while the slate asks for a BIOS. Neither waits for the other.
@@ -199,7 +198,7 @@ The total is about 124 KB.
   - It shows the file name and where it is stored, then "Choose another file…" and "Forget this BIOS".
   - While the PS2 is running, the items are `aria-disabled` and described by the line that gives the reason.
   - Forget asks for confirmation inline, with focus on Keep.
-- **Keys drawer.**
+- **Keys drawer.** Two tabs, Keyboard and Gamepad (§13).
   - Keys are laid out like a controller (D4). Caps are at least 28 px, on `--raise` with a 1 px `--line-2` border, and turn amber while held (`kbd.down`).
   - Letter labels come from `navigator.keyboard.getLayoutMap()`, so AZERTY shows Z Q S D; QWERTY is the fallback.
   - It includes "Keep controls visible", saved as `pcsx2web.keepChrome`.
@@ -264,6 +263,9 @@ With reduced motion, every duration is 0. The controls still hide.
   - "In the system menus ✕ confirms and △ goes back (○ confirms on Japanese consoles)." The glyphs are SVG.
   - "While the PS2 runs, keys you press light up here."
   - "Keep controls visible"
+  - Tabs: "Keyboard" · "Gamepad". Keyboard player: "The keyboard plays as" with "Player 1" · "Player 2".
+  - Gamepad tab: "Press a button on your gamepad to connect it." (no gamepad), "Swap players", "Not used: two gamepads at most."
+  - Announcer: "Gamepad connected: <name>, Player 1." · "Gamepad connected: <name>. Only two gamepads play, so it is not used." · "Gamepad disconnected: <name>." · "<name> plays as Player 2." · "The keyboard plays as Player 2." · "Players swapped. <name> is Player 2. <name> is Player 1."
 - **Stopped:** "Stopped." / "SCPH-39001.bin · ran 04:12" / "Boot again"
 - **Failed:** "The PS2 didn't start." / "PCSX2 couldn't boot SCPH-39001.bin. The end of the log:" / "Try again" · "Use another BIOS…" · "Open the log"
 - **Fatal:**
@@ -289,7 +291,7 @@ With reduced motion, every duration is 0. The controls still hide.
   - "About TabStationToo."
   - "PCSX2, compiled to WebAssembly, running entirely in this tab."
   - "Use only a BIOS dumped from a console you own. It's kept in this browser (IndexedDB), never sent anywhere, and you can forget it from the BIOS menu."
-  - "Works today: the BIOS menus and games from disc images, with sound and a keyboard, and a memory card kept in this browser. Most games run well below full speed for now. Not yet: save states, gamepads."
+  - "Works today: the BIOS menus and games from disc images, with sound, a keyboard and gamepads, and a memory card kept in this browser. Most games run well below full speed for now. Not yet: save states."
   - "Built from PCSX2, GPL-3.0-or-later. Source"
   - "PlayStation and PS2 are trademarks of Sony Interactive Entertainment. This project isn't affiliated with or endorsed by Sony."
   - "Type: Archivo and Chivo Mono by Omnibus-Type (OFL 1.1). Icons: Phosphor (MIT)." Each name links to its licence file.
@@ -356,7 +358,7 @@ Pointer activity, focus entering the controls (they show at once), a page shortc
      section#slate > h2[tabindex=-1], p.body, pre.excerpt, div.actions, p.error, details.dev, p.fine
    div.sill > div.capture, p#subtitle[role=status], p#readout, span.tally
    div.transport[role=group] > .t-left(#btn-stop #disc-btn #bios-btn) .t-right(#btn-sound #btn-crisp #btn-keys #btn-log #btn-fs)
-   section#keys-drawer[hidden], section#log-drawer[hidden] > div#log[role=log], div#disc-menu[popover], div#bios-menu[popover], div#sound-menu[popover]
+   section#keys-drawer[hidden] > div.tabs[role=tablist], div#panel-keyboard[role=tabpanel], div#panel-gamepad[role=tabpanel], section#log-drawer[hidden] > div#log[role=log], div#disc-menu[popover], div#bios-menu[popover], div#sound-menu[popover]
  footer.credits, dialog#about, p#announce[role=status], input#bios-input[type=file][hidden], input#disc-input[type=file][hidden]
 ```
 
@@ -496,3 +498,22 @@ The picture comes one of three ways, and the page says which. **GPU renderer**: 
 **Phone (under 640 px).** The tools row is Sound, Graphics, Crisp, Keys, Log, Fullscreen; on touch each tool is at least 56 px wide so the six fit in 358 px. The menu is at most the width between the gutters and scrolls if taller than the screen.
 
 **Microcopy:** "Graphics" · "Now" · "Not started yet" · "GPU renderer" · "GPU display, software drawing" · "Software on a 2D canvas" · "Because …" · "Renderer" · "Auto" · "GPU" · "Software" · "Check WebGPU" · "Checking…".
+
+## 13. Players and gamepads
+
+The PS2 has two pad ports. Each device the page can play with (the keyboard, and each gamepad) plays as Player 1 (port 1) or Player 2 (port 2). Any device can take either port, and two devices can share one: the port plays the larger of their values, so a key and a stick never cancel each other.
+
+**Gamepads.** Only gamepads that the browser reports with the Gamepad API's `"standard"` layout play (Xbox, DualShock, DualSense, Switch Pro and most others); the rest are ignored and the log says so. The layout goes by position: the bottom face button is Cross, right Circle, left Square, top Triangle. L2 and R2 pass their pressure; the sticks are analog; the Guide/Home button is the PS2's Analog toggle (some browsers and systems keep it for themselves). A round dead zone of 10 % is applied by the page (rescaled, so the full throw still reaches 1), and the core's diagonal scale correction is on at 100 % sensitivity, so a round gate reaches the corners. Fixed mapping: no remapping, rumble or menu navigation by gamepad yet.
+
+**Which port.** The first two gamepads that connect take Player 1 and Player 2 (a first gamepad starts on the port saved as `pcsx2web.padFirst`, the second on the other one); a third and later one is not used. The keyboard starts on the port saved as `pcsx2web.padKeyboard` (default Player 1). Defaults: keyboard Player 1, first gamepad Player 1, second gamepad Player 2. A gamepad that was unplugged and plugged in again takes its port back within the visit. Per-device memory is not kept: two identical gamepads share one `id`.
+
+**When it plays.** A gamepad plays while the PS2 runs, the page has focus and is visible, whatever the state of the keyboard capture (Esc, Tab and a focus on the drawer release only the keyboard). It lets go of everything on blur, a hidden tab, a disconnect, a stop, and when its player changes (what was held then has to be released and pressed again).
+
+**Keys drawer.** Two tabs (`role="tablist"`; Left and Right, Home and End move between them; focus ring as everywhere).
+- **Keyboard:** the controller-shaped layout of D4, under "The keyboard plays as" with two radios, "Player 1" and "Player 2".
+- **Gamepad:** with none connected, "Press a button on your gamepad to connect it." (a browser lists a gamepad only after its first button press). For each connected gamepad, in connection order: its name (15 px, 560), a "Player 1" / "Player 2" radio pair (the fieldset is named "Player for <name>"; a third gamepad shows "Not used: two gamepads at most." instead), and a live picture of the pad: the same caps as the Keyboard tab (L2, L1, D-pad, Select, Analog, Start, R1, R2, face buttons, L3, R3) that turn amber while held, and each stick as a 44 px circle with a dot that follows it (amber while it is off centre). The picture is `aria-hidden`: it shows state and is not announced. With two gamepads, "Swap players" (`.btn-quiet`) exchanges their ports.
+- Changes apply at once and are remembered (`localStorage`, failing quietly).
+
+**Microcopy:** see §7 (Keys drawer and the announcer).
+
+**Tests.** `tools/wasm/pad-test.mjs` plays a mocked `navigator.getGamepads()` and the keyboard in headless Chrome and reads each port's pad through `pcsx2web_test_pad_state`. A real controller is a manual check.

@@ -924,7 +924,9 @@ p.fine {
 }
 
 .pad kbd,
-.sticks kbd {
+.pad .cap,
+.sticks kbd,
+.sticks .cap {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -942,17 +944,166 @@ p.fine {
   transition: background-color var(--d-cap) var(--ease-out), border-color var(--d-cap) var(--ease-out), color var(--d-cap) var(--ease-out);
 }
 
-.pad kbd .icon {
+.pad kbd .icon,
+.pad .cap .icon {
   width: 14px;
   height: 14px;
 }
 
 .pad kbd.down,
-.sticks kbd.down {
+.pad .cap.down,
+.sticks kbd.down,
+.sticks .cap.down {
   background: var(--amber);
   border-color: var(--amber);
   color: var(--amber-ink);
   transition: none;
+}
+
+.pad .cap.down .glyph {
+  color: var(--amber-ink);
+}
+
+/* Keys drawer tabs: Keyboard and Gamepad. */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  position: relative;
+  min-height: var(--hit);
+  padding: 0 12px;
+  border: 0;
+  border-radius: 3px 3px 0 0;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 560;
+  transition: background-color var(--d-line) var(--ease-out), color var(--d-line) var(--ease-out);
+}
+
+.tab:hover {
+  background: var(--raise);
+  color: var(--ink);
+}
+
+.tab[aria-selected="true"] {
+  color: var(--ink);
+}
+
+.tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: -1px;
+  height: 2px;
+  background: var(--ink);
+}
+
+/* Who a device plays as (Player 1 or 2): the keyboard's, and one per gamepad. */
+.players {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 16px;
+  margin: 0 0 12px;
+  padding: 0;
+  border: 0;
+  min-inline-size: 0;
+}
+
+.players legend {
+  float: left;
+  padding: 0 16px 0 0;
+}
+
+.players .check input:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.gp {
+  padding: 12px 0;
+}
+
+.gp + .gp {
+  border-top: 1px solid var(--line);
+}
+
+.gp-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0 24px;
+  margin-bottom: 12px;
+}
+
+.gp-head .players {
+  margin: 0;
+}
+
+.gp-name {
+  margin: 0;
+  min-width: 0;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 560;
+  overflow-wrap: anywhere;
+}
+
+.gp-unused,
+.gp-empty {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.gp-actions {
+  margin-top: 4px;
+}
+
+.gp-actions .btn-quiet {
+  margin-left: -12px;
+}
+
+.gp-sticks {
+  margin-top: 12px;
+}
+
+.stick {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--line-2);
+  border-radius: 50%;
+  background: var(--raise);
+}
+
+.stick-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: var(--ink-2);
+  transform: translate(calc(var(--sx, 0) * 17px), calc(var(--sy, 0) * 17px));
+}
+
+.stick.down .stick-dot {
+  background: var(--amber);
 }
 
 .pad {
@@ -2196,6 +2347,21 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
 }
 
 @media (forced-colors: active) {
+  .tab[aria-selected="true"]::after,
+  .stick.down .stick-dot {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+
+  .stick {
+    border-color: ButtonText;
+  }
+
+  .stick-dot {
+    forced-color-adjust: none;
+    background: ButtonText;
+  }
+
   .screen {
     outline-color: CanvasText;
   }
@@ -2233,7 +2399,9 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   }
 
   .pad kbd.down,
-  .sticks kbd.down {
+  .pad .cap.down,
+  .sticks kbd.down,
+  .sticks .cap.down {
     forced-color-adjust: none;
     background: Highlight;
     border-color: Highlight;

@@ -32,7 +32,9 @@ Early and experimental.
   running: title screen and logos 100 % of full speed, menus 60–100 %, character select 60–95 %,
   movies 20–70 %, and battles 10–16 % (5–8 of the PS2's 50 frames per second), which is not
   playable yet. Drawing is not what slows it down.
-- Not there yet: save states, gamepads, compressed disc images (CHD, CSO, GZ), and swapping discs
+- Gamepads play too (the standard layout of Xbox, DualShock, DualSense and Switch Pro pads), and the
+  keyboard and each gamepad can be Player 1 or Player 2 (Keys, then Gamepad).
+- Not there yet: save states, rumble, remapping keys and buttons, compressed disc images (CHD, CSO, GZ), and swapping discs
   while a game runs.
 - Desktop Chrome and Edge are the targets. Other browsers may work; phones are not supported yet.
 

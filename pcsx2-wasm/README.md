@@ -100,6 +100,13 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    hiding the tab also release it. Clicking Stop, Crisp, Keys, Log or Fullscreen keeps the keyboard
    on the PS2. Browser shortcuts (Ctrl/Cmd/Alt combinations, F5, F11, F12) keep working. The controls fade after 2.5 s without
    pointer activity; **Keep controls visible** in the Keys drawer turns that off.
+   **Gamepads** play too: a gamepad with the browser's standard layout (Xbox, DualShock, DualSense,
+   Switch Pro and most others; press a button once so the browser lists it) plays by position
+   (bottom face button = Cross), with analog sticks and triggers, and the Guide/Home button as the
+   PS2's Analog button. It plays while the PS2 runs and the page has focus, whatever the keyboard's
+   state. In the **Keys** drawer, the **Gamepad** tab shows a live picture of each gamepad and lets
+   each device (the keyboard on its own tab, every gamepad) play as Player 1 or Player 2; two
+   gamepads can be swapped. The choices are remembered in this browser.
 5. Under the screen: **Stop** shuts the VM down (then **Boot again**); the BIOS menu shows where the
    BIOS is stored and has **Choose another file…** and **Forget this BIOS**; **Sound** opens the
    volume slider and **Mute** (M mutes and unmutes from the screen too; both are remembered in this
@@ -174,6 +181,14 @@ Switches for comparisons and tests (all optional):
 | `?iopjit=0` | Runs the IOP (I/O processor) interpreter instead of the IOP JIT, which compiles IOP code to WebAssembly at run time |
 | `?vu1jit=0` | Runs the VU1 (vector unit 1) interpreter instead of the VU1 JIT, which compiles VU1 micro programs to WebAssembly at run time |
 | `?gsidle=block` | Keeps the GS thread's idle wait blocking with WebGPU, leaving only the device's bounded event-loop turn |
+
+`tools/wasm/pad-test.mjs` tests the players (the keyboard and gamepads going to port 1 or 2): it
+plays a mocked `navigator.getGamepads()` and the keyboard in headless Chrome and reads each port's
+pad through `pcsx2web_test_pad_state`:
+
+```sh
+node tools/wasm/pad-test.mjs --bios-dir DIR --bios FILE   # [--root build-wasm/bin] [--chrome PATH]
+```
 
 Frames are identified by the vsync they show, counted from boot, not by how many were presented:
 PCSX2 skips presenting duplicate frames (`SkipDuplicateFrames`) based on a wall-clock measure, so
@@ -411,6 +426,8 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_state()` | 0 waiting, 1 starting, 2 running, 3 stopped, 4 failed (polled every 500 ms) |
 | `pcsx2web_speed()`, `pcsx2web_vps()` | speed in percent, vertical syncs per second |
 | `pcsx2web_key_code(name)`, `pcsx2web_key(code, pressed)` | resolve host key names once, then queue key events |
+| `pcsx2web_pad_input(name)`, `pcsx2web_pad(port, input, value)` | resolve a pad input name ("Cross", "L2", "LUp", ...) once, then queue its state (0 to 1) for port 0 or 1; 1 if queued, 0 if the queue is full. The page routes the keyboard and the gamepads to a port (UI-SPEC §13); the core has no keyboard bindings for the pads |
+| `pcsx2web_test_pad_state(port)` | test hook: the raw value (0 to 255) of each pad input of a port, four to a word, then a flags word (bit 0 connected, bit 1 analog light) |
 | `pcsx2web_frame()` | address of the frame descriptor: `seq, width, height, pixels, vsync` (u32) |
 | `pcsx2web_surface_size(w, h, scale)` | the display canvas's backing size and device pixel ratio (WebGPU presents at it) |
 | `pcsx2web_set_crisp(on)` | nearest (1) or bilinear (0) presentation, applied at the next vsync |
@@ -490,7 +507,7 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 
 ## Current limitations
 
-- No save states, gamepads or touch controls yet; fixed key layout. One memory card (slot 1).
+- No save states, rumble or touch controls yet; fixed key and gamepad layouts (no remapping). Two pads (ports 1 and 2, no multitap). One memory card (slot 1).
 - Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
   continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
   Safari is untested.

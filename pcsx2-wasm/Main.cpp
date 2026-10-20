@@ -67,6 +67,8 @@
 #include "pcsx2/Input/InputManager.h"
 #include "pcsx2/MTGS.h"
 #include "pcsx2/PerformanceMetrics.h"
+#include "pcsx2/SIO/Pad/Pad.h"
+#include "pcsx2/SIO/Pad/PadBase.h"
 #include "pcsx2/VMManager.h"
 #include "pcsx2/wasm/EEJit.h"
 #include "pcsx2/wasm/IopJit.h"
@@ -212,6 +214,50 @@ struct KeySlot
 };
 static u32 s_key_poll_count = 0; // CPU thread only
 static KeySlot s_keys[NUM_KEYS + 1] = {}; // CPU thread only
+
+// Pad events: the page sends the state of one PS2 input of one port (port 1 or 2) as a value from 0
+// to 1: the same single producer (browser main thread) and single consumer (CPU thread) as the
+// keys. The keyboard's pad keys and the gamepads all arrive here, already routed to a port by the
+// page (the Players choice in the Keys drawer), so the core has no keyboard bindings for the pads.
+// The CPU thread hands each value to the pad (Pad::SetControllerState, what a PCSX2 binding does).
+// Each entry: value 0..65535 in bits 0-15, the input in bits 16-20, the port in bit 21.
+static constexpr u32 PAD_QUEUE_SIZE = 512;
+static constexpr u32 PAD_EVENT_INPUT_SHIFT = 16;
+static constexpr u32 PAD_EVENT_PORT_SHIFT = 21;
+static u32 s_pad_queue[PAD_QUEUE_SIZE];
+static std::atomic<u32> s_pad_queue_head{0}; // written by the producer
+static std::atomic<u32> s_pad_queue_tail{0}; // written by the consumer
+static_assert((PAD_QUEUE_SIZE & (PAD_QUEUE_SIZE - 1)) == 0);
+
+// The inputs of a DualShock 2, by the core's binding names. The first NUM_PAD_BUTTONS are buttons
+// (L2 and R2 take a pressure), the rest the eight halves of the two sticks (a value 0 to 1 each).
+static constexpr const char* s_pad_input_names[] = {"Up", "Right", "Down", "Left", "Triangle", "Circle", "Cross",
+	"Square", "Select", "Start", "L1", "L2", "R1", "R2", "L3", "R3", "Analog", "LUp", "LRight", "LDown", "LLeft",
+	"RUp", "RRight", "RDown", "RLeft"};
+static constexpr u32 NUM_PAD_INPUTS = static_cast<u32>(std::size(s_pad_input_names));
+static constexpr u32 NUM_PAD_BUTTONS = 17;
+static constexpr u32 NUM_PAD_PORTS = 2;
+static_assert(NUM_PAD_INPUTS <= 32);
+
+// A button keeps the key rules above (a tap lasts at least MIN_KEY_HOLD_POLLS, mashing drops taps);
+// a stick half applies its latest value.
+struct PadSlot
+{
+	float target; // the last value (of a button: the last pressed value)
+	float applied; // what the pad was given
+	bool down; // button state applied
+	u8 pending; // button edges (toggles) still to apply
+	u32 changed_at; // poll of the last applied button edge, 0 = never
+};
+static PadSlot s_pad_slots[NUM_PAD_PORTS][NUM_PAD_INPUTS] = {}; // CPU thread only
+static u8 s_pad_bind_index[NUM_PAD_INPUTS] = {}; // the core's bind index of each input
+static bool s_pad_bind_index_ready = false;
+
+// What each port's pad holds, for tests (pcsx2web_test_pad_state): the raw value (0..255) of every
+// input in a byte, then a word with bit 0 set while the pad is connected and bit 1 while its analog
+// light is on.
+static constexpr u32 PAD_SNAPSHOT_WORDS = (NUM_PAD_INPUTS + 3) / 4 + 1;
+static std::atomic<u32> s_pad_snapshot[NUM_PAD_PORTS][PAD_SNAPSHOT_WORDS];
 
 //////////////////////////////////////////////////////////////////////////
 // Discs, game details and memory cards
@@ -906,6 +952,25 @@ static void ParseAudioArguments(int argc, char* argv[])
 }
 
 // InitializeConfig() (AUDIO-DESIGN.md 5), and the factory, before the CPU thread starts.
+// Two DualShock 2 pads, ports 1 and 2, fed by pcsx2web_pad (the keyboard and the gamepads, routed by
+// the page). The core's default keyboard bindings for port 1 are removed: the keyboard goes through
+// the page's Players choice like a gamepad. Sticks use the core's diagonal scale correction ("circular
+// pickup": a modern controller's round gate reaches the corners) at sensitivity 100%, as the core
+// recommends for it.
+static void ConfigurePads(SettingsInterface& si)
+{
+	const Pad::ControllerInfo* info = Pad::GetControllerInfo(Pad::ControllerType::DualShock2);
+	for (u32 port = 0; port < NUM_PAD_PORTS; port++)
+	{
+		const std::string section = Pad::GetConfigSection(port);
+		si.SetStringValue(section.c_str(), "Type", info->name);
+		si.SetBoolValue(section.c_str(), "UseDiagonalScaleCorrection", true);
+		si.SetFloatValue(section.c_str(), "AxisScale", 1.0f);
+		for (const InputBindingInfo& bi : info->bindings)
+			si.DeleteValue(section.c_str(), bi.name);
+	}
+}
+
 static void ConfigureAudio(SettingsInterface& si)
 {
 	AudioStream::SetFrontendStreamFactory(&WebAudioStream::Create);
@@ -1161,7 +1226,7 @@ static bool InitializeConfig()
 
 	// The hardware renderer on the WebGPU device (without WebGPU the GS falls back to the software
 	// renderer into GSDeviceNull; the page's ?renderer=sw picks the software renderer), sound through
-	// the page's Web Audio worklet, keyboard only (the default port 1 keyboard bindings stay), memory
+	// the page's Web Audio worklet, two DualShock 2 pads fed by the page (ConfigurePads), memory
 	// card slot 1 only. Hotkeys are
 	// cleared: most of them (pause menu, save states, screenshots) need host support that is not
 	// there yet.
@@ -1173,6 +1238,7 @@ static bool InitializeConfig()
 	ConfigureAudio(si);
 	si.SetBoolValue("InputSources", "SDL", false);
 	si.SetBoolValue("InputSources", "XInput", false);
+	ConfigurePads(si);
 	si.ClearSection("Hotkeys");
 	ConfigureMemoryCards(si);
 
@@ -1321,6 +1387,102 @@ static void CheckCrispRequest(bool apply_now)
 		ApplyCrispSetting(request != 0, apply_now);
 }
 
+static void ResolvePadBindIndexes()
+{
+	const Pad::ControllerInfo* info = Pad::GetControllerInfo(Pad::ControllerType::DualShock2);
+	for (u32 i = 0; i < NUM_PAD_INPUTS; i++)
+		s_pad_bind_index[i] = static_cast<u8>(info->GetBindIndex(s_pad_input_names[i]).value_or(0));
+	s_pad_bind_index_ready = true;
+}
+
+static void PublishPadSnapshot()
+{
+	for (u32 port = 0; port < NUM_PAD_PORTS; port++)
+	{
+		const PadBase* pad = Pad::GetPad(static_cast<u8>(port), 0);
+		u32 words[PAD_SNAPSHOT_WORDS] = {};
+		if (pad && pad->GetType() == Pad::ControllerType::DualShock2)
+		{
+			for (u32 i = 0; i < NUM_PAD_INPUTS; i++)
+				words[i / 4] |= static_cast<u32>(pad->GetRawInput(s_pad_bind_index[i])) << ((i % 4) * 8);
+			words[PAD_SNAPSHOT_WORDS - 1] = 1u | (pad->IsAnalogLightEnabled() ? 2u : 0u);
+		}
+		for (u32 i = 0; i < PAD_SNAPSHOT_WORDS; i++)
+			s_pad_snapshot[port][i].store(words[i], std::memory_order_relaxed);
+	}
+}
+
+static void ProcessPadEvents()
+{
+	if (!s_pad_bind_index_ready)
+		ResolvePadBindIndexes();
+
+	// Move everything from the ring into the per-input slots.
+	const u32 head = s_pad_queue_head.load(std::memory_order_acquire);
+	u32 tail = s_pad_queue_tail.load(std::memory_order_relaxed);
+	for (; tail != head; tail++)
+	{
+		const u32 event = s_pad_queue[tail % PAD_QUEUE_SIZE];
+		const u32 input = (event >> PAD_EVENT_INPUT_SHIFT) & 31;
+		const u32 port = (event >> PAD_EVENT_PORT_SHIFT) & 1;
+		if (input >= NUM_PAD_INPUTS)
+			continue;
+
+		PadSlot& slot = s_pad_slots[port][input];
+		const float value = static_cast<float>(event & 0xFFFF) / 65535.0f;
+		if (input >= NUM_PAD_BUTTONS)
+		{
+			slot.target = value;
+			continue;
+		}
+
+		const bool pressed = value > 0.0f;
+		if (pressed)
+			slot.target = value;
+		const bool target = slot.down ^ ((slot.pending & 1) != 0); // state once pending edges apply
+		if (pressed == target)
+			continue; // duplicate edge, or a new pressure
+
+		if (++slot.pending > MAX_PENDING_KEY_EDGES)
+			slot.pending -= 2; // drop one whole tap, keep the parity
+	}
+	s_pad_queue_tail.store(tail, std::memory_order_release);
+
+	// A pad exists only while a VM runs; a port without one keeps its values until it has.
+	for (u32 port = 0; port < NUM_PAD_PORTS; port++)
+	{
+		const PadBase* pad = Pad::GetPad(static_cast<u8>(port), 0);
+		const bool connected = pad && pad->GetType() == Pad::ControllerType::DualShock2;
+		for (u32 input = 0; input < NUM_PAD_INPUTS; input++)
+		{
+			PadSlot& slot = s_pad_slots[port][input];
+			float out;
+			if (input >= NUM_PAD_BUTTONS)
+			{
+				out = slot.target;
+			}
+			else
+			{
+				if (slot.pending != 0 &&
+					(slot.changed_at == 0 || (s_key_poll_count - slot.changed_at) >= MIN_KEY_HOLD_POLLS))
+				{
+					slot.down = !slot.down;
+					slot.pending--;
+					slot.changed_at = s_key_poll_count;
+				}
+				out = slot.down ? slot.target : 0.0f;
+			}
+
+			if (out == slot.applied || !connected)
+				continue;
+			slot.applied = out;
+			Pad::SetControllerState(port, s_pad_bind_index[input], out);
+		}
+	}
+
+	PublishPadSnapshot();
+}
+
 static void ProcessKeyEvents()
 {
 	s_key_poll_count++;
@@ -1358,11 +1520,15 @@ static void ProcessKeyEvents()
 		key.changed_at = s_key_poll_count;
 		InputManager::InvokeEvents(InputManager::MakeHostKeyboardKey(code), key.down ? 1.0f : 0.0f);
 	}
+
+	ProcessPadEvents();
 }
 
 static void DiscardKeyEvents()
 {
 	s_key_queue_tail.store(s_key_queue_head.load(std::memory_order_acquire), std::memory_order_release);
+	s_pad_queue_tail.store(s_pad_queue_head.load(std::memory_order_acquire), std::memory_order_release);
+	std::memset(s_pad_slots, 0, sizeof(s_pad_slots));
 	std::fill(std::begin(s_keys), std::end(s_keys), KeySlot{});
 }
 
@@ -1644,6 +1810,52 @@ EMSCRIPTEN_KEEPALIVE void pcsx2web_key(int key_code, int pressed)
 
 	s_key_queue[head % KEY_QUEUE_SIZE] = static_cast<u32>(key_code) | (pressed ? KEY_PRESSED_BIT : 0u);
 	s_key_queue_head.store(head + 1, std::memory_order_release);
+}
+
+/// Pad input name (as in the Keys drawer: "Cross", "L2", "LUp", ...) to its number, -1 if unknown.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_pad_input(const char* input_name)
+{
+	if (!input_name)
+		return -1;
+
+	for (u32 i = 0; i < NUM_PAD_INPUTS; i++)
+	{
+		if (std::strcmp(input_name, s_pad_input_names[i]) == 0)
+			return static_cast<int>(i);
+	}
+
+	return -1;
+}
+
+/// Queues the state of one input of the pad on port 0 or 1 for the CPU thread: value 0 to 1 (a button:
+/// 0 released, above 0 pressed, L2 and R2 take the pressure; a stick half: how far). 1 if queued, 0 if
+/// the queue is full (try again) or the arguments are invalid.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_pad(int port, int input, float value)
+{
+	if (port < 0 || static_cast<u32>(port) >= NUM_PAD_PORTS || input < 0 || static_cast<u32>(input) >= NUM_PAD_INPUTS)
+		return 0;
+
+	const u32 quantized = static_cast<u32>(std::lround(std::clamp(value, 0.0f, 1.0f) * 65535.0f));
+	const u32 head = s_pad_queue_head.load(std::memory_order_relaxed);
+	const u32 tail = s_pad_queue_tail.load(std::memory_order_acquire);
+	if (head - tail >= PAD_QUEUE_SIZE)
+		return 0;
+
+	s_pad_queue[head % PAD_QUEUE_SIZE] = quantized | (static_cast<u32>(input) << PAD_EVENT_INPUT_SHIFT) |
+	                                     (static_cast<u32>(port) << PAD_EVENT_PORT_SHIFT);
+	s_pad_queue_head.store(head + 1, std::memory_order_release);
+	return 1;
+}
+
+/// Test hook: what the pad on port 0 or 1 holds, as the raw value (0..255) of each input in the order of
+/// pcsx2web_pad_input, four to a word (the first in the low byte), then a word with bit 0 set while the
+/// pad is connected and bit 1 while its analog light is on. Null for a bad port.
+EMSCRIPTEN_KEEPALIVE const unsigned int* pcsx2web_test_pad_state(int port)
+{
+	if (port < 0 || static_cast<u32>(port) >= NUM_PAD_PORTS)
+		return nullptr;
+
+	return reinterpret_cast<const unsigned int*>(s_pad_snapshot[port]);
 }
 
 /// The frame descriptor: seq, width, height, pixels address, reserved.

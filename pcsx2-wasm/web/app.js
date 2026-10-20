@@ -58,6 +58,9 @@
 	// The Graphics menu's choice (UI-SPEC.md §12): 'auto', 'gpu' or 'sw'; ?gpu= and ?renderer= win over it.
 	const PREF_RENDERER = 'pcsx2web.renderer';
 	const PREF_KEEP_CHROME = 'pcsx2web.keepChrome';
+	// Which PS2 port the keyboard plays as, and which one the first gamepad does (1 or 2).
+	const PREF_PAD_KEYBOARD = 'pcsx2web.padKeyboard';
+	const PREF_PAD_FIRST = 'pcsx2web.padFirst';
 	const PREF_HINTED = 'pcsx2web.firstBootHint';
 
 	const SOURCE_URL = 'https://github.com/TabStationToo/TabStationToo';
@@ -224,6 +227,12 @@
 			running: 'Running. Keys go to the PS2.',
 			runningReleased: 'Running. Click the screen to play.',
 			released: 'Keyboard released.',
+			gamepadConnected: (name, port) => `Gamepad connected: ${name}, Player ${port}.`,
+			gamepadUnused: (name) => `Gamepad connected: ${name}. Only two gamepads play, so it is not used.`,
+			gamepadDisconnected: (name) => `Gamepad disconnected: ${name}.`,
+			gamepadPlayer: (name, port) => `${name} plays as Player ${port}.`,
+			keyboardPlayer: (port) => `The keyboard plays as Player ${port}.`,
+			gamepadsSwapped: (a, b) => `Players swapped. ${a.name} is Player ${a.port}. ${b.name} is Player ${b.port}.`,
 			stopped: 'Stopped.',
 			failed: 'The PS2 didn’t start.',
 			dead: 'The emulator stopped working.',
@@ -293,6 +302,16 @@
 		keysDrawer: $('keys-drawer'),
 		keysClose: $('keys-close'),
 		keepChrome: $('keep-chrome'),
+		tabKeyboard: $('tab-keyboard'),
+		tabGamepad: $('tab-gamepad'),
+		panelKeyboard: $('panel-keyboard'),
+		panelGamepad: $('panel-gamepad'),
+		kbPlayers: [...document.querySelectorAll('input[name="kb-player"]')],
+		gpEmpty: $('gp-empty'),
+		gpList: $('gp-list'),
+		gpActions: $('gp-actions'),
+		gpSwap: $('gp-swap'),
+		gpTemplate: $('gp-template'),
 		logDrawer: $('log-drawer'),
 		log: $('log'),
 		logEmpty: $('log-empty'),
@@ -780,7 +799,7 @@
 	function bindApi() {
 		const M = window.Module;
 		const fns = ['pcsx2web_boot', 'pcsx2web_stop', 'pcsx2web_state', 'pcsx2web_speed', 'pcsx2web_vps',
-			'pcsx2web_key_code', 'pcsx2web_key', 'pcsx2web_frame'];
+			'pcsx2web_key_code', 'pcsx2web_key', 'pcsx2web_pad_input', 'pcsx2web_pad', 'pcsx2web_frame'];
 		const missing = fns.filter((n) => typeof M['_' + n] !== 'function').map((n) => '_' + n + ' (EMSCRIPTEN_KEEPALIVE export)');
 		if (typeof M.ccall !== 'function')
 			missing.push('Module.ccall (add ccall to -sEXPORTED_RUNTIME_METHODS)');
@@ -805,6 +824,9 @@
 			vps: () => M._pcsx2web_vps(),
 			keyCode: (name) => M.ccall('pcsx2web_key_code', 'number', ['string'], [name]),
 			key: (code, pressed) => M._pcsx2web_key(code, pressed ? 1 : 0),
+			padInput: (name) => M.ccall('pcsx2web_pad_input', 'number', ['string'], [name]),
+			// 0 when the emulator's queue is full: try again.
+			pad: (port, input, value) => M._pcsx2web_pad(port, input, value) === 1,
 			// Pointers are returned as signed i32; make them unsigned.
 			frame: () => M._pcsx2web_frame() >>> 0,
 			surfaceSize: (w, h, scale) => M._pcsx2web_surface_size && M._pcsx2web_surface_size(w, h, scale),
@@ -831,6 +853,7 @@
 			if (!frame.ptr || frame.ptr % 4 !== 0)
 				throw new Error(`pcsx2web_frame() returned an unusable pointer (${frame.ptr})`);
 			resolveKeyCodes();
+			checkPadInputs();
 			ensureBiosDir();
 		} catch (err) {
 			fatal('build', 'This build of the emulator is missing part of its page interface', err);
@@ -4039,6 +4062,7 @@
 		if (refs === 1) {
 			sendKey(code, true);
 			markKey(name, true);
+			setKeyboardPad(name, true);
 		}
 	}
 
@@ -4062,6 +4086,7 @@
 		heldHostRefs.delete(code);
 		sendKey(code, false);
 		markKey(name, false);
+		setKeyboardPad(name, false);
 	}
 
 	function releaseAllKeys(send) {
@@ -4074,6 +4099,7 @@
 		swallowed.clear();
 		for (const k of document.querySelectorAll('kbd.down'))
 			k.classList.remove('down');
+		releaseKeyboardPad();
 	}
 
 	// Esc, or fullscreen ended by the browser: keys stop going to the PS2 and focus moves to the
@@ -4129,6 +4155,424 @@
 	function keyLabel(code, fallback) {
 		const ch = layoutMap && layoutMap.get(code);
 		return ch && ch.length === 1 && ch.trim() ? ch.toUpperCase() : fallback;
+	}
+
+	// ------------------------------------------------------------------ players: keyboard and gamepads
+
+	// The PS2 pad's inputs, in the order of the emulator's table (checkPadInputs verifies it).
+	const PAD_INPUTS = ['Up', 'Right', 'Down', 'Left', 'Triangle', 'Circle', 'Cross', 'Square', 'Select', 'Start',
+		'L1', 'L2', 'R1', 'R2', 'L3', 'R3', 'Analog', 'LUp', 'LRight', 'LDown', 'LLeft', 'RUp', 'RRight', 'RDown', 'RLeft'];
+	const PAD_INDEX = Object.fromEntries(PAD_INPUTS.map((name, i) => [name, i]));
+	// Host key name (KEY_NAMES) -> the pad input it plays. The Keys drawer shows the same layout.
+	const KEY_PAD = {
+		Up: 'Up', Down: 'Down', Left: 'Left', Right: 'Right', Return: 'Start', Backspace: 'Select',
+		Q: 'L1', E: 'R1', 1: 'L2', 3: 'R2', 2: 'L3', 4: 'R3',
+		W: 'LUp', A: 'LLeft', S: 'LDown', D: 'LRight', T: 'RUp', F: 'RLeft', G: 'RDown', H: 'RRight',
+		I: 'Triangle', J: 'Square', K: 'Cross', L: 'Circle',
+	};
+	// Gamepad API "standard" mapping, by position: the bottom face button is Cross.
+	const GAMEPAD_BUTTONS = { 0: 'Cross', 1: 'Circle', 2: 'Square', 3: 'Triangle', 4: 'L1', 5: 'R1', 8: 'Select',
+		9: 'Start', 10: 'L3', 11: 'R3', 12: 'Up', 13: 'Down', 14: 'Left', 15: 'Right', 16: 'Analog' };
+	const GAMEPAD_TRIGGERS = { 6: 'L2', 7: 'R2' };
+	// Browsers pass sticks on as the hardware reports them, with the rest-position noise of worn
+	// sticks; the PS2 pad has no dead zone of its own here. A round dead zone, rescaled so that the
+	// full throw still reaches 1.
+	const STICK_DEAD_ZONE = 0.1;
+	const TRIGGER_DEAD_ZONE = 0.05;
+	const STICK_STEPS = 127; // sticks change in steps of 1/127, so noise does not flood the queue
+	const MAX_GAMEPADS = 2;
+
+	const players = {
+		keyboard: readPref(PREF_PAD_KEYBOARD) === '2' ? 2 : 1, // PS2 port 1 or 2
+		first: readPref(PREF_PAD_FIRST) === '2' ? 2 : 1, // the port a first gamepad starts on
+	};
+	// Per device (the keyboard, "pad:<Gamepad.index>"): the value of every pad input, 0 to 1. The
+	// port plays the largest of its devices' values, so that a stick and a key never cancel each other.
+	const padDevices = new Map();
+	const padSent = [new Float32Array(PAD_INPUTS.length), new Float32Array(PAD_INPUTS.length)];
+	let padRetryTimer = 0;
+	const keyboardPad = new Float32Array(PAD_INPUTS.length);
+	padDevices.set('keyboard', keyboardPad);
+	// Gamepad.index -> { index, name, port (1, 2 or 0: not used), rank, connected, state, needsNeutral, view }
+	const gamepads = new Map();
+	let gamepadLoop = 0;
+
+	function checkPadInputs() {
+		for (let i = 0; i < PAD_INPUTS.length; i++) {
+			if (api.padInput(PAD_INPUTS[i]) !== i) {
+				pageLog(`The emulator numbers the pad input ${PAD_INPUTS[i]} differently; gamepads and the keyboard may not play.`, 'warn');
+				return;
+			}
+		}
+		syncPads();
+	}
+
+	function devicePort(id) {
+		if (id === 'keyboard')
+			return players.keyboard;
+		const g = gamepads.get(Number(id.slice(4)));
+		return g && g.connected ? g.port : 0;
+	}
+
+	// Sends what changed since the last call. A full queue (the emulator is far behind) keeps the
+	// difference for the next try.
+	function syncPads() {
+		if (!api || page.phase !== 'ready')
+			return;
+		let retry = false;
+		for (let port = 1; port <= 2; port++) {
+			const sent = padSent[port - 1];
+			for (let i = 0; i < PAD_INPUTS.length; i++) {
+				let v = 0;
+				for (const [id, state] of padDevices) {
+					if (state[i] > v && devicePort(id) === port)
+						v = state[i];
+				}
+				v = Math.round(v * 65535) / 65535;
+				if (v === sent[i])
+					continue;
+				let ok = false;
+				try {
+					ok = api.pad(port - 1, i, v);
+				} catch (err) {
+					fatal('crash', 'Calling pcsx2web_pad failed', err);
+					return;
+				}
+				if (ok)
+					sent[i] = v;
+				else
+					retry = true;
+			}
+		}
+		if (retry && !padRetryTimer)
+			padRetryTimer = setTimeout(() => { padRetryTimer = 0; syncPads(); }, 20);
+	}
+
+	function setKeyboardPad(keyName, down) {
+		const input = KEY_PAD[keyName];
+		if (input === undefined)
+			return;
+		keyboardPad[PAD_INDEX[input]] = down ? 1 : 0;
+		syncPads();
+	}
+
+	function releaseKeyboardPad() {
+		if (!keyboardPad.some((v) => v > 0))
+			return;
+		keyboardPad.fill(0);
+		syncPads();
+	}
+
+	// ---- gamepads
+
+	function gamepadName(gp) {
+		let name = String(gp.id || '').trim();
+		name = name.replace(/\s*\((?:STANDARD GAMEPAD|Vendor:)[^)]*\)\s*$/i, '') // Chrome: "Name (STANDARD GAMEPAD Vendor: 045e Product: 028e)"
+			.replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, ''); // Firefox: "045e-028e-Name"
+		return name || `Gamepad ${gp.index + 1}`;
+	}
+
+	// The PS2 only plays while it runs and the page has focus (a hidden or unfocused page gets no
+	// gamepad state from the browser anyway).
+	function gamepadsLive() {
+		return page.phase === 'ready' && page.vmState === STATE.RUNNING && page.frameSinceBoot &&
+			document.hasFocus() && document.visibilityState === 'visible';
+	}
+
+	function stickValue(x, y) {
+		const m = Math.hypot(x, y);
+		if (!(m > STICK_DEAD_ZONE))
+			return [0, 0];
+		const k = Math.min(1, (m - STICK_DEAD_ZONE) / (1 - STICK_DEAD_ZONE)) / m;
+		return [x * k, y * k];
+	}
+
+	function readGamepad(gp, out) {
+		out.fill(0);
+		for (const [i, name] of Object.entries(GAMEPAD_BUTTONS)) {
+			const b = gp.buttons[i];
+			if (b && b.pressed)
+				out[PAD_INDEX[name]] = 1;
+		}
+		for (const [i, name] of Object.entries(GAMEPAD_TRIGGERS)) {
+			const b = gp.buttons[i];
+			if (!b)
+				continue;
+			const v = b.pressed && !b.value ? 1 : b.value;
+			if (v > TRIGGER_DEAD_ZONE)
+				out[PAD_INDEX[name]] = Math.min(1, v);
+		}
+		for (const [x, y, up, down, left, right] of [[0, 1, 'LUp', 'LDown', 'LLeft', 'LRight'], [2, 3, 'RUp', 'RDown', 'RLeft', 'RRight']]) {
+			const [sx, sy] = stickValue(gp.axes[x] || 0, gp.axes[y] || 0);
+			const q = (v) => Math.round(Math.min(1, Math.abs(v)) * STICK_STEPS) / STICK_STEPS;
+			out[PAD_INDEX[sy < 0 ? up : down]] = q(sy);
+			out[PAD_INDEX[sx < 0 ? left : right]] = q(sx);
+		}
+	}
+
+	function registerGamepad(gp) {
+		let g = gamepads.get(gp.index);
+		if (g) {
+			g.name = gamepadName(gp);
+			g.connected = true;
+			g.needsNeutral = true;
+		} else {
+			const rank = [...gamepads.values()].filter((o) => o.connected).length;
+			g = {
+				index: gp.index,
+				name: gamepadName(gp),
+				port: rank === 0 ? players.first : rank === 1 ? 3 - players.first : 0,
+				rank,
+				connected: true,
+				state: new Float32Array(PAD_INPUTS.length), // what the PS2 gets
+				raw: new Float32Array(PAD_INPUTS.length), // what the gamepad holds
+				needsNeutral: true,
+				view: null,
+			};
+			gamepads.set(gp.index, g);
+		}
+		padDevices.set('pad:' + g.index, g.state);
+		renderGamepads();
+		announce(g.port ? COPY.announce.gamepadConnected(g.name, g.port) : COPY.announce.gamepadUnused(g.name));
+		pageLog(`Gamepad connected: ${g.name}${g.port ? ` (Player ${g.port})` : ' (not used)'}.`);
+		startGamepadLoop();
+	}
+
+	function dropGamepad(g) {
+		g.connected = false;
+		g.state.fill(0);
+		padDevices.delete('pad:' + g.index);
+		syncPads();
+		renderGamepads();
+		announce(COPY.announce.gamepadDisconnected(g.name));
+		pageLog(`Gamepad disconnected: ${g.name}.`);
+	}
+
+	function releaseGamepads() {
+		for (const g of gamepads.values()) {
+			if (g.connected) {
+				g.state.fill(0);
+				g.needsNeutral = true;
+			}
+		}
+		syncPads();
+	}
+
+	function pollGamepads() {
+		gamepadLoop = 0;
+		if (!navigator.getGamepads)
+			return;
+		const list = navigator.getGamepads();
+		const live = gamepadsLive();
+		for (const gp of list) {
+			if (gp && gp.connected && gp.mapping === 'standard' && !(gamepads.get(gp.index) || {}).connected)
+				registerGamepad(gp);
+		}
+		let any = false;
+		let changed = false;
+		for (const g of gamepads.values()) {
+			if (!g.connected)
+				continue;
+			const gp = list[g.index];
+			if (!gp || !gp.connected) {
+				dropGamepad(g);
+				continue;
+			}
+			any = true;
+			const raw = g.raw;
+			readGamepad(gp, raw);
+			if (g.view)
+				updateGamepadView(g);
+			const idle = !raw.some((v) => v > 0);
+			if (idle)
+				g.needsNeutral = false;
+			// After a change of player or a pause in play, the inputs held must be let go once.
+			if (live && !g.needsNeutral)
+				g.state.set(raw);
+			else
+				g.state.fill(0);
+			changed = true;
+		}
+		if (changed)
+			syncPads();
+		if (any)
+			startGamepadLoop();
+	}
+
+	function startGamepadLoop() {
+		if (!gamepadLoop && document.visibilityState === 'visible')
+			gamepadLoop = requestAnimationFrame(pollGamepads);
+	}
+
+	function stopGamepadLoop() {
+		if (gamepadLoop) {
+			cancelAnimationFrame(gamepadLoop);
+			gamepadLoop = 0;
+		}
+	}
+
+	function setGamepadPort(g, port) {
+		if (g.port === port)
+			return;
+		g.port = port;
+		g.state.fill(0);
+		g.needsNeutral = true;
+		if (g.rank === 0) {
+			players.first = port;
+			writePref(PREF_PAD_FIRST, String(port));
+		}
+		syncPads();
+		renderGamepads();
+		announce(COPY.announce.gamepadPlayer(g.name, port));
+	}
+
+	function swapGamepads() {
+		const two = [...gamepads.values()].filter((g) => g.connected && g.port).sort((a, b) => a.rank - b.rank);
+		if (two.length < 2)
+			return;
+		const [a, b] = two;
+		[a.port, b.port] = [b.port, a.port];
+		for (const g of two) {
+			g.state.fill(0);
+			g.needsNeutral = true;
+		}
+		if (a.rank === 0) {
+			players.first = a.port;
+			writePref(PREF_PAD_FIRST, String(a.port));
+		}
+		syncPads();
+		renderGamepads();
+		announce(COPY.announce.gamepadsSwapped(a, b));
+	}
+
+	function setKeyboardPlayer(port) {
+		if (players.keyboard === port)
+			return;
+		releaseAllKeys(true); // keys held now are let go; they play again once pressed anew
+		players.keyboard = port;
+		writePref(PREF_PAD_KEYBOARD, String(port));
+		syncPads();
+		announce(COPY.announce.keyboardPlayer(port));
+	}
+
+	// ---- Keys drawer: the Gamepad tab
+
+	function renderGamepads() {
+		const connected = [...gamepads.values()].filter((g) => g.connected).sort((a, b) => a.rank - b.rank);
+		els.gpEmpty.hidden = connected.length > 0;
+		els.gpActions.hidden = connected.filter((g) => g.port).length < 2;
+		for (const g of gamepads.values()) {
+			if (!g.connected && g.view) {
+				g.view.el.remove();
+				g.view = null;
+			}
+		}
+		for (const g of connected) {
+			if (!g.view)
+				g.view = buildGamepadView(g);
+			g.view.name.textContent = g.name;
+			g.view.legend.textContent = `Player for ${g.name}`;
+			g.view.players.hidden = !g.port;
+			g.view.unused.hidden = !!g.port;
+			for (const r of g.view.radios)
+				r.checked = Number(r.value) === g.port;
+			els.gpList.append(g.view.el); // in order
+		}
+	}
+
+	function buildGamepadView(g) {
+		const el = els.gpTemplate.content.firstElementChild.cloneNode(true);
+		const radios = [...el.querySelectorAll('input[type="radio"]')];
+		for (const r of radios) {
+			r.name = `gp-player-${g.index}`;
+			r.addEventListener('change', () => {
+				if (r.checked)
+					setGamepadPort(g, Number(r.value));
+			});
+		}
+		const caps = new Map();
+		for (const c of el.querySelectorAll('.cap[data-input]'))
+			caps.set(PAD_INDEX[c.dataset.input], c);
+		return {
+			el,
+			name: el.querySelector('.gp-name'),
+			legend: el.querySelector('legend'),
+			players: el.querySelector('.players'),
+			unused: el.querySelector('.gp-unused'),
+			radios,
+			caps,
+			sticks: [...el.querySelectorAll('.stick')].map((s) => ({ el: s, left: s.dataset.stick === 'L' })),
+		};
+	}
+
+	function updateGamepadView(g) {
+		if (page.drawer !== 'keys' || els.panelGamepad.hidden)
+			return;
+		const v = g.view;
+		const raw = g.raw;
+		for (const [i, cap] of v.caps)
+			cap.classList.toggle('down', raw[i] > 0);
+		for (const s of v.sticks) {
+			const [up, down, left, right] = s.left ? ['LUp', 'LDown', 'LLeft', 'LRight'] : ['RUp', 'RDown', 'RLeft', 'RRight'];
+			const x = raw[PAD_INDEX[right]] - raw[PAD_INDEX[left]];
+			const y = raw[PAD_INDEX[down]] - raw[PAD_INDEX[up]];
+			s.el.style.setProperty('--sx', x.toFixed(3));
+			s.el.style.setProperty('--sy', y.toFixed(3));
+			s.el.classList.toggle('down', x !== 0 || y !== 0);
+		}
+	}
+
+	function selectControlsTab(name, focus) {
+		const gamepad = name === 'gamepad';
+		els.tabKeyboard.setAttribute('aria-selected', String(!gamepad));
+		els.tabGamepad.setAttribute('aria-selected', String(gamepad));
+		els.tabKeyboard.tabIndex = gamepad ? -1 : 0;
+		els.tabGamepad.tabIndex = gamepad ? 0 : -1;
+		els.panelKeyboard.hidden = gamepad;
+		els.panelGamepad.hidden = !gamepad;
+		if (focus)
+			(gamepad ? els.tabGamepad : els.tabKeyboard).focus();
+		syncScreenWidth();
+	}
+
+	function wirePlayersUi() {
+		for (const r of els.kbPlayers) {
+			r.checked = Number(r.value) === players.keyboard;
+			r.addEventListener('change', () => {
+				if (r.checked)
+					setKeyboardPlayer(Number(r.value));
+			});
+		}
+		els.tabKeyboard.addEventListener('click', () => selectControlsTab('keyboard', false));
+		els.tabGamepad.addEventListener('click', () => selectControlsTab('gamepad', false));
+		for (const tab of [els.tabKeyboard, els.tabGamepad]) {
+			tab.addEventListener('keydown', (e) => {
+				if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey)
+					return;
+				let to = null;
+				if (e.key === 'ArrowLeft' || e.key === 'ArrowRight')
+					to = tab === els.tabKeyboard ? 'gamepad' : 'keyboard';
+				else if (e.key === 'Home')
+					to = 'keyboard';
+				else if (e.key === 'End')
+					to = 'gamepad';
+				if (to) {
+					e.preventDefault();
+					selectControlsTab(to, true);
+				}
+			});
+		}
+		els.gpSwap.addEventListener('click', swapGamepads);
+		window.addEventListener('gamepadconnected', (e) => {
+			if (e.gamepad.mapping === 'standard')
+				startGamepadLoop();
+			else
+				pageLog(`Gamepad not used: ${gamepadName(e.gamepad)} does not report the standard layout.`, 'warn');
+		});
+		window.addEventListener('gamepaddisconnected', startGamepadLoop);
+		// A gamepad that was connected before the page opened shows up after its first button press;
+		// look once in case the browser already lists it.
+		startGamepadLoop();
 	}
 
 	// ------------------------------------------------------------------ graphics (UI-SPEC.md §12)
@@ -5417,12 +5861,18 @@
 		window.addEventListener('keyup', onKeyUp);
 		window.addEventListener('blur', () => {
 			releaseAllKeys(true);
+			releaseGamepads();
 			onWindowFocusChange();
 		});
 		window.addEventListener('focus', onWindowFocusChange);
 		document.addEventListener('visibilitychange', () => {
-			if (document.visibilityState !== 'visible')
+			if (document.visibilityState !== 'visible') {
 				releaseAllKeys(true);
+				releaseGamepads();
+				stopGamepadLoop();
+			} else {
+				startGamepadLoop();
+			}
 			onWindowFocusChange();
 		});
 		document.addEventListener('focusin', onFocusChange);
@@ -5633,6 +6083,7 @@
 		observeCanvasSize();
 		wireSoundUi();
 		wireGfxUi();
+		wirePlayersUi();
 		setCrisp(readPref(PREF_CRISP) === '1');
 		page.keepChrome = readPref(PREF_KEEP_CHROME) === '1';
 		els.keepChrome.checked = page.keepChrome;
