@@ -684,6 +684,45 @@ namespace VU1Jit
 					}
 					continue;
 				}
+				if (pattern >= 96 && i + 6 < length)
+				{
+					// A counted loop, as a vertex loop: the counter set, a body of upper ops (some reading registers
+					// the body never writes) with loads, stores, divides and kicks, the decrement and a branch back,
+					// which generated code takes without leaving it (VU1JitEmit.cpp, EmitLoopBack). A kick that finds
+					// the previous one busy leaves in the middle of a pass (EmitLoopState).
+					const u32 counter = 8 + m_rng.Below(8);
+					Put(micro, pc, LowerOpcodeBits(Lower::IADDIU) | (counter << 16) | (1 + m_rng.Below(m_rng.Chance(20) ? 40 : 6)),
+						MakeUpper(true));
+					static constexpr VU1Jit::Lower body_ops[] = {Lower::MOVE, Lower::MOVE, Lower::LQ, Lower::LQ, Lower::SQ,
+						Lower::DIV, Lower::MR32, Lower::MFIR, Lower::ISW, Lower::WAITQ, Lower::FSSET, Lower::RNEXT, Lower::XGKICK,
+						Lower::ESQRT};
+					const u32 body = 1 + m_rng.Below(std::min<u32>(12, length - i - 5));
+					for (u32 b = 1; b <= body + 2; b++)
+					{
+						u32 bl = MakeLower(body_ops[m_rng.Below(std::size(body_ops))]);
+						if (b == body + 1)
+							bl = LowerOpcodeBits(Lower::IADDI) | (counter << 16) | (counter << 11) | (0x1fu << 6); // -1
+						else if (b == body + 2)
+							bl = LowerOpcodeBits(Lower::IBNE) | (counter << 11) | (static_cast<u32>(-static_cast<s32>(body) - 2) & 0x7ff);
+						Put(micro, pc + b * 8, bl, MakeUpper(m_rng.Chance(20)));
+					}
+					// The delay slot: an op that writes no VI register.
+					Put(micro, pc + (body + 3) * 8, MakeLower(body_ops[m_rng.Below(std::size(body_ops))]), MakeUpper(m_rng.Chance(20)));
+					if (body >= 2 && m_rng.Chance(40))
+					{
+						// A kick in the delay slot that the next pass's first instruction finds still running, and an
+						// FMAC result of the delay slot that its second instruction reads: generated code leaves while
+						// that entry is pending from the previous pass, and the stall after shows its timing.
+						const u32 kick_vi = 1 + m_rng.Below(7);
+						Put(micro, pc + (body + 3) * 8, (MakeLower(Lower::XGKICK) & ~0x0000f800u) | (kick_vi << 11),
+							UpperOpcodeBits(Upper::MUL) | 0x01e00000u | (reg << 6) | (RandomVF() << 11) | (RandomVF() << 16));
+						Put(micro, pc + 8, (MakeLower(Lower::XGKICK) & ~0x0000f800u) | (kick_vi << 11), MakeUpper(true));
+						Put(micro, pc + 16, MakeLower(Lower::MOVE),
+							UpperOpcodeBits(Upper::ADD) | 0x01e00000u | (RandomVF() << 6) | (reg << 11) | (RandomVF() << 16));
+					}
+					i += body + 3;
+					continue;
+				}
 				if (pattern < 13)
 				{
 					// FDIV or EFU ops close together: waits, and the efu.Cycle -= 1 quirk.

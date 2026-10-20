@@ -1667,6 +1667,245 @@ namespace VU1Jit
 					m_out->native_ops++;
 					return true;
 				}
+				case L::WAITQ:
+				case L::WAITP:
+					return true; // _vuWAITQ, _vuWAITP: empty bodies, the wait is timing (the model)
+				case L::XTOP:
+				case L::XITOP:
+					// _vuXTOP, _vuXITOP (VUops.cpp:1818-1827, 1954-1963): MTVU's copy of VIF1's TOP/ITOP.
+					if (it == 0)
+						return true;
+					if (m_vu == 0)
+					{
+						HelperLower(p, delta); // VIF0's registers
+						return true;
+					}
+					SetVI(it, [&] { Ld32(A(p.ins.lo == L::XTOP ? vu1Thread.vifRegs.top : vu1Thread.vifRegs.itop)); });
+					m_out->native_ops++;
+					return true;
+				case L::ILW:
+				case L::ILWR:
+				{
+					// _vuILW, _vuILWR (VUops.cpp:1239-1279): the halfword of the last lane in dest wins.
+					if (it == 0 || dest == 0)
+						return true;
+					const u32 lane = (dest & 1) ? 3 : (dest & 2) ? 2 :
+					                              (dest & 4)     ? 1 :
+					                                               0;
+					SetVI(it, [&] {
+						if (p.ins.lo == L::ILW)
+						{
+							VIs(is);
+							m_f.i32_const(imm11);
+							m_f.i32_add();
+						}
+						else
+							VI(is);
+						qaddr();
+						m_f.i32_load16_u(m_mem + lane * 4);
+					});
+					m_out->native_ops++;
+					return true;
+				}
+				case L::ISW:
+				case L::ISWR:
+				{
+					// _vuISW, _vuISWR (VUops.cpp:1254-1290): the halfword and a zero halfword in each lane of dest.
+					if (dest == 0)
+						return true;
+					if (p.ins.lo == L::ISW)
+					{
+						VIs(is);
+						m_f.i32_const(imm11);
+						m_f.i32_add();
+					}
+					else
+						VI(is);
+					qaddr();
+					m_f.local_set(m_i[0]);
+					for (u32 lane = 0; lane < 4; lane++)
+					{
+						if (!(dest & (8 >> lane)))
+							continue;
+						m_f.local_get(m_i[0]);
+						VI(it);
+						m_f.i32_store(m_mem + lane * 4);
+					}
+					m_out->native_ops++;
+					return true;
+				}
+				case L::MFIR:
+				{
+					// _vuMFIR (VUops.cpp:1100-1109): VI sign-extended into each lane of dest.
+					if (ft == 0)
+						return true;
+					VIs(is);
+					Simd(Simd::I32x4Splat);
+					m_f.local_set(v);
+					SetVF(ft, v, dest);
+					m_out->native_ops++;
+					return true;
+				}
+				case L::MTIR:
+					// _vuMTIR (VUops.cpp:1111-1119)
+					if (it == 0)
+						return true;
+					vi_op(it, [&] { VFLane(fs, (code >> 21) & 3); });
+					return true;
+				case L::MFP:
+				case L::RGET:
+				case L::RNEXT:
+				{
+					// _vuMFP, _vuRGET, _vuRNEXT (VUops.cpp:1335-1345, 1648-1657): P or R into each lane of dest;
+					// RNEXT advances the LFSR first (AdvanceLFSR, VUops.cpp:1310-1318), not with Ft 0.
+					if (ft == 0)
+						return true;
+					const u32 reg = (p.ins.lo == L::MFP) ? REG_P : REG_R;
+					if (p.ins.lo == L::RNEXT)
+					{
+						St32(A(R.VI[REG_R]), [&] {
+							const u32 r = m_i[0];
+							Ld32(A(R.VI[REG_R]));
+							m_f.local_tee(r);
+							m_f.i32_const(1);
+							m_f.i32_shl();
+							m_f.local_get(r);
+							m_f.i32_const(4);
+							m_f.i32_shr_u();
+							m_f.local_get(r);
+							m_f.i32_const(22);
+							m_f.i32_shr_u();
+							m_f.i32_xor();
+							m_f.i32_const(1);
+							m_f.i32_and();
+							m_f.i32_xor();
+							m_f.i32_const(0x7fffff);
+							m_f.i32_and();
+							m_f.i32_const(0x3f800000);
+							m_f.i32_or();
+						});
+					}
+					m_f.i32_const(0);
+					m_f.simd_mem(Simd::V128Load32Splat, A(R.VI[reg]), 2);
+					m_f.local_set(v);
+					SetVF(ft, v, dest);
+					m_out->native_ops++;
+					return true;
+				}
+				case L::RINIT:
+				case L::RXOR:
+					// _vuRINIT, _vuRXOR (VUops.cpp:1320-1350)
+					St32(A(R.VI[REG_R]), [&] {
+						VFLane(fs, (code >> 21) & 3);
+						if (p.ins.lo == L::RXOR)
+						{
+							Ld32(A(R.VI[REG_R]));
+							m_f.i32_xor();
+						}
+						m_f.i32_const(0x007fffff);
+						m_f.i32_and();
+						m_f.i32_const(0x3f800000);
+						m_f.i32_or();
+					});
+					m_out->native_ops++;
+					return true;
+				case L::FSAND:
+				case L::FSEQ:
+				case L::FSOR:
+				{
+					// _vuFSAND, _vuFSEQ, _vuFSOR (VUops.cpp:1359-1393) on the committed status.
+					if (it == 0)
+						return true;
+					const u32 imm = (((code >> 21) & 1) << 11) | (code & 0x7ff);
+					SetVI(it, [&] {
+						m_f.local_get(m_vstat);
+						m_f.i32_const(0xFFF);
+						m_f.i32_and();
+						m_f.i32_const(static_cast<s32>(imm));
+						if (p.ins.lo == L::FSAND)
+							m_f.i32_and();
+						else if (p.ins.lo == L::FSOR)
+							m_f.i32_or();
+						else
+							m_f.i32_eq();
+					});
+					m_out->native_ops++;
+					return true;
+				}
+				case L::FSSET:
+				{
+					// _vuFSSET (VUops.cpp:1395-1401) on the pending status.
+					const u32 imm = (((code >> 21) & 1) << 11) | (code & 0x7ff);
+					m_f.i32_const(static_cast<s32>(imm & 0xFC0));
+					m_f.local_get(m_pstat);
+					m_f.i32_const(0x3F);
+					m_f.i32_and();
+					m_f.i32_or();
+					m_f.local_set(m_pstat);
+					m_out->native_ops++;
+					return true;
+				}
+				case L::FMAND:
+				case L::FMEQ:
+				case L::FMOR:
+					// _vuFMAND, _vuFMEQ, _vuFMOR (VUops.cpp:1403-1427) on the committed MAC flag.
+					if (it == 0)
+						return true;
+					SetVI(it, [&] {
+						m_f.local_get(m_vmac);
+						m_f.i32_const(0xFFFF);
+						m_f.i32_and();
+						VI(is);
+						if (p.ins.lo == L::FMAND)
+							m_f.i32_and();
+						else if (p.ins.lo == L::FMOR)
+							m_f.i32_or();
+						else
+							m_f.i32_eq();
+					});
+					m_out->native_ops++;
+					return true;
+				case L::FCSET:
+					// _vuFCSET (VUops.cpp:1454-1457) on the pending clip flag.
+					m_f.i32_const(static_cast<s32>(code & 0xFFFFFF));
+					m_f.local_set(m_pclip);
+					m_out->native_ops++;
+					return true;
+				case L::XGKICK:
+				{
+					// _vuXGKICK (VUops.cpp:1932-1952). The busy-kick exit before this instruction (EmitInstruction)
+					// leaves while a kick runs, so none does here and nothing is flushed. MTVU: no VPU_STAT.
+					if (m_vu == 0)
+					{
+						HelperLower(p, delta);
+						return true;
+					}
+					const u32 addr = m_i[0];
+					VI(is);
+					m_f.i32_const(0x3ff);
+					m_f.i32_and();
+					m_f.i32_const(4);
+					m_f.i32_shl();
+					m_f.local_set(addr);
+					St32c(A(R.xgkickenable), 1);
+					St32(A(R.xgkickaddr), [&] { m_f.local_get(addr); });
+					St32(A(R.xgkickdiff), [&] {
+						m_f.i32_const(0x4000);
+						m_f.local_get(addr);
+						m_f.i32_sub();
+					});
+					St32c(A(R.xgkicksizeremaining), 0);
+					St32c(A(R.xgkickendpacket), 0);
+					m_f.i32_const(0);
+					m_f.i32_const(0);
+					m_f.i64_load(A(g_block_base));
+					m_f.i64_const(delta);
+					m_f.i64_add();
+					m_f.i64_store(A(R.xgkicklastcycle));
+					St32c(A(R.xgkickcyclecount), 1);
+					m_out->native_ops++;
+					return true;
+				}
 				case L::FCGET:
 					if (it == 0)
 						return true;
