@@ -78,7 +78,8 @@ const TEST = `(async () => {
 	set(gps[0], 0, 0); set(gps[0], 6, 0); gps[0].axes = [0, 0, 0, 0];
 	await wait(500);
 	r['gamepad: released'] = only(state(0), {});
-	// A tap shorter than a display frame: the page looks 125 times a second and holds a press for 50 ms.
+	// A tap shorter than a display frame: the page looks 125 times a second, and the emulator holds what it
+	// sees for at least two vsyncs.
 	set(gps[0], 0, 1);
 	await wait(20);
 	set(gps[0], 0, 0);
@@ -90,6 +91,31 @@ const TEST = `(async () => {
 	r['a 20 ms tap on a gamepad reaches the PS2'] = tapSeen;
 	await wait(300);
 	r['the tap lets go again'] = only(state(0), {});
+	// Mashing: taps let go for less than 50 ms must stay separate presses (a hold in the page once
+	// merged them into one).
+	let presses = 0;
+	let wasDown = false;
+	let sampling = true;
+	const sampler = (async () => {
+		while (sampling) {
+			const down = !!state(0).Cross;
+			if (down && !wasDown)
+				presses++;
+			wasDown = down;
+			await wait(2);
+		}
+	})();
+	for (let n = 0; n < 3; n++) {
+		set(gps[0], 0, 1);
+		await wait(40);
+		set(gps[0], 0, 0);
+		await wait(40);
+	}
+	await wait(400);
+	sampling = false;
+	await sampler;
+	r['three quick taps reach the PS2 as three presses'] = presses === 3;
+	r['the mashed button lets go'] = only(state(0), {});
 
 	key('keydown', 'KeyK', 'k'); key('keydown', 'KeyW', 'w');
 	await wait(400);

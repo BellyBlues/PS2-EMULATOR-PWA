@@ -4191,11 +4191,12 @@
 	const STICK_STEPS = 127; // sticks change in steps of 1/127, so noise does not flood the queue
 	const MAX_GAMEPADS = 2;
 	// The Gamepad API has no button events: the page looks at the state. Once per animation frame can miss
-	// a quick tap (and a busy page draws fewer frames than the display has), so it looks 125 times a second,
-	// and a button seen pressed stays pressed for at least GAMEPAD_TAP_MS, so that even a tap shorter than
-	// one look shows in the Gamepad tab and reaches the PS2.
+	// a quick tap (and a busy page draws fewer frames than the display has), so it looks 125 times a second.
+	// Every press and release seen goes to the PS2 as it is; the emulator holds each for at least two
+	// vsyncs so the game sees it. Only the Gamepad tab's picture keeps a press for GAMEPAD_SHOW_MS, so a tap
+	// shows there too: holding it for the PS2 would merge quick taps into one press when mashing.
 	const GAMEPAD_POLL_MS = 8;
-	const GAMEPAD_TAP_MS = 50;
+	const GAMEPAD_SHOW_MS = 50;
 	const PAD_BUTTON_COUNT = 17; // the PAD_INPUTS before the stick halves
 	const VIEW_REFRESH_MS = 16;
 
@@ -4206,7 +4207,7 @@
 	// Per device (the keyboard, "pad:<Gamepad.index>"): the value of every pad input, 0 to 1. The
 	// port plays the largest of its devices' values, so that a stick and a key never cancel each other.
 	const padDevices = new Map();
-	const padSent = [new Float32Array(PAD_INPUTS.length), new Float32Array(PAD_INPUTS.length)];
+	const padSent = [new Float64Array(PAD_INPUTS.length), new Float64Array(PAD_INPUTS.length)]; // doubles: a float would never equal the value sent
 	let padRetryTimer = 0;
 	const keyboardPad = new Float32Array(PAD_INPUTS.length);
 	padDevices.set('keyboard', keyboardPad);
@@ -4347,9 +4348,10 @@
 				connected: true,
 				state: new Float32Array(PAD_INPUTS.length), // what the PS2 gets
 				raw: new Float32Array(PAD_INPUTS.length), // what the gamepad holds
+				shown: new Float32Array(PAD_INPUTS.length), // what the Gamepad tab shows
 				needsNeutral: true,
 				latch: new Float32Array(PAD_INPUTS.length), // the value a button was last seen at ...
-				latchUntil: new Float64Array(PAD_INPUTS.length), // ... and until when it counts as pressed
+				latchUntil: new Float64Array(PAD_INPUTS.length), // ... and until when the picture shows it
 				viewAt: 0,
 				view: null,
 			};
@@ -4415,12 +4417,13 @@
 			const raw = g.raw;
 			readGamepad(gp, raw, g);
 			const now = performance.now();
+			g.shown.set(raw);
 			for (let i = 0; i < PAD_BUTTON_COUNT; i++) {
 				if (raw[i] > 0) {
 					g.latch[i] = raw[i];
-					g.latchUntil[i] = now + GAMEPAD_TAP_MS;
+					g.latchUntil[i] = now + GAMEPAD_SHOW_MS;
 				} else if (now < g.latchUntil[i]) {
-					raw[i] = g.latch[i];
+					g.shown[i] = g.latch[i];
 				}
 			}
 			if (g.mapper)
@@ -4917,7 +4920,7 @@
 		if (page.drawer !== 'keys' || els.panelGamepad.hidden)
 			return;
 		const v = g.view;
-		const raw = g.raw;
+		const raw = g.shown;
 		for (const [i, cap] of v.caps)
 			cap.classList.toggle('down', raw[i] > 0);
 		for (const s of v.sticks) {
