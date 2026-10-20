@@ -4191,11 +4191,12 @@
 	const STICK_STEPS = 127; // sticks change in steps of 1/127, so noise does not flood the queue
 	const MAX_GAMEPADS = 2;
 	// The Gamepad API has no button events: the page looks at the state. Once per animation frame can miss
-	// a quick tap (and a busy page draws fewer frames than the display has), so it looks 125 times a second.
+	// a quick tap (and a busy page draws fewer frames than the display has), so it looks as often as the
+	// browser runs a timer (an interval of 0: about every 4 ms, the floor browsers keep for repeating timers).
 	// Every press and release seen goes to the PS2 as it is; the emulator holds each for at least two
 	// vsyncs so the game sees it. Only the Gamepad tab's picture keeps a press for GAMEPAD_SHOW_MS, so a tap
 	// shows there too: holding it for the PS2 would merge quick taps into one press when mashing.
-	const GAMEPAD_POLL_MS = 8;
+	const GAMEPAD_POLL_MS = 0;
 	const GAMEPAD_SHOW_MS = 50;
 	const PAD_BUTTON_COUNT = 17; // the PAD_INPUTS before the stick halves
 	const VIEW_REFRESH_MS = 16;

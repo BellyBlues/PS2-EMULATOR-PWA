@@ -78,7 +78,7 @@ const TEST = `(async () => {
 	set(gps[0], 0, 0); set(gps[0], 6, 0); gps[0].axes = [0, 0, 0, 0];
 	await wait(500);
 	r['gamepad: released'] = only(state(0), {});
-	// A tap shorter than a display frame: the page looks 125 times a second, and the emulator holds what it
+	// A tap shorter than a display frame: the page looks about every 4 ms, and the emulator holds what it
 	// sees for at least two vsyncs.
 	set(gps[0], 0, 1);
 	await wait(20);
