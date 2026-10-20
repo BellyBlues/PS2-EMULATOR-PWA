@@ -4,8 +4,8 @@ A file for [guiding AI coding agents](https://agents.md/) working in this reposi
 
 ## Project
 
-TabStationToo runs PlayStation 2 emulation in the browser. It is a fork of
-[PCSX2](https://github.com/PCSX2/pcsx2): PCSX2's C/C++ core compiled to WebAssembly with
+TabStationToo runs PlayStation 2 emulation in the browser. It is built on
+[PCSX2](https://github.com/PCSX2/pcsx2) (its own repository, no longer a GitHub fork): PCSX2's C/C++ core compiled to WebAssembly with
 Emscripten, plus a browser frontend. Read these before changing anything:
 
 - `README.md`: what the project is and how to build and run it.
@@ -145,11 +145,10 @@ bring any new engineering guidance over here.
 
 ## Git and GitHub
 
-- Remotes: `origin` is this fork (public), `upstream` is PCSX2. Stage files explicitly; never
+- Remotes: `origin` is this repository (public, TabStationToo/TabStationToo), `upstream` is PCSX2. Stage files explicitly; never
   `git add -A`.
-- Never open pull requests, issues, discussions or comments on PCSX2's repository. In this fork,
-  GitHub targets new pull requests at PCSX2 by default: do not open pull requests unless the
-  owner asks, and then target this repository.
+- Never open pull requests, issues, discussions or comments on PCSX2's repository. Do not open
+  pull requests unless the owner asks.
 - GitHub Actions run only `.github/workflows/pages.yml`, which builds `wasm`, smoke-tests the page
   and deploys it to GitHub Pages (`pcsx2-wasm/README.md`, "Deploying"). PCSX2's workflows,
   `dependabot.yml` and `labeler.yml` are deleted on `wasm`, and PCSX2's workflows are also disabled
