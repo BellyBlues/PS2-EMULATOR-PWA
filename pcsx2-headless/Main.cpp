@@ -640,14 +640,16 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
 
 void Host::OnPerformanceMetricsUpdated()
 {
-	// Thread usage comes from per-thread CPU clocks. Emscripten has none (pthread_getcpuclockid returns ENOENT,
-	// so every thread reads 0 CPU time): print n/a there and use a CPU profile to see EE- vs GS-bound instead.
+	// Thread usage comes from per-thread CPU clocks; on Emscripten, from wall time minus the time each thread
+	// waits for the others (Threading::ScopedWaitTimer). n/a when a thread reports no time.
 	static const bool has_thread_clocks = Threading::ThreadHandle::GetForCallingThread().GetCPUTime() != 0;
 	std::string threads;
 	if (has_thread_clocks)
 	{
 		threads = fmt::format("EE {:.0f}%, GS {:.0f}%", PerformanceMetrics::GetCPUThreadUsage(),
 			PerformanceMetrics::GetGSThreadUsage());
+		if (THREAD_VU1)
+			threads += fmt::format(", VU {:.0f}%", PerformanceMetrics::GetVUThreadUsage());
 		for (u32 i = 0; i < PerformanceMetrics::GetGSSWThreadCount(); i++)
 			threads += fmt::format(", SW{} {:.0f}%", i, PerformanceMetrics::GetGSSWThreadUsage(i));
 	}

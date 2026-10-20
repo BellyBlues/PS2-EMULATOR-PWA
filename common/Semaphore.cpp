@@ -224,6 +224,8 @@ void Threading::KernelSemaphore::WaitImpl()
 	if (TryWait())
 		return;
 
+	ScopedWaitTimer timer;
+
 	for (int spins = 100; spins > 0 && !(m_value.load() & SEMA_VALUE_MASK) && m_waiters.load() == 0; spins--)
 		;
 

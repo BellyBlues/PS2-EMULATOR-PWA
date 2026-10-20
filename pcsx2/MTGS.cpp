@@ -482,6 +482,7 @@ void MTGS::MainLoop()
 						mtvu_lock.unlock();
 						bool kicked = false;
 #ifdef __EMSCRIPTEN__
+						Threading::ScopedWaitTimer timer;
 						// A VU1 program usually ends within microseconds, and waking a sleeping MTGS costs the
 						// VU thread a call to JS (Atomics.notify) per program, 13 % of its time in the crowd
 						// benchmark: spin first, so its Post() finds no sleeper (100 figures in Chrome: 102-104 %

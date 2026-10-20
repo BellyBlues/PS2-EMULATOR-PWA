@@ -10,6 +10,7 @@
 #include "wasm/VU1JitHooks.h"
 #endif
 
+#include <optional>
 #include <thread>
 
 VU_Thread vu1Thread;
@@ -220,6 +221,9 @@ void VU_Thread::ExecuteRingBuffer()
 // Should only be called by ReserveSpace()
 __ri void VU_Thread::WaitOnSize(s32 size)
 {
+#ifdef __EMSCRIPTEN__
+	std::optional<Threading::ScopedWaitTimer> timer;
+#endif
 	for (;;)
 	{
 		s32 readPos = GetReadPos();
@@ -233,6 +237,10 @@ __ri void VU_Thread::WaitOnSize(s32 size)
 		if (readPos > m_write_pos + size + _4kb)
 			break; // Enough free front space
 		{          // Let MTVU run to free up buffer space
+#ifdef __EMSCRIPTEN__
+			if (!timer) // the EE is waiting for the VU thread (thread usage, Threading::ScopedWaitTimer)
+				timer.emplace();
+#endif
 			KickStart();
 			// Locking might trigger a full flush of the ring buffer. Yield
 			// will be more aggressive, and only flush the minimal size.

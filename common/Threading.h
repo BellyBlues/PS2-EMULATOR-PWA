@@ -55,6 +55,21 @@ namespace Threading
 	/// True while the calling thread is suspended in KernelSemaphore::WaitSuspending() (its idle wait):
 	/// its worker's event loop runs then, and nothing it runs may enter code that waits again.
 	extern bool InSuspendingSemaphoreWait();
+
+	/// WebAssembly has no per-thread CPU clocks, so ThreadHandle::GetCPUTime() is the thread's wall time
+	/// minus the time it spent waiting for other threads (blocked, suspended or spinning), which the
+	/// waits record with a ScopedWaitTimer. Nested timers count once.
+	extern void BeginWait();
+	extern void EndWait();
+
+	class ScopedWaitTimer
+	{
+	public:
+		ScopedWaitTimer() { BeginWait(); }
+		~ScopedWaitTimer() { EndWait(); }
+		ScopedWaitTimer(const ScopedWaitTimer&) = delete;
+		ScopedWaitTimer& operator=(const ScopedWaitTimer&) = delete;
+	};
 #endif
 
 	// --------------------------------------------------------------------------------------

@@ -58,6 +58,7 @@ set(PCSX2_WASM_EXPORTS
 	_pcsx2web_state
 	_pcsx2web_speed
 	_pcsx2web_vps
+	_pcsx2web_thread_usage
 	_pcsx2web_key_code
 	_pcsx2web_key
 	_pcsx2web_pad_input

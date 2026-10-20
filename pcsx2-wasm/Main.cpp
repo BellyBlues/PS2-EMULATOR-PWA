@@ -119,6 +119,8 @@ static std::atomic<bool> s_vu1jit_enabled{true};
 static std::atomic<bool> s_cpu_thread_ready{false};
 static std::atomic<float> s_speed{0.0f};
 static std::atomic<float> s_vps{0.0f};
+// EE, GS and VU thread usage in percent (busy wall time; see Threading::ScopedWaitTimer).
+static std::atomic<float> s_thread_usage[3] = {0.0f, 0.0f, 0.0f};
 
 // Boot request: the page writes the name, then sets the futex word to 1 and wakes the CPU
 // thread. Only one request can be in flight (the state CAS to STARTING guards the buffer).
@@ -1945,6 +1947,13 @@ EMSCRIPTEN_KEEPALIVE float pcsx2web_vps(void)
 	return s_vps.load(std::memory_order_relaxed);
 }
 
+/// How busy a thread was over the last measurement, in percent: 0 the EE (CPU) thread, 1 the GS thread,
+/// 2 the VU1 thread (0 without MTVU). Busy means not waiting for another thread.
+EMSCRIPTEN_KEEPALIVE float pcsx2web_thread_usage(int thread)
+{
+	return (thread >= 0 && thread < 3) ? s_thread_usage[thread].load(std::memory_order_relaxed) : 0.0f;
+}
+
 /// Host key name (e.g. "Return") to key code, -1 if unknown.
 EMSCRIPTEN_KEEPALIVE int pcsx2web_key_code(const char* key_name)
 {
@@ -2343,6 +2352,9 @@ void Host::OnGameChanged(const std::string& title, const std::string& elf_overri
 void Host::OnPerformanceMetricsUpdated()
 {
 	s_speed.store(PerformanceMetrics::GetSpeed(), std::memory_order_relaxed);
+	s_thread_usage[0].store(static_cast<float>(PerformanceMetrics::GetCPUThreadUsage()), std::memory_order_relaxed);
+	s_thread_usage[1].store(PerformanceMetrics::GetGSThreadUsage(), std::memory_order_relaxed);
+	s_thread_usage[2].store(THREAD_VU1 ? PerformanceMetrics::GetVUThreadUsage() : 0.0f, std::memory_order_relaxed);
 	s_vps.store(PerformanceMetrics::GetAvgVPS(), std::memory_order_relaxed);
 }
 

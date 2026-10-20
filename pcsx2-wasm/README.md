@@ -460,6 +460,7 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_stop()` | request shutdown |
 | `pcsx2web_state()` | 0 waiting, 1 starting, 2 running, 3 stopped, 4 failed (polled every 500 ms) |
 | `pcsx2web_speed()`, `pcsx2web_vps()` | speed in percent, vertical syncs per second |
+| `pcsx2web_thread_usage(t)` | how busy the EE (0), GS (1) and VU1 (2) threads were, in percent: wall time not spent waiting for another thread (WebAssembly has no per-thread CPU clocks) |
 | `pcsx2web_key_code(name)`, `pcsx2web_key(code, pressed)` | resolve host key names once, then queue key events |
 | `pcsx2web_pad_input(name)`, `pcsx2web_pad(port, input, value)` | resolve a pad input name ("Cross", "L2", "LUp", ...) once, then queue its state (0 to 1) for port 0 or 1; 1 if queued, 0 if the queue is full. The page routes the keyboard and the gamepads to a port (UI-SPEC §13); the core has no keyboard bindings for the pads |
 | `pcsx2web_test_pad_state(port)` | test hook: the raw value (0 to 255) of each pad input of a port, four to a word, then a flags word (bit 0 connected, bit 1 analog light) |

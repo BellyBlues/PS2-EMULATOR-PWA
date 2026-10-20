@@ -38,7 +38,8 @@
 //
 // The page runs with ?console=1 (its log is mirrored to the browser console, where the runner reads
 // the phase lines) and ?mute=1. Each sample records the speed (pcsx2web_speed), the VPS
-// (pcsx2web_vps), the vsync count (pcsx2web_vsync_count) and the page's stats (state, display path,
+// (pcsx2web_vps), the vsync count (pcsx2web_vsync_count), how busy the EE, GS and VU1 threads were
+// (pcsx2web_thread_usage: not waiting for another thread) and the page's stats (state, display path,
 // renderer). A phase's speed is the median of its samples, leaving out the first one after each
 // change of phase (its averaging window may still hold the previous phase); its VPS comes from the
 // vsync count over the phase's sampled time. The browser and the server are stopped at exit and the
@@ -282,6 +283,7 @@ const SAMPLE = `(() => {
 		speed: has('pcsx2web_speed') ? M._pcsx2web_speed() : null,
 		vps: has('pcsx2web_vps') ? M._pcsx2web_vps() : null,
 		vsync: has('pcsx2web_vsync_count') ? M._pcsx2web_vsync_count() >>> 0 : null,
+		threads: has('pcsx2web_thread_usage') ? [0, 1, 2].map((i) => M._pcsx2web_thread_usage(i)) : null,
 		stats: s && { phase: s.phase, state: s.state, view: s.view, display: s.display, gpuMode: s.gpuMode,
 			gpuFallback: s.gpuFallback, framesPresented: s.framesPresented, gpuFrames: s.gpuFrames,
 			width: s.width, height: s.height },
@@ -311,7 +313,7 @@ const fmt = (x, d = 1) => (x === null || x === undefined || Number.isNaN(x) ? "-
 function summarise(samples) {
 	const phases = new Map();
 	const get = (name) => {
-		if (!phases.has(name)) phases.set(name, { phase: name, speeds: [], seconds: 0, vsyncs: 0, segments: new Set() });
+		if (!phases.has(name)) phases.set(name, { phase: name, speeds: [], threads: [[], [], []], seconds: 0, vsyncs: 0, segments: new Set() });
 		return phases.get(name);
 	};
 	for (let i = 0; i < samples.length; i++) {
@@ -321,6 +323,7 @@ function summarise(samples) {
 		// The first sample of a segment may still average the previous phase.
 		if (prev && prev.segment === s.segment) {
 			if (s.speed !== null) p.speeds.push(s.speed);
+			if (s.threads) s.threads.forEach((u, k) => p.threads[k].push(u));
 			if (s.vsync !== null && prev.vsync !== null) {
 				p.seconds += s.t - prev.t;
 				p.vsyncs += s.vsync - prev.vsync;
@@ -336,6 +339,8 @@ function summarise(samples) {
 		speedMax: p.speeds.length ? Math.max(...p.speeds) : null,
 		seconds: p.seconds,
 		vps: p.seconds > 0 ? p.vsyncs / p.seconds : null,
+		// Busy (not waiting for another thread), median percent: EE, GS, VU1.
+		threads: p.threads.map((xs) => median(xs)),
 	}));
 	const all = samples.filter((s, i) => i > 0 && s.speed !== null && samples[i - 1].segment === s.segment).map((s) => s.speed);
 	const first = samples.find((s) => s.vsync !== null), last = [...samples].reverse().find((s) => s.vsync !== null);
@@ -353,9 +358,9 @@ function summarise(samples) {
 }
 
 function printTable(rows) {
-	const head = ["phase", "segments", "samples", "speed % (median)", "min", "max", "VPS", "seconds"];
+	const head = ["phase", "segments", "samples", "speed % (median)", "min", "max", "VPS", "seconds", "EE/GS/VU busy %"];
 	const body = rows.map((r) => [r.phase, String(r.segments), String(r.samples), fmt(r.speedMedian), fmt(r.speedMin),
-		fmt(r.speedMax), fmt(r.vps), fmt(r.seconds)]);
+		fmt(r.speedMax), fmt(r.vps), fmt(r.seconds), r.threads ? r.threads.map((x) => fmt(x, 0)).join("/") : "-"]);
 	const widths = head.map((h, i) => Math.max(h.length, ...body.map((b) => b[i].length)));
 	const line = (cells) => cells.map((c, i) => (i === 0 ? c.padEnd(widths[i]) : c.padStart(widths[i]))).join("  ");
 	console.log(line(head));
@@ -493,7 +498,7 @@ async function main() {
 				shownRenderer = renderer;
 				console.log(`${elapsed().toFixed(1).padStart(7)} s  renderer: ${renderer}; display ${s.stats.display}`);
 			}
-			results.samples.push({ t, phase, segment, speed: s.speed, vps: s.vps, vsync: s.vsync, state: s.stats?.state,
+			results.samples.push({ t, phase, segment, speed: s.speed, vps: s.vps, vsync: s.vsync, threads: s.threads, state: s.stats?.state,
 				display: s.stats?.display, frames: Math.max(s.stats?.framesPresented ?? 0, s.stats?.gpuFrames ?? 0),
 				size: s.stats ? `${s.stats.width}x${s.stats.height}` : null });
 			results.renderer = renderer;

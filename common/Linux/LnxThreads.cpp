@@ -23,7 +23,11 @@
 #define gettid() syscall(SYS_gettid)
 #endif
 #elif defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
+
+#include <algorithm>
+#include <atomic>
 #else
 #include <pthread_np.h>
 #endif
@@ -149,10 +153,93 @@ Threading::ThreadHandle& Threading::ThreadHandle::operator=(const ThreadHandle& 
 	return *this;
 }
 
+#ifdef __EMSCRIPTEN__
+// Per-thread wait accounting (Threading::ScopedWaitTimer): a thread is entered here the first time it
+// waits or asks for its own CPU time, and its CPU time is its wall time since then minus its waits.
+namespace
+{
+	struct ThreadWaitTimes
+	{
+		std::atomic<pthread_t> thread{};
+		std::atomic<u64> start_us{0};
+		std::atomic<u64> waited_us{0};
+		std::atomic<u64> wait_since_us{0}; // non-zero while the thread waits
+	};
+
+	static constexpr int MAX_TIMED_THREADS = 64;
+	static ThreadWaitTimes s_thread_times[MAX_TIMED_THREADS];
+	static std::atomic<int> s_timed_threads{0};
+	static thread_local ThreadWaitTimes* s_my_times = nullptr;
+	static thread_local int s_wait_depth = 0;
+
+	static u64 NowMicroseconds()
+	{
+		return static_cast<u64>(emscripten_get_now() * 1000.0);
+	}
+
+	static ThreadWaitTimes* MyWaitTimes()
+	{
+		if (!s_my_times)
+		{
+			const int index = s_timed_threads.fetch_add(1, std::memory_order_relaxed);
+			if (index >= MAX_TIMED_THREADS)
+				return nullptr;
+			ThreadWaitTimes& t = s_thread_times[index];
+			t.start_us.store(NowMicroseconds(), std::memory_order_relaxed);
+			t.thread.store(pthread_self(), std::memory_order_release);
+			s_my_times = &t;
+		}
+		return s_my_times;
+	}
+} // namespace
+
+void Threading::BeginWait()
+{
+	if (s_wait_depth++ == 0)
+	{
+		if (ThreadWaitTimes* t = MyWaitTimes())
+			t->wait_since_us.store(NowMicroseconds(), std::memory_order_relaxed);
+	}
+}
+
+void Threading::EndWait()
+{
+	if (--s_wait_depth == 0 && s_my_times)
+	{
+		const u64 since = s_my_times->wait_since_us.exchange(0, std::memory_order_relaxed);
+		if (since)
+			s_my_times->waited_us.fetch_add(NowMicroseconds() - since, std::memory_order_relaxed);
+	}
+}
+
+u64 Threading::ThreadHandle::GetCPUTime() const
+{
+	if (!m_native_handle)
+		return 0;
+	const pthread_t thread = (pthread_t)m_native_handle;
+	if (pthread_equal(thread, pthread_self()))
+		MyWaitTimes();
+	const int count = std::min(s_timed_threads.load(std::memory_order_acquire), MAX_TIMED_THREADS);
+	for (int i = 0; i < count; i++)
+	{
+		const ThreadWaitTimes& t = s_thread_times[i];
+		if (!pthread_equal(t.thread.load(std::memory_order_acquire), thread))
+			continue;
+		const u64 now = NowMicroseconds();
+		const u64 since = t.wait_since_us.load(std::memory_order_relaxed);
+		const u64 waited = t.waited_us.load(std::memory_order_relaxed) + (since ? now - since : 0);
+		const u64 lived = now - t.start_us.load(std::memory_order_relaxed);
+		// Never 0 for a known thread: 0 means "no CPU clock" to the frontends.
+		return std::max<u64>(1, lived > waited ? lived - waited : 0);
+	}
+	return 0;
+}
+#else
 u64 Threading::ThreadHandle::GetCPUTime() const
 {
 	return m_native_handle ? get_thread_time((uptr)m_native_handle) : 0;
 }
+#endif
 
 bool Threading::ThreadHandle::SetAffinity(u64 processor_mask) const
 {
