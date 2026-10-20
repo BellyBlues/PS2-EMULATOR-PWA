@@ -238,15 +238,32 @@ namespace VU1Jit
 			return true;
 		}
 
+		// The VU registers a block's native code reads or writes (Emitter::VF and Emitter::VI): they live in locals
+		// while it runs (VF0 to VF31 and ACC as index 32, VI0 to VI15).
+		struct RegUse
+		{
+			u64 vf_used = 0; // written ones included: a partial write merges with the old value
+			u64 vf_written = 0;
+			u64 vf_fmac_read = 0; // read as FMAC operands (clamped)
+			u32 vi_used = 0;
+			u32 vi_written = 0;
+			bool helpers = false; // the block calls op bodies, which may write any register
+		};
+		static constexpr u32 ACC_INDEX = 32;
+
 		class Emitter
 		{
 		public:
-			Emitter(CompiledBlock* out, int vu)
+			// use: the registers to keep in locals, from a first emission of the same block (null for that one,
+			// which only records them).
+			Emitter(CompiledBlock* out, int vu, const RegUse* use)
 				: m_out(out)
 				, R(vu ? VU1 : VU0)
 				, m_vu(vu)
 				, m_f(1)
 			{
+				if (use)
+					m_use = *use;
 				m_type_run = m_m.type({ValType::I32}, {ValType::I32});
 				const u32 t1 = m_m.type({ValType::I32}, {});
 				const u32 t2 = m_m.type({ValType::I32, ValType::I32}, {});
@@ -264,36 +281,69 @@ namespace VU1Jit
 				m_hn = m_f.local(ValType::V128);
 				m_dx = m_f.local(ValType::I32);
 				m_de = m_f.local(ValType::I32);
+				m_splat = m_f.local(ValType::V128);
+				for (u32* l : {&m_pmac, &m_pstat, &m_pclip, &m_vmac, &m_vstat, &m_vclip})
+					*l = m_f.local(ValType::I32);
+				for (auto& slot : m_snap)
+				{
+					for (u32& l : slot)
+						l = m_f.local(ValType::I32);
+				}
 				m_mem = A(*R.Mem);
 			}
 
-			// A block that loops (CompiledBlock::loops): its instructions run inside a wasm loop, with VU1.cycle at
-			// the entry of the current pass in a local.
-			void BeginLoop()
+			const RegUse& Use() const { return m_use; }
+
+			// The registers and the flags in locals (LoadRegs, LoadFlags), and the snapshots of the FMAC entries
+			// pending at the entry, which NormalizeRings put in ring slots 0 to fmac_count - 1.
+			void EmitEntry(u32 fmac_count)
 			{
+				LoadRegs();
+				LoadFlags();
+				for (u32 i = 0; i < fmac_count; i++)
+				{
+					Ld32(A(R.fmac[i].macflag));
+					m_f.local_set(m_snap[i][0]);
+					Ld32(A(R.fmac[i].statusflag));
+					m_f.local_set(m_snap[i][1]);
+					Ld32(A(R.fmac[i].clipflag));
+					m_f.local_set(m_snap[i][2]);
+				}
+			}
+
+			// A block that loops (CompiledBlock::loops): its instructions run inside a wasm loop, with VU1.cycle at
+			// the entry of the current pass in a local. loop is the exit that comes back to the entry.
+			void BeginLoop(const BlockExit& loop)
+			{
+				m_loop = &loop;
 				m_base = m_f.local(ValType::I64);
-				m_next_base = m_f.local(ValType::I64);
-				for (u32& t : m_rot_v)
-					t = m_f.local(ValType::V128);
-				for (u32& t : m_rot_i)
-					t = m_f.local(ValType::I64);
+				m_looped = m_f.local(ValType::I32);
+				for (u32& t : m_snap_tmp)
+					t = m_f.local(ValType::I32);
 				m_f.i32_const(0);
 				m_f.i64_load(A(g_block_base));
 				m_f.local_set(m_base);
+				// Loop-invariant operand clamps: registers the block never writes, with no op body that could.
+				ForgetClean();
+				if (!m_use.helpers)
+				{
+					for (u32 r = 0; r <= ACC_INDEX; r++)
+					{
+						if ((m_use.vf_fmac_read & ~m_use.vf_written) & (u64(1) << r))
+							MakeClampedCopy(r);
+					}
+				}
 				m_f.loop();
 			}
 			void EndLoop() { m_f.end(); }
 
 			void EmitInstruction(const Plan& p, s32 busy_kick_exit);
 			void FlushAllAtEnd(const Plan& p, const VURegs& after);
-			// loop: the taken exit when it goes back to the entry with the entry's signature (BeginLoop), else null.
-			void EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn,
-				const BlockExit* loop, u32 last_start);
-			void EmitReturn(u32 exit_id)
-			{
-				m_f.i32_const(static_cast<s32>(exit_id));
-				m_f.return_();
-			}
+			// loop: whether the taken exit is the loop exit of BeginLoop.
+			void EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn, bool loop,
+				u32 last_start);
+			// Returns exit_id, with the flags and the pending entries' snapshots stored for it.
+			void EmitExit(u32 exit_id);
 			void Finish()
 			{
 				m_f.i32_const(0); // unreachable: every path returns
@@ -336,7 +386,189 @@ namespace VU1Jit
 
 			void Clamp(u32 v); // local v = vuDouble(v)
 			void ScalarDouble(); // vuDouble on the i32 bits on the stack
-			void EmitLoopBack(const BlockExit& x, u32 exit_id, u32 last_start, u32 depth);
+			void EmitLoopBack(u32 exit_id, u32 last_start, u32 depth);
+			void EmitLoopState(); // the loop exit's ApplyExit and NormalizeRings, for the pass that just ended
+
+			// VF0-VF31, ACC and VI0-VI15 as the block's native code uses them: in locals (RegUse). VI locals hold
+			// the 16-bit value; memory only ever gets its low half (i32.store16), as the interpreter writes US[0].
+			u32 VFLocal(u32 r)
+			{
+				if (!m_vf[r])
+					m_vf[r] = m_f.local(ValType::V128) + 1;
+				return m_vf[r] - 1;
+			}
+			u32 VILocal(u32 r)
+			{
+				if (!m_vi[r])
+					m_vi[r] = m_f.local(ValType::I32) + 1;
+				return m_vi[r] - 1;
+			}
+			u32 VFAddr(u32 r) { return r == ACC_INDEX ? A(R.ACC) : A(R.VF[r]); }
+			void VF(u32 r) // pushes VF[r] (or ACC)
+			{
+				m_use.vf_used |= u64(1) << r;
+				m_f.local_get(VFLocal(r));
+			}
+			void VFLane(u32 r, u32 lane) // pushes VF[r].UL[lane]
+			{
+				VF(r);
+				m_f.simd_lane(Simd::I32x4ExtractLane, static_cast<u8>(lane));
+			}
+			void VFSplat(u32 r, u32 lane) // pushes VF[r].UL[lane] in every lane
+			{
+				VF(r);
+				u8 l[16];
+				for (u32 i = 0; i < 16; i++)
+					l[i] = static_cast<u8>(lane * 4 + (i & 3));
+				m_f.local_tee(m_splat);
+				m_f.local_get(m_splat);
+				m_f.shuffle(l);
+			}
+			// VF[r] (or ACC) = local v, lanes outside dest kept. clean: the lanes of v known to be vuDouble's fixed
+			// points (Clean).
+			void SetVF(u32 r, u32 v, u32 dest, u32 clean = 0)
+			{
+				if ((dest & 0xf) == 0)
+					return;
+				m_use.vf_used |= u64(1) << r;
+				m_use.vf_written |= u64(1) << r;
+				m_clean[r] = static_cast<u8>((m_clean[r] & ~dest & 0xf) | (clean & dest & 0xf));
+				m_cc[r] = 0;
+				m_f.local_get(v);
+				if ((dest & 0xf) != 0xf)
+				{
+					m_f.local_get(VFLocal(r));
+					DestConst(dest);
+					Simd(Simd::V128Bitselect);
+				}
+				m_f.local_set(VFLocal(r));
+			}
+			void VI(u32 r) // pushes VI[r] zero-extended
+			{
+				m_use.vi_used |= 1u << r;
+				m_f.local_get(VILocal(r));
+			}
+			void VIs(u32 r) // pushes VI[r] sign-extended
+			{
+				VI(r);
+				m_f.i32_extend16_s();
+			}
+			template <typename F>
+			void SetVI(u32 r, F&& value) // VI[r] = low 16 bits of value()
+			{
+				m_use.vi_used |= 1u << r;
+				m_use.vi_written |= 1u << r;
+				value();
+				m_f.i32_const(0xffff);
+				m_f.i32_and();
+				m_f.local_set(VILocal(r));
+			}
+			// Clean registers (the design's section 13, step 3): lanes known to be fixed points of vuDouble (results of
+			// FMAC ops, which went through the result clamp), whose operand clamp can go, and clamped copies of
+			// registers (m_cc) that stay valid until the register is written. Compile-time state along the block's
+			// straight-line code; a helper call forgets it; at a loop's head only copies of registers the block never
+			// writes are kept, made before the loop (BeginLoop).
+			void ForgetClean()
+			{
+				std::memset(m_clean, 0, sizeof(m_clean));
+				std::memset(m_cc, 0, sizeof(m_cc));
+			}
+			void MakeClampedCopy(u32 r)
+			{
+				const u32 cc = m_f.local(ValType::V128);
+				VF(r);
+				m_f.local_set(cc);
+				Clamp(cc);
+				m_cc[r] = cc + 1;
+			}
+			// local dst = vuDouble(VF[r]) on the lanes in need (dest bits).
+			void ClampedVF(u32 r, u32 need, u32 dst)
+			{
+				m_use.vf_fmac_read |= u64(1) << r;
+				if ((m_clean[r] & need & 0xf) == (need & 0xf))
+					VF(r);
+				else
+				{
+					if (!m_cc[r])
+						MakeClampedCopy(r);
+					m_f.local_get(m_cc[r] - 1);
+				}
+				m_f.local_set(dst);
+			}
+			// local dst = vuDouble(VF[r].UL[lane]) in every lane.
+			void ClampedSplat(u32 r, u32 lane, u32 dst)
+			{
+				m_use.vf_fmac_read |= u64(1) << r;
+				if (m_clean[r] & (8 >> lane))
+					VFSplat(r, lane);
+				else
+				{
+					if (!m_cc[r])
+						MakeClampedCopy(r);
+					u8 l[16];
+					for (u32 i = 0; i < 16; i++)
+						l[i] = static_cast<u8>(lane * 4 + (i & 3));
+					m_f.local_get(m_cc[r] - 1);
+					m_f.local_get(m_cc[r] - 1);
+					m_f.shuffle(l);
+				}
+				m_f.local_set(dst);
+			}
+
+			void LoadRegs()
+			{
+				for (u32 r = 0; r <= ACC_INDEX; r++)
+				{
+					if (m_use.vf_used & (u64(1) << r))
+					{
+						LdV(VFAddr(r));
+						m_f.local_set(VFLocal(r));
+					}
+				}
+				for (u32 r = 0; r < 16; r++)
+				{
+					if (m_use.vi_used & (1u << r))
+					{
+						Ld16u(A(R.VI[r]));
+						m_f.local_set(VILocal(r));
+					}
+				}
+			}
+			void StoreRegs()
+			{
+				for (u32 r = 0; r <= ACC_INDEX; r++)
+				{
+					if (m_use.vf_written & (u64(1) << r))
+						StV(VFAddr(r), [&] { m_f.local_get(VFLocal(r)); });
+				}
+				for (u32 r = 0; r < 16; r++)
+				{
+					if (m_use.vi_written & (1u << r))
+						St16(A(R.VI[r]), [&] { m_f.local_get(VILocal(r)); });
+				}
+			}
+
+			// The pending macflag, statusflag and clipflag and the committed VI[MAC], VI[STATUS] and VI[CLIP]
+			// live in locals while generated code runs; memory has them at every exit and around helper calls.
+			void LoadFlags()
+			{
+				const u32 locals[6] = {m_pmac, m_pstat, m_pclip, m_vmac, m_vstat, m_vclip};
+				const u32 addrs[6] = {A(R.macflag), A(R.statusflag), A(R.clipflag), A(R.VI[REG_MAC_FLAG]),
+					A(R.VI[REG_STATUS_FLAG]), A(R.VI[REG_CLIP_FLAG])};
+				for (u32 i = 0; i < 6; i++)
+				{
+					Ld32(addrs[i]);
+					m_f.local_set(locals[i]);
+				}
+			}
+			void StoreFlags()
+			{
+				const u32 locals[6] = {m_pmac, m_pstat, m_pclip, m_vmac, m_vstat, m_vclip};
+				const u32 addrs[6] = {A(R.macflag), A(R.statusflag), A(R.clipflag), A(R.VI[REG_MAC_FLAG]),
+					A(R.VI[REG_STATUS_FLAG]), A(R.VI[REG_CLIP_FLAG])};
+				for (u32 i = 0; i < 6; i++)
+					St32(addrs[i], [&] { m_f.local_get(locals[i]); });
+			}
 			void Flags(u32 r, u32 dest); // MAC and status from the raw result in local r (VU_MAC_UPDATE, VU_STAT_UPDATE)
 			void Flushes(const Plan& p);
 			void FmacWriteback(u32 slot, int flagreg);
@@ -346,9 +578,15 @@ namespace VU1Jit
 			void Backup(const Plan& p);
 			void HelperUpper(const Plan& p, u32 delta)
 			{
+				StoreRegs();
+				StoreFlags();
 				m_f.i32_const(static_cast<s32>(p.ins.upper));
 				m_f.i32_const(static_cast<s32>(delta));
 				m_f.call(m_h_upper);
+				LoadRegs();
+				LoadFlags();
+				ForgetClean();
+				m_use.helpers = true;
 				m_out->helper_ops++;
 			}
 			void HelperLower(const Plan& p, u32 delta)
@@ -361,9 +599,15 @@ namespace VU1Jit
 					m_f.i32_store8(A(R.VIBackupCycles));
 					St32c(A(R.VIRegNumber), p.info.vi_backup_cycles ? p.info.vi_backup_reg : p.pre.VIRegNumber);
 				}
+				StoreRegs();
+				StoreFlags();
 				m_f.i32_const(static_cast<s32>(p.ins.lower));
 				m_f.i32_const(static_cast<s32>(delta));
 				m_f.call(m_h_lower);
+				LoadRegs();
+				LoadFlags();
+				ForgetClean();
+				m_use.helpers = true;
 				m_out->helper_ops++;
 			}
 
@@ -378,9 +622,18 @@ namespace VU1Jit
 			u32 m_i[6];
 			u32 m_hs, m_hn, m_hc_old, m_hc_new; // the upper/lower hazard copies
 			u32 m_dx, m_de; // ScalarDouble
-			u32 m_base = 0, m_next_base = 0; // BeginLoop
-			u32 m_rot_v[12] = {}; // the FMAC ring's four 48-byte slots, while they rotate
-			u32 m_rot_i[12] = {}; // the IALU ring's four 24-byte slots
+			u32 m_pmac, m_pstat, m_pclip, m_vmac, m_vstat, m_vclip; // LoadFlags
+			u32 m_snap[4][3]; // per ring slot of the model: the FMAC entry's macflag, statusflag and clipflag
+			const BlockExit* m_loop = nullptr; // BeginLoop
+			u32 m_base = 0; // VU1.cycle at the entry of the current pass
+			u32 m_looped = 0; // nonzero once a pass went back to the entry
+			u32 m_snap_tmp[12] = {};
+			RegUse m_use;
+			u32 m_vf[ACC_INDEX + 1] = {}; // local index + 1, 0 until used
+			u8 m_clean[ACC_INDEX + 1] = {}; // dest-style lane bits (x = 8)
+			u32 m_cc[ACC_INDEX + 1] = {}; // local index + 1 of a clamped copy, 0 if none
+			u32 m_vi[16] = {};
+			u32 m_splat = 0;
 			u32 m_mem;
 		};
 
@@ -413,62 +666,84 @@ namespace VU1Jit
 			m_f.select(); // exponent 0 ? sign : ...
 		}
 
-		void Emitter::EmitLoopBack(const BlockExit& x, u32 exit_id, u32 last_start, u32 depth)
+		void Emitter::EmitLoopBack(u32 exit_id, u32 last_start, u32 depth)
 		{
-			// The dispatcher's work between this exit and the same block again (VU1Jit.cpp, Dispatch and Run), done
-			// here: its budget test, ApplyExit with this pass's base, NormalizeRings, the next pass's base.
-			const PipeImage& m = x.pipes;
-			const auto rel = [](u64 model_time) { return static_cast<s64>(model_time - TIMING_MODEL_BASE); };
+			// The dispatcher's work between the loop exit and the same block again (VU1Jit.cpp, Dispatch and Run).
+			// Its budget test is made here. ApplyExit and NormalizeRings only matter to the exit that finally leaves:
+			// the timing fields they write are read by nothing else, and the next pass writes them again (the loop
+			// exit has no entry left from the pass's entry, CompileBlock). So EmitExit makes them, once, for the
+			// last pass (EmitLoopState). The flags' snapshots move with the ring, as NormalizeRings moves them.
+			const PipeImage& m = m_loop->pipes;
+			const s64 pass = static_cast<s64>(m.cycle - TIMING_MODEL_BASE);
 
 			// Dispatch enters a block only if its last instruction starts inside the budget.
 			m_f.local_get(m_base);
-			m_f.i64_const(rel(m.cycle));
-			m_f.i64_add();
-			m_f.local_tee(m_next_base);
-			m_f.i64_const(last_start);
+			m_f.i64_const(pass + last_start);
 			m_f.i64_add();
 			m_f.i32_const(0);
 			m_f.i64_load(A(g_budget_end));
 			m_f.i64_ge_u();
 			m_f.if_();
-			EmitReturn(exit_id);
+			EmitExit(exit_id);
 			m_f.end();
 
-			const auto st64 = [&](u32 addr, u64 model_time) { // base + (model_time - TIMING_MODEL_BASE)
-				m_f.i32_const(0);
-				m_f.local_get(m_base);
-				m_f.i64_const(rel(model_time));
-				m_f.i64_add();
-				m_f.i64_store(addr);
-			};
-			m_f.i32_const(0);
-			m_f.local_get(m_next_base);
-			m_f.i64_store(A(R.cycle));
-
-			// FMAC: the ring rotated so that the read position is 0 (NormalizeRings), then the entries this pass
-			// added get the model's static fields and times (ApplyExit); older ones keep theirs.
 			const u32 fr = m.fmacreadpos;
 			if (fr)
 			{
-				for (u32 k = 0; k < 4; k++)
+				for (u32 i = 0; i < m.fmaccount; i++)
 				{
 					for (u32 j = 0; j < 3; j++)
 					{
-						LdV(A(R.fmac[(fr + k) & 3]) + j * 16);
-						m_f.local_set(m_rot_v[k * 3 + j]);
+						m_f.local_get(m_snap[(fr + i) & 3][j]);
+						m_f.local_set(m_snap_tmp[i * 3 + j]);
 					}
 				}
-				for (u32 k = 0; k < 4; k++)
+				for (u32 i = 0; i < m.fmaccount; i++)
 				{
 					for (u32 j = 0; j < 3; j++)
-						StV(A(R.fmac[k]) + j * 16, [&] { m_f.local_get(m_rot_v[k * 3 + j]); });
+					{
+						m_f.local_get(m_snap_tmp[i * 3 + j]);
+						m_f.local_set(m_snap[i][j]);
+					}
 				}
 			}
+
+			// The next pass: its base, for the helpers and Run too.
+			m_f.local_get(m_base);
+			m_f.i64_const(pass);
+			m_f.i64_add();
+			m_f.local_set(m_base);
+			m_f.i32_const(0);
+			m_f.local_get(m_base);
+			m_f.i64_store(A(g_block_base));
+			m_f.i32_const(1);
+			m_f.local_set(m_looped);
+			St32(A(g_block_loops), [&] {
+				Ld32(A(g_block_loops));
+				m_f.i32_const(1);
+				m_f.i32_add();
+			});
+			m_f.br(depth);
+		}
+
+		void Emitter::EmitLoopState()
+		{
+			// ApplyExit (VU1Jit.cpp) for the loop exit at the end of the previous pass, whose base is this pass's
+			// minus the pass's cycles, then NormalizeRings: entry i of the exit goes to ring slot i. Every entry is
+			// one the previous pass added, so every field comes from the model. Fields ApplyExit then writes again
+			// for the exit that leaves (TPC, the control state, the cycle) are left to it.
+			const PipeImage& m = m_loop->pipes;
+			const s64 pass = static_cast<s64>(m.cycle - TIMING_MODEL_BASE);
+			const auto st64 = [&](u32 addr, u64 model_time) { // previous base + (model_time - TIMING_MODEL_BASE)
+				m_f.i32_const(0);
+				m_f.local_get(m_base);
+				m_f.i64_const(static_cast<s64>(model_time - TIMING_MODEL_BASE) - pass);
+				m_f.i64_add();
+				m_f.i64_store(addr);
+			};
 			for (u32 i = 0; i < m.fmaccount; i++)
 			{
-				const fmacPipe& p = m.fmac[(fr + i) & 3];
-				if (p.sCycle < TIMING_MODEL_BASE)
-					continue;
+				const fmacPipe& p = m.fmac[(m.fmacreadpos + i) & 3];
 				const fmacPipe& q = R.fmac[i];
 				St32c(A(q.regupper), p.regupper);
 				St32c(A(q.reglower), p.reglower);
@@ -478,93 +753,48 @@ namespace VU1Jit
 				st64(A(q.sCycle), p.sCycle);
 				St32c(A(q.Cycle), p.Cycle);
 			}
-			St32c(A(R.fmacreadpos), 0);
-			St32c(A(R.fmacwritepos), fr ? (m.fmaccount & 3) : m.fmacwritepos);
-			St32c(A(R.fmaccount), m.fmaccount);
-
-			// IALU, the same way.
-			const u32 ir = m.ialureadpos;
-			if (ir)
-			{
-				for (u32 k = 0; k < 4; k++)
-				{
-					for (u32 j = 0; j < 3; j++)
-					{
-						m_f.i32_const(0);
-						m_f.i64_load(A(R.ialu[(ir + k) & 3]) + j * 8);
-						m_f.local_set(m_rot_i[k * 3 + j]);
-					}
-				}
-				for (u32 k = 0; k < 4; k++)
-				{
-					for (u32 j = 0; j < 3; j++)
-					{
-						m_f.i32_const(0);
-						m_f.local_get(m_rot_i[k * 3 + j]);
-						m_f.i64_store(A(R.ialu[k]) + j * 8);
-					}
-				}
-			}
 			for (u32 i = 0; i < m.ialucount; i++)
 			{
-				const ialuPipe& p = m.ialu[(ir + i) & 3];
-				if (p.sCycle < TIMING_MODEL_BASE)
-					continue;
+				const ialuPipe& p = m.ialu[(m.ialureadpos + i) & 3];
 				St32c(A(R.ialu[i].reg), static_cast<u32>(p.reg));
 				st64(A(R.ialu[i].sCycle), p.sCycle);
 				St32c(A(R.ialu[i].Cycle), p.Cycle);
 			}
-			St32c(A(R.ialureadpos), 0);
-			St32c(A(R.ialuwritepos), ir ? (m.ialucount & 3) : m.ialuwritepos);
-			St32c(A(R.ialucount), m.ialucount);
-
-			St32c(A(R.fdiv.enable), static_cast<u32>(m.fdiv.enable));
-			if (m.fdiv.enable && m.fdiv.sCycle >= TIMING_MODEL_BASE)
+			if (m.fdiv.enable)
 			{
 				st64(A(R.fdiv.sCycle), m.fdiv.sCycle);
 				St32c(A(R.fdiv.Cycle), m.fdiv.Cycle);
 			}
-			St32c(A(R.efu.enable), static_cast<u32>(m.efu.enable));
 			if (m.efu.enable)
 			{
-				if (m.efu.sCycle >= TIMING_MODEL_BASE)
-				{
-					st64(A(R.efu.sCycle), m.efu.sCycle);
-					St32c(A(R.efu.Cycle), m.efu.Cycle);
-				}
-				else if (x.efu_cycle_adjust)
-				{
-					St32(A(R.efu.Cycle), [&] {
-						Ld32(A(R.efu.Cycle));
-						m_f.i32_const(x.efu_cycle_adjust);
-						m_f.i32_add();
-					});
-				}
+				st64(A(R.efu.sCycle), m.efu.sCycle);
+				St32c(A(R.efu.Cycle), m.efu.Cycle);
 			}
+		}
 
-			m_f.i32_const(0);
-			m_f.i32_const(m.VIBackupCycles);
-			m_f.i32_store8(A(R.VIBackupCycles));
-			St32c(A(R.VIRegNumber), m.VIRegNumber);
-			St32c(A(R.VI[REG_TPC]), x.tpc);
-			St32c(A(R.branch), 0);
-			m_f.i32_const(0);
-			m_f.i32_const(0);
-			m_f.i32_store8(A(R.takedelaybranch));
-			St32c(A(R.ebit), x.ebit);
-
-			// The next pass.
-			m_f.local_get(m_next_base);
-			m_f.local_set(m_base);
-			m_f.i32_const(0);
-			m_f.local_get(m_base);
-			m_f.i64_store(A(g_block_base));
-			St32(A(g_block_loops), [&] {
-				Ld32(A(g_block_loops));
-				m_f.i32_const(1);
-				m_f.i32_add();
-			});
-			m_f.br(depth);
+		void Emitter::EmitExit(u32 exit_id)
+		{
+			// Every exit leaves the registers and the flags in memory (LoadRegs, LoadFlags), with the snapshots of the
+			// FMAC entries pending there in their ring slots; ApplyExit writes the rest of the timing state.
+			StoreRegs();
+			StoreFlags();
+			const PipeImage& m = m_out->exits[exit_id].pipes;
+			for (u32 i = 0; i < m.fmaccount; i++)
+			{
+				const u32 s = (m.fmacreadpos + i) & 3;
+				St32(A(R.fmac[s].macflag), [&] { m_f.local_get(m_snap[s][0]); });
+				St32(A(R.fmac[s].statusflag), [&] { m_f.local_get(m_snap[s][1]); });
+				St32(A(R.fmac[s].clipflag), [&] { m_f.local_get(m_snap[s][2]); });
+			}
+			if (m_loop)
+			{
+				m_f.local_get(m_looped);
+				m_f.if_();
+				EmitLoopState();
+				m_f.end();
+			}
+			m_f.i32_const(static_cast<s32>(exit_id));
+			m_f.return_();
 		}
 
 		void Emitter::Clamp(u32 v)
@@ -652,38 +882,38 @@ namespace VU1Jit
 			m_f.local_set(n);
 
 			// macflag = (macflag & ~0xffff) | mac
-			St32(A(R.macflag), [&] {
-				Ld32(A(R.macflag));
-				m_f.i32_const(static_cast<s32>(0xffff0000u));
-				m_f.i32_and();
-				m_f.local_get(n);
-				m_f.local_get(n);
-				static constexpr u8 rev[16] = {3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12};
-				m_f.shuffle(rev);
-				Simd(Simd::I8x16Bitmask);
-				m_f.i32_or();
-			});
+			m_f.local_get(m_pmac);
+			m_f.i32_const(static_cast<s32>(0xffff0000u));
+			m_f.i32_and();
+			m_f.local_get(n);
+			m_f.local_get(n);
+			static constexpr u8 rev[16] = {3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12};
+			m_f.shuffle(rev);
+			Simd(Simd::I8x16Bitmask);
+			m_f.i32_or();
+			m_f.local_set(m_pmac);
 			// statusflag = one bit per group with any lane set (VU_STAT_UPDATE)
-			St32(A(R.statusflag), [&] {
-				m_f.local_get(n);
-				Splat(0);
-				Simd(Simd::I32x4Ne);
-				Simd(Simd::I32x4Bitmask);
-			});
+			m_f.local_get(n);
+			Splat(0);
+			Simd(Simd::I32x4Ne);
+			Simd(Simd::I32x4Bitmask);
+			m_f.local_set(m_pstat);
 		}
 
 		void Emitter::FmacWriteback(u32 slot, int flagreg)
 		{
-			// _vuFMACflush / _vuFlushAll for one entry (VUops.cpp:51-63).
-			const fmacPipe& e = R.fmac[slot];
+			// _vuFMACflush / _vuFlushAll for one entry (VUops.cpp:51-63), on the flags in locals.
+			const u32* e = m_snap[slot];
 			if (flagreg & (1 << REG_CLIP_FLAG))
-				St32(A(R.VI[REG_CLIP_FLAG]), [&] { Ld32(A(e.clipflag)); });
-			const u32 st = A(R.VI[REG_STATUS_FLAG]);
-			St32(st, [&] {
-				const u32 sf = m_i[0];
-				Ld32(A(e.statusflag));
+			{
+				m_f.local_get(e[2]);
+				m_f.local_set(m_vclip);
+			}
+			{
+				const u32 sf = m_dx;
+				m_f.local_get(e[1]);
 				m_f.local_set(sf);
-				Ld32(st);
+				m_f.local_get(m_vstat);
 				if (flagreg & (1 << REG_STATUS_FLAG))
 				{
 					m_f.i32_const(0x30);
@@ -711,8 +941,10 @@ namespace VU1Jit
 					m_f.i32_shl();
 					m_f.i32_or();
 				}
-			});
-			St32(A(R.VI[REG_MAC_FLAG]), [&] { Ld32(A(e.macflag)); });
+				m_f.local_set(m_vstat);
+			}
+			m_f.local_get(e[0]);
+			m_f.local_set(m_vmac);
 		}
 
 		void Emitter::Flushes(const Plan& p)
@@ -726,16 +958,14 @@ namespace VU1Jit
 			if (p.info.fdiv_flushed)
 			{
 				St32(A(R.VI[REG_Q]), [&] { Ld32(A(R.fdiv.reg)); });
-				const u32 st = A(R.VI[REG_STATUS_FLAG]);
-				St32(st, [&] {
-					Ld32(st);
-					m_f.i32_const(0xFCF);
-					m_f.i32_and();
-					Ld32(A(R.fdiv.statusflag));
-					m_f.i32_const(0xC30);
-					m_f.i32_and();
-					m_f.i32_or();
-				});
+				m_f.local_get(m_vstat);
+				m_f.i32_const(0xFCF);
+				m_f.i32_and();
+				Ld32(A(R.fdiv.statusflag));
+				m_f.i32_const(0xC30);
+				m_f.i32_and();
+				m_f.i32_or();
+				m_f.local_set(m_vstat);
 			}
 			if (p.info.efu_flushed)
 				St32(A(R.VI[REG_P]), [&] { Ld32(A(R.efu.reg)); });
@@ -747,16 +977,14 @@ namespace VU1Jit
 			if (p.info.end_fdiv)
 			{
 				St32(A(R.VI[REG_Q]), [&] { Ld32(A(R.fdiv.reg)); });
-				const u32 st = A(R.VI[REG_STATUS_FLAG]);
-				St32(st, [&] {
-					Ld32(st);
-					m_f.i32_const(0xFCF);
-					m_f.i32_and();
-					Ld32(A(R.fdiv.statusflag));
-					m_f.i32_const(0xC30);
-					m_f.i32_and();
-					m_f.i32_or();
-				});
+				m_f.local_get(m_vstat);
+				m_f.i32_const(0xFCF);
+				m_f.i32_and();
+				Ld32(A(R.fdiv.statusflag));
+				m_f.i32_const(0xC30);
+				m_f.i32_and();
+				m_f.i32_or();
+				m_f.local_set(m_vstat);
 			}
 			if (p.info.end_efu)
 				St32(A(R.VI[REG_P]), [&] { Ld32(A(R.efu.reg)); });
@@ -780,6 +1008,23 @@ namespace VU1Jit
 		{
 			static const int mask = [] { const char* e = std::getenv("VU1JIT_HELPERS"); return e ? std::atoi(e) : 0; }();
 			return mask;
+		}
+
+		// Whether every pipe entry pending in m was added by the block (none left from its entry): then the block's
+		// loop exit is fully described by the model (EmitLoopState).
+		static bool OnlyNewEntries(const PipeImage& m)
+		{
+			for (u32 i = 0; i < m.fmaccount; i++)
+			{
+				if (m.fmac[(m.fmacreadpos + i) & 3].sCycle < TIMING_MODEL_BASE)
+					return false;
+			}
+			for (u32 i = 0; i < m.ialucount; i++)
+			{
+				if (m.ialu[(m.ialureadpos + i) & 3].sCycle < TIMING_MODEL_BASE)
+					return false;
+			}
+			return (!m.fdiv.enable || m.fdiv.sCycle >= TIMING_MODEL_BASE) && (!m.efu.enable || m.efu.sCycle >= TIMING_MODEL_BASE);
 		}
 
 		// Loops in generated code (EmitLoopBack). Off with VU1JIT_NOLOOP, to bisect a difference, and with the
@@ -844,7 +1089,7 @@ namespace VU1Jit
 						return true;
 					const u32 off = (p.ins.up == U::FTOI0) ? 0 : (p.ins.up == U::FTOI4) ? 4 : (p.ins.up == U::FTOI12) ? 12 : 15;
 					const u32 u = m_v[0], r = m_v[1];
-					LdV(A(R.VF[fs]));
+					VF(fs);
 					if (off)
 					{
 						Splat(0x3f800000u + (off << 23));
@@ -865,7 +1110,7 @@ namespace VU1Jit
 					Simd(Simd::I32x4GeU);
 					Simd(Simd::V128Bitselect);
 					m_f.local_set(r);
-					StoreMerged(A(R.VF[ft]), r, dest);
+					SetVF(ft, r, dest);
 					m_out->native_ops++;
 					return true;
 				}
@@ -876,7 +1121,7 @@ namespace VU1Jit
 						return true;
 					const u32 off = (p.ins.up == U::ITOF0) ? 0 : (p.ins.up == U::ITOF4) ? 4 : (p.ins.up == U::ITOF12) ? 12 : 15;
 					const u32 r = m_v[1];
-					LdV(A(R.VF[fs]));
+					VF(fs);
 					Simd(Simd::F32x4ConvertI32x4S);
 					if (off)
 					{
@@ -884,7 +1129,7 @@ namespace VU1Jit
 						Simd(Simd::F32x4Mul);
 					}
 					m_f.local_set(r);
-					StoreMerged(A(R.VF[ft]), r, dest);
+					SetVF(ft, r, dest);
 					m_out->native_ops++;
 					return true;
 				}
@@ -893,11 +1138,12 @@ namespace VU1Jit
 					if (ft == 0)
 						return true;
 					const u32 r = m_v[1];
-					LdV(A(R.VF[fs]));
+					const u32 clean = m_clean[fs]; // |x| is clean when x is
+					VF(fs);
 					Splat(0x7fffffffu);
 					Simd(Simd::V128And);
 					m_f.local_set(r);
-					StoreMerged(A(R.VF[ft]), r, dest);
+					SetVF(ft, r, dest, clean);
 					m_out->native_ops++;
 					return true;
 				}
@@ -905,7 +1151,7 @@ namespace VU1Jit
 				{
 					// _vuCLIP (VUops.cpp:912-928)
 					const u32 w = m_i[0], pm = m_i[1], nm = m_i[2], fsv = m_v[0];
-					Ld32(A(R.VF[ft].i.w));
+					VFLane(ft, 3);
 					m_f.local_tee(w);
 					m_f.i32_const(0x7fffffff);
 					m_f.i32_and();
@@ -916,7 +1162,7 @@ namespace VU1Jit
 					m_f.select();
 					Simd(Simd::I32x4Splat);
 					m_f.local_set(m_v[1]);
-					LdV(A(R.VF[fs]));
+					VF(fs);
 					m_f.local_tee(fsv);
 					m_f.local_get(m_v[1]);
 					Simd(Simd::I32x4GtS);
@@ -929,8 +1175,8 @@ namespace VU1Jit
 					Simd(Simd::I32x4GtS);
 					Simd(Simd::I32x4Bitmask);
 					m_f.local_set(nm);
-					St32(A(R.clipflag), [&] {
-						Ld32(A(R.clipflag));
+					{
+						m_f.local_get(m_pclip);
 						m_f.i32_const(6);
 						m_f.i32_shl();
 						// pos x,y,z -> bits 0,2,4; neg -> 1,3,5
@@ -954,7 +1200,8 @@ namespace VU1Jit
 						}
 						m_f.i32_const(0xFFFFFF);
 						m_f.i32_and();
-					});
+						m_f.local_set(m_pclip);
+					}
 					m_out->native_ops++;
 					return true;
 				}
@@ -978,16 +1225,20 @@ namespace VU1Jit
 					const bool max = p.ins.up == U::MAX || p.ins.up == U::MAXx || p.ins.up == U::MAXy ||
 					                 p.ins.up == U::MAXz || p.ins.up == U::MAXw || p.ins.up == U::MAXi;
 					const u32 a = m_v[0], b = m_v[1], r = m_v[3];
-					LdV(A(R.VF[fs]));
+					// Each result lane is one of its operands' lanes: clean where both are (Clean).
+					u32 clean = m_clean[fs];
+					VF(fs);
 					m_f.local_set(a);
 					switch (p.ins.up)
 					{
 						case U::MAX:
 						case U::MINI:
-							LdV(A(R.VF[ft]));
+							clean &= m_clean[ft];
+							VF(ft);
 							break;
 						case U::MAXi:
 						case U::MINIi:
+							clean = 0;
 							m_f.i32_const(0);
 							m_f.simd_mem(Simd::V128Load32Splat, A(R.VI[REG_I]), 2);
 							break;
@@ -997,8 +1248,9 @@ namespace VU1Jit
 							                 (p.ins.up == U::MAXy || p.ins.up == U::MINIy) ? 1 :
 							                 (p.ins.up == U::MAXz || p.ins.up == U::MINIz) ? 2 :
 							                                                                 3;
-							m_f.i32_const(0);
-							m_f.simd_mem(Simd::V128Load32Splat, A(R.VF[ft].UL[lane]), 2);
+							if (!(m_clean[ft] & (8 >> lane)))
+								clean = 0;
+							VFSplat(ft, lane);
 							break;
 						}
 					}
@@ -1017,7 +1269,7 @@ namespace VU1Jit
 					Simd(Simd::I32x4ShrS);
 					Simd(Simd::V128Bitselect);
 					m_f.local_set(r);
-					StoreMerged(A(R.VF[fd]), r, dest);
+					SetVF(fd, r, dest, clean);
 					m_out->native_ops++;
 					return true;
 				}
@@ -1030,24 +1282,23 @@ namespace VU1Jit
 			}
 
 			// applyBinaryMACOp / applyTernaryMACOp and their broadcasts (VUops.cpp:516-552, 681-710).
+			// Only the dest lanes of the operands matter: the others are neither stored nor flagged.
 			const u32 a = m_v[0], b = m_v[1], c = m_v[2], r = m_v[3];
-			LdV(A(R.VF[fs]));
-			m_f.local_set(a);
-			Clamp(a);
+			ClampedVF(fs, dest, a);
 			if (bc < 0)
-				LdV(A(R.VF[ft]));
+				ClampedVF(ft, dest, b);
+			else if (bc < 4)
+				ClampedSplat(ft, static_cast<u32>(bc), b);
 			else
 			{
 				m_f.i32_const(0);
-				m_f.simd_mem(Simd::V128Load32Splat, (bc < 4) ? A(R.VF[ft].UL[bc]) : A(R.VI[(bc == 4) ? REG_I : REG_Q]), 2);
+				m_f.simd_mem(Simd::V128Load32Splat, A(R.VI[(bc == 4) ? REG_I : REG_Q]), 2);
+				m_f.local_set(b);
+				Clamp(b);
 			}
-			m_f.local_set(b);
-			Clamp(b);
 			if (k == MADD || k == MSUB)
 			{
-				LdV(A(R.ACC));
-				m_f.local_set(c);
-				Clamp(c);
+				ClampedVF(ACC_INDEX, dest, c);
 				m_f.local_get(c);
 				m_f.local_get(a);
 				m_f.local_get(b);
@@ -1065,7 +1316,7 @@ namespace VU1Jit
 			if (acc || fd != 0) // fd 0 writes RDzero, which nothing reads
 			{
 				Clamp(r);
-				StoreMerged(acc ? A(R.ACC) : A(R.VF[fd]), r, dest);
+				SetVF(acc ? ACC_INDEX : fd, r, dest, 0xf);
 			}
 			m_out->native_ops++;
 			return true;
@@ -1076,7 +1327,7 @@ namespace VU1Jit
 			// _vuBackupVI (VUops.cpp:420-434): the window's cycles and register are the model's; only the value is data.
 			if (p.info.backup_vi < 0 || p.info.backup_chained)
 				return;
-			St32(A(R.VIOldValue), [&] { Ld16u(A(R.VI[p.info.backup_vi])); });
+			St32(A(R.VIOldValue), [&] { VI(p.info.backup_vi); });
 		}
 
 		bool Emitter::Lower(const Plan& p, u32 delta)
@@ -1090,7 +1341,7 @@ namespace VU1Jit
 			const u32 v = m_v[0];
 			const auto vi_op = [&](u32 dst, auto&& value) {
 				Backup(p);
-				St16(A(R.VI[dst]), value);
+				SetVI(dst, value);
 				m_out->native_ops++;
 			};
 			// VU memory address of a qword index on the stack (GET_VU_MEM for VU1: & 0x3fff after * 16).
@@ -1103,13 +1354,13 @@ namespace VU1Jit
 			const auto load_q = [&](u32 to_vf) { // VF[to_vf] <- mem[addr on stack], dest merged
 				m_f.v128_load(m_mem);
 				m_f.local_set(v);
-				StoreMerged(A(R.VF[to_vf]), v, dest);
+				SetVF(to_vf, v, dest);
 			};
 			const auto store_q = [&](u32 from_vf) { // mem[addr in m_i[0]] <- VF[from_vf], dest merged
 				if (dest == 0)
 					return;
 				m_f.local_get(m_i[0]);
-				LdV(A(R.VF[from_vf]));
+				VF(from_vf);
 				if (dest != 0xf)
 				{
 					m_f.local_get(m_i[0]);
@@ -1132,9 +1383,9 @@ namespace VU1Jit
 				case L::MOVE:
 					if (ft == 0 || dest == 0)
 						return true;
-					LdV(A(R.VF[fs]));
+					VF(fs);
 					m_f.local_set(v);
-					StoreMerged(A(R.VF[ft]), v, dest);
+					SetVF(ft, v, dest);
 					m_out->native_ops++;
 					return true;
 				case L::MR32:
@@ -1142,17 +1393,17 @@ namespace VU1Jit
 					if (ft == 0)
 						return true;
 					static constexpr u8 rot[16] = {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3};
-					LdV(A(R.VF[fs]));
+					VF(fs);
 					m_f.shuffle1(rot, v);
 					m_f.local_set(v);
-					StoreMerged(A(R.VF[ft]), v, dest);
+					SetVF(ft, v, dest);
 					m_out->native_ops++;
 					return true;
 				}
 				case L::LQ:
 					if (ft == 0)
 						return true;
-					Ld16s(A(R.VI[is]));
+					VIs(is);
 					m_f.i32_const(imm11);
 					m_f.i32_add();
 					qaddr();
@@ -1160,7 +1411,7 @@ namespace VU1Jit
 					m_out->native_ops++;
 					return true;
 				case L::SQ:
-					Ld16s(A(R.VI[it]));
+					VIs(it);
 					m_f.i32_const(imm11);
 					m_f.i32_add();
 					qaddr();
@@ -1172,21 +1423,21 @@ namespace VU1Jit
 					Backup(p);
 					if (ft)
 					{
-						Ld16u(A(R.VI[is]));
+						VI(is);
 						qaddr();
 						load_q(ft);
 					}
 					if (fs != 0)
-						St16(A(R.VI[is]), [&] { Ld16u(A(R.VI[is])); m_f.i32_const(1); m_f.i32_add(); });
+						SetVI(is, [&] { VI(is); m_f.i32_const(1); m_f.i32_add(); });
 					m_out->native_ops++;
 					return true;
 				case L::LQD:
 					Backup(p);
 					if (is != 0)
-						St16(A(R.VI[is]), [&] { Ld16u(A(R.VI[is])); m_f.i32_const(1); m_f.i32_sub(); });
+						SetVI(is, [&] { VI(is); m_f.i32_const(1); m_f.i32_sub(); });
 					if (ft)
 					{
-						Ld16u(A(R.VI[is]));
+						VI(is);
 						qaddr();
 						load_q(ft);
 					}
@@ -1194,19 +1445,19 @@ namespace VU1Jit
 					return true;
 				case L::SQI:
 					Backup(p);
-					Ld16u(A(R.VI[it]));
+					VI(it);
 					qaddr();
 					m_f.local_set(m_i[0]);
 					store_q(fs);
 					if (ft != 0)
-						St16(A(R.VI[it]), [&] { Ld16u(A(R.VI[it])); m_f.i32_const(1); m_f.i32_add(); });
+						SetVI(it, [&] { VI(it); m_f.i32_const(1); m_f.i32_add(); });
 					m_out->native_ops++;
 					return true;
 				case L::SQD:
 					Backup(p);
 					if (ft != 0)
-						St16(A(R.VI[it]), [&] { Ld16u(A(R.VI[it])); m_f.i32_const(1); m_f.i32_sub(); });
-					Ld16u(A(R.VI[it]));
+						SetVI(it, [&] { VI(it); m_f.i32_const(1); m_f.i32_sub(); });
+					VI(it);
 					qaddr();
 					m_f.local_set(m_i[0]);
 					store_q(fs);
@@ -1219,14 +1470,22 @@ namespace VU1Jit
 					if (id == 0)
 						return true;
 					vi_op(id, [&] {
-						Ld16u(A(R.VI[is]));
-						Ld16u(A(R.VI[it]));
+						VI(is);
+						VI(it);
 						switch (p.ins.lo)
 						{
-							case L::IADD: m_f.i32_add(); break;
-							case L::ISUB: m_f.i32_sub(); break;
-							case L::IAND: m_f.i32_and(); break;
-							default: m_f.i32_or(); break;
+							case L::IADD:
+								m_f.i32_add();
+								break;
+							case L::ISUB:
+								m_f.i32_sub();
+								break;
+							case L::IAND:
+								m_f.i32_and();
+								break;
+							default:
+								m_f.i32_or();
+								break;
 						}
 					});
 					return true;
@@ -1235,7 +1494,7 @@ namespace VU1Jit
 					if (it == 0)
 						return true;
 					const s32 imm5 = static_cast<s32>(((code >> 6) & 0x10) ? (0xfff0u | ((code >> 6) & 0xf)) : ((code >> 6) & 0xf));
-					vi_op(it, [&] { Ld16u(A(R.VI[is])); m_f.i32_const(static_cast<s16>(imm5)); m_f.i32_add(); });
+					vi_op(it, [&] { VI(is); m_f.i32_const(static_cast<s16>(imm5)); m_f.i32_add(); });
 					return true;
 				}
 				case L::IADDIU:
@@ -1243,7 +1502,7 @@ namespace VU1Jit
 					if (it == 0)
 						return true;
 					vi_op(it, [&] {
-						Ld16u(A(R.VI[is]));
+						VI(is);
 						m_f.i32_const(imm15);
 						if (p.ins.lo == L::IADDIU)
 							m_f.i32_add();
@@ -1254,8 +1513,8 @@ namespace VU1Jit
 				case L::FCAND:
 				case L::FCEQ:
 				case L::FCOR:
-					St16(A(R.VI[1]), [&] {
-						Ld32(A(R.VI[REG_CLIP_FLAG]));
+					SetVI(1, [&] {
+						m_f.local_get(m_vclip);
 						m_f.i32_const(0xFFFFFF);
 						m_f.i32_and();
 						m_f.i32_const(static_cast<s32>(code & 0xFFFFFF));
@@ -1285,14 +1544,14 @@ namespace VU1Jit
 					// m_i[4] or m_i[5]: this may be a branch's delay slot.
 					const u32 fsf = (code >> 21) & 3, ftf = (code >> 23) & 3;
 					const u32 t = m_i[0], s = m_i[1], st = m_i[2];
-					Ld32(A(R.VF[ft].UL[ftf]));
+					VFLane(ft, ftf);
 					m_f.local_set(t);
 					if (p.ins.lo != L::SQRT)
 					{
-						Ld32(A(R.VF[fs].UL[fsf]));
+						VFLane(fs, fsf);
 						m_f.local_set(s);
 					}
-					Ld32(A(R.statusflag));
+					m_f.local_get(m_pstat);
 					m_f.i32_const(~0x30);
 					m_f.i32_and();
 					m_f.local_set(st);
@@ -1403,14 +1662,15 @@ namespace VU1Jit
 						});
 						m_f.end();
 					}
-					St32(A(R.statusflag), [&] { m_f.local_get(st); });
+					m_f.local_get(st);
+					m_f.local_set(m_pstat);
 					m_out->native_ops++;
 					return true;
 				}
 				case L::FCGET:
 					if (it == 0)
 						return true;
-					St16(A(R.VI[it]), [&] { Ld32(A(R.VI[REG_CLIP_FLAG])); m_f.i32_const(0x0FFF); m_f.i32_and(); });
+					SetVI(it, [&] { m_f.local_get(m_vclip); m_f.i32_const(0x0FFF); m_f.i32_and(); });
 					m_out->native_ops++;
 					return true;
 				case L::B:
@@ -1420,19 +1680,19 @@ namespace VU1Jit
 					return true;
 				case L::BAL:
 					if (it)
-						St16(A(R.VI[it]), [&] { m_f.i32_const(static_cast<s32>((p.pc + 16) / 8)); });
+						SetVI(it, [&] { m_f.i32_const(static_cast<s32>((p.pc + 16) / 8)); });
 					m_f.i32_const(1);
 					m_f.local_set(m_i[4]);
 					m_out->native_ops++;
 					return true;
 				case L::JR:
 				case L::JALR:
-					Ld16u(A(R.VI[is]));
+					VI(is);
 					m_f.i32_const(3);
 					m_f.i32_shl();
 					m_f.local_set(m_i[5]);
 					if (p.ins.lo == L::JALR && it)
-						St16(A(R.VI[it]), [&] { m_f.i32_const(static_cast<s32>((p.pc + 16) / 8)); });
+						SetVI(it, [&] { m_f.i32_const(static_cast<s32>((p.pc + 16) / 8)); });
 					m_out->native_ops++;
 					return true;
 				case L::IBEQ:
@@ -1448,7 +1708,7 @@ namespace VU1Jit
 						if (window && p.info.vi_backup_reg == reg)
 							Ld16s(A(R.VIOldValue));
 						else
-							Ld16s(A(R.VI[reg]));
+							VIs(reg);
 					};
 					if (p.ins.lo == L::IBEQ || p.ins.lo == L::IBNE)
 					{
@@ -1491,7 +1751,7 @@ namespace VU1Jit
 				// A kick still running at an XGKICK: the interpreter takes it (section 7.7).
 				Ld32(A(R.xgkickenable));
 				m_f.if_();
-				EmitReturn(static_cast<u32>(busy_kick_exit));
+				EmitExit(static_cast<u32>(busy_kick_exit));
 				m_f.end();
 			}
 
@@ -1511,12 +1771,12 @@ namespace VU1Jit
 				const bool lower = info.lower_runs;
 				if (lower && old_vf)
 				{
-					LdV(A(R.VF[old_vf]));
+					VF(old_vf);
 					m_f.local_set(m_hs);
 				}
 				if (lower && info.old_clip)
 				{
-					Ld32(A(R.VI[REG_CLIP_FLAG]));
+					m_f.local_get(m_vclip);
 					m_f.local_set(m_hc_old);
 				}
 				Upper(p, delta);
@@ -1524,66 +1784,78 @@ namespace VU1Jit
 				{
 					if (old_vf)
 					{
-						LdV(A(R.VF[old_vf]));
+						VF(old_vf);
 						m_f.local_set(m_hn);
-						StV(A(R.VF[old_vf]), [&] { m_f.local_get(m_hs); });
+						m_use.vf_written |= u64(1) << old_vf; // the lower op's helper must find the old value in memory
+						m_f.local_get(m_hs);
+						m_f.local_set(VFLocal(old_vf));
 					}
 					if (info.old_clip)
 					{
-						Ld32(A(R.VI[REG_CLIP_FLAG]));
+						m_f.local_get(m_vclip);
 						m_f.local_set(m_hc_new);
-						St32(A(R.VI[REG_CLIP_FLAG]), [&] { m_f.local_get(m_hc_old); });
+						m_f.local_get(m_hc_old);
+						m_f.local_set(m_vclip);
 					}
 					Lower(p, delta);
 					if (old_vf)
-						StV(A(R.VF[old_vf]), [&] { m_f.local_get(m_hn); });
+					{
+						m_f.local_get(m_hn);
+						m_f.local_set(VFLocal(old_vf));
+					}
 					if (info.old_clip)
-						St32(A(R.VI[REG_CLIP_FLAG]), [&] { m_f.local_get(m_hc_new); });
+					{
+						m_f.local_get(m_hc_new);
+						m_f.local_set(m_vclip);
+					}
 				}
 			}
 
 			// Pipe entries (VU1microInterp.cpp:187-192): their value snapshots, taken after both ops.
 			if (info.fmac_added)
 			{
-				const fmacPipe& e = R.fmac[p.pre.fmacwritepos];
-				St32(A(e.macflag), [&] { Ld32(A(R.macflag)); });
-				St32(A(e.statusflag), [&] { Ld32(A(R.statusflag)); });
-				St32(A(e.clipflag), [&] { Ld32(A(R.clipflag)); });
+				const u32* e = m_snap[p.pre.fmacwritepos];
+				const u32 from[3] = {m_pmac, m_pstat, m_pclip};
+				for (u32 j = 0; j < 3; j++)
+				{
+					m_f.local_get(from[j]);
+					m_f.local_set(e[j]);
+				}
 			}
 			if (info.fdiv_added)
 			{
 				St32(A(R.fdiv.reg), [&] { Ld32(A(R.q)); });
-				St32(A(R.fdiv.statusflag), [&] { Ld32(A(R.statusflag)); });
+				St32(A(R.fdiv.statusflag), [&] { m_f.local_get(m_pstat); });
 			}
 			if (info.efu_added)
 				St32(A(R.efu.reg), [&] { Ld32(A(R.p)); });
 		}
 
 		void Emitter::EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn,
-			const BlockExit* loop, u32 last_start)
+			bool loop, u32 last_start)
 		{
 			(void)delay;
 			const u16 flags = GetLowerFlags(branch.ins.lo);
 			if (flags & LOWER_DYNAMIC)
 			{
 				St32(A(R.VI[REG_TPC]), [&] { m_f.local_get(m_i[5]); });
-				EmitReturn(exit_dyn);
+				EmitExit(exit_dyn);
 			}
 			else if (flags & LOWER_COND)
 			{
 				m_f.local_get(m_i[4]);
 				m_f.if_();
 				if (loop)
-					EmitLoopBack(*loop, exit_taken, last_start, 1);
+					EmitLoopBack(exit_taken, last_start, 1);
 				else
-					EmitReturn(exit_taken);
+					EmitExit(exit_taken);
 				m_f.end();
-				EmitReturn(exit_fall);
+				EmitExit(exit_fall);
 			}
 			else if (loop)
-				EmitLoopBack(*loop, exit_taken, last_start, 0);
+				EmitLoopBack(exit_taken, last_start, 0);
 			else
-				EmitReturn(exit_taken);
+				EmitExit(exit_taken);
 		}
 	} // namespace
 
@@ -1735,47 +2007,64 @@ namespace VU1Jit
 			out->exits[exit_dyn].dynamic_tpc = true;
 			const BlockExit& t = out->exits[exit_taken];
 			loop = vu == 1 && LoopsEnabled() && !(GetLowerFlags(branch.ins.lo) & LOWER_DYNAMIC) && t.chain && t.tpc == pc &&
-			       t.sig == sig;
+			       t.sig == sig && OnlyNewEntries(t.pipes);
 			if (loop)
 				loop_exit = t;
 		}
 
-		Emitter em(out, vu);
-		if (loop)
-			em.BeginLoop();
-		for (u32 i = 0; i < n; i++)
-		{
-			const Plan& p = plans[i];
-			s32 busy = -1;
-			if (vu && !p.ins.IBit() && p.ins.lo == L::XGKICK && !p.info.discarded)
+		// Emitted twice: the first time records which registers the native code uses (RegUse), the second keeps
+		// them in locals. Both make the same exits.
+		const size_t exits_before = out->exits.size();
+		const auto emit = [&](Emitter& em) {
+			em.EmitEntry(sig.fmac_count);
+			if (loop)
+				em.BeginLoop(loop_exit);
+			for (u32 i = 0; i < n; i++)
 			{
-				// The interpreter's state before this instruction: TPC is its own address.
-				busy = static_cast<s32>(make_exit(ExitKind::Boundary, ExitReason::BusyKick, i, p.pre, p.pre_ctl, p.pc));
+				const Plan& p = plans[i];
+				s32 busy = -1;
+				if (vu && !p.ins.IBit() && p.ins.lo == L::XGKICK && !p.info.discarded)
+				{
+					// The interpreter's state before this instruction: TPC is its own address.
+					busy = static_cast<s32>(make_exit(ExitKind::Boundary, ExitReason::BusyKick, i, p.pre, p.pre_ctl, p.pc));
+				}
+				em.EmitInstruction(p, busy);
+				if (i + 1 == n && ended)
+					em.FlushAllAtEnd(p, after_end);
 			}
-			em.EmitInstruction(p, busy);
-			if (i + 1 == n && ended)
-				em.FlushAllAtEnd(p, after_end);
-		}
 
-		if (ended)
+			if (ended)
+			{
+				em.EmitExit(make_exit(ExitKind::End, ExitReason::Block, n, final_img, final_ctl, last.pc + 8));
+			}
+			else if (branch_end)
+			{
+				em.EmitBranchEnd(plans[n - 2], last, exit_taken, exit_fall, exit_dyn, loop, last.cyc);
+			}
+			else if (stop_before)
+			{
+				em.EmitExit(make_exit(ExitKind::Boundary, ExitReason::Fallback, n, stop_img, stop_ctl, stop_pc));
+			}
+			else
+			{
+				const u32 id = make_exit(ExitKind::Boundary, (wrapped || mbit_end) ? ExitReason::Block : ExitReason::Cap, n,
+					final_img, final_ctl, last.pc + 8);
+				em.EmitExit(id);
+			}
+			if (loop)
+				em.EndLoop();
+		};
+		RegUse use;
 		{
-			em.EmitReturn(make_exit(ExitKind::End, ExitReason::Block, n, final_img, final_ctl, last.pc + 8));
+			Emitter first(out, vu, nullptr);
+			emit(first);
+			use = first.Use();
 		}
-		else if (branch_end)
-		{
-			em.EmitBranchEnd(plans[n - 2], last, exit_taken, exit_fall, exit_dyn, loop ? &loop_exit : nullptr, last.cyc);
-		}
-		else if (stop_before)
-		{
-			em.EmitReturn(make_exit(ExitKind::Boundary, ExitReason::Fallback, n, stop_img, stop_ctl, stop_pc));
-		}
-		else
-		{
-			const u32 id = make_exit(ExitKind::Boundary, (wrapped || mbit_end) ? ExitReason::Block : ExitReason::Cap, n, final_img, final_ctl, last.pc + 8);
-			em.EmitReturn(id);
-		}
-		if (loop)
-			em.EndLoop();
+		out->exits.resize(exits_before);
+		out->native_ops = 0;
+		out->helper_ops = 0;
+		Emitter em(out, vu, &use);
+		emit(em);
 		em.Finish();
 		out->instrs = n;
 		out->last_start = last.cyc;
