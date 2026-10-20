@@ -7,7 +7,9 @@
 // compile time; generated code does only the data work, on the interpreter's own state in VURegs (VF, VI, ACC, the
 // pending flags and the pipe entries' value snapshots stay in memory), so that ops without native code call the
 // interpreter's op bodies directly and every exit leaves a state the interpreter continues from. The timing
-// fields of the pipes are written at the exit, from the model (ApplyExit).
+// fields of the pipes are written at the exit, from the model (ApplyExit). A block whose branch goes back to its own
+// entry with the entry's signature (a vertex loop) does ApplyExit's and the dispatcher's work for that exit itself
+// and runs again without leaving generated code.
 
 #pragma once
 
@@ -72,6 +74,7 @@ namespace VU1Jit
 		u32 last_start = 0; // cycles from the entry to the start of the last instruction (the budget test)
 		u32 native_ops = 0;
 		u32 helper_ops = 0;
+		bool loops = false; // a taken branch back to the entry with the entry's signature stays in generated code
 	};
 
 	// Compiles the block at pc (byte address) for an entry with signature sig and no branch or E bit pending,
@@ -86,9 +89,16 @@ namespace VU1Jit
 	// positions are not observable (the interpreter only uses them relative to each other).
 	void NormalizeRings(VURegs& R);
 
-	// VU1.cycle at the entry of the running block, for the helpers.
+	// VU1.cycle at the entry of the running block, for the helpers. A block that loops (CompiledBlock::loops) moves it
+	// to the start of each pass, so after it returns it is the base of the pass that exited.
 	extern u64 g_block_base;
 	extern u64 g_block_base0; // the same for VU0
+
+	// The dispatcher's budget (VU1): VU1.cycle at the start of its Execute plus its cycles. A looping block leaves
+	// before a pass whose last instruction would start at or after it, as the dispatcher would not enter it.
+	extern u64 g_budget_end;
+	// Passes a looping block made back to its start since the dispatcher entered it (VU1).
+	extern u32 g_block_loops;
 
 	// Debugging: log every block and interpreter step of the dispatcher.
 	extern bool g_trace;

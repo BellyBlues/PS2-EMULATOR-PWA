@@ -182,6 +182,7 @@ namespace VU1Jit
 			WasmJit::LoadedFunction fn;
 			std::vector<ExitSlot> exits;
 			u32 last_start; // budget test: cycles from the entry to its last instruction
+			u32 instrs; // instructions in one pass of the block
 			u64 runs;
 		};
 
@@ -269,6 +270,7 @@ namespace VU1Jit
 			u64 m_native_ops = 0;
 			u64 m_helper_ops = 0;
 			u64 m_jit_instructions = 0;
+			u64 m_loops = 0; // passes looping blocks made without leaving generated code
 			u32 m_epoch = 1; // changes whenever a Program may have gone or become stale (chained exits)
 			u64 m_flushes = 0;
 		};
@@ -487,6 +489,7 @@ namespace VU1Jit
 		p->bytes.assign(&VU1.Micro[pc], &VU1.Micro[pc] + p->range_size);
 		p->needs_compare = false;
 		p->last_start = block.last_start;
+		p->instrs = block.instrs;
 		p->runs = 0;
 		for (const BlockExit& x : block.exits)
 			p->exits.push_back(ExitSlot{x, nullptr, 0});
@@ -528,8 +531,8 @@ namespace VU1Jit
 		m_entries++;
 		p->runs++;
 		NormalizeRings(VU1);
-		const u64 base = VU1.cycle;
-		g_block_base = base;
+		g_block_base = VU1.cycle;
+		g_block_loops = 0;
 		const u32 id = static_cast<u32>(reinterpret_cast<s32 (*)(s32)>(static_cast<uptr>(p->fn.slot))(0));
 		if (id >= p->exits.size())
 		{
@@ -538,10 +541,12 @@ namespace VU1Jit
 			return nullptr;
 		}
 		const ExitSlot& x = p->exits[id];
-		ApplyExit(VU1, x.x, base);
-		m_instructions += x.x.instrs;
-		m_jit_instructions += x.x.instrs;
-		s_run_instructions += x.x.instrs;
+		ApplyExit(VU1, x.x, g_block_base); // a looping block moved the base to the pass that exited
+		const u64 instrs = x.x.instrs + static_cast<u64>(g_block_loops) * p->instrs;
+		m_loops += g_block_loops;
+		m_instructions += instrs;
+		m_jit_instructions += instrs;
+		s_run_instructions += instrs;
 		return &x;
 	}
 
@@ -573,6 +578,7 @@ namespace VU1Jit
 
 		VU1.VI[REG_TPC].UL <<= 3;
 		const u64 start = VU1.cycle;
+		g_budget_end = start + cycles; // looping blocks test it as the loop below does before it enters a block
 		vu1InterpMTVURunning = true;
 		Program* next = nullptr; // the block a chained exit names
 		bool force_step = false;
@@ -778,8 +784,10 @@ namespace VU1Jit
 									"the pipeline state; {} EE-thread Clears",
 			m_executes, m_compiles, m_compile_ms, m_programs.size(), m_dropped, m_flushes, m_entries, m_bad_runs,
 			m_instructions, m_fallback_steps, exits.empty() ? "none" : exits, m_refused, CpuWasmVU1.GetEEThreadClears()));
-		Console.WriteLn(fmt::format("VU1 JIT: {} instructions in generated code ({:.2f}%), compiled ops {} native, {} through helpers",
-			m_jit_instructions, m_instructions ? 100.0 * m_jit_instructions / m_instructions : 0.0, m_native_ops, m_helper_ops));
+		Console.WriteLn(fmt::format("VU1 JIT: {} instructions in generated code ({:.2f}%), compiled ops {} native, {} through helpers; "
+									"{} loop passes without leaving generated code",
+			m_jit_instructions, m_instructions ? 100.0 * m_jit_instructions / m_instructions : 0.0, m_native_ops, m_helper_ops,
+			m_loops));
 		if (s_oracle)
 			m_oracle.LogSummary("VU1 JIT timing oracle");
 		if (s_lockstep)

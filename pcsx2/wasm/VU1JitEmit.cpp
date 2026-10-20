@@ -20,6 +20,8 @@ namespace VU1Jit
 {
 	u64 g_block_base = 0;
 	u64 g_block_base0 = 0;
+	u64 g_budget_end = 0;
+	u32 g_block_loops = 0;
 	bool g_trace = false;
 }
 
@@ -260,12 +262,33 @@ namespace VU1Jit
 				m_hc_new = m_f.local(ValType::I32);
 				m_hs = m_f.local(ValType::V128);
 				m_hn = m_f.local(ValType::V128);
+				m_dx = m_f.local(ValType::I32);
+				m_de = m_f.local(ValType::I32);
 				m_mem = A(*R.Mem);
 			}
 
+			// A block that loops (CompiledBlock::loops): its instructions run inside a wasm loop, with VU1.cycle at
+			// the entry of the current pass in a local.
+			void BeginLoop()
+			{
+				m_base = m_f.local(ValType::I64);
+				m_next_base = m_f.local(ValType::I64);
+				for (u32& t : m_rot_v)
+					t = m_f.local(ValType::V128);
+				for (u32& t : m_rot_i)
+					t = m_f.local(ValType::I64);
+				m_f.i32_const(0);
+				m_f.i64_load(A(g_block_base));
+				m_f.local_set(m_base);
+				m_f.loop();
+			}
+			void EndLoop() { m_f.end(); }
+
 			void EmitInstruction(const Plan& p, s32 busy_kick_exit);
 			void FlushAllAtEnd(const Plan& p, const VURegs& after);
-			void EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn);
+			// loop: the taken exit when it goes back to the entry with the entry's signature (BeginLoop), else null.
+			void EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn,
+				const BlockExit* loop, u32 last_start);
 			void EmitReturn(u32 exit_id)
 			{
 				m_f.i32_const(static_cast<s32>(exit_id));
@@ -312,6 +335,8 @@ namespace VU1Jit
 			}
 
 			void Clamp(u32 v); // local v = vuDouble(v)
+			void ScalarDouble(); // vuDouble on the i32 bits on the stack
+			void EmitLoopBack(const BlockExit& x, u32 exit_id, u32 last_start, u32 depth);
 			void Flags(u32 r, u32 dest); // MAC and status from the raw result in local r (VU_MAC_UPDATE, VU_STAT_UPDATE)
 			void Flushes(const Plan& p);
 			void FmacWriteback(u32 slot, int flagreg);
@@ -352,8 +377,195 @@ namespace VU1Jit
 			u32 m_v[8];
 			u32 m_i[6];
 			u32 m_hs, m_hn, m_hc_old, m_hc_new; // the upper/lower hazard copies
+			u32 m_dx, m_de; // ScalarDouble
+			u32 m_base = 0, m_next_base = 0; // BeginLoop
+			u32 m_rot_v[12] = {}; // the FMAC ring's four 48-byte slots, while they rotate
+			u32 m_rot_i[12] = {}; // the IALU ring's four 24-byte slots
 			u32 m_mem;
 		};
+
+		static_assert(sizeof(fmacPipe) == 48 && sizeof(ialuPipe) == 24);
+
+		void Emitter::ScalarDouble()
+		{
+			// vuDouble (VUops.cpp:443-460) with the overflow clamp on: exponent 0 gives the signed zero, exponent 255
+			// the signed maximum.
+			const u32 x = m_dx, e = m_de;
+			m_f.local_set(x);
+			m_f.local_get(x);
+			m_f.i32_const(static_cast<s32>(SIGN));
+			m_f.i32_and();
+			m_f.local_get(x);
+			m_f.i32_const(static_cast<s32>(SIGN));
+			m_f.i32_and();
+			m_f.i32_const(0x7f7fffff);
+			m_f.i32_or();
+			m_f.local_get(x);
+			m_f.local_get(x);
+			m_f.i32_const(static_cast<s32>(EXP));
+			m_f.i32_and();
+			m_f.local_tee(e);
+			m_f.i32_const(static_cast<s32>(EXP));
+			m_f.i32_eq();
+			m_f.select(); // exponent 255 ? sign | max : x
+			m_f.local_get(e);
+			m_f.i32_eqz();
+			m_f.select(); // exponent 0 ? sign : ...
+		}
+
+		void Emitter::EmitLoopBack(const BlockExit& x, u32 exit_id, u32 last_start, u32 depth)
+		{
+			// The dispatcher's work between this exit and the same block again (VU1Jit.cpp, Dispatch and Run), done
+			// here: its budget test, ApplyExit with this pass's base, NormalizeRings, the next pass's base.
+			const PipeImage& m = x.pipes;
+			const auto rel = [](u64 model_time) { return static_cast<s64>(model_time - TIMING_MODEL_BASE); };
+
+			// Dispatch enters a block only if its last instruction starts inside the budget.
+			m_f.local_get(m_base);
+			m_f.i64_const(rel(m.cycle));
+			m_f.i64_add();
+			m_f.local_tee(m_next_base);
+			m_f.i64_const(last_start);
+			m_f.i64_add();
+			m_f.i32_const(0);
+			m_f.i64_load(A(g_budget_end));
+			m_f.i64_ge_u();
+			m_f.if_();
+			EmitReturn(exit_id);
+			m_f.end();
+
+			const auto st64 = [&](u32 addr, u64 model_time) { // base + (model_time - TIMING_MODEL_BASE)
+				m_f.i32_const(0);
+				m_f.local_get(m_base);
+				m_f.i64_const(rel(model_time));
+				m_f.i64_add();
+				m_f.i64_store(addr);
+			};
+			m_f.i32_const(0);
+			m_f.local_get(m_next_base);
+			m_f.i64_store(A(R.cycle));
+
+			// FMAC: the ring rotated so that the read position is 0 (NormalizeRings), then the entries this pass
+			// added get the model's static fields and times (ApplyExit); older ones keep theirs.
+			const u32 fr = m.fmacreadpos;
+			if (fr)
+			{
+				for (u32 k = 0; k < 4; k++)
+				{
+					for (u32 j = 0; j < 3; j++)
+					{
+						LdV(A(R.fmac[(fr + k) & 3]) + j * 16);
+						m_f.local_set(m_rot_v[k * 3 + j]);
+					}
+				}
+				for (u32 k = 0; k < 4; k++)
+				{
+					for (u32 j = 0; j < 3; j++)
+						StV(A(R.fmac[k]) + j * 16, [&] { m_f.local_get(m_rot_v[k * 3 + j]); });
+				}
+			}
+			for (u32 i = 0; i < m.fmaccount; i++)
+			{
+				const fmacPipe& p = m.fmac[(fr + i) & 3];
+				if (p.sCycle < TIMING_MODEL_BASE)
+					continue;
+				const fmacPipe& q = R.fmac[i];
+				St32c(A(q.regupper), p.regupper);
+				St32c(A(q.reglower), p.reglower);
+				St32c(A(q.flagreg), static_cast<u32>(p.flagreg));
+				St32c(A(q.xyzwupper), p.xyzwupper);
+				St32c(A(q.xyzwlower), p.xyzwlower);
+				st64(A(q.sCycle), p.sCycle);
+				St32c(A(q.Cycle), p.Cycle);
+			}
+			St32c(A(R.fmacreadpos), 0);
+			St32c(A(R.fmacwritepos), fr ? (m.fmaccount & 3) : m.fmacwritepos);
+			St32c(A(R.fmaccount), m.fmaccount);
+
+			// IALU, the same way.
+			const u32 ir = m.ialureadpos;
+			if (ir)
+			{
+				for (u32 k = 0; k < 4; k++)
+				{
+					for (u32 j = 0; j < 3; j++)
+					{
+						m_f.i32_const(0);
+						m_f.i64_load(A(R.ialu[(ir + k) & 3]) + j * 8);
+						m_f.local_set(m_rot_i[k * 3 + j]);
+					}
+				}
+				for (u32 k = 0; k < 4; k++)
+				{
+					for (u32 j = 0; j < 3; j++)
+					{
+						m_f.i32_const(0);
+						m_f.local_get(m_rot_i[k * 3 + j]);
+						m_f.i64_store(A(R.ialu[k]) + j * 8);
+					}
+				}
+			}
+			for (u32 i = 0; i < m.ialucount; i++)
+			{
+				const ialuPipe& p = m.ialu[(ir + i) & 3];
+				if (p.sCycle < TIMING_MODEL_BASE)
+					continue;
+				St32c(A(R.ialu[i].reg), static_cast<u32>(p.reg));
+				st64(A(R.ialu[i].sCycle), p.sCycle);
+				St32c(A(R.ialu[i].Cycle), p.Cycle);
+			}
+			St32c(A(R.ialureadpos), 0);
+			St32c(A(R.ialuwritepos), ir ? (m.ialucount & 3) : m.ialuwritepos);
+			St32c(A(R.ialucount), m.ialucount);
+
+			St32c(A(R.fdiv.enable), static_cast<u32>(m.fdiv.enable));
+			if (m.fdiv.enable && m.fdiv.sCycle >= TIMING_MODEL_BASE)
+			{
+				st64(A(R.fdiv.sCycle), m.fdiv.sCycle);
+				St32c(A(R.fdiv.Cycle), m.fdiv.Cycle);
+			}
+			St32c(A(R.efu.enable), static_cast<u32>(m.efu.enable));
+			if (m.efu.enable)
+			{
+				if (m.efu.sCycle >= TIMING_MODEL_BASE)
+				{
+					st64(A(R.efu.sCycle), m.efu.sCycle);
+					St32c(A(R.efu.Cycle), m.efu.Cycle);
+				}
+				else if (x.efu_cycle_adjust)
+				{
+					St32(A(R.efu.Cycle), [&] {
+						Ld32(A(R.efu.Cycle));
+						m_f.i32_const(x.efu_cycle_adjust);
+						m_f.i32_add();
+					});
+				}
+			}
+
+			m_f.i32_const(0);
+			m_f.i32_const(m.VIBackupCycles);
+			m_f.i32_store8(A(R.VIBackupCycles));
+			St32c(A(R.VIRegNumber), m.VIRegNumber);
+			St32c(A(R.VI[REG_TPC]), x.tpc);
+			St32c(A(R.branch), 0);
+			m_f.i32_const(0);
+			m_f.i32_const(0);
+			m_f.i32_store8(A(R.takedelaybranch));
+			St32c(A(R.ebit), x.ebit);
+
+			// The next pass.
+			m_f.local_get(m_next_base);
+			m_f.local_set(m_base);
+			m_f.i32_const(0);
+			m_f.local_get(m_base);
+			m_f.i64_store(A(g_block_base));
+			St32(A(g_block_loops), [&] {
+				Ld32(A(g_block_loops));
+				m_f.i32_const(1);
+				m_f.i32_add();
+			});
+			m_f.br(depth);
+		}
 
 		void Emitter::Clamp(u32 v)
 		{
@@ -570,6 +782,14 @@ namespace VU1Jit
 			return mask;
 		}
 
+		// Loops in generated code (EmitLoopBack). Off with VU1JIT_NOLOOP, to bisect a difference, and with the
+		// dispatcher's VU1JIT_BLOCKCHECK, which replays one pass of a block on the interpreter.
+		static bool LoopsEnabled()
+		{
+			static const bool enabled = !std::getenv("VU1JIT_NOLOOP") && !std::getenv("VU1JIT_BLOCKCHECK");
+			return enabled;
+		}
+
 		bool Emitter::Upper(const Plan& p, u32 delta)
 		{
 			if ((DebugMask() & 1) && p.ins.up != U::NOP)
@@ -735,6 +955,69 @@ namespace VU1Jit
 						m_f.i32_const(0xFFFFFF);
 						m_f.i32_and();
 					});
+					m_out->native_ops++;
+					return true;
+				}
+				case U::MAX:
+				case U::MAXx:
+				case U::MAXy:
+				case U::MAXz:
+				case U::MAXw:
+				case U::MAXi:
+				case U::MINI:
+				case U::MINIx:
+				case U::MINIy:
+				case U::MINIz:
+				case U::MINIw:
+				case U::MINIi:
+				{
+					// applyMinMax / applyMinMaxBroadcast with fp_max / fp_min (VUops.cpp:788-842): signed integer
+					// compares of the raw bits, reversed when both are negative. No flags; fd 0 writes nothing.
+					if (fd == 0)
+						return true;
+					const bool max = p.ins.up == U::MAX || p.ins.up == U::MAXx || p.ins.up == U::MAXy ||
+					                 p.ins.up == U::MAXz || p.ins.up == U::MAXw || p.ins.up == U::MAXi;
+					const u32 a = m_v[0], b = m_v[1], r = m_v[3];
+					LdV(A(R.VF[fs]));
+					m_f.local_set(a);
+					switch (p.ins.up)
+					{
+						case U::MAX:
+						case U::MINI:
+							LdV(A(R.VF[ft]));
+							break;
+						case U::MAXi:
+						case U::MINIi:
+							m_f.i32_const(0);
+							m_f.simd_mem(Simd::V128Load32Splat, A(R.VI[REG_I]), 2);
+							break;
+						default:
+						{
+							const u32 lane = (p.ins.up == U::MAXx || p.ins.up == U::MINIx) ? 0 :
+							                 (p.ins.up == U::MAXy || p.ins.up == U::MINIy) ? 1 :
+							                 (p.ins.up == U::MAXz || p.ins.up == U::MINIz) ? 2 :
+							                                                                 3;
+							m_f.i32_const(0);
+							m_f.simd_mem(Simd::V128Load32Splat, A(R.VF[ft].UL[lane]), 2);
+							break;
+						}
+					}
+					m_f.local_set(b);
+					// both negative ? (max ? min_s : max_s) : (max ? max_s : min_s)
+					m_f.local_get(a);
+					m_f.local_get(b);
+					Simd(max ? Simd::I32x4MinS : Simd::I32x4MaxS);
+					m_f.local_get(a);
+					m_f.local_get(b);
+					Simd(max ? Simd::I32x4MaxS : Simd::I32x4MinS);
+					m_f.local_get(a);
+					m_f.local_get(b);
+					Simd(Simd::V128And);
+					m_f.i32_const(31);
+					Simd(Simd::I32x4ShrS);
+					Simd(Simd::V128Bitselect);
+					m_f.local_set(r);
+					StoreMerged(A(R.VF[fd]), r, dest);
 					m_out->native_ops++;
 					return true;
 				}
@@ -993,6 +1276,137 @@ namespace VU1Jit
 					});
 					m_out->native_ops++;
 					return true;
+				case L::DIV:
+				case L::SQRT:
+				case L::RSQRT:
+				{
+					// _vuDIV, _vuSQRT, _vuRSQRT (VUops.cpp:934-1015): vuDouble'd operands (zero for exponent 0, so
+					// "== 0.0" is an exponent test), the pending status's D and I bits, q through vuDouble. Never
+					// m_i[4] or m_i[5]: this may be a branch's delay slot.
+					const u32 fsf = (code >> 21) & 3, ftf = (code >> 23) & 3;
+					const u32 t = m_i[0], s = m_i[1], st = m_i[2];
+					Ld32(A(R.VF[ft].UL[ftf]));
+					m_f.local_set(t);
+					if (p.ins.lo != L::SQRT)
+					{
+						Ld32(A(R.VF[fs].UL[fsf]));
+						m_f.local_set(s);
+					}
+					Ld32(A(R.statusflag));
+					m_f.i32_const(~0x30);
+					m_f.i32_and();
+					m_f.local_set(st);
+					const auto exp_zero = [&](u32 local) {
+						m_f.local_get(local);
+						m_f.i32_const(static_cast<s32>(EXP));
+						m_f.i32_and();
+						m_f.i32_eqz();
+					};
+					const auto set_status = [&](u32 bits) {
+						m_f.local_get(st);
+						m_f.i32_const(static_cast<s32>(bits));
+						m_f.i32_or();
+						m_f.local_set(st);
+					};
+					const auto set_q = [&](auto&& value) { St32(A(R.q), value); };
+					// The sign of fs ^ ft picks between two constants.
+					const auto signed_const = [&](u32 negative, u32 positive) {
+						set_q([&] {
+							m_f.i32_const(static_cast<s32>(negative));
+							m_f.i32_const(static_cast<s32>(positive));
+							m_f.local_get(t);
+							m_f.local_get(s);
+							m_f.i32_xor();
+							m_f.i32_const(0);
+							m_f.i32_lt_s();
+							m_f.select();
+						});
+					};
+					// ft < 0.0 after vuDouble: the sign bit with a non-zero exponent.
+					const auto negative_status = [&] {
+						m_f.local_get(t);
+						m_f.i32_const(0);
+						m_f.i32_lt_s();
+						exp_zero(t);
+						m_f.i32_eqz();
+						m_f.i32_and();
+						m_f.if_();
+						set_status(0x10);
+						m_f.end();
+					};
+					// |vuDouble(ft)| as a float: vuDouble then the sign cleared (fabs).
+					const auto abs_ft = [&] {
+						m_f.local_get(t);
+						ScalarDouble();
+						m_f.i32_const(0x7fffffff);
+						m_f.i32_and();
+						m_f.f32_reinterpret_i32();
+					};
+					if (p.ins.lo == L::SQRT)
+					{
+						negative_status();
+						set_q([&] {
+							abs_ft();
+							m_f.f32_sqrt();
+							m_f.i32_reinterpret_f32();
+							ScalarDouble();
+						});
+					}
+					else
+					{
+						exp_zero(t);
+						m_f.if_();
+						if (p.ins.lo == L::DIV)
+						{
+							// 0x10 for 0/0, 0x20 for x/0
+							m_f.i32_const(0x10);
+							m_f.i32_const(0x20);
+							exp_zero(s);
+							m_f.select();
+							m_f.local_get(st);
+							m_f.i32_or();
+							m_f.local_set(st);
+							signed_const(0xFF7FFFFFu, 0x7F7FFFFFu);
+						}
+						else
+						{
+							set_status(0x20);
+							exp_zero(s);
+							m_f.if_();
+							set_status(0x10);
+							signed_const(0x80000000u, 0);
+							m_f.else_();
+							signed_const(0xFF7FFFFFu, 0x7F7FFFFFu);
+							m_f.end();
+						}
+						m_f.else_();
+						if (p.ins.lo == L::RSQRT)
+							negative_status();
+						set_q([&] {
+							m_f.local_get(s);
+							ScalarDouble();
+							m_f.f32_reinterpret_i32();
+							if (p.ins.lo == L::DIV)
+							{
+								m_f.local_get(t);
+								ScalarDouble();
+								m_f.f32_reinterpret_i32();
+							}
+							else
+							{
+								abs_ft();
+								m_f.f32_sqrt();
+							}
+							m_f.f32_div();
+							m_f.i32_reinterpret_f32();
+							ScalarDouble();
+						});
+						m_f.end();
+					}
+					St32(A(R.statusflag), [&] { m_f.local_get(st); });
+					m_out->native_ops++;
+					return true;
+				}
 				case L::FCGET:
 					if (it == 0)
 						return true;
@@ -1145,7 +1559,8 @@ namespace VU1Jit
 				St32(A(R.efu.reg), [&] { Ld32(A(R.p)); });
 		}
 
-		void Emitter::EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn)
+		void Emitter::EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn,
+			const BlockExit* loop, u32 last_start)
 		{
 			(void)delay;
 			const u16 flags = GetLowerFlags(branch.ins.lo);
@@ -1158,10 +1573,15 @@ namespace VU1Jit
 			{
 				m_f.local_get(m_i[4]);
 				m_f.if_();
-				EmitReturn(exit_taken);
+				if (loop)
+					EmitLoopBack(*loop, exit_taken, last_start, 1);
+				else
+					EmitReturn(exit_taken);
 				m_f.end();
 				EmitReturn(exit_fall);
 			}
+			else if (loop)
+				EmitLoopBack(*loop, exit_taken, last_start, 0);
 			else
 				EmitReturn(exit_taken);
 		}
@@ -1295,8 +1715,34 @@ namespace VU1Jit
 			return static_cast<u32>(out->exits.size() - 1);
 		};
 
-		Emitter em(out, vu);
+		const PipeImage final_img = CaptureImage(model.State());
+		const Control final_ctl = model.GetControl();
 		const u32 n = static_cast<u32>(plans.size());
+		const Plan& last = plans.back();
+
+		// A branch's exits, and whether the taken one comes back to this block with the same signature: a loop
+		// generated code runs by itself.
+		u32 exit_taken = 0, exit_fall = 0, exit_dyn = 0;
+		bool loop = false;
+		BlockExit loop_exit;
+		if (branch_end)
+		{
+			const Plan& branch = plans[n - 2];
+			exit_taken = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl,
+				StaticBranchTarget(branch.pc, branch.ins.lower) & (progsize - 1));
+			exit_fall = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl, last.pc + 8);
+			exit_dyn = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl, 0);
+			out->exits[exit_dyn].dynamic_tpc = true;
+			const BlockExit& t = out->exits[exit_taken];
+			loop = vu == 1 && LoopsEnabled() && !(GetLowerFlags(branch.ins.lo) & LOWER_DYNAMIC) && t.chain && t.tpc == pc &&
+			       t.sig == sig;
+			if (loop)
+				loop_exit = t;
+		}
+
+		Emitter em(out, vu);
+		if (loop)
+			em.BeginLoop();
 		for (u32 i = 0; i < n; i++)
 		{
 			const Plan& p = plans[i];
@@ -1311,22 +1757,13 @@ namespace VU1Jit
 				em.FlushAllAtEnd(p, after_end);
 		}
 
-		const PipeImage final_img = CaptureImage(model.State());
-		const Control final_ctl = model.GetControl();
-		const Plan& last = plans.back();
 		if (ended)
 		{
 			em.EmitReturn(make_exit(ExitKind::End, ExitReason::Block, n, final_img, final_ctl, last.pc + 8));
 		}
 		else if (branch_end)
 		{
-			const Plan& branch = plans[n - 2];
-			const u32 taken = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl,
-				StaticBranchTarget(branch.pc, branch.ins.lower) & (progsize - 1));
-			const u32 fall = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl, last.pc + 8);
-			const u32 dyn = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl, 0);
-			out->exits[dyn].dynamic_tpc = true;
-			em.EmitBranchEnd(branch, last, taken, fall, dyn);
+			em.EmitBranchEnd(plans[n - 2], last, exit_taken, exit_fall, exit_dyn, loop ? &loop_exit : nullptr, last.cyc);
 		}
 		else if (stop_before)
 		{
@@ -1337,9 +1774,12 @@ namespace VU1Jit
 			const u32 id = make_exit(ExitKind::Boundary, (wrapped || mbit_end) ? ExitReason::Block : ExitReason::Cap, n, final_img, final_ctl, last.pc + 8);
 			em.EmitReturn(id);
 		}
+		if (loop)
+			em.EndLoop();
 		em.Finish();
 		out->instrs = n;
 		out->last_start = last.cyc;
+		out->loops = loop;
 		return true;
 	}
 } // namespace VU1Jit
