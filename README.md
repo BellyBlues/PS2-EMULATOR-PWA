@@ -21,7 +21,7 @@ Early and experimental.
 - Games boot from disc images (uncompressed `.iso`, `.bin` or `.img`), read straight from your
   file. One game has been tested so far, Dragon Ball Z: Budokai Tenkaichi 3 (PAL): it runs from
   its language menu through the title and menus into a battle, driven from the keyboard, and its
-  save on memory card slot 1 is kept in the browser and loaded again after a reload.
+  save on a memory card is kept in the browser and loaded again after a reload.
 - The BIOS still boots on its own: the start-up animation, the console's menus and its settings.
 - Sound plays: PCSX2's sound chip emulation (SPU2) through a Web Audio worklet, with a Sound control
   for volume and mute (M). Below full speed the sound is time-stretched, as in PCSX2 on the desktop:
@@ -54,8 +54,9 @@ Early and experimental.
   third-party requests. The BIOS you pick stays in your browser (IndexedDB).
 - A disc image is never copied: a worker reads the parts the game asks for from your file and
   hands them to the emulator through shared memory
-  ([docs/web-port/DISC-DESIGN.md](docs/web-port/DISC-DESIGN.md)). The memory card is a file the
-  page keeps in IndexedDB.
+  ([docs/web-port/DISC-DESIGN.md](docs/web-port/DISC-DESIGN.md)). Memory cards come from a
+  library the page keeps in IndexedDB, or from `.ps2` files on your disk in Chromium browsers; two
+  slots, plugged in and out while a game runs.
 
 The porting plan, with the measurements and decisions behind it, is in
 [docs/web-port/PLAN.md](docs/web-port/PLAN.md). The interface design is in

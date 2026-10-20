@@ -538,9 +538,9 @@ The PS2 has two memory card slots, Card 1 and Card 2. The page keeps a library o
 - Only the cards in the slots are loaded into the emulator.
 
 **Transport.** Two menu buttons sit between Stop and the disc menu, shown while a BIOS is chosen.
-- Plugged in: the filled card icon, ink, and "1 · RPG saves" (the name ellipsised at 9rem). A 6 px amber dot on the icon while the game writes to the card (it stays 0.6 s after the last write; colour only, never animated).
-- Empty: the outline card icon, ink-3, and "Card 1 · empty".
-- Under 1024 px: the icon and the slot number, with the full label as tooltip.
+- Plugged in: the filled card icon (Phosphor `sim-card`, Fill), ink. A 6 px amber dot on the icon while the game writes to the card (it stays 0.6 s after the last write; colour only, never animated).
+- Empty: the outline card icon, ink-3.
+- Each shows its slot number and caret; the tooltip (hover, `:focus-visible`) reads "Card 1: RPG saves" or "Card 1 · empty". The transport has no room for names next to the disc and BIOS menus at usual widths, so only a transport 1100 px wide or wider shows "1 · RPG saves" / "Card 1 · empty" (the name ellipsised at 9rem) instead of the tooltip. The slot buttons never shrink; when the left group runs short, the BIOS name gives way first, then the disc title (which keeps at least 4em).
 - Accessible name: "Memory card 1: RPG saves, plugged in" or "Memory card 1: empty". `aria-expanded` and `aria-controls` as the other menu buttons.
 
 **Plugged-in menu** (popover, opens upward, focuses its first item):
@@ -550,10 +550,10 @@ The PS2 has two memory card slots, Card 1 and Card 2. The page keeps a library o
 
 **Empty-slot menu (the picker).**
 - "Card 1 is empty." then the library: the last card used in this slot first, then the most recently used. Each row: the name, and under it "In this browser" or "`rpg.ps2` on disk". A card in the other slot is listed with "In Card 2" and `aria-disabled`. Choosing a card plugs it in.
-- Each row has a **More** button (`dots-three`, named "More for RPG saves"): **Rename…**, **Save a copy to disk…**, then **Delete** (a browser card) or **Remove from list** (a linked card; the file stays on disk).
+- Each row has a **More** button (`dots-three`, named "More for RPG saves"). Its view shows the card's name and where it is, then **Rename…**, **Save a copy to disk…**, **Delete** (a browser card) or **Remove from list** (a linked card; the file stays on disk), and **Back to the cards**. Delete is `aria-disabled` for a card in the other slot, described by "Unplug it from Card 2 first."
 - Then **New card…** and **Open a card file…**. With no cards, only these two.
-- **New card…** asks for a name inline (a text field, "Create" and "Cancel"); the default is "Memory card N" with the lowest free N. With the File System Access API, a save dialog then suggests `<name>.ps2` and the card is linked to that file; otherwise it is kept in this browser. A new card is blank (all `0xFF`); the game or the console's menus format it.
-- **Open a card file…** adds an 8 MB `.ps2` file and plugs it in, named after the file without `.ps2` (" (2)" and so on when the name is taken). A file already linked in the library is plugged in instead of added twice. Anything else is refused: "That file isn't an 8 MB PS2 memory card (.ps2)."
+- **New card…** asks for a name inline (a line "A new card, for Card 1.", a text field labelled "Name", "Create" and "Cancel"; Rename is the same form with "Rename RPG saves." and "Rename"); the default is "Memory card N" with the lowest free N. With the File System Access API, a save dialog then suggests `<name>.ps2` and the card is linked to that file; otherwise it is kept in this browser. A new card is blank (all `0xFF`); the game or the console's menus format it.
+- **Open a card file…** adds an 8 MB `.ps2` file and plugs it in, named after the file without `.ps2` (" (2)" and so on when the name is taken). A file already linked in the library is plugged in instead of added twice (or refused with "That card is in Card 2."). Anything else is refused: "That file isn't an 8 MB PS2 memory card (.ps2)." A New card saved over a file the library already links is refused: "rpg.ps2 is in the list already, as RPG saves."
 - Names: 1 to 32 characters, unique ignoring case. "Give the card a name." / "Another card is called that already."
 - **Delete** a browser card asks first: "Delete RPG saves? Its saves are only in this browser." with **Keep** (focused), **Save a copy first…** and **Delete** (coral). Remove from list does not ask. A card in a slot cannot be deleted; it is unplugged first.
 
@@ -569,6 +569,6 @@ The PS2 has two memory card slots, Card 1 and Card 2. The page keeps a library o
 
 **Errors** (a coral line in the menu): "The browser has no room for another card. Delete one or save a copy to disk." · "Couldn't read that file. Try choosing it again." · "The browser didn't allow opening rpg.ps2." · "Couldn't save the card here. Try again."
 
-**Subtitles and announcer:** "RPG saves is in Card 1." · "Card 1 unplugged." · "Card 1 will unplug when the game finishes saving." · "RPG saves deleted." · "Renamed to RPG saves."
+**Subtitles and announcer:** "RPG saves is in Card 1." · "Card 1 unplugged." · "Card 1 will unplug when the game finishes saving." · "RPG saves deleted." · "RPG saves removed from the list. Its file stays on disk." · "Renamed to RPG saves." Errors in a menu are also announced.
 
 **Not here:** multitap slots, PS1 cards, folder cards, cards larger than 8 MB, and a list of the saves on a card.

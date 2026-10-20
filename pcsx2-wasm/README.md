@@ -7,13 +7,13 @@ game (or the BIOS menu) renders in a `<canvas>`, driven from the keyboard. Where
 WebGPU, the GS draws with PCSX2's hardware renderer on the GPU and posts each frame to the page as an
 `ImageBitmap` (the WebGPU device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise it uses the software
 renderer and its output is copied to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio worklet.
-Memory card slot 1 is kept in the browser. There are no save states yet.
+Memory cards plug into both slots from a library of named cards kept in the browser or in `.ps2` files on disk. There are no save states yet.
 
 - `Main.cpp`: the frontend (Host callbacks, settings, CPU thread loop, `pcsx2web_*` exports)
 - `web/`: the page (`index.html`, `app.js`, `disc-worker.js`, `audio-tap.js`, `style.css`,
   `icons.svg`, `favicon.svg`, `fonts/`, `icons/`, and `isolation.js` with `coi-serviceworker.js`
   for hosts without isolation headers), copied next to the build output. The design is
-  `docs/web-port/UI-SPEC.md` (§10 for discs, §11 for sound).
+  `docs/web-port/UI-SPEC.md` (§10 for discs, §11 for sound, §14 for memory cards).
 - `../pcsx2/CDVD/Emscripten/WebDisc.*`, `WebDiscFileReader.*`: the emulator's side of the disc
   reader; `web/disc-worker.js` is the page's side (`docs/web-port/DISC-DESIGN.md`).
 - `../tools/wasm/serve.py`: local dev server with the headers the page needs
@@ -121,37 +121,44 @@ Use only a BIOS dumped from a console you own. The file never leaves the browser
 into the emulator's in-memory file system (`/bios/<name>`) and remembered in the site's IndexedDB
 so you do not have to pick it again. **Forget this BIOS** deletes it.
 
-### Memory card
+### Memory cards
 
-Slot 1 holds an 8 MB card, `/memcards/Mcd001.ps2`; slot 2 is empty. `/memcards` is an IDBFS mount
-(Emscripten's IndexedDB-backed file system, database `/memcards`), loaded before `main()` runs.
-PCSX2 keeps the card file open and writes it in place (unbuffered on wasm), so the page copies it
-to IndexedDB itself: 1.5 s after the game's last write to it, at once when the VM stops (Stop
-closes the card, so a normal Stop never loses a save), and when the page is hidden. The page counts
-the card's writes (`FS.write`) rather than trusting its time alone: `FS.syncfs` only copies files
-whose time changed, in whole milliseconds, so before each copy the page moves the time of every card
-written since the last one past any time it had, and a write in the same millisecond as the last copy
-is still copied. On wasm PCSX2 rewrites the card's checksum at shutdown only if it changed, so a Stop
-without a save copies nothing. A copy that fails is tried again after 2, 5 and 15 s; then the page
-stops copying until the game writes to the card again, and says that saves last for the visit. The copy when the page is
-hidden or left does not wait for that pause, and its failure does not count toward giving up. A copy of the 8 MB card blocks
-the page's thread for 30–50 ms (measured: 28–31 ms on an idle machine, 42–51 ms with another emulator
-running), once per save, so the picture may skip a frame or two then. The copy is asynchronous and
-cannot finish while the page unloads, so from the first card write (seen as it happens, through
-`FS.write`) until the copy is done the page asks before it is closed or reloaded (`beforeunload`).
+The two slots, **Card 1** and **Card 2** in the controls, hold cards from a library the page keeps
+(UI-SPEC §14). A card is an 8 MB `.ps2` file, the format desktop PCSX2 uses. The library is the
+IndexedDB database `pcsx2-web-cards`: `cards` holds each card's name and, for a card linked to a
+file on disk, its `FileSystemFileHandle`; `bytes` holds each card's 8 MB image; `meta` says which
+card is in which slot and which was last in each. Only the cards in the slots reach the emulator: the
+page writes each to `/memcards/<card id>.ps2` (MEMFS) and names it with `pcsx2web_memcard(slot,
+file, id)`. The CPU thread applies that at the next vsync (or at the next boot): PCSX2 ejects the
+card for 60 frames (`AutoEject`) and reopens the slot, so a game sees a card come and go, and the id
+then shows in `pcsx2web_memcard_status()`, with a flag while PCSX2 counts the card busy (300 vsyncs
+after a write). An unplug waits for that flag to clear, so a save is never cut short.
 
-Only one tab keeps the card: the page holds the Web Lock `tabstationtoo-memcards` for as long as it
-is open (waiting up to 2 s for it at start-up, for the page a reload replaces). A second tab loads
-the saved card but never copies its own back, so it cannot overwrite the first tab's saves (desktop
-PCSX2 gets the same from opening the card with `DenyWrite`), and its title card says that its saves
-last for the visit.
+PCSX2 keeps a card file open and writes it in place (unbuffered on wasm), so the page copies the cards
+to IndexedDB itself: 1.5 s after the game's last write, at once when the VM stops (Stop closes the
+cards), when a card is unplugged, and when the page is hidden. It counts writes (`FS.write` on a card
+file) to know what is unsaved. A linked card is then written to its file (`createWritable`, the whole
+8 MB). A copy that fails is tried again after 2, 5 and 15 s; then the page stops copying until the
+game writes again, and says that saves last for the visit. The copy on hiding or leaving does not
+wait for that pause, and its failure does not count toward giving up. The copy is asynchronous and
+cannot finish while the page unloads, so from the first card write until the copy is done the page
+asks before it is closed or reloaded (`beforeunload`).
 
-Why IDBFS rather than OPFS: the card is written through PCSX2's `FILE*` calls, which this build's
-file system (the legacy JS one, MEMFS) runs on the page's thread. OPFS can only be written
-synchronously from a worker, so it would need WasmFS (a separate decision, PLAN §5) or a second
-copy path; IDBFS persists the same MEMFS files asynchronously, works in every browser with
-IndexedDB, and the card is small. If IndexedDB is unavailable, the card lasts for the visit and the
-disc's title card says so.
+A linked card is read from its file when it is plugged in (the file wins over the browser's copy).
+After a reload it stays plugged in only if the browser still allows the page to write the file;
+otherwise it comes back unplugged, and choosing it in the slot's menu asks for permission. A file that
+cannot be written any more unlinks the card: it goes on from the browser's copy. Without the File
+System Access API (Firefox, Safari), cards live in the browser, and **Open a card file…** and **Save
+a copy to disk…** move them in and out.
+
+Only one tab keeps the cards: the page holds the Web Lock `tabstationtoo-memcards` for as long as it
+is open (waiting up to 2 s for it at start-up, for the page a reload replaces). A second tab loads the
+cards in the slots but never writes them back, and its card menus are disabled.
+
+Earlier versions kept slot 1's card in Emscripten's IDBFS (database `/memcards`). On the first visit
+with this version the page moves that card into the library as "Memory card 1", plugged into Card 1,
+then deletes the old database. The page no longer links IDBFS: one copy per card, written by the page,
+is simpler than two file systems that could disagree.
 
 The **Log** drawer shows PCSX2's log (the last 2000 lines), with **Copy** for bug reports.
 
@@ -266,7 +273,7 @@ URL. A name with only letters, digits, spaces, `-`, `,`, `.` and parentheses als
 encoding, but `#`, `?`, `&`, `+` and `%` need both.
 `?fastboot=0` boots discs through the BIOS intro instead of fast boot. `window.PCSX2WebDisc.stats()`
 reports the disc (name, size, source, whether it is open), the disc reader's state and read counts,
-the game's title and serial as PCSX2 reported them, and the memory card's last save.
+the game's title and serial as PCSX2 reported them, and the memory cards (library, slots, unsaved writes).
 
 The three JITs are on by default: `?eejit=0`, `?iopjit=0` and `?vu1jit=0` switch them off one at a time (the VU0
 micro-mode JIT stays off). VU1 JIT testing (`docs/web-port/VU1-JIT-DESIGN.md`; not a user setting):
@@ -380,7 +387,7 @@ workers, which load the script's own URL), `pcsx2-wasm.wasm`, `pcsx2-wasm.data` 
 URL on every deploy would reinstall it and reload every visitor's page. The browser checks the
 script for changes itself on navigations, bypassing the HTTP cache.
 
-Everything the page keeps in the browser (the remembered BIOS, the memory card, the last disc's
+Everything the page keeps in the browser (the remembered BIOS, the memory cards, the last disc's
 file handle, preferences) belongs to the site's origin. Moving the site to another address starts
 from nothing there, so choose the final address before people use it. On a project site
 (`<user>.github.io/TabStationToo/`) the origin is shared with the user's other project sites.
@@ -513,7 +520,7 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 
 ## Current limitations
 
-- No save states, rumble or touch controls yet; fixed key and gamepad layouts (no remapping). Two pads (ports 1 and 2, no multitap). One memory card (slot 1).
+- No save states, rumble or touch controls yet; fixed key and gamepad layouts (no remapping). Two pads (ports 1 and 2, no multitap). Two memory card slots of 8 MB `.ps2` cards (no multitap, PS1 or folder cards).
 - Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
   continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
   Safari is untested.
