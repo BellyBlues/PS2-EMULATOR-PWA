@@ -839,9 +839,15 @@ p.fine {
   height: 16px;
 }
 
-/* The disc menu button (UI-SPEC §10) carries the game's title, which runs longer than a BIOS name. */
+/* The disc menu button (UI-SPEC §10) carries the game's title, which runs longer than a BIOS name. When the
+   left group runs short of room (memory cards, Stop), the BIOS name gives way first. */
 .disc-btn .bios-btn-name {
+  min-width: 4em;
   max-width: 16rem;
+}
+
+#bios-btn {
+  flex-shrink: 4;
 }
 
 /* Icon-only buttons: the tooltip hangs below the button, over the credits or the drawer's top
@@ -1532,6 +1538,186 @@ p.fine {
   color: var(--coral);
 }
 
+/* ---------------------------------------------------------------- components: memory cards (UI-SPEC §14) */
+
+/* The transport has room for the card names only when it is wide: otherwise each slot is its icon and number,
+   and the tooltip names the card. */
+.card-btn {
+  flex: none;
+}
+
+.card-btn .card-label {
+  max-width: 9rem;
+}
+
+.card-btn :is(.card-pre, .card-rest) {
+  display: none;
+}
+
+@media (hover: hover) {
+  .card-btn:hover .tip,
+  .card-btn:focus-visible .tip {
+    display: block;
+  }
+}
+
+@container transport (min-width: 1100px) {
+  .card-btn {
+    flex: 0 1 auto;
+  }
+
+  .card-btn :is(.card-pre, .card-rest) {
+    display: inline;
+  }
+
+  .card-btn:is(:hover, :focus-visible) .tip {
+    display: none;
+  }
+}
+
+.card-btn.empty,
+.card-btn.empty .card-label {
+  color: var(--ink-3);
+}
+
+.card-btn.empty:hover,
+.card-btn.empty[aria-expanded="true"],
+.card-btn.empty:hover .card-label,
+.card-btn.empty[aria-expanded="true"] .card-label {
+  color: var(--ink-2);
+}
+
+/* While the game writes to the card: colour only, never animated. */
+.card-dot {
+  position: absolute;
+  top: 9px;
+  left: 25px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  visibility: hidden;
+}
+
+.card-btn.writing .card-dot {
+  visibility: visible;
+}
+
+.card-btn .tip {
+  left: 0;
+  translate: none;
+}
+
+.card-btn.tip-off .tip,
+.card-btn[aria-expanded="true"] .tip {
+  display: none !important;
+}
+
+.card-list {
+  display: grid;
+}
+
+.card-list[hidden] {
+  display: none;
+}
+
+.card-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.card-row .card-pick {
+  flex: 1;
+  min-width: 0;
+  padding-right: 4px;
+}
+
+.card-pick-text {
+  display: grid;
+  min-width: 0;
+  padding: 6px 0;
+}
+
+.card-pick-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-pick-where {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--ink-2);
+}
+
+.card-pick[aria-disabled="true"] .card-pick-where {
+  color: var(--ink-3);
+}
+
+.card-row .card-more {
+  flex: none;
+  align-self: center;
+  margin-right: 8px;
+}
+
+.card-more:hover {
+  background: var(--line);
+}
+
+.card-more:focus-visible {
+  outline-offset: -2px;
+}
+
+.card-form {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid var(--line);
+  padding: 12px 16px 0;
+}
+
+.card-name {
+  width: 100%;
+  height: 36px;
+  padding: 0 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: var(--house);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 480;
+}
+
+.card-name[aria-invalid="true"] {
+  border-color: var(--coral);
+}
+
+.card-form .menu-confirm-actions {
+  margin-top: 2px;
+}
+
+.card-delete-yes {
+  color: var(--coral);
+}
+
+.card-error {
+  padding: 8px 16px 0;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 480;
+  color: var(--coral);
+}
+
+.card-view[hidden],
+.card-error[hidden] {
+  display: none;
+}
+
 /* ---------------------------------------------------------------- components: Sound menu (UI-SPEC §11) */
 
 .sound-volume {
@@ -1942,10 +2128,11 @@ body[data-subtitle="on"] .subtitle {
 
 body[data-runtime="deferred"] .hairline,
 body:not([data-state="starting"]):not([data-state="running"]) #btn-stop,
-body[data-bios="none"] #bios-btn,
+body[data-bios="none"] :is(#bios-btn, .card-btn),
+body[data-cards="loading"] .card-btn,
 body[data-disc="none"] #disc-btn,
-body[data-state="dead"] :is(#bios-btn, #disc-btn, #btn-crisp, #btn-keys, #btn-fs),
-body[data-state="unsupported"] :is(#bios-btn, #disc-btn, #btn-crisp, #btn-keys, #btn-fs) {
+body[data-state="dead"] :is(#bios-btn, #disc-btn, .card-btn, #btn-crisp, #btn-keys, #btn-fs),
+body[data-state="unsupported"] :is(#bios-btn, #disc-btn, .card-btn, #btn-crisp, #btn-keys, #btn-fs) {
   display: none;
 }
 
@@ -2282,6 +2469,7 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   }
 
   .transport > .t-left {
+    flex-wrap: wrap;
     margin-left: -10px;
   }
 
@@ -2479,6 +2667,15 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   .menu-item[aria-disabled="true"],
   .menu-item[aria-disabled="true"] .icon {
     color: GrayText;
+  }
+
+  .card-dot {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+
+  .card-name {
+    border-color: ButtonText;
   }
 
   .sound-range {

@@ -33,8 +33,11 @@ const ICONS = [
 	'play', 'stop', 'memory', 'caret-up', 'folder-open', 'trash', 'checkerboard', 'keyboard',
 	'terminal-window', 'corners-out', 'corners-in', 'copy', 'x', 'arrow-clockwise', 'arrow-up-right',
 	'arrow-line-down', 'arrow-up', 'arrow-down', 'arrow-left', 'arrow-right', 'disc',
-	'speaker-high', 'speaker-low', 'speaker-x', 'speaker-slash', 'graphics-card',
+	'speaker-high', 'speaker-low', 'speaker-x', 'speaker-slash', 'graphics-card', 'sim-card', 'eject',
+	'pencil-simple', 'download-simple', 'plus', 'dots-three',
 ];
+// Phosphor Fill icons; each becomes <symbol id="i-NAME-fill">.
+const FILL_ICONS = ['sim-card'];
 
 for (const [from, to] of FILES) {
 	const dest = join(web, to);
@@ -47,15 +50,18 @@ const phosphor = join(modules, '@phosphor-icons/core');
 const { version } = JSON.parse(readFileSync(join(phosphor, 'package.json'), 'utf8'));
 const lines = [
 	'<svg xmlns="http://www.w3.org/2000/svg">',
-	`<!-- Phosphor Icons core ${version}, Regular weight (MIT, see icons/Phosphor-LICENSE.txt). Paths copied verbatim. -->`,
+	`<!-- Phosphor Icons core ${version}, Regular weight and a few Fill icons (MIT, see icons/Phosphor-LICENSE.txt). Paths copied verbatim. -->`,
 ];
-for (const name of ICONS) {
-	const svg = readFileSync(join(phosphor, 'assets/regular', `${name}.svg`), 'utf8');
-	const inner = svg.match(/^<svg[^>]*>([\s\S]*)<\/svg>\s*$/);
-	if (!inner)
-		throw new Error(`Unexpected markup in Phosphor icon "${name}"`);
-	lines.push(`<symbol id="i-${name}" viewBox="0 0 256 256" fill="currentColor">${inner[1]}</symbol>`);
+for (const [weight, names, suffix] of [['regular', ICONS, ''], ['fill', FILL_ICONS, '-fill']]) {
+	for (const name of names) {
+		const file = weight === 'regular' ? `${name}.svg` : `${name}-${weight}.svg`;
+		const svg = readFileSync(join(phosphor, 'assets', weight, file), 'utf8');
+		const inner = svg.match(/^<svg[^>]*>([\s\S]*)<\/svg>\s*$/);
+		if (!inner)
+			throw new Error(`Unexpected markup in Phosphor icon "${name}" (${weight})`);
+		lines.push(`<symbol id="i-${name}${suffix}" viewBox="0 0 256 256" fill="currentColor">${inner[1]}</symbol>`);
+	}
 }
 const local = readFileSync(join(here, 'icons-local.svg'), 'utf8');
 writeFileSync(join(web, 'icons.svg'), `${lines.join('\n')}\n${local}</svg>\n`);
-console.log(`icons.svg  <-  ${ICONS.length} Phosphor icons + icons-local.svg`);
+console.log(`icons.svg  <-  ${ICONS.length + FILL_ICONS.length} Phosphor icons + icons-local.svg`);

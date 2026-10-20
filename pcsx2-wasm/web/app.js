@@ -1034,7 +1034,7 @@
 			onAbort: (what) => fatal('crash', 'The emulator aborted', what),
 			onExit,
 			preRun: [mountMemoryCards],
-			postRun: [onRuntimeReadyForDiscs],
+			postRun: [onRuntimeReadyForDiscs, onRuntimeReadyForCards],
 		};
 
 		const script = document.createElement('script');
@@ -1933,7 +1933,6 @@
 		remove: 'Remove the disc',
 		where: { file: 'Read from your file', handle: 'Remembered in this browser', url: 'Loaded from ?disc=, not saved' },
 		withBios: (bios) => `With ${bios}.`,
-		savesKept: 'Saves go to a memory card kept in this browser.',
 		savesVisit: 'Saves last for this visit only.',
 		savesOtherTab: 'Saves last for this visit only: TabStationToo is open in another tab.',
 		lastDisc: 'Last disc: ',
@@ -2849,15 +2848,6 @@
 
 	// ---- the slate, the disc menu
 
-	function memcardLine() {
-		if (memcards.otherTab)
-			return DISC_COPY.savesOtherTab;
-		if (memcards.failed || memcards.visitOnly)
-			return DISC_COPY.savesVisit;
-		// Before the runtime mounts the cards, the line says what will happen.
-		return memcards.persistent || (!memcards.mounted && typeof indexedDB !== 'undefined') ? DISC_COPY.savesKept : DISC_COPY.savesVisit;
-	}
-
 	function discLine(d) {
 		return [{ name: d.name }, { sep: 1 }, ...discSizeParts(d.size), { sep: 1 }, discWhere(d)];
 	}
@@ -2879,7 +2869,7 @@
 				m.body = discLine(d);
 				m.alt = false; // the BIOS changes from its menu
 				m.remove = true;
-				m.fine = [[b ? DISC_COPY.withBios(biosTitle(b.name)) + ' ' : '', memcardLine()]];
+				m.fine = [[b ? DISC_COPY.withBios(biosTitle(b.name)) + ' ' : '', ...memcardParts()]];
 			} else if (disc.remembered && !disc.dead) {
 				m.fine = [[DISC_COPY.lastDisc, { name: disc.remembered.name }, { sep: 1 }, { discLink: DISC_COPY.openAgain }]];
 			}
@@ -3046,39 +3036,340 @@
 		render();
 	}
 
-	// ---- memory cards
-	// Slot 1's card lives in /memcards, an IDBFS (IndexedDB) mount made before main() runs, so it outlives
-	// a reload. One tab owns the cards: the one holding the MEMCARD_LOCK Web Lock, for as long as it is
-	// open. Only the owner copies them to IndexedDB, so a second tab can never overwrite the first one's
-	// saves with its older card; its own saves last for its visit (the slate says so).
-	// PCSX2 keeps the card file open and writes it in place (unbuffered on wasm), so the copy is driven from
-	// here: once the writes have been quiet for MEMCARD_QUIET_MS, at once when the PS2 stops, and when the
-	// page is hidden. FS.syncfs copies only files whose time changed; for an 8 MB card that blocks this
-	// thread for 30-50 ms. The copy is asynchronous and cannot finish during an unload, so from the first write
-	// until the copy is done, leaving or reloading the page asks first (beforeunload).
+	// ---- memory cards (UI-SPEC.md §14)
+	// A library of named cards in IndexedDB (CARD_IDB_NAME): 'cards' holds each card's record, 'bytes' its 8 MB
+	// image, 'meta' which card is in which slot and which was last in each. A card in a slot is also a file in
+	// /memcards (MEMFS), named after its id, which PCSX2 opens once pcsx2web_memcard() names it. Only those two are
+	// loaded into the emulator. A card can be linked to a .ps2 file on disk (File System Access, Chromium): it is
+	// read from the file when plugged in, and written back to it after each copy to IndexedDB.
+	// One tab owns the cards: the one holding the MEMCARD_LOCK Web Lock, for as long as it is open. Only the owner
+	// writes the library and the files, so a second tab can never overwrite the first one's saves with its older
+	// cards; it loads the cards in the slots for its visit, and its card menus are disabled.
+	// PCSX2 keeps a card's file open and writes it in place (unbuffered on wasm), so the copy is driven from here:
+	// once the writes have been quiet for MEMCARD_QUIET_MS, at once when the PS2 stops, when a card is unplugged
+	// and when the page is hidden. The copy is asynchronous and cannot finish during an unload, so from the first
+	// write until the copy is done, leaving or reloading the page asks first (beforeunload).
 	// A copy that fails is tried again later (MEMCARD_RETRY_MS; the copy on leaving does not wait, and is not
-	// counted); after the last try the page gives up until the game writes to the card again, and the card line
-	// says that saves last for this visit.
+	// counted); after the last try the page gives up until the game writes to a card again, and the card line says
+	// that saves last for this visit.
 
 	const MEMCARD_DIR = '/memcards';
 	const MEMCARD_QUIET_MS = 1500;
 	const MEMCARD_RETRY_MS = [2000, 5000, 15000]; // after the 1st, 2nd and 3rd failed copy in a row
 	const MEMCARD_LOCK = 'tabstationtoo-memcards';
 	const MEMCARD_LOCK_WAIT_MS = 2000; // on a reload, the page being replaced may hold the lock a moment longer
+	const CARD_SLOTS = 2;
+	const CARD_BYTES = 8650752; // 8 MB of 512-byte pages, each with 16 bytes of ECC: PCSX2's .ps2 file
+	const CARD_NAME_MAX = 32;
+	const CARD_IDB_NAME = 'pcsx2-web-cards';
+	const CARD_META_KEY = 'slots';
+	const CARD_WRITE_DOT_MS = 600;
+	const CARD_ACK_POLL_MS = 30;
+	// Earlier versions kept slot 1's card in Emscripten's IDBFS: database '/memcards', store 'FILE_DATA', keyed
+	// by path. It becomes "Memory card 1" once, then that database is deleted.
+	const OLD_CARD_IDB = { name: '/memcards', store: 'FILE_DATA', key: '/memcards/Mcd001.ps2' };
+	const MEMCARD_STATUS_BUSY = 1; // pcsx2web_memcard_status() flags
+	const CARD_PICKER_TYPES = [{ description: 'PS2 memory card', accept: { 'application/octet-stream': ['.ps2'] } }];
+
+	const CARD_COPY = {
+		slot: (n) => `Card ${n}`,
+		empty: (n) => `Card ${n} · empty`,
+		saving: (n) => `Card ${n} · saving…`,
+		btnName: (n, name) => name ? `Memory card ${n}: ${name}, plugged in` : `Memory card ${n}: empty`,
+		emptyLine: (n) => `Card ${n} is empty.`,
+		newTitle: (n) => `A new card, for Card ${n}.`,
+		renameTitle: (name) => `Rename ${name}.`,
+		inBrowser: 'In this browser',
+		linked: 'Linked to ',
+		onDisk: ' on disk',
+		unlinked: 'Not linked any more',
+		inOther: (n) => `In Card ${n}`,
+		defaultName: (n) => `Memory card ${n}`,
+		inserted: (name, n) => `${name} is in Card ${n}.`,
+		unplugged: (n) => `Card ${n} unplugged.`,
+		waitSave: (n) => `Card ${n} will unplug when the game finishes saving.`,
+		waitReason: 'Unplugs when the game finishes saving.',
+		deleted: (name) => `${name} deleted.`,
+		removed: (name) => `${name} removed from the list. Its file stays on disk.`,
+		renamed: (name) => `Renamed to ${name}.`,
+		confirmDelete: (name) => `Delete ${name}? Its saves are only in this browser.`,
+		nameEmpty: 'Give the card a name.',
+		nameTaken: 'Another card is called that already.',
+		notCard: 'That file isn’t an 8 MB PS2 memory card (.ps2).',
+		unreadable: 'Couldn’t read that file. Try choosing it again.',
+		denied: (file) => `The browser didn’t allow opening ${file}.`,
+		noRoom: 'The browser has no room for another card. Delete one or save a copy to disk.',
+		saveFailed: 'Couldn’t save the card here. Try again.',
+		copyFailed: 'Couldn’t save the copy. Try again.',
+		alreadyListed: (file, name) => `${file} is in the list already, as ${name}.`,
+		inOtherSlot: (n) => `That card is in Card ${n}.`,
+		unplugFirst: (n) => `Unplug it from Card ${n} first.`,
+		writeFailed: (file, name) => `Couldn’t write ${file}. ${name} goes on in this browser.`,
+		otherTab: 'TabStationToo is open in another tab.',
+		noCard: 'No memory card in. Games won’t be able to save. ',
+		insert: 'Insert a card',
+		savesTo: (parts) => `Saves go to ${parts}.`,
+		inSlot: (name, n) => `${name} in Card ${n}`,
+	};
+
 	const memcards = {
 		mounted: false, persistent: false, failed: false, owner: false, otherTab: false,
-		seen: '', changedAt: 0, saved: '', syncing: false, again: false, warned: false, guarded: false,
-		// Writes are counted (FS.write on a card) because file times are whole milliseconds: a write in the
-		// same millisecond as the last copy changes neither the signature nor what IDBFS compares.
-		writes: 0, savedWrites: 0, dirty: new Set(), lastTime: 0,
+		changedAt: 0, syncing: false, again: false, warned: false, guarded: false,
+		// Writes are counted (FS.write on a card file): what the game wrote since the last copy is unsaved.
+		writes: 0, savedWrites: 0, dirty: new Set(), loading: false,
 		failures: 0, retryAt: 0, gaveUp: false, visitOnly: false,
 	};
+
+	// The library. slots[i] / last[i]: card ids or null. boot[i]: the bytes of the card a slot holds at start-up,
+	// until the runtime's file system takes them. pending[i]: 'unplug' while an unplug waits for a save.
+	const cards = {
+		ready: null, loaded: false, list: new Map(), slots: [null, null], last: [null, null],
+		boot: [null, null], fsReady: false, pending: [null, null], reqSeq: 0, statusPtr: 0,
+		writeDot: [0, 0], dotTimer: [0, 0], busyOp: [false, false], persistAsked: false,
+	};
+
+	const cardFile = (id) => `${id}.ps2`;
+	const cardPath = (id) => `${MEMCARD_DIR}/${cardFile(id)}`;
+	const hasFileAccess = () => typeof window.showSaveFilePicker === 'function' && typeof window.showOpenFilePicker === 'function';
+
+	function newCardId() {
+		const bytes = new Uint8Array(6);
+		crypto.getRandomValues(bytes);
+		return 'c' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+	}
+
+	function blankCard() {
+		return new Uint8Array(CARD_BYTES).fill(0xff);
+	}
+
+	function slotOf(id) {
+		const i = cards.slots.indexOf(id);
+		return i < 0 ? -1 : i;
+	}
+
+	// The cards, the last one used in this slot first, then the most recently used.
+	function cardsForPicker(slot) {
+		const last = cards.last[slot];
+		return [...cards.list.values()].sort((a, b) => (b.id === last) - (a.id === last) || (b.used || 0) - (a.used || 0) ||
+			a.name.localeCompare(b.name));
+	}
+
+	function cardNameProblem(name, exceptId) {
+		if (!name)
+			return CARD_COPY.nameEmpty;
+		const lower = name.toLocaleLowerCase();
+		for (const c of cards.list.values()) {
+			if (c.id !== exceptId && c.name.toLocaleLowerCase() === lower)
+				return CARD_COPY.nameTaken;
+		}
+		return '';
+	}
+
+	function cleanCardName(name) {
+		return String(name || '').replace(/\s+/g, ' ').trim().slice(0, CARD_NAME_MAX).trim();
+	}
+
+	function freeCardName(base) {
+		base = cleanCardName(base) || CARD_COPY.defaultName(1);
+		if (!cardNameProblem(base))
+			return base;
+		for (let n = 2; ; n++) {
+			const suffix = ` (${n})`;
+			const name = base.slice(0, CARD_NAME_MAX - suffix.length).trim() + suffix;
+			if (!cardNameProblem(name))
+				return name;
+		}
+	}
+
+	function defaultCardName() {
+		for (let n = 1; ; n++) {
+			if (!cardNameProblem(CARD_COPY.defaultName(n)))
+				return CARD_COPY.defaultName(n);
+		}
+	}
+
+	// ---- the library in IndexedDB
+
+	let cardDb = null;
+	function cardIdbOpen() {
+		if (cardDb)
+			return cardDb;
+		cardDb = new Promise((resolve, reject) => {
+			if (typeof indexedDB === 'undefined') {
+				reject(new Error('IndexedDB is not available'));
+				return;
+			}
+			const req = indexedDB.open(CARD_IDB_NAME, 1);
+			req.onupgradeneeded = () => {
+				const db = req.result;
+				db.createObjectStore('cards', { keyPath: 'id' });
+				db.createObjectStore('bytes');
+				db.createObjectStore('meta');
+			};
+			req.onsuccess = () => resolve(req.result);
+			req.onerror = () => reject(req.error);
+			req.onblocked = () => reject(new Error('IndexedDB is blocked by another tab'));
+		});
+		cardDb.catch(() => {
+			cardDb = null;
+		});
+		return cardDb;
+	}
+
+	// fn(tx) queues requests; resolves with fn's result once the transaction is committed.
+	async function cardTx(stores, mode, fn) {
+		const db = await cardIdbOpen();
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(stores, mode);
+			let result;
+			try {
+				result = fn(tx);
+			} catch (err) {
+				tx.abort();
+				reject(err);
+				return;
+			}
+			tx.oncomplete = () => resolve(result instanceof IDBRequest ? result.result : result);
+			tx.onerror = () => reject(tx.error);
+			tx.onabort = () => reject(tx.error || new Error('The IndexedDB transaction was aborted'));
+		});
+	}
+
+	function cardRecordForDb(c) {
+		return { id: c.id, name: c.name, created: c.created, used: c.used || 0, handle: c.handle || null,
+			file: c.file || null, unlinked: !!c.unlinked };
+	}
+
+	function saveCardMeta() {
+		if (!memcards.owner || !memcards.persistent)
+			return Promise.resolve();
+		const meta = { slots: cards.slots.slice(), last: cards.last.slice() };
+		return cardTx('meta', 'readwrite', (tx) => tx.objectStore('meta').put(meta, CARD_META_KEY))
+			.catch((err) => pageLog(`Could not remember which cards are plugged in: ${errorText(err)}`, 'warn'));
+	}
+
+	function saveCardRecord(c) {
+		if (!memcards.owner || !memcards.persistent)
+			return Promise.resolve();
+		return cardTx('cards', 'readwrite', (tx) => tx.objectStore('cards').put(cardRecordForDb(c)))
+			.catch((err) => pageLog(`Could not save the card ${c.name}: ${errorText(err)}`, 'warn'));
+	}
+
+	// A new card: its record and bytes in one transaction (a quota error leaves neither).
+	async function addCardToLibrary(c, bytes) {
+		if (!memcards.persistent)
+			c.visitBytes = bytes; // no IndexedDB: the card lasts for this visit, in memory
+		if (memcards.owner && memcards.persistent) {
+			await cardTx(['cards', 'bytes'], 'readwrite', (tx) => {
+				tx.objectStore('cards').put(cardRecordForDb(c));
+				tx.objectStore('bytes').put(bytes, c.id);
+			});
+		}
+		cards.list.set(c.id, c);
+		askPersistentStorage();
+	}
+
+	async function readCardBytes(id) {
+		if (!memcards.persistent) {
+			const c = cards.list.get(id);
+			return c && c.visitBytes ? c.visitBytes : null;
+		}
+		const bytes = await cardTx('bytes', 'readonly', (tx) => tx.objectStore('bytes').get(id));
+		if (!bytes)
+			return null;
+		const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+		return view.byteLength === CARD_BYTES ? view : null;
+	}
+
+	function askPersistentStorage() {
+		if (cards.persistAsked || !navigator.storage || typeof navigator.storage.persist !== 'function')
+			return;
+		cards.persistAsked = true;
+		navigator.storage.persist().then((ok) => pageLog(ok ? 'The browser keeps this site’s storage (persistent).' :
+			'The browser may clear this site’s storage when space runs low; save a copy of each card to disk to be safe.', ok ? undefined : 'warn'))
+			.catch(() => {});
+	}
+
+	function isQuotaError(err) {
+		return !!err && (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+			(err.inner && err.inner.name === 'QuotaExceededError'));
+	}
+
+	// The card an earlier version kept in IDBFS. Resolves to its bytes, or null.
+	function readOldCard() {
+		return new Promise((resolve) => {
+			let req;
+			try {
+				req = indexedDB.open(OLD_CARD_IDB.name);
+			} catch {
+				resolve(null);
+				return;
+			}
+			let created = false;
+			req.onupgradeneeded = (e) => {
+				if (e.oldVersion === 0) {
+					created = true; // there was none: do not leave an empty one behind
+					req.transaction.abort();
+				}
+			};
+			req.onerror = () => {
+				if (created)
+					indexedDB.deleteDatabase(OLD_CARD_IDB.name);
+				resolve(null);
+			};
+			req.onsuccess = () => {
+				const db = req.result;
+				if (!db.objectStoreNames.contains(OLD_CARD_IDB.store)) {
+					db.close();
+					resolve(null);
+					return;
+				}
+				const get = db.transaction(OLD_CARD_IDB.store, 'readonly').objectStore(OLD_CARD_IDB.store).get(OLD_CARD_IDB.key);
+				get.onsuccess = () => {
+					db.close();
+					const rec = get.result;
+					const contents = rec && rec.contents;
+					resolve(contents && contents.byteLength === CARD_BYTES ? new Uint8Array(contents) : null);
+				};
+				get.onerror = () => {
+					db.close();
+					resolve(null);
+				};
+			};
+		});
+	}
+
+	// First visit of this version: the old card, if any, becomes "Memory card 1" in Card 1.
+	async function migrateOldCard() {
+		const bytes = await readOldCard();
+		const meta = { slots: [null, null], last: [null, null] };
+		if (bytes) {
+			const c = { id: newCardId(), name: CARD_COPY.defaultName(1), created: Date.now(), used: Date.now(), handle: null, file: null };
+			meta.slots[0] = meta.last[0] = c.id;
+			await cardTx(['cards', 'bytes', 'meta'], 'readwrite', (tx) => {
+				tx.objectStore('cards').put(cardRecordForDb(c));
+				tx.objectStore('bytes').put(bytes, c.id);
+				tx.objectStore('meta').put(meta, CARD_META_KEY);
+			});
+			pageLog('The memory card from an earlier visit is now “Memory card 1”, in Card 1.');
+		} else {
+			await cardTx('meta', 'readwrite', (tx) => tx.objectStore('meta').put(meta, CARD_META_KEY));
+		}
+		if (bytes) {
+			try {
+				indexedDB.deleteDatabase(OLD_CARD_IDB.name);
+			} catch {
+				// it stays; nothing reads it again
+			}
+		}
+		return meta;
+	}
 
 	// Resolves true once this tab owns the cards, false when another tab keeps them.
 	function claimMemoryCards() {
 		const locks = navigator.locks;
 		if (!locks || typeof locks.request !== 'function')
-			return Promise.resolve(true); // no Web Locks: every tab copies its card, as without this
+			return Promise.resolve(true); // no Web Locks: every tab keeps its cards, as without this
 		return new Promise((resolve) => {
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), MEMCARD_LOCK_WAIT_MS);
@@ -3093,15 +3384,118 @@
 		});
 	}
 
-	// Card writes reach the file system on this thread (Emscripten runs a pthread's file calls here), so
-	// they are seen as they happen: the unload guard is up from the first write of a save.
+	// At page start: the lock, then the library (after the lock: the page a reload replaced has made its last
+	// copy by then), then the bytes of the cards in the slots.
+	function loadCardLibrary() {
+		if (cards.ready)
+			return cards.ready;
+		cards.ready = (async () => {
+			const owner = await claimMemoryCards();
+			memcards.owner = owner;
+			memcards.otherTab = !owner;
+			if (!owner)
+				pageLog('TabStationToo is open in another tab, which keeps the memory cards: saves in this tab last for this visit only.', 'warn');
+			let meta = null;
+			try {
+				meta = await cardTx('meta', 'readonly', (tx) => tx.objectStore('meta').get(CARD_META_KEY));
+				memcards.persistent = true;
+				if (!meta && owner)
+					meta = await migrateOldCard();
+				const records = await cardTx('cards', 'readonly', (tx) => tx.objectStore('cards').getAll());
+				for (const r of records || [])
+					cards.list.set(r.id, { ...r });
+			} catch (err) {
+				memcards.failed = true;
+				memcards.persistent = false;
+				pageLog(`Could not load the memory cards from this browser: ${errorText(err)}`, 'warn');
+			}
+			if (meta && Array.isArray(meta.slots)) {
+				for (let i = 0; i < CARD_SLOTS; i++) {
+					cards.slots[i] = cards.list.has(meta.slots[i]) ? meta.slots[i] : null;
+					cards.last[i] = cards.list.has(meta.last && meta.last[i]) ? meta.last[i] : null;
+				}
+			}
+			let changed = false;
+			for (let i = 0; i < CARD_SLOTS; i++) {
+				const id = cards.slots[i];
+				if (!id)
+					continue;
+				const bytes = await bootCardBytes(cards.list.get(id));
+				if (bytes) {
+					cards.boot[i] = bytes;
+				} else {
+					cards.slots[i] = null; // a linked file not allowed again yet: the picker offers it first
+					cards.last[i] = id;
+					changed = true;
+				}
+			}
+			if (changed)
+				saveCardMeta();
+			if (cards.list.size)
+				askPersistentStorage();
+			cards.loaded = true;
+			const names = cards.slots.map((id, i) => id ? `Card ${i + 1}: ${cards.list.get(id).name}` : '').filter(Boolean);
+			if (names.length)
+				pageLog(`Memory cards: ${names.join(', ')}.`);
+			render();
+		})();
+		return cards.ready;
+	}
+
+	// A plugged card's bytes at start-up: from its file when it is linked and the browser still allows it,
+	// otherwise the browser's copy (a linked card without permission comes back unplugged: null).
+	async function bootCardBytes(c) {
+		try {
+			if (c.handle && !c.unlinked) {
+				if (memcards.owner) {
+					if (typeof c.handle.queryPermission !== 'function' ||
+						(await c.handle.queryPermission({ mode: 'readwrite' })) !== 'granted')
+						return null;
+					const bytes = await readLinkedFile(c);
+					if (bytes) {
+						storeBrowserCopy(c, bytes);
+						return bytes;
+					}
+					return null;
+				}
+			}
+			return await readCardBytes(c.id);
+		} catch (err) {
+			pageLog(`Could not load the card ${c.name}: ${errorText(err)}`, 'warn');
+			return null;
+		}
+	}
+
+	// A linked card's file: its bytes, or null (logged) when it is not a card or cannot be read.
+	async function readLinkedFile(c) {
+		const file = await c.handle.getFile();
+		if (file.size !== CARD_BYTES) {
+			pageLog(`${file.name} is ${formatSize(file.size)}, not an 8 MB memory card.`, 'warn');
+			return null;
+		}
+		return new Uint8Array(await file.arrayBuffer());
+	}
+
+	function storeBrowserCopy(c, bytes) {
+		if (!memcards.owner || !memcards.persistent)
+			return Promise.resolve(true);
+		return cardTx('bytes', 'readwrite', (tx) => tx.objectStore('bytes').put(bytes, c.id)).then(() => true, (err) => {
+			pageLog(`Could not keep a copy of ${c.name} in this browser: ${errorText(err)}`, 'warn');
+			return false;
+		});
+	}
+
+	// ---- the emulator's side
+
+	// Card writes reach the file system on this thread (Emscripten runs a pthread's file calls here), so they are
+	// seen as they happen: the unload guard is up from the first write of a save, and the card's dot lights.
 	function watchMemcardWrites(FS) {
 		const write = FS.write;
 		if (typeof write !== 'function' || write.memcardWatch)
 			return;
 		const watched = function (stream) {
 			const result = write.apply(this, arguments);
-			if (stream && typeof stream.path === 'string' && stream.path.startsWith(`${MEMCARD_DIR}/`))
+			if (!memcards.loading && stream && typeof stream.path === 'string' && stream.path.startsWith(`${MEMCARD_DIR}/`))
 				onMemcardWrite(stream.path);
 			return result;
 		};
@@ -3116,6 +3510,20 @@
 		memcards.gaveUp = false; // a new save: try to keep it again
 		if (memcards.owner && memcards.persistent)
 			setMemcardGuard(true);
+		for (let i = 0; i < CARD_SLOTS; i++) {
+			if (cards.slots[i] && cardPath(cards.slots[i]) === path)
+				lightWriteDot(i);
+		}
+	}
+
+	function lightWriteDot(slot) {
+		const ui = cardUi[slot];
+		if (!ui)
+			return;
+		if (!ui.btn.classList.contains('writing'))
+			ui.btn.classList.add('writing');
+		clearTimeout(cards.dotTimer[slot]);
+		cards.dotTimer[slot] = setTimeout(() => ui.btn.classList.remove('writing'), CARD_WRITE_DOT_MS);
 	}
 
 	function onBeforeUnloadWithCard(e) {
@@ -3136,7 +3544,7 @@
 			window.removeEventListener('beforeunload', onBeforeUnloadWithCard);
 	}
 
-	// Module.preRun: before main(), so PCSX2 finds the cards that were saved.
+	// Module.preRun: before main(). The cards in the slots go into /memcards once the library is loaded.
 	function mountMemoryCards() {
 		const M = window.Module;
 		const FS = M.FS;
@@ -3145,85 +3553,233 @@
 		} catch {
 			// exists
 		}
-		const IDBFS = FS.filesystems && FS.filesystems.IDBFS;
-		if (!IDBFS || typeof indexedDB === 'undefined') {
-			memcards.failed = true;
-			pageLog('IndexedDB is not available: the memory card lasts for this visit only.', 'warn');
-			return;
-		}
-		try {
-			FS.mount(IDBFS, {}, MEMCARD_DIR);
-		} catch (err) {
-			memcards.failed = true;
-			pageLog(`Could not keep memory cards in this browser: ${errorText(err)}`, 'warn');
-			return;
-		}
 		memcards.mounted = true;
 		watchMemcardWrites(FS);
 		M.addRunDependency('memcards');
-		claimMemoryCards().then((owner) => {
-			memcards.owner = owner;
-			memcards.otherTab = !owner;
-			if (!owner)
-				pageLog('TabStationToo is open in another tab, which keeps the memory card: saves in this tab last for this visit only.', 'warn');
-			// Loaded after the lock: the page a reload replaced has made its last copy by then.
-			FS.syncfs(true, (err) => {
-				if (err) {
-					memcards.failed = true;
-					pageLog(`Could not load the memory cards from this browser: ${errorText(err)}`, 'warn');
-				} else {
-					memcards.persistent = true;
-				}
-				// Loading wrote the cards through FS.write: what is there now is what IndexedDB holds.
-				memcards.savedWrites = memcards.writes;
-				memcards.dirty.clear();
-				memcards.seen = memcards.saved = memcardSignature();
-				if (memcards.saved)
-					pageLog(`Memory cards from this browser: ${memcards.saved.split(';').filter(Boolean).map((e) => e.split(':')[0]).join(', ')}`);
-				M.removeRunDependency('memcards');
-			});
+		loadCardLibrary().then(() => {
+			for (let i = 0; i < CARD_SLOTS; i++) {
+				if (cards.slots[i] && cards.boot[i])
+					writeCardFile(cards.slots[i], cards.boot[i]);
+				cards.boot[i] = null;
+			}
+			cards.fsReady = true;
+			M.removeRunDependency('memcards');
 		});
 	}
 
-	function memcardSignature() {
-		const FS = window.Module && window.Module.FS;
-		if (!FS)
-			return '';
-		let sig = '';
+	function writeCardFile(id, bytes) {
+		const FS = window.Module.FS;
+		memcards.loading = true; // not a write of the game's
 		try {
-			for (const name of FS.readdir(MEMCARD_DIR)) {
-				if (name === '.' || name === '..')
-					continue;
-				const st = FS.stat(`${MEMCARD_DIR}/${name}`);
-				sig += `${name}:${st.size}:${st.mtime.getTime()};`;
-			}
-		} catch {
-			// no folder yet
+			FS.writeFile(cardPath(id), bytes);
+		} finally {
+			memcards.loading = false;
 		}
-		return sig;
 	}
 
-	// Something is not in IndexedDB yet: a write since the last copy began, or a change the signature shows
-	// (a card created, resized or removed).
-	function memcardsUnsaved(sig = memcardSignature()) {
-		return memcards.writes !== memcards.savedWrites || sig !== memcards.saved;
+	function removeCardFile(id) {
+		const path = cardPath(id);
+		memcards.dirty.delete(path);
+		try {
+			window.Module.FS.unlink(path);
+		} catch {
+			// not there
+		}
+	}
+
+	// The bytes of a plugged card as the game left them.
+	function readCardFile(id) {
+		try {
+			return window.Module.FS.readFile(cardPath(id));
+		} catch {
+			return null;
+		}
+	}
+
+	// Module.postRun: the exports are bound; PCSX2 learns which cards are in the slots (it applies them at boot).
+	function onRuntimeReadyForCards() {
+		if (!api)
+			return;
+		cards.statusPtr = window.Module._pcsx2web_memcard_status ? window.Module._pcsx2web_memcard_status() >>> 0 : 0;
+		for (let i = 0; i < CARD_SLOTS; i++) {
+			if (cards.slots[i])
+				coreSetCard(i, cardFile(cards.slots[i]));
+		}
+	}
+
+	function cardStatus() {
+		const buf = heapBuffer();
+		if (!buf || !cards.statusPtr || cards.statusPtr + 12 > buf.byteLength)
+			return null;
+		const words = new Uint32Array(buf, cards.statusPtr, 1 + CARD_SLOTS);
+		return { busy: (Atomics.load(words, 0) & MEMCARD_STATUS_BUSY) !== 0, applied: [Atomics.load(words, 1), Atomics.load(words, 2)] };
+	}
+
+	// Names the slot's file for PCSX2 ('' empties it). Resolves once PCSX2 has applied it, or at once when no VM
+	// runs (it is applied at the next boot, and no card file is open meanwhile).
+	function coreSetCard(slot, file) {
+		const M = window.Module;
+		if (!api || !M || typeof M._pcsx2web_memcard !== 'function')
+			return Promise.resolve();
+		const id = ++cards.reqSeq;
+		return new Promise((resolve) => {
+			const send = () => {
+				const r = M.ccall('pcsx2web_memcard', 'number', ['number', 'string', 'number'], [slot, file, id]);
+				if (r === 1) {
+					setTimeout(send, CARD_ACK_POLL_MS); // the CPU thread is reading the last request
+					return;
+				}
+				if (r !== 0) {
+					pageLog(`The emulator refused the memory card ${file || '(none)'} for slot ${slot + 1}.`, 'warn');
+					resolve();
+					return;
+				}
+				const wait = () => {
+					const st = cardStatus();
+					if (!vmLive() || !st || st.applied[slot] >= id) {
+						resolve();
+						return;
+					}
+					setTimeout(wait, CARD_ACK_POLL_MS);
+				};
+				wait();
+			};
+			send();
+		});
+	}
+
+	function cardBusy() {
+		const st = vmLive() ? cardStatus() : null;
+		return !!(st && st.busy);
+	}
+
+	// ---- plugging in and out
+
+	// Plugs card id into the slot. gesture: called from a click (a linked file may ask for permission). Resolves
+	// to '' or an error line for the menu.
+	async function plugCard(slot, id) {
+		const c = cards.list.get(id);
+		if (!c || cards.slots[slot] || slotOf(id) >= 0)
+			return '';
+		let bytes = null;
+		try {
+			if (c.handle && memcards.owner) {
+				const perm = typeof c.handle.requestPermission === 'function' ?
+					await c.handle.requestPermission({ mode: 'readwrite' }) : 'granted';
+				if (perm !== 'granted')
+					return CARD_COPY.denied(c.file || c.name);
+				bytes = await readLinkedFile(c);
+				if (!bytes)
+					return CARD_COPY.notCard;
+				if (c.unlinked) {
+					c.unlinked = false;
+					saveCardRecord(c);
+				}
+				storeBrowserCopy(c, bytes);
+			} else {
+				bytes = await readCardBytes(id);
+			}
+		} catch (err) {
+			pageLog(`Could not load the card ${c.name}: ${errorText(err)}`, 'warn');
+			return c.handle ? CARD_COPY.unreadable : CARD_COPY.saveFailed;
+		}
+		if (!bytes)
+			return CARD_COPY.unreadable;
+		if (cards.slots[slot] || slotOf(id) >= 0)
+			return ''; // plugged meanwhile (a second click)
+		cards.slots[slot] = id;
+		cards.last[slot] = id;
+		c.used = Date.now();
+		saveCardRecord(c);
+		saveCardMeta();
+		if (cards.fsReady) {
+			writeCardFile(id, bytes);
+			coreSetCard(slot, cardFile(id));
+		} else {
+			cards.boot[slot] = bytes; // the runtime's file system takes it before main()
+		}
+		pageLog(`Card ${slot + 1}: ${c.name}${c.handle ? ` (${c.file})` : ''}.`);
+		subtitle(CARD_COPY.inserted(c.name, slot + 1));
+		announce(CARD_COPY.inserted(c.name, slot + 1));
+		render();
+		return '';
+	}
+
+	// Unplug: at once, or once the game has finished writing (PCSX2's busy time) so a save is never cut short.
+	function requestUnplug(slot) {
+		if (!cards.slots[slot] || cards.pending[slot])
+			return;
+		if (cardBusy()) {
+			cards.pending[slot] = 'unplug';
+			subtitle(CARD_COPY.waitSave(slot + 1));
+			announce(CARD_COPY.waitSave(slot + 1));
+			render();
+			return;
+		}
+		unplugCard(slot);
+	}
+
+	async function unplugCard(slot) {
+		const id = cards.slots[slot];
+		if (!id || cards.busyOp[slot])
+			return;
+		cards.busyOp[slot] = true;
+		cards.pending[slot] = 'unplug';
+		render();
+		await coreSetCard(slot, ''); // PCSX2 has closed the file (or no VM has it open)
+		const c = cards.list.get(id);
+		const bytes = cards.fsReady ? readCardFile(id) : cards.boot[slot];
+		if (bytes && c && !memcards.persistent)
+			c.visitBytes = bytes;
+		if (bytes && c && memcards.owner && memcards.persistent) {
+			const path = cardPath(id);
+			if (memcards.dirty.has(path) || memcards.writes !== memcards.savedWrites) {
+				if (!(await storeBrowserCopy(c, bytes)))
+					subtitle(DISC_COPY.memcardFailed);
+				writeLinked(c, bytes);
+			}
+		}
+		if (cards.fsReady)
+			removeCardFile(id);
+		cards.boot[slot] = null;
+		cards.slots[slot] = null;
+		cards.last[slot] = id;
+		cards.pending[slot] = null;
+		cards.busyOp[slot] = false;
+		saveCardMeta();
+		if (!memcards.dirty.size)
+			memcards.savedWrites = memcards.writes; // nothing left unsaved
+		cardUi[slot] && cardUi[slot].btn.classList.remove('writing');
+		subtitle(CARD_COPY.unplugged(slot + 1));
+		announce(CARD_COPY.unplugged(slot + 1));
+		render();
+		checkMemoryCards(false);
+	}
+
+	// The tick: an unplug that waits for a save goes on once PCSX2 is no longer busy with the cards.
+	function checkPendingUnplugs() {
+		for (let i = 0; i < CARD_SLOTS; i++) {
+			if (cards.pending[i] === 'unplug' && !cards.busyOp[i] && !cardBusy())
+				unplugCard(i);
+		}
+	}
+
+	// ---- copying the cards to IndexedDB (and linked files)
+
+	function memcardsUnsaved() {
+		return memcards.writes !== memcards.savedWrites || memcards.dirty.size > 0;
 	}
 
 	function checkMemoryCards(now) {
+		checkPendingUnplugs();
 		if (!memcards.persistent || !memcards.owner)
 			return;
-		const sig = memcardSignature();
 		const t = performance.now();
-		if (sig !== memcards.seen) {
-			memcards.seen = sig;
-			memcards.changedAt = t;
-			memcards.gaveUp = false;
-		}
 		if (memcards.gaveUp) {
 			setMemcardGuard(memcards.syncing);
 			return;
 		}
-		const unsaved = memcardsUnsaved(sig);
+		const unsaved = memcardsUnsaved();
 		setMemcardGuard(unsaved || memcards.syncing);
 		if (unsaved && t >= memcards.retryAt && (now || t - memcards.changedAt >= MEMCARD_QUIET_MS))
 			persistMemoryCards();
@@ -3233,7 +3789,7 @@
 	// last chance to keep the card), and its failure does not count toward giving up: a few quick tab switches
 	// say nothing new about IndexedDB, so only the timed copies decide that.
 	function persistMemoryCards(leaving = false) {
-		if (!memcards.persistent || !memcards.owner || memcards.gaveUp)
+		if (!memcards.persistent || !memcards.owner || memcards.gaveUp || !cards.fsReady)
 			return;
 		if (memcards.syncing) {
 			memcards.again = true;
@@ -3243,30 +3799,25 @@
 			setMemcardGuard(false);
 			return;
 		}
-		// IDBFS copies a file only when its time differs from the stored copy's, in whole milliseconds. The
-		// stored time is one the page gave (below) or a write's, so every file written since the last copy
-		// began gets a time later than its own and than any the page gave before: it is copied even when it
-		// was written in the millisecond the last copy took its time from. Writes from now on go to the next
-		// copy (they may also reach this one).
-		const FS = window.Module.FS;
+		// Writes from now on go to the next copy (they may also reach this one).
 		const writes = memcards.writes;
 		const dirty = memcards.dirty;
 		memcards.dirty = new Set();
-		for (const path of dirty) {
-			try {
-				const st = FS.stat(path);
-				const time = Math.max(Date.now(), st.mtime.getTime() + 1, memcards.lastTime + 1);
-				memcards.lastTime = time;
-				FS.utime(path, st.atime.getTime(), time);
-			} catch {
-				// removed since: the copy removes it too
+		const copies = [];
+		for (let i = 0; i < CARD_SLOTS; i++) {
+			const id = cards.slots[i];
+			if (id && dirty.has(cardPath(id))) {
+				const bytes = readCardFile(id);
+				if (bytes)
+					copies.push({ c: cards.list.get(id), bytes });
 			}
 		}
-		const sig = memcardSignature();
-		memcards.seen = sig; // the new times are not a change of their own
 		memcards.syncing = true;
 		setMemcardGuard(true);
-		FS.syncfs(false, (err) => {
+		cardTx('bytes', 'readwrite', (tx) => {
+			for (const { c, bytes } of copies)
+				tx.objectStore('bytes').put(bytes, c.id);
+		}).then(() => null, (err) => err || new Error('IndexedDB failed')).then((err) => {
 			memcards.syncing = false;
 			if (err) {
 				for (const path of dirty)
@@ -3274,10 +3825,12 @@
 				memcardCopyFailed(err, !leaving);
 			} else {
 				memcards.savedWrites = writes;
-				memcards.saved = sig;
 				memcards.failures = 0;
 				memcards.retryAt = 0;
-				pageLog('Memory card saved in this browser.');
+				if (copies.length)
+					pageLog(`Saved in this browser: ${copies.map((x) => x.c.name).join(', ')}.`);
+				for (const { c, bytes } of copies)
+					writeLinked(c, bytes);
 				if (memcards.visitOnly) {
 					memcards.visitOnly = false; // kept again: the card line says so
 					render();
@@ -3292,9 +3845,8 @@
 		});
 	}
 
-	// Tried again after a pause that grows; after the last try, no more copies (each one reads the whole
-	// card) and no "Leave site?" question until the game writes to the card again, and the card line and
-	// one subtitle say that saves last for this visit.
+	// Tried again after a pause that grows; after the last try, no more copies and no "Leave site?" question until
+	// the game writes to a card again, and the card line and one subtitle say that saves last for this visit.
 	function memcardCopyFailed(err, counted) {
 		pageLog(`Could not save the memory card in this browser: ${errorText(err)}${counted ? '' : ' (copy on leaving; not counted)'}`, 'warn');
 		if (!counted)
@@ -3309,12 +3861,722 @@
 		memcards.failures = 0;
 		memcards.retryAt = 0;
 		setMemcardGuard(false);
-		pageLog('Stopped saving the memory card in this browser until the game writes to it again.', 'warn');
+		pageLog('Stopped saving the memory cards in this browser until the game writes to one again.', 'warn');
 		if (!memcards.warned) {
 			memcards.warned = true;
 			subtitle(DISC_COPY.memcardFailed);
 		}
 		render();
+	}
+
+	// A linked card's file gets each copy, the latest only, one write at a time. A file that cannot be written
+	// unlinks the card: it goes on from the browser's copy, and one subtitle says so.
+	function writeLinked(c, bytes) {
+		if (!c || !c.handle || c.unlinked || !memcards.owner)
+			return;
+		c.diskNext = bytes;
+		if (c.diskBusy)
+			return;
+		c.diskBusy = true;
+		(async () => {
+			while (c.diskNext) {
+				const next = c.diskNext;
+				c.diskNext = null;
+				try {
+					if (typeof c.handle.queryPermission === 'function' &&
+						(await c.handle.queryPermission({ mode: 'readwrite' })) !== 'granted')
+						throw new Error('permission to write it was withdrawn');
+					const w = await c.handle.createWritable();
+					await w.write(next);
+					await w.close();
+				} catch (err) {
+					pageLog(`Could not write ${c.file}: ${errorText(err)}`, 'warn');
+					c.unlinked = true;
+					c.diskNext = null;
+					saveCardRecord(c);
+					subtitle(CARD_COPY.writeFailed(c.file, c.name), HINT_MS);
+					render();
+				}
+			}
+			c.diskBusy = false;
+		})();
+	}
+
+	// ---- making, opening, copying, renaming and deleting cards
+
+	// New card: linked to a file the user picks where the browser can, otherwise kept in this browser. Resolves
+	// to '' (done or cancelled) or an error line.
+	async function createCard(slot, name) {
+		const c = { id: newCardId(), name, created: Date.now(), used: Date.now(), handle: null, file: null };
+		const bytes = blankCard();
+		if (hasFileAccess()) {
+			let handle;
+			try {
+				handle = await window.showSaveFilePicker({ suggestedName: `${name}.ps2`, types: CARD_PICKER_TYPES });
+			} catch (err) {
+				if (err && err.name === 'AbortError')
+					return null; // cancelled: the name stays in the field
+				pageLog(`The save dialog failed: ${errorText(err)}`, 'warn');
+				return CARD_COPY.saveFailed;
+			}
+			const same = await findLinked(handle);
+			if (same)
+				return CARD_COPY.alreadyListed(handle.name, same.name);
+			try {
+				const w = await handle.createWritable();
+				await w.write(bytes);
+				await w.close();
+			} catch (err) {
+				pageLog(`Could not write ${handle.name}: ${errorText(err)}`, 'warn');
+				return CARD_COPY.saveFailed;
+			}
+			c.handle = handle;
+			c.file = handle.name;
+		}
+		try {
+			await addCardToLibrary(c, bytes);
+		} catch (err) {
+			pageLog(`Could not keep the new card in this browser: ${errorText(err)}`, 'warn');
+			return isQuotaError(err) ? CARD_COPY.noRoom : CARD_COPY.saveFailed;
+		}
+		return (await plugCard(slot, c.id)) || '';
+	}
+
+	async function findLinked(handle) {
+		for (const c of cards.list.values()) {
+			try {
+				if (c.handle && typeof c.handle.isSameEntry === 'function' && await c.handle.isSameEntry(handle))
+					return c;
+			} catch {
+				// a handle the browser cannot compare any more
+			}
+		}
+		return null;
+	}
+
+	// Open a card file: with File System Access the card is linked to it, otherwise its bytes are kept in this
+	// browser. pickedFile: from the file input (no File System Access).
+	async function openCardFile(slot, pickedFile) {
+		let handle = null;
+		let file = pickedFile;
+		if (!file) {
+			try {
+				[handle] = await window.showOpenFilePicker({ types: CARD_PICKER_TYPES, multiple: false });
+			} catch (err) {
+				if (err && err.name === 'AbortError')
+					return null; // cancelled: the menu stays
+				pageLog(`The file picker failed: ${errorText(err)}`, 'warn');
+				return CARD_COPY.unreadable;
+			}
+			const same = await findLinked(handle);
+			if (same) {
+				const other = slotOf(same.id);
+				if (other >= 0)
+					return other === slot ? '' : CARD_COPY.inOtherSlot(other + 1);
+				return plugCard(slot, same.id);
+			}
+			try {
+				file = await handle.getFile();
+			} catch (err) {
+				pageLog(`Could not read ${handle.name}: ${errorText(err)}`, 'warn');
+				return CARD_COPY.unreadable;
+			}
+		}
+		if (file.size !== CARD_BYTES)
+			return CARD_COPY.notCard;
+		let bytes;
+		try {
+			bytes = new Uint8Array(await file.arrayBuffer());
+		} catch (err) {
+			pageLog(`Could not read ${file.name}: ${errorText(err)}`, 'warn');
+			return CARD_COPY.unreadable;
+		}
+		if (handle && typeof handle.requestPermission === 'function') {
+			let perm = 'denied';
+			try {
+				perm = await handle.requestPermission({ mode: 'readwrite' });
+			} catch (err) {
+				pageLog(`The browser did not let the page write ${handle.name}: ${errorText(err)}`, 'warn');
+			}
+			if (perm !== 'granted')
+				return CARD_COPY.denied(handle.name);
+		}
+		const c = { id: newCardId(), name: freeCardName(file.name.replace(/\.ps2$/i, '')), created: Date.now(), used: Date.now(),
+			handle, file: handle ? handle.name : null };
+		try {
+			await addCardToLibrary(c, bytes);
+		} catch (err) {
+			pageLog(`Could not keep ${file.name} in this browser: ${errorText(err)}`, 'warn');
+			return isQuotaError(err) ? CARD_COPY.noRoom : CARD_COPY.saveFailed;
+		}
+		return (await plugCard(slot, c.id)) || '';
+	}
+
+	// Save a copy to disk: a save dialog where the browser has one, otherwise a download. Resolves to true when
+	// saved, false when cancelled, or an error line.
+	async function saveCardCopy(id) {
+		const c = cards.list.get(id);
+		if (!c)
+			return false;
+		let bytes = slotOf(id) >= 0 && cards.fsReady ? readCardFile(id) : null;
+		try {
+			bytes = bytes || (slotOf(id) >= 0 ? cards.boot[slotOf(id)] : null) || await readCardBytes(id);
+		} catch (err) {
+			pageLog(`Could not read the card ${c.name}: ${errorText(err)}`, 'warn');
+		}
+		if (!bytes)
+			return CARD_COPY.copyFailed;
+		const name = `${c.name.replace(/[\\/:*?"<>|]+/g, '_')}.ps2`;
+		if (typeof window.showSaveFilePicker === 'function') {
+			try {
+				const handle = await window.showSaveFilePicker({ suggestedName: name, types: CARD_PICKER_TYPES });
+				const w = await handle.createWritable();
+				await w.write(bytes);
+				await w.close();
+				pageLog(`Saved a copy of ${c.name} as ${handle.name}.`);
+				return true;
+			} catch (err) {
+				if (err && err.name === 'AbortError')
+					return false;
+				pageLog(`Could not save a copy of ${c.name}: ${errorText(err)}`, 'warn');
+				return CARD_COPY.copyFailed;
+			}
+		}
+		const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = name;
+		document.body.appendChild(a);
+		a.click();
+		a.remove();
+		setTimeout(() => URL.revokeObjectURL(url), 60000);
+		pageLog(`Downloading a copy of ${c.name} (${name}).`);
+		return true;
+	}
+
+	function renameCard(id, name) {
+		const c = cards.list.get(id);
+		if (!c)
+			return '';
+		const problem = cardNameProblem(name, id);
+		if (problem)
+			return problem;
+		if (c.name !== name) {
+			c.name = name;
+			saveCardRecord(c);
+			subtitle(CARD_COPY.renamed(name));
+			announce(CARD_COPY.renamed(name));
+			render();
+		}
+		return '';
+	}
+
+	async function deleteCard(id) {
+		const c = cards.list.get(id);
+		if (!c || slotOf(id) >= 0)
+			return '';
+		try {
+			if (memcards.owner && memcards.persistent) {
+				await cardTx(['cards', 'bytes'], 'readwrite', (tx) => {
+					tx.objectStore('cards').delete(id);
+					tx.objectStore('bytes').delete(id);
+				});
+			}
+		} catch (err) {
+			pageLog(`Could not delete the card ${c.name}: ${errorText(err)}`, 'warn');
+			return CARD_COPY.saveFailed;
+		}
+		cards.list.delete(id);
+		let changed = false;
+		for (let i = 0; i < CARD_SLOTS; i++) {
+			if (cards.last[i] === id) {
+				cards.last[i] = null;
+				changed = true;
+			}
+		}
+		if (changed)
+			saveCardMeta();
+		pageLog(`${c.handle ? 'Removed from the list' : 'Deleted'}: ${c.name}.`);
+		const said = c.handle ? CARD_COPY.removed(c.name) : CARD_COPY.deleted(c.name);
+		subtitle(said);
+		announce(said);
+		render();
+		return '';
+	}
+
+	// ---- the card buttons and menus
+	// Each slot has a menu button in the transport and a popover, both made from #card-template. The popover shows
+	// one view at a time: 'plugged' (the card in the slot), 'picker' (an empty slot: the library), 'more' (one card
+	// of the picker), 'name' (a new card's name, or a new name) and 'confirm' (deleting a browser card).
+
+	const cardUi = [];
+
+	function cardWhere(c) {
+		if (!c.handle)
+			return [CARD_COPY.inBrowser];
+		if (c.unlinked)
+			return [CARD_COPY.unlinked];
+		return [CARD_COPY.linked, { name: c.file }];
+	}
+
+	function cardMenuOpen() {
+		return cardUi.some((ui) => {
+			try {
+				return ui.menu.matches(':popover-open');
+			} catch {
+				return false;
+			}
+		});
+	}
+
+	function cardMenuIsOpen(ui) {
+		try {
+			return ui.menu.matches(':popover-open');
+		} catch {
+			return false;
+		}
+	}
+
+	function hideCardMenu(ui) {
+		if (cardMenuIsOpen(ui))
+			ui.menu.hidePopover();
+	}
+
+	function openCardMenu(slot) {
+		const ui = cardUi[slot];
+		if (ui && !cardMenuIsOpen(ui) && ui.btn.getClientRects().length)
+			ui.menu.showPopover();
+	}
+
+	function placeCardMenu(ui) {
+		const r = ui.btn.getBoundingClientRect();
+		const width = Math.min(296, window.innerWidth - 32);
+		const left = Math.max(16, Math.min(r.left, window.innerWidth - width - 16));
+		ui.menu.style.left = `${Math.round(left)}px`;
+		ui.menu.style.bottom = `${Math.round(Math.max(8, window.innerHeight - r.top + 8))}px`;
+	}
+
+	// Cards can change only in the tab that keeps them.
+	const cardsLocked = () => !memcards.owner || !cards.loaded;
+
+	function setItemDisabled(item, disabled, reasonId) {
+		if (disabled) {
+			item.setAttribute('aria-disabled', 'true');
+			if (reasonId)
+				item.setAttribute('aria-describedby', reasonId);
+			else
+				item.removeAttribute('aria-describedby');
+		} else {
+			item.removeAttribute('aria-disabled');
+			item.removeAttribute('aria-describedby');
+		}
+	}
+
+	const isDisabled = (el) => el.getAttribute('aria-disabled') === 'true';
+
+	function makeCardUi(slot) {
+		const tpl = $('card-template').content;
+		const n = slot + 1;
+		const btn = tpl.querySelector('.card-btn').cloneNode(true);
+		const menu = tpl.querySelector('.card-menu').cloneNode(true);
+		menu.id = `card-menu-${n}`;
+		btn.id = `card-btn-${n}`;
+		btn.setAttribute('popovertarget', menu.id);
+		btn.setAttribute('aria-controls', menu.id);
+		menu.setAttribute('aria-label', `Memory card ${n}`);
+		const q = (sel) => menu.querySelector(sel);
+		const ui = {
+			slot, btn, menu, view: 'plugged', target: null, nameMode: 'new', back: 'picker', error: '', working: false,
+			icon: btn.querySelector('.card-icon use'),
+			pre: btn.querySelector('.card-pre'), num: btn.querySelector('.card-num'), rest: btn.querySelector('.card-rest'),
+			tip: btn.querySelector('.tip'),
+			views: {
+				plugged: q('[data-view="plugged"]'), picker: q('[data-view="picker"]'), more: q('[data-view="more"]'),
+				name: q('[data-view="name"]'), confirm: q('[data-view="confirm"]'),
+			},
+			plugName: q('[data-view="plugged"] .menu-name'), plugWhere: q('[data-view="plugged"] .menu-where'),
+			unplug: q('[data-act="unplug"]'), rename: q('[data-act="rename"]'), copy: q('[data-act="copy"]'),
+			plugReason: q('[data-view="plugged"] .menu-reason'),
+			emptyLine: q('[data-view="picker"] .menu-where'), list: q('.card-list'),
+			create: q('[data-act="new"]'), open: q('[data-act="open"]'), pickReason: q('[data-view="picker"] .menu-reason'),
+			moreName: q('[data-view="more"] .menu-name'), moreWhere: q('[data-view="more"] .menu-where'),
+			moreRename: q('[data-act="more-rename"]'), moreCopy: q('[data-act="more-copy"]'), moreDelete: q('[data-act="more-delete"]'),
+			moreDeleteLabel: q('[data-act="more-delete"] .label'), moreDeleteIcon: q('[data-act="more-delete"] use'),
+			moreBack: q('[data-act="more-back"]'), moreReason: q('[data-view="more"] .menu-reason'),
+			form: q('[data-view="name"]'), formTitle: q('.card-form-title'), nameLabel: q('[data-view="name"] label'), nameInput: q('[data-view="name"] input'),
+			nameOk: q('[data-act="name-ok"]'), nameCancel: q('[data-act="name-cancel"]'),
+			confirmQ: q('[data-view="confirm"] p'), keep: q('[data-act="keep"]'), copyFirst: q('[data-act="copy-first"]'),
+			deleteYes: q('[data-act="delete-yes"]'),
+			errorLine: q('.card-error'),
+			listKey: '',
+		};
+		// Ids for the labels and descriptions inside this slot's menu.
+		for (const [el, id] of [[ui.plugReason, 'plug-reason'], [ui.pickReason, 'pick-reason'], [ui.moreReason, 'more-reason'],
+			[ui.nameInput, 'name'], [ui.confirmQ, 'confirm-q'], [ui.errorLine, 'error']])
+			el.id = `card-${n}-${id}`;
+		ui.nameLabel.htmlFor = ui.nameInput.id;
+		ui.views.confirm.setAttribute('aria-labelledby', ui.confirmQ.id);
+		ui.nameInput.maxLength = CARD_NAME_MAX;
+		ui.nameInput.setAttribute('aria-describedby', ui.errorLine.id);
+		discEls.btn.before(btn);
+		discEls.menu.before(menu);
+		wireCardUi(ui);
+		return ui;
+	}
+
+	function setCardView(ui, view, focus = true) {
+		ui.view = view;
+		ui.error = '';
+		renderCardMenu(ui);
+		if (focus)
+			focusCardView(ui);
+	}
+
+	function focusCardView(ui) {
+		const v = ui.views[ui.view];
+		let el = null;
+		if (ui.view === 'name')
+			el = ui.nameInput;
+		else if (ui.view === 'confirm')
+			el = ui.keep;
+		else
+			el = [...v.querySelectorAll('.menu-item')].find((b) => !isDisabled(b) && b.getClientRects().length) ||
+				v.querySelector('.menu-item');
+		if (el) {
+			el.focus({ preventScroll: true });
+			if (el === ui.nameInput)
+				el.select();
+		}
+	}
+
+	function showCardError(ui, text) {
+		ui.error = text || '';
+		renderCardMenu(ui);
+		if (text)
+			announce(text);
+	}
+
+	// Runs an action of the menu once at a time; a result that is a string is the menu's error line.
+	async function cardAction(ui, fn, closeOnDone = true) {
+		if (ui.working)
+			return;
+		ui.working = true;
+		let result;
+		try {
+			result = await fn();
+		} catch (err) {
+			pageLog(`Memory card: ${errorText(err)}`, 'warn');
+			result = CARD_COPY.saveFailed;
+		}
+		ui.working = false;
+		if (typeof result === 'string' && result) {
+			if (!cardMenuIsOpen(ui))
+				openCardMenu(ui.slot);
+			showCardError(ui, result);
+			return result;
+		}
+		if (closeOnDone && result !== null && result !== false) {
+			hideCardMenu(ui);
+			ui.btn.focus({ preventScroll: true });
+		} else {
+			renderCardMenu(ui);
+		}
+		return result;
+	}
+
+	function renderCardButton(ui) {
+		const n = ui.slot + 1;
+		const id = cards.slots[ui.slot];
+		const c = id ? cards.list.get(id) : null;
+		const saving = !!c && cards.pending[ui.slot] === 'unplug';
+		const href = icon(c ? 'sim-card-fill' : 'sim-card');
+		if (ui.icon.getAttribute('href') !== href)
+			ui.icon.setAttribute('href', href);
+		ui.btn.classList.toggle('empty', !c);
+		setText(ui.pre, c ? '' : 'Card ');
+		setText(ui.num, String(n));
+		setText(ui.rest, saving ? ' · saving…' : c ? ` · ${c.name}` : ' · empty');
+		const label = saving ? CARD_COPY.saving(n) : c ? `${n} · ${c.name}` : CARD_COPY.empty(n);
+		setText(ui.tip, saving ? CARD_COPY.saving(n) : c ? `Card ${n}: ${c.name}` : CARD_COPY.empty(n));
+		const name = saving ? `${CARD_COPY.btnName(n, c.name)}, ${CARD_COPY.waitReason.toLowerCase()}` : CARD_COPY.btnName(n, c ? c.name : '');
+		if (ui.btn.getAttribute('aria-label') !== name)
+			ui.btn.setAttribute('aria-label', name);
+		ui.btn.dataset.label = label;
+	}
+
+	function renderCardMenu(ui) {
+		if (!cardMenuIsOpen(ui))
+			return;
+		const slot = ui.slot;
+		const id = cards.slots[slot];
+		const plugged = id ? cards.list.get(id) : null;
+		const locked = cardsLocked();
+		// The slot changed under a root view, or the card of a view went away: back to the slot's root view.
+		if ((ui.view === 'plugged' && !plugged) || (ui.view === 'picker' && plugged) ||
+			(['more', 'confirm'].includes(ui.view) && (!cards.list.has(ui.target) || slotOf(ui.target) >= 0 && ui.view === 'confirm')) ||
+			(ui.view === 'name' && ui.nameMode === 'rename' && !cards.list.has(ui.target))) {
+			const hadFocus = ui.menu.contains(document.activeElement);
+			ui.view = plugged ? 'plugged' : 'picker';
+			if (hadFocus)
+				queueMicrotask(() => focusCardView(ui));
+		}
+		for (const [name, el] of Object.entries(ui.views))
+			el.hidden = name !== ui.view;
+		const lockedReason = locked ? CARD_COPY.otherTab : '';
+
+		if (ui.view === 'plugged' && plugged) {
+			setText(ui.plugName, plugged.name);
+			rich(ui.plugWhere, cardWhere(plugged));
+			const waiting = cards.pending[slot] === 'unplug';
+			setItemDisabled(ui.unplug, locked || waiting, ui.plugReason.id);
+			setItemDisabled(ui.rename, locked, ui.plugReason.id);
+			setItemDisabled(ui.copy, false);
+			setText(ui.plugReason, lockedReason || (waiting ? CARD_COPY.waitReason : ''));
+			ui.plugReason.hidden = !ui.plugReason.textContent;
+		} else if (ui.view === 'picker') {
+			setText(ui.emptyLine, CARD_COPY.emptyLine(slot + 1));
+			renderCardList(ui, locked);
+			setItemDisabled(ui.create, locked, ui.pickReason.id);
+			setItemDisabled(ui.open, locked, ui.pickReason.id);
+			setText(ui.pickReason, lockedReason);
+			ui.pickReason.hidden = !lockedReason;
+		} else if (ui.view === 'more') {
+			const c = cards.list.get(ui.target);
+			const other = slotOf(c.id);
+			setText(ui.moreName, c.name);
+			rich(ui.moreWhere, other >= 0 ? [CARD_COPY.inOther(other + 1)] : cardWhere(c));
+			setText(ui.moreDeleteLabel, c.handle ? 'Remove from list' : 'Delete');
+			const href = icon(c.handle ? 'x' : 'trash');
+			if (ui.moreDeleteIcon.getAttribute('href') !== href)
+				ui.moreDeleteIcon.setAttribute('href', href);
+			setItemDisabled(ui.moreRename, locked, ui.moreReason.id);
+			setItemDisabled(ui.moreCopy, false);
+			setItemDisabled(ui.moreDelete, locked || other >= 0, ui.moreReason.id);
+			const reason = lockedReason || (other >= 0 ? CARD_COPY.unplugFirst(other + 1) : '');
+			setText(ui.moreReason, reason);
+			ui.moreReason.hidden = !reason;
+		} else if (ui.view === 'name') {
+			setText(ui.nameOk, ui.nameMode === 'new' ? 'Create' : 'Rename');
+			const c = ui.nameMode === 'rename' ? cards.list.get(ui.target) : null;
+			setText(ui.formTitle, c ? CARD_COPY.renameTitle(c.name) : CARD_COPY.newTitle(slot + 1));
+			ui.nameInput.setAttribute('aria-invalid', ui.error ? 'true' : 'false');
+		} else if (ui.view === 'confirm') {
+			const c = cards.list.get(ui.target);
+			setText(ui.confirmQ, CARD_COPY.confirmDelete(c.name));
+		}
+		setText(ui.errorLine, ui.error);
+		ui.errorLine.hidden = !ui.error;
+	}
+
+	// The picker's rows, rebuilt only when what they show changes (focus stays on the same card).
+	function renderCardList(ui, locked) {
+		const rows = cardsForPicker(ui.slot).map((c) => {
+			const other = slotOf(c.id);
+			return { id: c.id, name: c.name, where: other >= 0 ? [CARD_COPY.inOther(other + 1)] : c.handle && !c.unlinked ? [{ name: c.file }, CARD_COPY.onDisk] : cardWhere(c),
+				disabled: locked || other >= 0 };
+		});
+		const key = JSON.stringify(rows);
+		if (key === ui.listKey)
+			return;
+		ui.listKey = key;
+		const a = document.activeElement;
+		const focusId = a && ui.list.contains(a) ? a.closest('.card-row').dataset.id : null;
+		const focusMore = !!(a && a.classList.contains('card-more'));
+		ui.list.textContent = '';
+		ui.list.hidden = rows.length === 0;
+		for (const r of rows) {
+			const row = document.createElement('div');
+			row.className = 'card-row';
+			row.dataset.id = r.id;
+			const pick = document.createElement('button');
+			pick.type = 'button';
+			pick.className = 'menu-item card-pick';
+			pick.appendChild(svgIcon('sim-card', 'icon'));
+			const text = span('card-pick-text', '');
+			text.appendChild(span('card-pick-name', r.name));
+			const where = span('card-pick-where', '');
+			rich(where, r.where);
+			text.appendChild(where);
+			pick.appendChild(text);
+			if (r.disabled)
+				setItemDisabled(pick, true, locked ? ui.pickReason.id : null);
+			pick.addEventListener('click', () => {
+				if (isDisabled(pick))
+					return;
+				cardAction(ui, () => plugCard(ui.slot, r.id));
+			});
+			const more = document.createElement('button');
+			more.type = 'button';
+			more.className = 'btn-icon card-more';
+			more.setAttribute('aria-label', `More for ${r.name}`);
+			more.appendChild(svgIcon('dots-three', 'icon'));
+			more.addEventListener('click', () => {
+				ui.target = r.id;
+				setCardView(ui, 'more');
+			});
+			row.append(pick, more);
+			ui.list.appendChild(row);
+			if (r.id === focusId)
+				queueMicrotask(() => (focusMore ? more : pick).focus({ preventScroll: true }));
+		}
+	}
+
+	function startNameForm(ui, mode, id, back) {
+		ui.nameMode = mode;
+		ui.target = id;
+		ui.back = back;
+		ui.nameInput.value = mode === 'new' ? defaultCardName() : cards.list.get(id).name;
+		setCardView(ui, 'name');
+	}
+
+	async function submitNameForm(ui) {
+		const name = cleanCardName(ui.nameInput.value);
+		ui.nameInput.value = name;
+		if (ui.nameMode === 'rename') {
+			const problem = renameCard(ui.target, name);
+			if (problem) {
+				showCardError(ui, problem);
+				ui.nameInput.focus({ preventScroll: true });
+				return;
+			}
+			setCardView(ui, ui.back);
+			return;
+		}
+		const problem = cardNameProblem(name);
+		if (problem) {
+			showCardError(ui, problem);
+			ui.nameInput.focus({ preventScroll: true });
+			return;
+		}
+		const result = await cardAction(ui, () => createCard(ui.slot, name));
+		if (result === null && cardMenuIsOpen(ui))
+			ui.nameInput.focus({ preventScroll: true }); // the save dialog was cancelled
+	}
+
+	function wireCardUi(ui) {
+		const { menu, btn } = ui;
+		menu.addEventListener('beforetoggle', (e) => {
+			if (e.newState === 'open') {
+				ui.view = cards.slots[ui.slot] ? 'plugged' : 'picker';
+				ui.error = '';
+				ui.listKey = '';
+				placeCardMenu(ui);
+			}
+		});
+		menu.addEventListener('toggle', (e) => {
+			const open = e.newState === 'open';
+			btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+			if (open) {
+				renderCardMenu(ui);
+				focusCardView(ui);
+			} else {
+				const a = document.activeElement;
+				if (!a || a === document.body || menu.contains(a))
+					btn.focus({ preventScroll: true });
+			}
+			updateChrome();
+		});
+		menu.addEventListener('focusout', (e) => {
+			const to = e.relatedTarget;
+			if (to && !menu.contains(to) && to !== btn)
+				hideCardMenu(ui);
+		});
+		window.addEventListener('resize', () => {
+			if (cardMenuIsOpen(ui))
+				placeCardMenu(ui);
+		});
+		const on = (el, fn) => el.addEventListener('click', (e) => {
+			if (!isDisabled(el))
+				fn(e);
+		});
+		on(ui.unplug, () => {
+			requestUnplug(ui.slot);
+			if (cards.pending[ui.slot] === 'unplug' && !cards.busyOp[ui.slot]) {
+				renderCardMenu(ui); // waits for the save: the menu says so
+				focusCardView(ui);
+				return;
+			}
+			hideCardMenu(ui);
+			btn.focus({ preventScroll: true });
+		});
+		on(ui.rename, () => startNameForm(ui, 'rename', cards.slots[ui.slot], 'plugged'));
+		on(ui.copy, () => cardAction(ui, () => saveCardCopy(cards.slots[ui.slot]), false));
+		on(ui.create, () => startNameForm(ui, 'new', null, 'picker'));
+		on(ui.open, () => {
+			if (hasFileAccess()) {
+				cardAction(ui, () => openCardFile(ui.slot, null));
+				return;
+			}
+			const input = $('card-input');
+			input.dataset.slot = String(ui.slot);
+			input.click();
+		});
+		on(ui.moreRename, () => startNameForm(ui, 'rename', ui.target, 'more'));
+		on(ui.moreCopy, () => cardAction(ui, () => saveCardCopy(ui.target), false));
+		on(ui.moreDelete, () => {
+			const c = cards.list.get(ui.target);
+			if (!c)
+				return;
+			if (c.handle) {
+				cardAction(ui, () => deleteCard(c.id), false).then(() => setCardView(ui, 'picker'));
+				return;
+			}
+			setCardView(ui, 'confirm');
+		});
+		on(ui.moreBack, () => setCardView(ui, 'picker'));
+		ui.form.addEventListener('submit', (e) => {
+			e.preventDefault();
+			submitNameForm(ui);
+		});
+		ui.nameCancel.addEventListener('click', () => setCardView(ui, ui.back));
+		ui.keep.addEventListener('click', () => setCardView(ui, 'more'));
+		ui.copyFirst.addEventListener('click', async () => {
+			await cardAction(ui, () => saveCardCopy(ui.target), false);
+			if (cardMenuIsOpen(ui) && ui.view === 'confirm')
+				ui.keep.focus({ preventScroll: true });
+		});
+		ui.deleteYes.addEventListener('click', () => {
+			const id = ui.target;
+			cardAction(ui, () => deleteCard(id), false).then(() => {
+				if (cardMenuIsOpen(ui))
+					setCardView(ui, 'picker');
+			});
+		});
+	}
+
+	function renderCards() {
+		setData('cards', cards.loaded ? 'ready' : 'loading');
+		for (const ui of cardUi) {
+			renderCardButton(ui);
+			renderCardMenu(ui);
+		}
+	}
+
+	// The memory-card line of the disc title card's fine print.
+	function memcardParts() {
+		if (memcards.otherTab)
+			return [DISC_COPY.savesOtherTab];
+		if (memcards.failed || memcards.visitOnly)
+			return [DISC_COPY.savesVisit];
+		if (!cards.loaded)
+			return [];
+		const inSlots = cards.slots.map((id, i) => id ? CARD_COPY.inSlot(cards.list.get(id).name, i + 1) : null).filter(Boolean);
+		if (!inSlots.length)
+			return [CARD_COPY.noCard, { cardLink: CARD_COPY.insert }];
+		return [CARD_COPY.savesTo(inSlots.join(' and '))];
+	}
+
+	function wireCardsUi() {
+		for (let i = 0; i < CARD_SLOTS; i++)
+			cardUi.push(makeCardUi(i));
+		const input = $('card-input');
+		input.addEventListener('change', () => {
+			const file = input.files && input.files[0];
+			const slot = Number(input.dataset.slot) || 0;
+			input.value = '';
+			if (file)
+				cardAction(cardUi[slot], () => openCardFile(slot, file));
+		});
 	}
 
 	// ---- wiring
@@ -3390,8 +4652,10 @@
 			game: { title: disc.runTitle, serial: disc.runSerial, disc: disc.runIsDisc },
 			lastDisc: disc.remembered ? disc.remembered.name : null,
 			memcards: { persistent: memcards.persistent, owner: memcards.owner, otherTab: memcards.otherTab, failed: memcards.failed,
-				saved: memcards.saved, syncing: memcards.syncing, unloadGuard: memcards.guarded, writes: memcards.writes,
-				savedWrites: memcards.savedWrites, failures: memcards.failures, gaveUp: memcards.gaveUp, visitOnly: memcards.visitOnly },
+				loaded: cards.loaded, syncing: memcards.syncing, unloadGuard: memcards.guarded, writes: memcards.writes,
+				savedWrites: memcards.savedWrites, failures: memcards.failures, gaveUp: memcards.gaveUp, visitOnly: memcards.visitOnly,
+				slots: cards.slots.map((id) => id ? cards.list.get(id).name : null), pending: cards.pending.slice(),
+				library: [...cards.list.values()].map((c) => ({ name: c.name, file: c.file, unlinked: !!c.unlinked })) },
 		}),
 	});
 
@@ -3972,7 +5236,8 @@
 		const a = document.activeElement;
 		if (!a || a === document.body || a === document.documentElement)
 			return captureActive();
-		if (els.biosMenu.contains(a) || discEls.menu.contains(a) || soundEls.menu.contains(a) || els.about.contains(a))
+		if (els.biosMenu.contains(a) || discEls.menu.contains(a) || soundEls.menu.contains(a) || els.about.contains(a) ||
+			cardUi.some((ui) => ui.menu.contains(a)))
 			return false;
 		return els.theatre.contains(a);
 	}
@@ -4012,13 +5277,13 @@
 	// Esc hides a transport tooltip (hovered or focused) until the pointer and focus have left
 	// its button (WCAG 1.4.13).
 	function dismissTips() {
-		for (const b of document.querySelectorAll('.t-btn:hover, .t-btn:focus-visible'))
+		for (const b of document.querySelectorAll(':is(.t-btn, .card-btn):is(:hover, :focus-visible)'))
 			b.classList.add('tip-off');
 	}
 
 	// Esc: native dialog/popover close first, then a drawer, then the keyboard.
 	function onEscape(e) {
-		if (els.about.open || menuOpen() || discMenuOpen() || soundMenuOpen() || gfxMenuOpen())
+		if (els.about.open || menuOpen() || discMenuOpen() || cardMenuOpen() || soundMenuOpen() || gfxMenuOpen())
 			return;
 		dismissTips();
 		const a = document.activeElement;
@@ -5432,7 +6697,7 @@
 
 	function chromeMayHide() {
 		return pageState() === 'running' && captureActive() && document.hasFocus() &&
-			!page.drawer && !menuOpen() && !discMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
+			!page.drawer && !menuOpen() && !discMenuOpen() && !cardMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
 			!pointerOverChrome && !page.keepChrome && hoverQuery.matches;
 	}
 
@@ -5654,7 +6919,7 @@
 	}
 
 	// Rich text: strings, { name } (mono file name), { num, unit }, { sep }, { br }, { line }
-	// (a mono line of its own) and { link, href }. Rebuilt only when the parts change.
+	// (a mono line of its own), { link, href }, and buttons that look like links ({ logLink }, { discLink }, { cardLink }). Rebuilt only when the parts change.
 	const richKeys = new WeakMap();
 	function rich(el, parts) {
 		const key = JSON.stringify(parts);
@@ -5699,6 +6964,13 @@
 				b.className = 'link-btn';
 				b.textContent = p.discLink;
 				b.addEventListener('click', reopenLastDisc);
+				el.appendChild(b);
+			} else if (p.cardLink !== undefined) {
+				const b = document.createElement('button');
+				b.type = 'button';
+				b.className = 'link-btn';
+				b.textContent = p.cardLink;
+				b.addEventListener('click', () => openCardMenu(0));
 				el.appendChild(b);
 			}
 		}
@@ -6077,6 +7349,7 @@
 		renderReadout(state);
 		renderBiosMenu();
 		renderDiscMenu();
+		renderCards();
 		audioSync(state);
 		renderSound();
 		els.btnFs.hidden = !fullscreenSupported();
@@ -6294,7 +7567,7 @@
 		});
 
 		// A tooltip hidden with Esc stays hidden until both the pointer and focus have left its button.
-		for (const b of document.querySelectorAll('.t-btn')) {
+		for (const b of document.querySelectorAll('.t-btn, .card-btn')) {
 			const clearTipOff = () => setTimeout(() => {
 				if (!b.matches(':hover') && document.activeElement !== b)
 					b.classList.remove('tip-off');
@@ -6544,6 +7817,7 @@
 	function main() {
 		wireUi();
 		wireDiscUi();
+		wireCardsUi();
 		observeCanvasSize();
 		wireSoundUi();
 		wireGfxUi();
@@ -6574,6 +7848,7 @@
 		}
 		if (navigator.serviceWorker && navigator.serviceWorker.controller)
 			pageLog('A service worker (coi-serviceworker.js) serves this page and adds the cross-origin isolation headers.');
+		loadCardLibrary();
 
 		const biosParam = params.get('bios');
 		const discParam = params.get('disc');
