@@ -1060,6 +1060,7 @@ p.fine {
 }
 
 .gp-unused,
+.gp-taps,
 .gp-empty {
   font-size: 13px;
   line-height: 18px;
@@ -1069,6 +1070,11 @@ p.fine {
 
 .gp-actions {
   margin-top: 4px;
+}
+
+.gp-taps code {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
 }
 
 .gp-actions .btn-quiet {

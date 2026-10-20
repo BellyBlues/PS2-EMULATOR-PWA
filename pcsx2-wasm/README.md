@@ -192,6 +192,8 @@ pad through `pcsx2web_test_pad_state`:
 node tools/wasm/pad-test.mjs --bios-dir DIR --bios FILE   # [--root build-wasm/bin] [--chrome PATH]
 ```
 
+In Firefox (and Zen), quick gamepad taps can be lost unless `dom.gamepad.non_standard_events.enabled` is set to true in `about:config`: release builds hand the page some taps' press and release together, and only those (non-standard) events say which button it was. The Gamepad tab says so.
+
 In Firefox (and Zen) the page draws through the 2D canvas under Auto, because the WebGPU display stops after its first frame there (measured in Zen 1.22 on macOS); choosing GPU in the Graphics menu, or `?gpu=1`, still tries WebGPU.
 
 Frames are identified by the vsync they show, counted from boot, not by how many were presented:

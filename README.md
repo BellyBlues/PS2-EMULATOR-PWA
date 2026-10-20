@@ -34,7 +34,8 @@ Early and experimental.
   playable yet. Drawing is not what slows it down.
 - Gamepads play too (the standard layout of Xbox, DualShock, DualSense and Switch Pro pads; any other
   gamepad can be mapped by its owner), and the
-  keyboard and each gamepad can be Player 1 or Player 2 (Keys, then Gamepad).
+  keyboard and each gamepad can be Player 1 or Player 2 (Keys, then Gamepad). In Firefox and Zen, set
+  `dom.gamepad.non_standard_events.enabled` to true in `about:config`, or quick taps can be lost.
 - Not there yet: save states, rumble, remapping keys and buttons, compressed disc images (CHD, CSO, GZ), and swapping discs
   while a game runs.
 - Desktop Chrome and Edge are the targets. Other browsers may work; phones are not supported yet.
