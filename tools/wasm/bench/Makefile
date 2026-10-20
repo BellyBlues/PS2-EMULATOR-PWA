@@ -22,5 +22,7 @@ clean:
 clean-objs:
 	rm -f $(EE_OBJS)
 
+ifneq ($(PS2SDK),)
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal
+endif

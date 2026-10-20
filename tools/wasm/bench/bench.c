@@ -8,7 +8,8 @@
 // to the GS: textured, Gouraud-shaded, Z-buffered triangle strips, a floor and see-through
 // shadows. The number of figures steps through PHASE_COUNTS, PHASE_FRAMES frames each, and the
 // program prints "BENCH phase N=<figures> frame=<frame>" at every step so a runner can tell
-// the phases apart. It draws at most one frame per vsync, like a game.
+// the phases apart. It draws at most one frame per vsync and sleeps on interrupts while it waits,
+// like a game.
 
 #include <dma.h>
 #include <draw.h>
@@ -96,6 +97,7 @@ static const float FIGURE_COLOURS[4][3] = {
 
 // Per-frame data the DMA chain points at, one set per frame in flight.
 // Each block: colour, light, screen offset, matrix (7 quadwords, VU1 addresses 2 to 8).
+#define BLOCK_QW 7
 #define MAX_BLOCKS (MAX_FIGURES * (BONES + 1) + 1)
 static qword_t* s_blocks[2];
 static packet2_t* s_chain[2];
@@ -112,6 +114,7 @@ static texbuffer_t s_tex;
 static clutbuffer_t s_clut;
 static lod_t s_lod;
 static blend_t s_blend;
+static texwrap_t s_wrap;
 
 // ------------------------------------------------------------------ meshes
 
@@ -367,8 +370,8 @@ static void build_frame(int ctx, int frame, int figures)
 	{
 		MATRIX identity;
 		matrix_unit(identity);
-		block_fill(&blocks[used], white, 128.0f, identity, s_view_screen, 0.35f);
-		chain_mesh(chain, &s_floor, KIND_LIT_TEXTURED, &blocks[used]);
+		block_fill(&blocks[BLOCK_QW * used], white, 128.0f, identity, s_view_screen, 0.35f);
+		chain_mesh(chain, &s_floor, KIND_LIT_TEXTURED, &blocks[BLOCK_QW * used]);
 		used++;
 	}
 
@@ -407,8 +410,8 @@ static void build_frame(int ctx, int frame, int figures)
 			matrix_multiply(bone_screen, world[b], s_view_screen);
 			matrix_multiply(local_screen, mesh_local, bone_screen);
 
-			block_fill(&blocks[used], FIGURE_COLOURS[f % 4], 128.0f, world[b], local_screen, 0.3f);
-			chain_mesh(chain, &s_ellipsoid, KIND_LIT_TEXTURED, &blocks[used]);
+			block_fill(&blocks[BLOCK_QW * used], FIGURE_COLOURS[f % 4], 128.0f, world[b], local_screen, 0.3f);
+			chain_mesh(chain, &s_ellipsoid, KIND_LIT_TEXTURED, &blocks[BLOCK_QW * used]);
 			used++;
 		}
 
@@ -423,8 +426,8 @@ static void build_frame(int ctx, int frame, int figures)
 			shadow[13] = 0.02f;
 			shadow[14] = pos[2];
 			matrix_multiply(shadow_screen, shadow, s_view_screen);
-			block_fill(&blocks[used], black, 72.0f, NULL, shadow_screen, 1.0f);
-			chain_mesh(chain, &s_ellipsoid, KIND_SHADOW, &blocks[used]);
+			block_fill(&blocks[BLOCK_QW * used], black, 72.0f, NULL, shadow_screen, 1.0f);
+			chain_mesh(chain, &s_ellipsoid, KIND_SHADOW, &blocks[BLOCK_QW * used]);
 			used++;
 		}
 
@@ -481,7 +484,7 @@ static void upload_texture(void)
 	packet2_update(p, draw_texture_transfer(p->next, pixels, 64, 64, GS_PSM_32, s_tex.address, s_tex.width));
 	packet2_update(p, draw_texture_flush(p->next));
 	dma_channel_send_packet2(p, DMA_CHANNEL_GIF, 1);
-	dma_wait_fast();
+	dma_channel_wait(DMA_CHANNEL_GIF, 0);
 	packet2_free(p);
 	free(pixels);
 }
@@ -523,6 +526,10 @@ static void init_gs(void)
 	s_lod.l = 0;
 	s_lod.k = 0;
 
+	s_wrap.horizontal = WRAP_REPEAT;
+	s_wrap.vertical = WRAP_REPEAT;
+	s_wrap.minu = s_wrap.maxu = s_wrap.minv = s_wrap.maxv = 0;
+
 	// (Cs - Cd) * As + Cd
 	s_blend.color1 = BLEND_COLOR_SOURCE;
 	s_blend.color2 = BLEND_COLOR_DEST;
@@ -537,7 +544,7 @@ static void init_gs(void)
 	packet2_update(p, draw_primitive_xyoffset(p->next, 0, 2048 - SCREEN_W / 2, 2048 - SCREEN_H / 2));
 	packet2_update(p, draw_finish(p->next));
 	dma_channel_send_packet2(p, DMA_CHANNEL_GIF, 1);
-	dma_wait_fast();
+	dma_channel_wait(DMA_CHANNEL_GIF, 0);
 	packet2_free(p);
 }
 
@@ -552,6 +559,7 @@ static void begin_gs_frame(int draw)
 	packet2_update(p, draw_enable_tests(p->next, 0, &s_z));
 	packet2_update(p, draw_texturebuffer(p->next, 0, &s_tex, &s_clut));
 	packet2_update(p, draw_texture_sampling(p->next, 0, &s_lod));
+	packet2_update(p, draw_texture_wrapping(p->next, 0, &s_wrap));
 	packet2_update(p, draw_alpha_blending(p->next, 0, &s_blend));
 	packet2_update(p, draw_finish(p->next));
 	dma_channel_send_packet2(p, DMA_CHANNEL_GIF, 1);
@@ -559,12 +567,65 @@ static void begin_gs_frame(int draw)
 	draw_wait_finish();
 }
 
+// Games sleep until an interrupt instead of polling registers: the EE thread waits on a semaphore
+// that the vblank and VIF1 DMA-end handlers signal, so the kernel's idle loop runs meanwhile.
+static int s_vsync_sema = -1;
+static int s_vif1_sema = -1;
+
+static s32 vsync_handler(s32 cause)
+{
+	iSignalSema(s_vsync_sema);
+	ExitHandler();
+	return 0;
+}
+
+static s32 vif1_handler(s32 channel)
+{
+	iSignalSema(s_vif1_sema);
+	ExitHandler();
+	return 0;
+}
+
+static int create_sema(void)
+{
+	ee_sema_t sema;
+	memset(&sema, 0, sizeof(sema));
+	sema.init_count = 0;
+	sema.max_count = 1;
+	return CreateSema(&sema);
+}
+
+static void init_interrupts(void)
+{
+	s_vsync_sema = create_sema();
+	s_vif1_sema = create_sema();
+	AddIntcHandler(INTC_VBLANK_S, vsync_handler, 0);
+	EnableIntc(INTC_VBLANK_S);
+	AddDmacHandler(DMAC_VIF1, vif1_handler, 0);
+	EnableDmac(DMAC_VIF1);
+}
+
+// Sleeps until the next vblank starts.
+static void wait_vsync(void)
+{
+	PollSema(s_vsync_sema); // drop a vblank that came while the frame was being built
+	WaitSema(s_vsync_sema);
+}
+
+// Sleeps until the chain sent with send_chain() has been transferred, then waits the few cycles
+// VIF1 may still need for the chain's final FLUSH (VU1 done, its last XGKICK sent).
 static void wait_vif1_idle(void)
 {
-	dma_channel_wait(DMA_CHANNEL_VIF1, 0);
+	WaitSema(s_vif1_sema);
 	volatile u32* vif1_stat = (volatile u32*)0x10003C00;
 	while ((*vif1_stat & 0x0F) || ((*vif1_stat >> 24) & 0x1F))
 		;
+}
+
+static void send_chain(packet2_t* chain)
+{
+	PollSema(s_vif1_sema);
+	dma_channel_send_packet2(chain, DMA_CHANNEL_VIF1, 0);
 }
 
 int main(int argc, char* argv[])
@@ -573,11 +634,10 @@ int main(int argc, char* argv[])
 
 	dma_channel_initialize(DMA_CHANNEL_GIF, NULL, 0);
 	dma_channel_initialize(DMA_CHANNEL_VIF1, NULL, 0);
-	dma_channel_fast_waits(DMA_CHANNEL_GIF);
-	dma_channel_fast_waits(DMA_CHANNEL_VIF1);
 
 	upload_vu1_program();
 	init_gs();
+	init_interrupts();
 	upload_texture();
 	build_ellipsoid();
 	build_floor();
@@ -595,7 +655,7 @@ int main(int argc, char* argv[])
 	const int max_batches = s_floor.batches + MAX_FIGURES * (BONES + 1) * s_ellipsoid.batches;
 	for (int i = 0; i < 2; i++)
 	{
-		s_blocks[i] = (qword_t*)memalign(64, sizeof(qword_t) * 7 * MAX_BLOCKS);
+		s_blocks[i] = (qword_t*)memalign(64, sizeof(qword_t) * BLOCK_QW * MAX_BLOCKS);
 		s_chain[i] = packet2_create(4 * max_batches + 4, P2_TYPE_NORMAL, P2_MODE_CHAIN, 1);
 	}
 	s_gs_setup = packet2_create(64, P2_TYPE_NORMAL, P2_MODE_NORMAL, 0);
@@ -614,13 +674,14 @@ int main(int argc, char* argv[])
 		build_frame(ctx, frame, figures);
 		FlushCache(0);
 
-		wait_vif1_idle();
-		graph_wait_vsync();
+		if (frame > 0)
+			wait_vif1_idle();
+		wait_vsync();
 		if (frame > 0)
 			graph_set_framebuffer_filtered(s_frame[draw].address, SCREEN_W, GS_PSM_32, 0, 0);
 		draw ^= 1;
 		begin_gs_frame(draw);
-		dma_channel_send_packet2(s_chain[ctx], DMA_CHANNEL_VIF1, 0);
+		send_chain(s_chain[ctx]);
 		ctx ^= 1;
 	}
 	return 0;
