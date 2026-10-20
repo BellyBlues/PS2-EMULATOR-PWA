@@ -26,7 +26,7 @@ The page is one column, top to bottom:
 There is also a BIOS-menu popover, a Sound popover (§11) and an About dialog. Before play, the slate holds the single primary action. During play, the transport does.
 
 Space reserved for later, with no controls today:
-- memory-card and save-state slots, left of the disc menu (the disc slot is in use, see §10)
+- save-state slots, left of the memory cards (the disc slot and the memory-card slots are in use, see §10 and §14)
 - Settings, as a third drawer
 
 **Flows:**
@@ -190,7 +190,7 @@ The total is about 124 KB.
 - **Readout.** Not a live region. It shows "—" while starting, and hidden text adds the frame size. When the lights are down, only the speed stays, in ink-3. The slow-speed hint adds to it and never replaces it.
 - **Subtitle** (`role="status"`). The newest replaces the last. It stays 4 s (8 s for the first-boot hint) and pauses on hover. It is only for confirmations and hints.
 - **Transport** (`role="group"`).
-  - Left: Stop (while starting or running), then the disc menu (while a disc is chosen, §10), then the BIOS menu.
+  - Left: Stop (while starting or running), then Card 1 and Card 2 (§14), then the disc menu (while a disc is chosen, §10), then the BIOS menu.
   - Right: Sound (a popover, §11), Crisp (`aria-pressed`), Keys and Log (`aria-expanded`), Fullscreen.
   - Labels show at 1024 px and wider. Narrower than that, buttons are icons only, with a CSS tooltip on hover and `:focus-visible` that includes the shortcut. On `hover: none` devices the labels sit under the icons.
 - **BIOS menu** (popover).
@@ -292,7 +292,7 @@ With reduced motion, every duration is 0. The controls still hide.
   - "About TabStationToo."
   - "PCSX2, compiled to WebAssembly, running entirely in this tab."
   - "Use only a BIOS dumped from a console you own. It's kept in this browser (IndexedDB), never sent anywhere, and you can forget it from the BIOS menu."
-  - "Works today: the BIOS menus and games from disc images, with sound, a keyboard and gamepads, and a memory card kept in this browser. Most games run well below full speed for now. Not yet: save states."
+  - "Works today: the BIOS menus and games from disc images, with sound, a keyboard and gamepads, and memory cards kept in this browser or in files on your disk. Most games run well below full speed for now. Not yet: save states."
   - "Built from PCSX2, GPL-3.0-or-later. Source"
   - "PlayStation and PS2 are trademarks of Sony Interactive Entertainment. This project isn't affiliated with or endorsed by Sony."
   - "Type: Archivo and Chivo Mono by Omnibus-Type (OFL 1.1). Icons: Phosphor (MIT)." Each name links to its licence file.
@@ -422,7 +422,7 @@ A disc is the second thing the page asks for, after the BIOS. It is optional: Bo
 - While the PS2 is starting or running the disc cannot change: picks and drops are refused with "Stop the PS2 first to change the disc." There is no swap or eject while running (PCSX2 can reopen the old disc only if it stays readable, and one worker serves one file).
 
 **Shown.**
-- The **disc title card** replaces the BIOS title card: the game's title (from PCSX2's game database once a boot has reported it, else the file name without its extension and region tags), then `<file> · 3.2 GB · <where>`, where is "Read from your file", "Remembered in this browser" (handle kept) or "Loaded from ?disc=, not saved". Actions: "Boot" (Enter), "Use another disc…", "Remove the disc". Fine print: "With <BIOS title>. Saves go to a memory card kept in this browser." (or "Saves last for this visit only." when IndexedDB is unavailable).
+- The **disc title card** replaces the BIOS title card: the game's title (from PCSX2's game database once a boot has reported it, else the file name without its extension and region tags), then `<file> · 3.2 GB · <where>`, where is "Read from your file", "Remembered in this browser" (handle kept) or "Loaded from ?disc=, not saved". Actions: "Boot" (Enter), "Use another disc…", "Remove the disc". Fine print: "With <BIOS title>." and the memory-card line of §14 (or "Saves last for this visit only." when IndexedDB is unavailable).
 - **Boot** first reads the start of the disc (milliseconds; at most 5 s for a server that does not answer). If that fails, nothing boots and the slate shows the error below, so a disc that went away never leaves the boot hanging in "Starting the PS2…". Meanwhile the boot is queued: past 0.3 s the slate is the queued variant titled "Reading the disc…" (announced "Reading the disc."), and pressing Boot again cancels it. Boot pressed while the disc is still opening (`?disc=`, a disc just chosen, a disc reader being restarted) is queued the same way.
 - **Starting:** "Starting the PS2…" / `<disc file> · 4 s`. **Stopped:** `<game title> · ran 04:12`. **Failed:** "PCSX2 couldn't boot <disc file>. The end of the log:".
 - **Transport:** a disc menu button (`#disc-btn`, icon `disc`, the game's title, ellipsised at 16rem; 9rem under 640 px) sits left of the BIOS menu and appears only while a disc is chosen. Its popover (`#disc-menu`, like the BIOS menu) shows the file name and where it comes from, then "Choose another disc…" and "Remove the disc". While the PS2 runs, the items are `aria-disabled` and described by "Stop the PS2 to change the disc." The button's accessible name is "Disc: <title>".
@@ -439,8 +439,7 @@ A disc is the second thing the page asks for, after the BIOS. It is optional: Bo
 - While running, from a file: "The disc can't be read any more. Stop, then choose the file again." From `?disc=`: "The disc server stopped answering, so the game can't read its disc." (no answer, or no connection) or "The game can't read its disc from the server any more." (anything else). A disc reader that had to be restarted and could not take the disc over counts as a read failure. A reader that stops while it opens a disc is restarted and opens that disc again; when no reader can start any more: "The disc reader stopped working. Reload the page to read discs again."
 - When reads work again during the same run (the server answers again): the subtitle "The disc can be read again. If the game doesn't go on, stop it and boot again." (a game that already got a read error may not retry).
 
-**Memory card.** Slot 1 is a memory card file kept in IndexedDB: copied there 1.5 s after the game stops writing to it, at once when the PS2 stops (only if the card changed), and when the page is hidden. From the first write until that copy is done, closing or reloading the page brings up the browser's own "Leave site?" question, because the copy cannot finish during an unload. There is no memory-card control yet. A copy that fails is tried again after 2, 5 and 15 s (the copy when the page is hidden or left does not wait for that pause, and its failure does not count). After that the page stops trying until the game writes to the card again and drops the "Leave site?" question; the fine print reads "Saves last for this visit only." until a copy works again, and one subtitle says "Couldn't keep the memory card in this browser. Saves last for this visit."
-- One tab keeps the card: the first TabStationToo tab open in the browser. A second tab loads the saved card but never writes it back, so it cannot overwrite the first tab's saves; its fine print reads "Saves last for this visit only: TabStationToo is open in another tab." Reloading it once the first tab is closed makes it the one that keeps the card.
+**Memory cards:** §14.
 
 **Announcer:** "Disc ready." · "Disc removed." · "Reading the disc."
 
@@ -526,3 +525,50 @@ The PS2 has two pad ports. Each device the page can play with (the keyboard, and
 **Microcopy:** see §7 (Keys drawer and the announcer).
 
 **Tests.** `tools/wasm/pad-test.mjs` plays a mocked `navigator.getGamepads()` and the keyboard in headless Chrome and reads each port's pad through `pcsx2web_test_pad_state`. A real controller is a manual check.
+
+## 14. Memory cards
+
+The PS2 has two memory card slots, Card 1 and Card 2. The page keeps a library of named cards; a slot holds one of them or nothing. A card is an 8 MB `.ps2` file, the format desktop PCSX2 uses, so saves move between the two. Plain words only: "memory card", "Card 1", "Card 2", no card art or logos.
+
+**The library.**
+- A card is kept in this browser (IndexedDB), or linked to a `.ps2` file on disk where the browser has the File System Access API (Chromium). A linked card also keeps a copy in the browser; when it is plugged in, the file on disk is read first (the disk wins), and every save is written back to it.
+- A card is in one slot at most. Unplugging puts it back in the library; nothing is deleted. Any number of cards (8 MB each); the page asks for persistent storage (`navigator.storage.persist()`).
+- A first visit has no cards and both slots empty. A card made by an earlier version of the page (slot 1's `Mcd001.ps2`) becomes "Memory card 1", plugged into Card 1.
+- Which card is in which slot, and the last card used in each, are remembered. A linked card whose file the browser has not allowed again since the reload comes back unplugged (one click on it in the picker asks for permission and plugs it in); one the browser still allows stays plugged in.
+- Only the cards in the slots are loaded into the emulator.
+
+**Transport.** Two menu buttons sit between Stop and the disc menu, shown while a BIOS is chosen.
+- Plugged in: the filled card icon, ink, and "1 · RPG saves" (the name ellipsised at 9rem). A 6 px amber dot on the icon while the game writes to the card (it stays 0.6 s after the last write; colour only, never animated).
+- Empty: the outline card icon, ink-3, and "Card 1 · empty".
+- Under 1024 px: the icon and the slot number, with the full label as tooltip.
+- Accessible name: "Memory card 1: RPG saves, plugged in" or "Memory card 1: empty". `aria-expanded` and `aria-controls` as the other menu buttons.
+
+**Plugged-in menu** (popover, opens upward, focuses its first item):
+- The card's name, then where it is: "In this browser", "Linked to `rpg.ps2`", or "Not linked any more" (the file could not be written; the card goes on from the browser's copy).
+- **Unplug** (focused), **Rename…**, **Save a copy to disk…** (a save dialog where the browser has one, otherwise a download).
+- While the game wrote to the card in the last 5 s (PCSX2's busy time), Unplug waits: the button reads "Card 1 · saving…" and the card unplugs itself once the write is done. The subtitle says "Card 1 will unplug when the game finishes saving."
+
+**Empty-slot menu (the picker).**
+- "Card 1 is empty." then the library: the last card used in this slot first, then the most recently used. Each row: the name, and under it "In this browser" or "`rpg.ps2` on disk". A card in the other slot is listed with "In Card 2" and `aria-disabled`. Choosing a card plugs it in.
+- Each row has a **More** button (`dots-three`, named "More for RPG saves"): **Rename…**, **Save a copy to disk…**, then **Delete** (a browser card) or **Remove from list** (a linked card; the file stays on disk).
+- Then **New card…** and **Open a card file…**. With no cards, only these two.
+- **New card…** asks for a name inline (a text field, "Create" and "Cancel"); the default is "Memory card N" with the lowest free N. With the File System Access API, a save dialog then suggests `<name>.ps2` and the card is linked to that file; otherwise it is kept in this browser. A new card is blank (all `0xFF`); the game or the console's menus format it.
+- **Open a card file…** adds an 8 MB `.ps2` file and plugs it in, named after the file without `.ps2` (" (2)" and so on when the name is taken). A file already linked in the library is plugged in instead of added twice. Anything else is refused: "That file isn't an 8 MB PS2 memory card (.ps2)."
+- Names: 1 to 32 characters, unique ignoring case. "Give the card a name." / "Another card is called that already."
+- **Delete** a browser card asks first: "Delete RPG saves? Its saves are only in this browser." with **Keep** (focused), **Save a copy first…** and **Delete** (coral). Remove from list does not ask. A card in a slot cannot be deleted; it is unplugged first.
+
+**While the PS2 runs.** Cards plug in and out at any time, unlike the disc. PCSX2 reports the slot empty for 60 frames, so the game sees the card change.
+
+**Saving.** A plugged card is copied to IndexedDB 1.5 s after the game stops writing to it, at once when the PS2 stops, when it is unplugged and when the page is hidden; a linked card is then written to its file. From the first write until the copy is done, closing or reloading the page brings up the browser's own "Leave site?" question. A copy that fails is tried again after 2, 5 and 15 s; then the page stops trying until the game writes again, the fine print reads "Saves last for this visit only." and one subtitle says "Couldn't keep the memory card in this browser. Saves last for this visit." A linked file that cannot be written: one subtitle, "Couldn't write rpg.ps2. RPG saves goes on in this browser.", and the menu shows "Not linked any more".
+
+**One tab.** The first TabStationToo tab keeps the cards. A second tab loads the cards in the slots for its visit but never writes them back; its card menus are `aria-disabled` and described by "TabStationToo is open in another tab.", and its fine print reads "Saves last for this visit only: TabStationToo is open in another tab."
+
+**Fine print** on the disc title card, after "With <BIOS title>.":
+- No card: "No memory card in. Games won't be able to save. Insert a card" ("Insert a card" opens Card 1's menu).
+- "Saves go to RPG saves in Card 1." (or Card 2) / "Saves go to RPG saves in Card 1 and Racing in Card 2."
+
+**Errors** (a coral line in the menu): "The browser has no room for another card. Delete one or save a copy to disk." · "Couldn't read that file. Try choosing it again." · "The browser didn't allow opening rpg.ps2." · "Couldn't save the card here. Try again."
+
+**Subtitles and announcer:** "RPG saves is in Card 1." · "Card 1 unplugged." · "Card 1 will unplug when the game finishes saving." · "RPG saves deleted." · "Renamed to RPG saves."
+
+**Not here:** multitap slots, PS1 cards, folder cards, cards larger than 8 MB, and a list of the saves on a card.
