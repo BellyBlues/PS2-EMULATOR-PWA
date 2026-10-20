@@ -27,6 +27,8 @@
 //   --param K=V          extra query parameter for the page (repeatable), e.g. --param renderer=sw,
 //                        --param gpu=1, --param set=EmuCore/GS/extrathreads=4
 //   --query Q            extra query string, appended as is (e.g. "gpu=0&eejit=0")
+//   --pref K=V           Zen/Firefox only: a preference for the fresh profile (repeatable; V is
+//                        true, false, a number or a string), e.g. to compare JavaScript engine settings
 //   --root DIR           the web root (default build-wasm/bin)
 //   --port N             serve.py's port on 127.0.0.1 (default: a free one)
 //   --out FILE           the JSON results (default: <tmp>/tst-bench-<browser>-<time>.json); the
@@ -64,7 +66,7 @@ function usage() {
 
 function parseArgs(argv) {
 	const o = { bios: null, elf: null, browser: "zen", browserPath: null, headless: false, seconds: 60, vsyncs: 0,
-		phases: 0, sampleMs: 1000, unlimited: false, params: [], query: "", root: path.join(REPO, "build-wasm/bin"),
+		phases: 0, sampleMs: 1000, unlimited: false, params: [], prefs: [], query: "", root: path.join(REPO, "build-wasm/bin"),
 		port: 0, out: null, bootTimeout: 120, quiet: false };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
@@ -84,6 +86,7 @@ function parseArgs(argv) {
 		else if (a === "--unlimited") o.unlimited = true;
 		else if (a === "--param") o.params.push(v());
 		else if (a === "--query") o.query = v().replace(/^[?&]/, "");
+		else if (a === "--pref") o.prefs.push(v());
 		else if (a === "--root") o.root = path.resolve(v());
 		else if (a === "--port") o.port = Number(v());
 		else if (a === "--out") o.out = path.resolve(v());
@@ -195,6 +198,12 @@ async function launchGecko(o, profile, onConsole, children) {
 		"app.update.disabledForTesting": true,
 		"zen.welcome-screen.seen": true,
 	};
+	for (const p of o.prefs) {
+		const eq = p.indexOf("=");
+		if (eq <= 0) throw new Error(`--pref ${p}: expected K=V`);
+		const v = p.slice(eq + 1);
+		prefs[p.slice(0, eq)] = v === "true" ? true : v === "false" ? false : /^-?\d+$/.test(v) ? Number(v) : v;
+	}
 	writeFileSync(path.join(profile, "user.js"),
 		Object.entries(prefs).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${JSON.stringify(v)});`).join("\n") + "\n");
 	const port = await freePort();
