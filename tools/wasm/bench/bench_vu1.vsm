@@ -1,0 +1,77 @@
+; SPDX-FileCopyrightText: 2026 TabStationToo contributors
+; SPDX-License-Identifier: MIT
+;
+; VU1 microprogram of the benchmark: transforms, lights and projects one batch of triangle-strip
+; vertices, then sends them to the GS with XGKICK. It runs once per batch (MSCAL 0) and reads
+; everything from the current double buffer (XTOP), laid out by bench.c:
+;
+;   0       x = vertex count (integer)
+;   1       GIF tag (PRIM, NLOOP = vertex count, registers ST, RGBAQ, XYZ2)
+;   2       base colour (float RGBA, 128 = 1.0)
+;   3       light direction in the mesh's space (xyz), ambient (w)
+;   4       screen offset (2048, 2048, 0, 0)
+;   5..8    local-to-screen matrix, rows 0 to 3 (row vectors: v * M)
+;   9..     vertices, three quadwords each: position (xyz, w = 1), normal (xyz; w = 32768.0 for
+;           the first two vertices of a strip, which become the XYZ2 ADC bit), texture (s, t, 1, 0)
+;
+; The output (GIF tag, then ST, RGBAQ and XYZ2 per vertex) follows the vertices.
+; The matrix gives (x * fx, -y * fy, Zk, depth); dividing by depth gives the screen position and
+; a depth value that grows towards the camera (the Z test is GEQUAL).
+; Written one instruction per line for clarity, not scheduled for the real VU1's pipeline.
+
+		.vu
+		.align 4
+		.global	BenchVU1_CodeStart
+		.global	BenchVU1_CodeEnd
+BenchVU1_CodeStart:
+		NOP				xtop		VI02
+		NOP				ilw.x		VI03, 0(VI02)
+		NOP				lq		VF01, 1(VI02)
+		NOP				lq		VF02, 2(VI02)
+		NOP				lq		VF03, 3(VI02)
+		NOP				lq		VF04, 4(VI02)
+		NOP				lq		VF05, 5(VI02)
+		NOP				lq		VF06, 6(VI02)
+		NOP				lq		VF07, 7(VI02)
+		NOP				lq		VF08, 8(VI02)
+		NOP				iaddiu		VI04, VI02, 9
+		NOP				iadd		VI05, VI03, VI03
+		NOP				iadd		VI05, VI05, VI03
+		NOP				iadd		VI05, VI05, VI04
+		NOP				sq		VF01, 0(VI05)
+		NOP				iaddiu		VI06, VI05, 1
+vertexLoop:
+		NOP				lq		VF10, 0(VI04)
+		NOP				lq		VF11, 1(VI04)
+		NOP				lq		VF12, 2(VI04)
+		NOP				iaddi		VI03, VI03, -1
+		mulax		ACC, VF05, VF10x	NOP
+		madday		ACC, VF06, VF10y	NOP
+		maddaz		ACC, VF07, VF10z	NOP
+		maddw		VF13, VF08, VF00w	NOP
+		mul.xyz		VF14, VF11, VF03	NOP
+		NOP				div		Q, VF00w, VF13w
+		addy.x		VF14, VF14, VF14y	NOP
+		addz.x		VF14, VF14, VF14z	NOP
+		max.x		VF14, VF14, VF00	NOP
+		addw.x		VF14, VF14, VF03w	NOP
+		mulx.xyz	VF15, VF02, VF14x	NOP
+		NOP				move.w		VF15, VF02
+		ftoi0		VF15, VF15		NOP
+		ftoi0.w		VF16, VF11		NOP
+		NOP				waitq
+		mulq.xyz	VF13, VF13, Q		NOP
+		mulq.xyz	VF12, VF12, Q		NOP
+		add.xy		VF13, VF13, VF04	NOP
+		ftoi4.xyz	VF16, VF13		NOP
+		NOP				sq		VF12, 0(VI06)
+		NOP				sq		VF15, 1(VI06)
+		NOP				sq		VF16, 2(VI06)
+		NOP				iaddiu		VI04, VI04, 3
+		NOP				ibne		VI03, VI00, vertexLoop
+		NOP				iaddiu		VI06, VI06, 3
+		NOP				xgkick		VI05
+		NOP[E]				NOP
+		NOP				NOP
+		.align 4
+BenchVU1_CodeEnd:

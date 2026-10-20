@@ -177,6 +177,8 @@
 		unreadable: 'Couldn’t read that file. Try choosing it again.',
 		fetchFailed: (path, why) => `Couldn’t fetch the BIOS from ${path} (${why}).`,
 		otherOrigin: '?bios= only accepts addresses on this server.',
+		elfFetchFailed: (path, why) => `Couldn’t fetch the ELF from ${path} (${why}).`,
+		elfOtherOrigin: '?elf= only accepts addresses on this server.',
 		stored: { idb: 'Remembered in this browser', visit: 'This visit only', url: 'Loaded from ?bios=, not saved' },
 		boot: 'Boot',
 		another: 'Use another BIOS…',
@@ -1010,6 +1012,8 @@
 			args.push('-surface', TEST_SURFACE[0]);
 		if (params.get('gsidle') === 'block')
 			args.push('-gs-idle', 'block');
+		if (params.get('unlimited') === '1')
+			args.push('-unlimited');
 		if (params.get('eejit') === '0')
 			args.push('-eejit', '0');
 		if (params.get('iopjit') === '0')
@@ -1388,7 +1392,7 @@
 	}
 
 	function canBoot() {
-		return page.phase === 'ready' && !!page.bios && !!page.writtenBiosName && !page.biosReading && discBootable() &&
+		return page.phase === 'ready' && !!page.bios && !!page.writtenBiosName && !page.biosReading && discBootable() && !devElf.pending &&
 			(page.vmState === STATE.WAITING || page.vmState === STATE.STOPPED || page.vmState === STATE.FAILED);
 	}
 
@@ -2777,8 +2781,72 @@
 		});
 	}
 
-	// startVm(): a disc boot when a disc is open, otherwise the BIOS alone.
+	// ?elf=<url> (developer runs, README "Automated runs"): a PS2 executable, fetched once and booted
+	// instead of a disc or the BIOS menu, with the ?bios= BIOS. The queued ?bios= boot waits for it.
+	const ELF_DIR = '/elf';
+	const devElf = { pending: false, name: null, bytes: null };
+
+	async function loadElfFromUrl(param) {
+		const fail = (text, detail) => {
+			devElf.pending = false;
+			page.autoBoot = false;
+			showError(text);
+			if (detail)
+				pageLog(detail, 'warn');
+			render();
+		};
+		let url;
+		try {
+			url = new URL(param, location.href);
+		} catch {
+			fail(COPY.elfFetchFailed(param, 'not a valid address'));
+			return;
+		}
+		if (url.origin !== location.origin) {
+			fail(COPY.elfOtherOrigin, `Refusing to fetch an ELF from another origin: ${url.href}`);
+			return;
+		}
+		let base = url.pathname.split('/').pop() || '';
+		try {
+			base = decodeURIComponent(base);
+		} catch {
+			// keep it encoded
+		}
+		devElf.pending = true;
+		pageLog(`Fetching ELF from ${url.pathname}`);
+		try {
+			const response = await fetch(url.href, { credentials: 'same-origin', cache: 'no-store' });
+			if (!response.ok)
+				throw httpError(response.status, response.statusText, url.pathname);
+			devElf.bytes = new Uint8Array(await response.arrayBuffer());
+		} catch (err) {
+			fail(COPY.elfFetchFailed(url.pathname, downloadReason(err)), `Could not fetch the ELF from ${url.pathname}: ${errorText(err)}`);
+			return;
+		}
+		// Same rules as a BIOS name: a plain file name, written directly inside /elf.
+		devElf.name = sanitizeBiosName(base || 'boot.elf');
+		devElf.pending = false;
+		pageLog(`ELF fetched: ${devElf.name} (${devElf.bytes.length.toLocaleString('en-US')} bytes).`);
+		maybeAutoBoot();
+	}
+
+	// Writes the ELF into the module's filesystem (again: a Stop leaves it there) and boots it.
+	function bootElfRequest() {
+		const FS = window.Module.FS;
+		const path = `${ELF_DIR}/${devElf.name}`;
+		if (!FS.analyzePath(ELF_DIR).exists)
+			FS.mkdir(ELF_DIR);
+		FS.writeFile(path, devElf.bytes);
+		pageLog(`ELF boot: ${path} with ${BIOS_DIR}/${page.bios.name}.`);
+		return window.Module.ccall('pcsx2web_boot_elf', 'number', ['string', 'string'], [page.bios.name, path]);
+	}
+
+	// startVm(): an ELF boot with ?elf=, a disc boot when a disc is open, otherwise the BIOS alone.
 	function bootRequest() {
+		if (devElf.bytes) {
+			disc.runIsDisc = false;
+			return bootElfRequest();
+		}
 		const d = disc.current;
 		disc.runIsDisc = !!(d && d.opened && !disc.dead);
 		disc.runTitle = '';
@@ -7844,7 +7912,9 @@
 
 		const biosParam = params.get('bios');
 		const discParam = params.get('disc');
+		const elfParam = params.get('elf');
 		disc.urlPending = !!discParam; // a queued ?bios= boot waits for the ?disc= check
+		devElf.pending = !!elfParam; // and for the ?elf= download
 		// Touch-only devices: the download waits for a BIOS.
 		if (!touchOnlyQuery.matches || biosParam)
 			ensureRuntime();
@@ -7858,6 +7928,8 @@
 			loadDiscFromUrl(discParam);
 		else
 			loadRememberedDisc();
+		if (elfParam)
+			loadElfFromUrl(elfParam);
 	}
 
 	main();

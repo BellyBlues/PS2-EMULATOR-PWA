@@ -190,6 +190,8 @@ Switches for comparisons and tests (all optional):
 | `?iopjit=0` | Runs the IOP (I/O processor) interpreter instead of the IOP JIT, which compiles IOP code to WebAssembly at run time |
 | `?vu1jit=0` | Runs the VU1 (vector unit 1) interpreter instead of the VU1 JIT, which compiles VU1 micro programs to WebAssembly at run time |
 | `?gsidle=block` | Keeps the GS thread's idle wait blocking with WebGPU, leaving only the device's bounded event-loop turn |
+| `?unlimited=1` | Boots with the frame limiter off (as `pcsx2-headless -unlimited`), to measure speed above 100 % |
+| `?elf=<url>` | Fetches a PS2 program (same origin only) and boots it instead of a disc or the BIOS menu, with the `?bios=` BIOS and fast boot (see below) |
 
 `tools/wasm/pad-test.mjs` tests the players (the keyboard and gamepads going to port 1 or 2): it
 plays a mocked `navigator.getGamepads()` and the keyboard in headless Chrome and reads each port's
@@ -274,6 +276,21 @@ encoding, but `#`, `?`, `&`, `+` and `%` need both.
 `?fastboot=0` boots discs through the BIOS intro instead of fast boot. `window.PCSX2WebDisc.stats()`
 reports the disc (name, size, source, whether it is open), the disc reader's state and read counts,
 the game's title and serial as PCSX2 reported them, and the memory cards (library, slots, unsaved writes).
+
+PS2 programs (developer runs, for example the benchmark in `tools/wasm/bench/`):
+
+```sh
+python3 tools/wasm/serve.py --bios-dir DIR --elf tools/wasm/bench/bench.elf
+# it prints the page's link, for example
+# http://127.0.0.1:8080/index.html?bios=dev-bios/<bios>&elf=dev-elf/bench.elf
+```
+
+`--elf FILE` serves exactly that one file, read-only, under `/dev-elf/`. `?elf=<url>` (encoded like
+`?disc=`) fetches it; the queued `?bios=` boot waits for it, writes it to `/elf/<name>` in the
+module's filesystem and boots it with `pcsx2web_boot_elf()`. What the program prints reaches the log
+(and, with `?console=1`, the browser console). `node tools/wasm/bench/run-bench.mjs` drives such a
+run in Zen or Chrome and reports the speed (see its header). `pcsx2-headless -elf FILE` does the same
+without a browser.
 
 The three JITs are on by default: `?eejit=0`, `?iopjit=0` and `?vu1jit=0` switch them off one at a time (the VU0
 micro-mode JIT stays off). VU1 JIT testing (`docs/web-port/VU1-JIT-DESIGN.md`; not a user setting):
@@ -433,6 +450,7 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | --- | --- |
 | `pcsx2web_boot(name)` | boot `/bios/<name>` with no disc; 0 if accepted, -1 otherwise |
 | `pcsx2web_boot_disc(name, path, flags)` | boot the disc at `path` (`/disc/<file>`, see below) with `/bios/<name>`; `flags` 1 = full boot (BIOS intro), 0 = fast boot; 0 if accepted, -1 otherwise |
+| `pcsx2web_boot_elf(name, path)` | developer runs (`?elf=`): boot the PS2 program at `path` (`/elf/<file>`) with `/bios/<name>`, no disc, fast boot; 0 if accepted, -1 otherwise |
 | `pcsx2web_disc_block()` | address of the disc request block the disc worker serves (`DISC-DESIGN.md` §4.1) |
 | `pcsx2web_game()` | address of the running game's details: `seq, disc CRC, ELF CRC` (u32), `serial[32]`, `title[256]` (UTF-8); `seq` is odd while they change |
 | `pcsx2web_stop()` | request shutdown |

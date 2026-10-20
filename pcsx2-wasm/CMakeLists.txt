@@ -74,6 +74,7 @@ set(PCSX2_WASM_EXPORTS
 # Discs, game details and memory cards (Main.cpp).
 list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_boot_disc
+	_pcsx2web_boot_elf
 	_pcsx2web_disc_block
 	_pcsx2web_game
 	_pcsx2web_memcard

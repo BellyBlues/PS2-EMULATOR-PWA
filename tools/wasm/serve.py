@@ -28,8 +28,10 @@ site data for it is cleared, so keep such a port for --no-isolation runs.
 With --bios-dir DIR the files directly inside DIR are also served, read-only, under /dev-bios/, so
 automated runs can open index.html?bios=dev-bios/<file> and boot without picking a file. With
 --disc FILE that one disc image is served, read-only, as /dev-disc/<its file name> (nothing else in
-its directory is reachable), so automated runs can read a disc by URL. The server only ever binds to
-127.0.0.1 and never serves anything outside the web root, the BIOS directory and that one file.
+its directory is reachable), so automated runs can read a disc by URL. With --elf FILE that one PS2
+executable is served the same way, as /dev-elf/<its file name>, for index.html?elf=dev-elf/<name>. The
+server only ever binds to 127.0.0.1 and never serves anything outside the web root, the BIOS
+directory and those files.
 Requests whose Host header is not 127.0.0.1/localhost on this port are refused, so a website cannot
 use DNS rebinding to reach the server (and the BIOS or disc files) through its own hostname.
 
@@ -39,8 +41,8 @@ sectors on demand. Multiple ranges, other units and malformed headers are ignore
 it): the whole file is sent with 200.
 
 Usage:
-    python3 tools/wasm/serve.py [--port 8080] [--bios-dir DIR] [--disc FILE] [--no-isolation]
-                                [--max-age SECONDS] [--quiet] [DIRECTORY]
+    python3 tools/wasm/serve.py [--port 8080] [--bios-dir DIR] [--disc FILE] [--elf FILE]
+                                [--no-isolation] [--max-age SECONDS] [--quiet] [DIRECTORY]
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ DEFAULT_ROOT = REPO_ROOT / "build-wasm" / "bin"
 BIND_ADDRESS = "127.0.0.1"
 DEV_BIOS_PREFIX = "/dev-bios/"
 DEV_DISC_PREFIX = "/dev-disc/"
+DEV_ELF_PREFIX = "/dev-elf/"
 
 ISOLATION_HEADERS = (
     ("Cross-Origin-Opener-Policy", "same-origin"),
@@ -144,11 +147,12 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
     disable_nagle_algorithm = True
 
     def __init__(self, *args, root: Path, bios_dir: Path | None, disc: Path | None, quiet: bool,
-                 isolation: bool = True, cache_control: str = "no-store", **kwargs):
+                 isolation: bool = True, cache_control: str = "no-store", elf: Path | None = None, **kwargs):
         # Set before super().__init__(), which handles the request immediately.
         self.root = root
         self.bios_dir = bios_dir
         self.disc = disc
+        self.elf = elf
         self.quiet = quiet
         self.isolation = isolation
         self.cache_control = cache_control
@@ -188,7 +192,7 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
 
     def resolve_request(self) -> tuple[Path | None, str, str | None]:
         """Maps the request path to a file. Returns (file, kind, redirect_location), kind being
-        "web", "bios" or "disc"."""
+        "web", "bios", "disc" or "elf"."""
         raw_path = urllib.parse.urlsplit(self.path).path
         try:
             decoded = urllib.parse.unquote(raw_path, errors="strict")
@@ -218,6 +222,11 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
             if self.disc is None or decoded[len(DEV_DISC_PREFIX):] != self.disc.name:
                 return None, "disc", None
             return self.disc, "disc", None
+
+        if decoded == DEV_ELF_PREFIX.rstrip("/") or decoded.startswith(DEV_ELF_PREFIX):
+            if self.elf is None or decoded[len(DEV_ELF_PREFIX):] != self.elf.name:
+                return None, "elf", None
+            return self.elf, "elf", None
 
         parts = [p for p in decoded.split("/") if p]
         if any(p in (".", "..") or p.startswith(".") for p in parts):
@@ -287,7 +296,7 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 return None
 
-            if kind in ("bios", "disc"):
+            if kind in ("bios", "disc", "elf"):
                 ctype = "application/octet-stream"
             else:
                 ctype = MIME_TYPES.get(path.suffix.lower()) or self.guess_type(str(path))
@@ -331,6 +340,9 @@ def main() -> int:
     parser.add_argument("--disc", metavar="FILE",
                         help="also serve this one disc image, read-only, as /dev-disc/<its file name> "
                              "(for automated disc reads; nothing else in its directory is served)")
+    parser.add_argument("--elf", metavar="FILE",
+                        help="also serve this one PS2 executable, read-only, as /dev-elf/<its file name> "
+                             "(for index.html?elf=dev-elf/<name>)")
     parser.add_argument("--no-isolation", action="store_true",
                         help="leave out the COOP/COEP/CORP headers, as on GitHub Pages (the page's service "
                              "worker then adds them; it stays registered for this port)")
@@ -369,8 +381,21 @@ def main() -> int:
             print(f"error: --disc {disc}: hidden files are not served", file=sys.stderr)
             return 1
 
+    elf = None
+    if args.elf:
+        try:
+            elf = Path(args.elf).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            elf = None
+        if elf is None or not elf.is_file():
+            print(f"error: --elf {args.elf} is not a file", file=sys.stderr)
+            return 1
+        if elf.name.startswith("."):
+            print(f"error: --elf {elf}: hidden files are not served", file=sys.stderr)
+            return 1
+
     cache_control = "no-store" if args.max_age is None else f"max-age={args.max_age}"
-    handler = functools.partial(IsolatedHandler, root=root, bios_dir=bios_dir, disc=disc, quiet=args.quiet,
+    handler = functools.partial(IsolatedHandler, root=root, bios_dir=bios_dir, disc=disc, elf=elf, quiet=args.quiet,
                                 isolation=not args.no_isolation, cache_control=cache_control)
     try:
         server = http.server.ThreadingHTTPServer((BIND_ADDRESS, args.port), handler)
@@ -411,6 +436,11 @@ def main() -> int:
         print(f"  {base}index.html?{disc_query}")
         if bios_query:
             print(f"  {base}index.html?{bios_query}&{disc_query}")
+    if elf is not None:
+        elf_query = "elf=" + query_path(DEV_ELF_PREFIX.lstrip("/"), elf.name)
+        print(f"Dev ELF {elf} (read-only)")
+        if bios_query:
+            print(f"  {base}index.html?{bios_query}&{elf_query}")
     print("Press Ctrl+C to stop.", flush=True)
 
     try:

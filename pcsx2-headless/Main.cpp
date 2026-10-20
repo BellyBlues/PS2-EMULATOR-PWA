@@ -64,6 +64,7 @@ static std::string s_app_root;
 static std::string s_data_root;
 static std::string s_bios_path;
 static std::string s_boot_path;
+static std::string s_elf_path;
 static std::string s_screenshot_path;
 static GSRendererType s_renderer = GSRendererType::SW;
 static u64 s_max_frames = 600;
@@ -301,6 +302,8 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			s_data_root = argv[++i];
 		else if (arg == "-bios" && has_value)
 			s_bios_path = argv[++i];
+		else if (arg == "-elf" && has_value)
+			s_elf_path = argv[++i];
 		else if (arg == "-frames" && has_value)
 			s_max_frames = StringUtil::FromChars<u64>(argv[++i]).value_or(s_max_frames);
 		else if (arg == "-screenshot" && has_value)
@@ -434,14 +437,15 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 		}
 		else if (arg == "-help" || arg == "--help")
 		{
-			std::fprintf(stderr, "Usage: %s -approot <dir with resources/> -dataroot <dir> -bios <file> [-frames N]\n"
+			std::fprintf(stderr, "Usage: %s -approot <dir with resources/> -dataroot <dir> -bios <file> [-elf FILE] [-frames N]\n"
 								 "         [-renderer sw|null] [-screenshot file.png [-screenshot-frame N]]\n"
 								 "         [-screenshot-dir DIR (-screenshot-every N | -screenshot-frames N,N,...)]\n"
 								 "         [-fastboot | -slowboot] [-memcards] [-input SCRIPT | -input @FILE]\n"
 								 "         [-loadstate FILE] [-savestate FILE] [-unlimited]\n"
 								 "         [-wav FILE.wav [-wav-realtime [-wav-period FRAMES]]]\n"
 								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n"
-								 "         [-eejit 0|1] [-eejit-link 0|1] [-iopjit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n", argv[0]);
+								 "         [-eejit 0|1] [-eejit-link 0|1] [-iopjit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n",
+				argv[0]);
 			std::fprintf(stderr, "  -eejit 0 runs the EE interpreter instead of the EE JIT, -iopjit 0 the IOP interpreter instead of the IOP JIT;\n"
 								 "  -eejit-trace prints EE and IOP state hashes to compare runs.\n");
 #ifdef __EMSCRIPTEN__
@@ -449,6 +453,7 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-vu1jit-stats FILE] [-mtvu-sync]\n");
 #endif
 			std::fprintf(stderr, "  With no disc image the BIOS boots to its menu. -frames 0 runs until stopped.\n");
+			std::fprintf(stderr, "  -elf boots a PS2 executable (always fast boot), with the disc image in the drive if one is given.\n");
 			std::fprintf(stderr, "  The screenshot is requested at vsync N (default: 10 before the end) and shows the next frame.\n");
 			std::fprintf(stderr, "  -screenshot-dir saves DIR/frame_NNNNNN.png every N vsyncs or at the listed vsyncs.\n");
 			std::fprintf(stderr, "  -fastboot skips the BIOS intro (the desktop default); without it the intro plays.\n");
@@ -797,6 +802,9 @@ static void CPUThreadMain(std::atomic<int>* ret)
 		params.filename = s_boot_path;
 		params.source_type = s_boot_path.empty() ? CDVD_SourceType::NoDisc : CDVD_SourceType::Iso;
 		params.fast_boot = s_fast_boot.value_or(false);
+		// The real path: PCSX2 lets the ELF open itself through host: only when its path matches the
+		// host: root it derives with Path::RealPath() (on macOS /tmp is a link to /private/tmp).
+		params.elf_override = s_elf_path.empty() ? std::string() : Path::RealPath(s_elf_path);
 		params.save_state = s_load_state_path;
 		params.start_unlimited = s_unlimited;
 

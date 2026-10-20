@@ -275,15 +275,21 @@ static std::atomic<u32> s_pad_snapshot[NUM_PAD_PORTS][PAD_SNAPSHOT_WORDS];
 // plugs in to /memcards (MEMFS) and names them with pcsx2web_memcard(); it copies a card back to IndexedDB
 // after the game writes to it (app.js, "memory cards"). The CPU thread applies a change at the next vsync, or
 // at boot: PCSX2 then reports the slot empty for a moment (AutoEject), so the game sees the card change.
+//
+// ELFs (developer runs, ?elf=): the page writes the file to /elf/<name> and boots it with
+// pcsx2web_boot_elf(), with no disc and fast boot, as PCSX2 boots an ELF on the desktop.
 
 static constexpr const char* DISC_DIRECTORY = "/disc";
+static constexpr const char* ELF_DIRECTORY = "/elf";
 static constexpr const char* MEMCARD_DIRECTORY = "/memcards";
 
 // pcsx2web_boot_disc() flags.
 static constexpr int BOOT_FLAG_FULL_BOOT = 1; // run the BIOS intro instead of fast boot
+static constexpr int BOOT_FLAG_ELF = 2; // internal: s_boot_disc_path is an ELF (pcsx2web_boot_elf())
 
-// The disc for the boot request in flight; written by pcsx2web_boot_disc() between its claim of the
-// STARTING state and the request, taken by RunVM() on the CPU thread.
+// The disc (or ELF) for the boot request in flight; written by pcsx2web_boot_disc() or
+// pcsx2web_boot_elf() between its claim of the STARTING state and the request, taken by RunVM() on
+// the CPU thread.
 static char s_boot_disc_path[512];
 static std::atomic<int> s_boot_disc_flags{0};
 static std::atomic<bool> s_boot_disc_requested{false};
@@ -291,6 +297,7 @@ static std::atomic<bool> s_boot_disc_requested{false};
 struct BootDisc
 {
 	std::string path; // empty: the BIOS alone
+	std::string elf; // an ELF to boot instead of a disc
 	bool full_boot = false;
 };
 
@@ -400,15 +407,28 @@ static BootDisc TakeBootDisc()
 	BootDisc disc;
 	if (s_boot_disc_requested.exchange(false, std::memory_order_acq_rel))
 	{
-		disc.path = s_boot_disc_path;
-		disc.full_boot = (s_boot_disc_flags.load(std::memory_order_relaxed) & BOOT_FLAG_FULL_BOOT) != 0;
+		const int flags = s_boot_disc_flags.load(std::memory_order_relaxed);
+		if (flags & BOOT_FLAG_ELF)
+			disc.elf = s_boot_disc_path;
+		else
+			disc.path = s_boot_disc_path;
+		disc.full_boot = (flags & BOOT_FLAG_FULL_BOOT) != 0;
 	}
 	return disc;
 }
 
-// RunVM() has set up a BIOS boot (no disc, no fast boot); a disc boot changes that.
+// RunVM() has set up a BIOS boot (no disc, no fast boot); a disc or ELF boot changes that.
 static void MakeBootParameters(const std::string& bios_name, const BootDisc& disc, VMBootParameters* params)
 {
+	if (!disc.elf.empty())
+	{
+		// PCSX2 always fast boots an ELF: the BIOS starts it instead of its menu.
+		params->elf_override = disc.elf;
+		params->fast_boot = true;
+		Console.WriteLnFmt("pcsx2-wasm: booting ELF '{}' with BIOS '{}'", disc.elf, bios_name);
+		return;
+	}
+
 	if (disc.path.empty())
 	{
 		Console.WriteLnFmt("pcsx2-wasm: booting BIOS '{}'", bios_name);
@@ -466,12 +486,50 @@ EMSCRIPTEN_KEEPALIVE int pcsx2web_boot_disc(const char* bios_filename, const cha
 
 	std::memcpy(s_boot_bios_name, bios_filename, bios_length + 1);
 	std::memcpy(s_boot_disc_path, disc_path, disc_length + 1);
-	s_boot_disc_flags.store(flags, std::memory_order_relaxed);
+	s_boot_disc_flags.store(flags & BOOT_FLAG_FULL_BOOT, std::memory_order_relaxed);
 	s_boot_disc_requested.store(true, std::memory_order_release);
 	s_stop_requested.store(false, std::memory_order_release);
 	// The last Stop cancelled disc reads; this boot reads again. Here, before the request, and on the page's
 	// thread like pcsx2web_stop(): a Stop that follows this call always cancels this boot's reads.
 	WebDisc::ResumeReads();
+	s_boot_request.store(1, std::memory_order_release);
+	emscripten_futex_wake(&s_boot_request, 1);
+	return 0;
+}
+
+/// Developer runs (?elf=): boots the PS2 executable at elf_path ("/elf/<name>", which the page wrote)
+/// with the BIOS named bios_filename inside /bios, without a disc. 0 if accepted; -1 as
+/// pcsx2web_boot(), or if elf_path is not a file directly inside /elf.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_boot_elf(const char* bios_filename, const char* elf_path)
+{
+	if (!bios_filename || !elf_path || s_fatal_error.load(std::memory_order_acquire) || VU1JitFuzzRunning())
+		return -1;
+
+	const size_t bios_length = std::strlen(bios_filename);
+	const size_t elf_length = std::strlen(elf_path);
+	const size_t dir_length = std::strlen(ELF_DIRECTORY);
+	const char* elf_name = (elf_length > dir_length) ? elf_path + dir_length + 1 : elf_path;
+	if (bios_length == 0 || bios_length >= sizeof(s_boot_bios_name) || std::strchr(bios_filename, '/') ||
+		std::strcmp(bios_filename, ".") == 0 || std::strcmp(bios_filename, "..") == 0 ||
+		elf_length >= sizeof(s_boot_disc_path) || elf_length <= dir_length + 1 ||
+		std::strncmp(elf_path, ELF_DIRECTORY, dir_length) != 0 || elf_path[dir_length] != '/' ||
+		std::strchr(elf_name, '/') || std::strcmp(elf_name, ".") == 0 || std::strcmp(elf_name, "..") == 0)
+	{
+		return -1;
+	}
+
+	int state = s_state.load(std::memory_order_acquire);
+	do
+	{
+		if (state == WEB_STATE_STARTING || state == WEB_STATE_RUNNING)
+			return -1;
+	} while (!s_state.compare_exchange_weak(state, WEB_STATE_STARTING, std::memory_order_acq_rel));
+
+	std::memcpy(s_boot_bios_name, bios_filename, bios_length + 1);
+	std::memcpy(s_boot_disc_path, elf_path, elf_length + 1);
+	s_boot_disc_flags.store(BOOT_FLAG_ELF, std::memory_order_relaxed);
+	s_boot_disc_requested.store(true, std::memory_order_release);
+	s_stop_requested.store(false, std::memory_order_release);
 	s_boot_request.store(1, std::memory_order_release);
 	emscripten_futex_wake(&s_boot_request, 1);
 	return 0;
@@ -1364,6 +1422,9 @@ static bool InitializeConfig()
 // The page's switches, passed as main()'s arguments (Module.arguments): -gpu 0|1 and, for tests,
 // -set Section/Key=Value, -surface WxH, -gs-idle block and -capture N,M,... (vsync numbers of the
 // 2D path's frames to keep a copy of).
+// Benchmarks (?unlimited=1): boot with the frame limiter off, as pcsx2-headless -unlimited.
+static bool s_start_unlimited = false;
+
 static void ParseArguments(int argc, char* argv[])
 {
 	for (int i = 1; i < argc; i++)
@@ -1383,6 +1444,10 @@ static void ParseArguments(int argc, char* argv[])
 		{
 			// Tests: "0" runs the IOP interpreter instead of the IOP JIT.
 			IopJit::g_mode = (std::string_view(argv[++i]) != "0") ? 1 : 0;
+		}
+		else if (arg == "-unlimited")
+		{
+			s_start_unlimited = true;
 		}
 		else if (arg == "-gs-idle" && has_value)
 		{
@@ -1716,6 +1781,7 @@ static void RunVM(const std::string& bios_name)
 	VMBootParameters params;
 	params.source_type = CDVD_SourceType::NoDisc;
 	params.fast_boot = false;
+	params.start_unlimited = s_start_unlimited;
 
 	MakeBootParameters(bios_name, disc, &params);
 	Error error;
