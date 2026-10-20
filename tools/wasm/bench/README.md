@@ -2,22 +2,28 @@
 
 `bench.elf` is a small PS2 program, written for TabStationToo, that measures the emulator the way
 games load it: no menu, no input, always the same frames. It draws a crowd of animated figures
-on a floor, each the way a game draws a character:
+on a floor, each the way a game draws a character, with the work games do around them:
 
-- the EE poses a 15-bone skeleton per figure (matrix products in VU0 macro mode) and does a little
-  per-figure work (bounding points through VU0, an overlap check);
-- one VIF1 DMA chain per frame points at the meshes, and VU1 (`bench_vu1.vsm`) transforms, lights
-  and projects every vertex and sends it to the GS with XGKICK;
-- the GS draws textured, Gouraud-shaded, Z-buffered triangle strips, with a see-through shadow
-  under each figure. A figure is about 2,900 triangles; the floor is 512.
+- the EE runs per-figure game logic (24 dust particles, two path searches on a 32 x 32 grid),
+  poses a 15-bone skeleton per figure (matrix products in VU0 macro mode) and builds one VIF1
+  DMA chain per frame;
+- VU1 (`bench_vu1.vsm`) transforms, lights and projects every vertex and sends it to the GS
+  with XGKICK: textured, Gouraud-shaded, Z-buffered triangle strips, with a see-through shadow
+  under each figure. A figure is about 2,900 triangles; the floor is 512;
+- each figure switches to its own palette of an 8-bit texture (a CLUT load) through PATH2, and its
+  dust is drawn as sprites the EE positioned;
+- the texture and its four palettes are uploaded again every frame through PATH3;
+- a glow pass renders the frame into a half-size target, blurs it twice and adds it back
+  (render-to-texture, as games do for glow and blur).
 
 The number of figures steps through 1, 2, 4, 8 and 16, 400 frames each, then starts again. At each
 step the program prints `BENCH phase N=<figures> frame=<frame>`. It draws at most one frame per
-vsync, like a game, so with the frame limiter off the emulator's speed shows how much faster than
-a PS2 it runs; with it on, anything under 100 % is what a player would see as slowdown.
+vsync and sleeps on interrupts while it waits, like a game, so with the frame limiter off the
+emulator's speed shows how much faster than a PS2 it runs; with it on, anything under 100 % is
+what a player would see as slowdown.
 
-It is a stand-in, not a copy of any game: it does not reproduce everything a game does (no game
-logic to speak of, no sound, no streaming, one VU1 program), so a gain here is a gain in the paths
+It is a stand-in, not a copy of any game: it does not reproduce everything a game does (no sound,
+no streaming from disc, one VU1 program, little game logic), so a gain here is a gain in the paths
 games share with it.
 
 ## Running
@@ -29,7 +35,11 @@ The emulator still boots a PS2 BIOS first (fast boot), so you need your own BIOS
 node build-wasm/bin/pcsx2-headless.js -approot "$PWD/bin" -dataroot "$PWD/build-wasm/data" \
   -bios <bios file> -elf tools/wasm/bench/bench.elf -frames 2000 -renderer sw
 # A browser, with the speed of each phase: see run-bench.mjs --help.
-node tools/wasm/bench/run-bench.mjs --help
+node tools/wasm/bench/run-bench.mjs --bios <bios file> --elf tools/wasm/bench/bench.elf --unlimited --phases 5
+# Chrome with a CPU profile of every thread (here 4 s from vsync 1750, in the 16-figure phase):
+node tools/wasm/run-app-headless.mjs --root build-wasm/bin --bios-dir <dir> --bios <file> \
+  --elf tools/wasm/bench/bench.elf --query unlimited=1 --gpu plain --chrome <path> \
+  --frames 0 --duration 45 --profile 1750:4 --out <dir>
 ```
 
 ## Building

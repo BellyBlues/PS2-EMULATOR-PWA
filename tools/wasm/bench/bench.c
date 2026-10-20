@@ -2,14 +2,21 @@
 // SPDX-License-Identifier: MIT
 
 // TabStationToo's benchmark: a PS2 program with no menu and no input that draws a crowd of
-// animated figures the way games draw characters. Each frame the EE poses every figure's
-// skeleton (VU0 macro-mode matrix products), builds one VIF1 DMA chain that points at the
-// meshes, and VU1 (bench_vu1.vsm) transforms, lights and projects the vertices and kicks them
-// to the GS: textured, Gouraud-shaded, Z-buffered triangle strips, a floor and see-through
-// shadows. The number of figures steps through PHASE_COUNTS, PHASE_FRAMES frames each, and the
-// program prints "BENCH phase N=<figures> frame=<frame>" at every step so a runner can tell
-// the phases apart. It draws at most one frame per vsync and sleeps on interrupts while it waits,
-// like a game.
+// animated figures the way games draw characters, with the extra work games do around them.
+//
+// Each frame:
+// - the EE runs per-figure game logic (dust particles, path searches on a grid), poses every
+//   figure's skeleton (VU0 macro-mode matrix products) and builds one VIF1 DMA chain;
+// - VU1 (bench_vu1.vsm) transforms, lights and projects the figures and the floor and kicks them
+//   to the GS: textured, Gouraud-shaded, Z-buffered triangle strips, see-through shadows;
+// - each figure switches to its own palette (an 8-bit texture with a CLUT load) through PATH2,
+//   and its dust is drawn as sprites the EE positioned;
+// - the texture and its four palettes are uploaded again every frame through PATH3;
+// - a glow pass renders the frame into a half-size target, blurs it twice and adds it back.
+//
+// The number of figures steps through PHASE_COUNTS, PHASE_FRAMES frames each, and the program
+// prints "BENCH phase N=<figures> frame=<frame>" at every step so a runner can tell the phases
+// apart. It draws at most one frame per vsync and sleeps on interrupts while it waits, like a game.
 
 #include <dma.h>
 #include <draw.h>
@@ -32,6 +39,10 @@ extern u32 BenchVU1_CodeEnd __attribute__((section(".vudata")));
 
 #define SCREEN_W 640
 #define SCREEN_H 512
+#define GLOW_W 320
+#define GLOW_H 256
+#define OFFSET_X (2048 - SCREEN_W / 2)
+#define OFFSET_Y (2048 - SCREEN_H / 2)
 #define MAX_FIGURES 16
 #define PHASE_FRAMES 400
 static const int PHASE_COUNTS[] = {1, 2, 4, 8, 16};
@@ -43,10 +54,14 @@ static const int PHASE_COUNTS[] = {1, 2, 4, 8, 16};
 #define MAX_BATCH_VERTS 80
 #define MAX_BATCHES 16
 
-// Z = ZK / depth, stored by FTOI4 (x16): ZK makes the nearest drawn depth (3.0) fill 24 bits.
-#define ZK (16777215.0f / 16.0f * 3.0f)
+// Z = ZK / depth, stored by FTOI4 (x16) in a 16-bit Z buffer: the nearest drawn depth (3.0)
+// gets the largest value.
+#define ZK (65535.0f / 16.0f * 3.0f)
 #define FOCAL_X 554.0f // 60 degrees across 640 pixels
 #define FOCAL_Y 591.0f // PAL pixels are taller than wide
+
+#define PARTICLES 24
+#define GRID 32
 
 typedef struct
 {
@@ -92,16 +107,22 @@ static const bone_t SKELETON[] = {
 };
 #define BONES ((int)(sizeof(SKELETON) / sizeof(SKELETON[0])))
 
-static const float FIGURE_COLOURS[4][3] = {
-	{128.0f, 72.0f, 40.0f}, {48.0f, 96.0f, 128.0f}, {112.0f, 112.0f, 56.0f}, {96.0f, 56.0f, 120.0f}};
+// Base hues of the four palettes (the texture modulates a light grey vertex colour).
+static const int PALETTE_HUES[4][3] = {{255, 140, 70}, {80, 170, 255}, {230, 220, 90}, {190, 100, 240}};
 
 // Per-frame data the DMA chain points at, one set per frame in flight.
 // Each block: colour, light, screen offset, matrix (7 quadwords, VU1 addresses 2 to 8).
 #define BLOCK_QW 7
 #define MAX_BLOCKS (MAX_FIGURES * (BONES + 1) + 1)
+// Per figure, GIF packets sent through PATH2: the texture switch (3 quadwords) and the dust.
+#define DIRECT_QW_PER_FIGURE (3 + 1 + 3 * PARTICLES)
 static qword_t* s_blocks[2];
+static qword_t* s_direct[2];
 static packet2_t* s_chain[2];
 static packet2_t* s_gs_setup;
+static packet2_t* s_uploads;
+static qword_t* s_post[2]; // the glow pass for each draw buffer
+static int s_post_qw;
 
 static mesh_t s_ellipsoid;
 static mesh_t s_floor;
@@ -110,11 +131,74 @@ static float s_light[3];
 
 static framebuffer_t s_frame[2];
 static zbuffer_t s_z;
-static texbuffer_t s_tex;
-static clutbuffer_t s_clut;
+static texbuffer_t s_floor_tex;
+static clutbuffer_t s_no_clut;
 static lod_t s_lod;
 static blend_t s_blend;
 static texwrap_t s_wrap;
+static u32 s_glow[2]; // glow targets' VRAM addresses
+static u32 s_figure_tex; // 128 x 128, 8-bit indices
+static u32 s_clut[4]; // 16 x 16 32-bit, one palette each
+static u8* s_figure_pixels;
+static u32* s_palettes; // 4 x 256 entries, rebuilt every frame
+
+// ------------------------------------------------------------------ GIF packet helpers
+
+static qword_t* gif_ad_tag(qword_t* q, int regs, int eop)
+{
+	q->dw[0] = GIF_SET_TAG(regs, eop, 0, 0, GIF_FLG_PACKED, 1);
+	q->dw[1] = GIF_REG_AD;
+	return q + 1;
+}
+
+static qword_t* gif_ad(qword_t* q, u64 reg, u64 value)
+{
+	q->dw[0] = value;
+	q->dw[1] = reg;
+	return q + 1;
+}
+
+// A sprite from pixel (x0, y0) to (x1, y1) of the current target, textured from texel (u0, v0)
+// to (u1, v1) unless untextured.
+static qword_t* gif_sprite(qword_t* q, int textured, int blend, float x0, float y0, float x1, float y1, float u0,
+	float v0, float u1, float v1, int r, int g, int b)
+{
+	const u64 prim = GS_SET_PRIM(PRIM_SPRITE, 0, textured, 0, blend, 0, 1, 0, 0);
+	q->dw[0] = GIF_SET_TAG(1, 1, 1, prim, GIF_FLG_PACKED, 5);
+	q->dw[1] = ((u64)GIF_REG_RGBAQ) | ((u64)GIF_REG_UV << 4) | ((u64)GIF_REG_XYZ2 << 8) | ((u64)GIF_REG_UV << 12) |
+			   ((u64)GIF_REG_XYZ2 << 16);
+	q++;
+	q->sw[0] = r;
+	q->sw[1] = g;
+	q->sw[2] = b;
+	q->sw[3] = 0x80;
+	q++;
+	q->sw[0] = (int)(u0 * 16.0f);
+	q->sw[1] = (int)(v0 * 16.0f);
+	q->sw[2] = q->sw[3] = 0;
+	q++;
+	q->sw[0] = (int)((x0 + OFFSET_X) * 16.0f);
+	q->sw[1] = (int)((y0 + OFFSET_Y) * 16.0f);
+	q->sw[2] = q->sw[3] = 0;
+	q++;
+	q->sw[0] = (int)(u1 * 16.0f);
+	q->sw[1] = (int)(v1 * 16.0f);
+	q->sw[2] = q->sw[3] = 0;
+	q++;
+	q->sw[0] = (int)((x1 + OFFSET_X) * 16.0f);
+	q->sw[1] = (int)((y1 + OFFSET_Y) * 16.0f);
+	q->sw[2] = q->sw[3] = 0;
+	q++;
+	return q;
+}
+
+static int log2_ceil(int v)
+{
+	int n = 0;
+	while ((1 << n) < v)
+		n++;
+	return n;
+}
 
 // ------------------------------------------------------------------ meshes
 
@@ -212,7 +296,7 @@ static void build_ellipsoid(void)
 static void build_floor(void)
 {
 	const int tiles = 16;
-	const float x0 = -4.5f, x1 = 4.5f, z0 = -1.5f, z1 = 7.5f;
+	const float x0 = -4.5f, x1 = 4.5f, z0 = -2.5f, z1 = 7.5f;
 	mesh_builder_t b;
 	mesh_begin(&b, &s_floor);
 	for (int row = 0; row < tiles; row++)
@@ -224,7 +308,7 @@ static void build_floor(void)
 			for (int k = 0; k < 2; k++)
 			{
 				const float z = z0 + (z1 - z0) * (row + k) / tiles;
-				mesh_vertex(&b, x, 0.0f, z, 0.0f, 1.0f, 0.0f, x * 0.5f, z * 0.5f);
+				mesh_vertex(&b, x, 0.0f, z, 0.0f, 1.0f, 0.0f, (x + 8.0f) * 0.5f, (z + 8.0f) * 0.5f);
 			}
 		}
 	}
@@ -282,6 +366,112 @@ static void build_view_screen(void)
 		s_light[i] = l[i] / len;
 }
 
+// ------------------------------------------------------------------ game logic on the EE
+
+typedef struct
+{
+	float p[3];
+	float v[3];
+	int life;
+} particle_t;
+
+static particle_t s_particles[MAX_FIGURES][PARTICLES];
+static u32 s_random = 12345;
+static s16 s_dist[GRID * GRID];
+static s16 s_queue[GRID * GRID];
+static u8 s_blocked[GRID * GRID];
+
+static float random_unit(void)
+{
+	s_random = s_random * 1664525u + 1013904223u;
+	return (float)(s_random >> 8) / 16777216.0f;
+}
+
+static void particle_spawn(particle_t* p, const float* pos)
+{
+	p->p[0] = pos[0] + (random_unit() - 0.5f) * 0.3f;
+	p->p[1] = 0.05f;
+	p->p[2] = pos[2] + (random_unit() - 0.5f) * 0.3f;
+	p->v[0] = (random_unit() - 0.5f) * 1.2f;
+	p->v[1] = 1.0f + random_unit() * 1.5f;
+	p->v[2] = (random_unit() - 0.5f) * 1.2f;
+	p->life = 20 + (int)(random_unit() * 40.0f);
+}
+
+static void particles_step(int figure, const float* pos)
+{
+	const float dt = 1.0f / 50.0f;
+	for (int i = 0; i < PARTICLES; i++)
+	{
+		particle_t* p = &s_particles[figure][i];
+		if (p->life <= 0)
+		{
+			particle_spawn(p, pos);
+			continue;
+		}
+		p->v[1] -= 9.8f * dt;
+		for (int k = 0; k < 3; k++)
+			p->p[k] += p->v[k] * dt;
+		if (p->p[1] < 0.0f)
+		{
+			p->p[1] = 0.0f;
+			p->v[1] = -p->v[1] * 0.4f;
+			p->v[0] *= 0.7f;
+			p->v[2] *= 0.7f;
+		}
+		p->life--;
+	}
+}
+
+static int grid_cell(float x, float z)
+{
+	int gx = (int)((x + 4.5f) / 9.0f * GRID), gz = (int)((z + 2.5f) / 10.0f * GRID);
+	gx = gx < 0 ? 0 : (gx >= GRID ? GRID - 1 : gx);
+	gz = gz < 0 ? 0 : (gz >= GRID ? GRID - 1 : gz);
+	return gz * GRID + gx;
+}
+
+// Breadth-first search on the floor grid from one cell to another; the path length, or -1.
+static int path_length(int from, int to)
+{
+	for (int i = 0; i < GRID * GRID; i++)
+		s_dist[i] = -1;
+	int head = 0, tail = 0;
+	s_dist[from] = 0;
+	s_queue[tail++] = (s16)from;
+	while (head < tail)
+	{
+		const int cell = s_queue[head++];
+		if (cell == to)
+			return s_dist[cell];
+		const int x = cell % GRID, z = cell / GRID;
+		const int next[4] = {x > 0 ? cell - 1 : -1, x < GRID - 1 ? cell + 1 : -1, z > 0 ? cell - GRID : -1,
+			z < GRID - 1 ? cell + GRID : -1};
+		for (int k = 0; k < 4; k++)
+		{
+			const int n = next[k];
+			if (n >= 0 && s_dist[n] < 0 && !s_blocked[n])
+			{
+				s_dist[n] = s_dist[cell] + 1;
+				s_queue[tail++] = (s16)n;
+			}
+		}
+	}
+	return -1;
+}
+
+static void block_crowd(int figures, int frame)
+{
+	// Fixed pillars, plus every figure's cell and its neighbours.
+	for (int i = 0; i < GRID * GRID; i++)
+		s_blocked[i] = ((i % 7) == 3 && ((i / GRID) % 5) == 2);
+	for (int f = 0; f < figures; f++)
+	{
+		const int c = (f * 37 + frame) % (GRID * GRID);
+		s_blocked[c] = 1;
+	}
+}
+
 // ------------------------------------------------------------------ frame building
 
 static void block_fill(qword_t* q, const float* colour, float alpha, const MATRIX bone_world, const MATRIX local_screen, float ambient)
@@ -323,6 +513,19 @@ static void chain_mesh(packet2_t* chain, const mesh_t* mesh, int kind, qword_t* 
 	}
 }
 
+// Waits until VU1 has finished and its GIF packets are out, then sends GIF packets through PATH2.
+static void chain_direct(packet2_t* chain, qword_t* data, int qwc)
+{
+	packet2_chain_open_cnt(chain, 0, 0, 0);
+	packet2_vif_flush(chain, 0);
+	packet2_vif_nop(chain, 0);
+	packet2_chain_close_tag(chain);
+	packet2_chain_ref(chain, data, qwc, 0, 0, 0);
+	packet2_vif_nop(chain, 0);
+	packet2_vif_open_direct(chain, 0);
+	packet2_vif_close_direct_manual(chain, qwc);
+}
+
 // Figure slots: a 4 x 4 crowd, filled front row first, middle columns first.
 static void figure_position(int index, float* out)
 {
@@ -333,44 +536,71 @@ static void figure_position(int index, float* out)
 	out[2] = row * 1.6f;
 }
 
-// Game-style EE work per figure: bounding points through VU0 and a crowd separation check.
-static VECTOR s_probe_in[32] __attribute__((aligned(16)));
-static VECTOR s_probe_out[32] __attribute__((aligned(16)));
-static float s_bounds[MAX_FIGURES][4];
-
-static void figure_logic(int figure, int figures, const MATRIX root_screen)
+static qword_t* figure_texture(qword_t* q, int figure)
 {
-	calculate_vertices(s_probe_out, 32, s_probe_in, (float*)root_screen);
-	float min_x = 1e9f, max_x = -1e9f;
-	for (int i = 0; i < 32; i++)
-	{
-		min_x = fminf(min_x, s_probe_out[i][0]);
-		max_x = fmaxf(max_x, s_probe_out[i][0]);
-	}
-	s_bounds[figure][0] = min_x;
-	s_bounds[figure][1] = max_x;
-	int overlaps = 0;
-	for (int other = 0; other < figure && other < figures; other++)
-		overlaps += (s_bounds[other][0] < max_x && s_bounds[other][1] > min_x);
-	s_bounds[figure][2] = (float)overlaps;
+	q = gif_ad_tag(q, 2, 1);
+	q = gif_ad(q, GS_REG_TEX0, GS_SET_TEX0(s_figure_tex >> 6, 128 >> 6, GS_PSM_8, 7, 7, 1, TEXTURE_FUNCTION_MODULATE,
+								   s_clut[figure % 4] >> 6, GS_PSM_32, 0, 0, 1));
+	q = gif_ad(q, GS_REG_TEXFLUSH, 1);
+	return q;
 }
 
-static void build_frame(int ctx, int frame, int figures)
+static qword_t* figure_dust(qword_t* q, int figure)
+{
+	const u64 prim = GS_SET_PRIM(PRIM_SPRITE, 0, 0, 0, 1, 0, 0, 0, 0);
+	q->dw[0] = GIF_SET_TAG(PARTICLES, 1, 1, prim, GIF_FLG_PACKED, 3);
+	q->dw[1] = ((u64)GIF_REG_RGBAQ) | ((u64)GIF_REG_XYZ2 << 4) | ((u64)GIF_REG_XYZ2 << 8);
+	q++;
+	const float* m = s_view_screen;
+	for (int i = 0; i < PARTICLES; i++)
+	{
+		const particle_t* p = &s_particles[figure][i];
+		float o[4];
+		for (int c = 0; c < 4; c++)
+			o[c] = p->p[0] * m[c] + p->p[1] * m[4 + c] + p->p[2] * m[8 + c] + m[12 + c];
+		const float inv = 1.0f / o[3];
+		const float sx = o[0] * inv + 2048.0f, sy = o[1] * inv + 2048.0f;
+		const float r = 0.035f * FOCAL_X * inv;
+		const int z = (int)(o[2] * inv * 16.0f);
+		q->sw[0] = 200;
+		q->sw[1] = 180;
+		q->sw[2] = 150;
+		q->sw[3] = 0x40;
+		q++;
+		q->sw[0] = (int)((sx - r) * 16.0f);
+		q->sw[1] = (int)((sy - r) * 16.0f);
+		q->sw[2] = z;
+		q->sw[3] = 0;
+		q++;
+		q->sw[0] = (int)((sx + r) * 16.0f);
+		q->sw[1] = (int)((sy + r) * 16.0f);
+		q->sw[2] = z;
+		q->sw[3] = 0;
+		q++;
+	}
+	return q;
+}
+
+// Builds the chain that draws frame number "frame" into draw buffer "target".
+static void build_frame(int ctx, int frame, int figures, int target)
 {
 	packet2_t* chain = s_chain[ctx];
 	qword_t* blocks = s_blocks[ctx];
+	qword_t* direct = s_direct[ctx];
 	int used = 0;
 	packet2_reset(chain, 0);
 
 	const float t = frame / 50.0f;
-	static const float white[3] = {128.0f, 128.0f, 128.0f};
+	static const float grey[3] = {128.0f, 128.0f, 128.0f};
 	static const float black[3] = {0.0f, 0.0f, 0.0f};
 
-	// Floor, lit from straight above in its own space.
+	block_crowd(figures, frame);
+
+	// Floor, lit from straight above in its own space (the GS has the floor texture).
 	{
 		MATRIX identity;
 		matrix_unit(identity);
-		block_fill(&blocks[BLOCK_QW * used], white, 128.0f, identity, s_view_screen, 0.35f);
+		block_fill(&blocks[BLOCK_QW * used], grey, 128.0f, identity, s_view_screen, 0.35f);
 		chain_mesh(chain, &s_floor, KIND_LIT_TEXTURED, &blocks[BLOCK_QW * used]);
 		used++;
 	}
@@ -380,23 +610,33 @@ static void build_frame(int ctx, int frame, int figures)
 		float pos[3];
 		figure_position(f, pos);
 		const float phase = f * 0.83f;
-		const float facing = 3.1415927f + 0.6f * sinf(t * 0.7f + phase);
+
+		// Game logic: dust, and two path searches that nudge where the figure looks.
+		particles_step(f, pos);
+		const int here = grid_cell(pos[0], pos[2]);
+		const int a = path_length(here, (frame * 7 + f * 131) % (GRID * GRID));
+		const int b = path_length(here, (GRID * GRID - 1) - (frame * 3 + f * 17) % (GRID * GRID));
+		const float facing = 3.1415927f + 0.6f * sinf(t * 0.7f + phase) + 0.002f * (float)((a + b) & 15);
+
+		qword_t* texture_switch = direct;
+		direct = figure_texture(direct, f);
+		chain_direct(chain, texture_switch, 3);
 
 		MATRIX world[BONES];
-		for (int b = 0; b < BONES; b++)
+		for (int bone_index = 0; bone_index < BONES; bone_index++)
 		{
-			const bone_t* bone = &SKELETON[b];
+			const bone_t* bone = &SKELETON[bone_index];
 			MATRIX local;
 			if (bone->parent < 0)
 			{
 				const float root[3] = {pos[0] + bone->offset[0], pos[1] + bone->offset[1] + 0.03f * sinf(t * 6.0f + phase), pos[2] + bone->offset[2]};
 				matrix_rotation_xy(local, bone->swing * sinf(t * 3.0f + phase), facing, root);
-				memcpy(world[b], local, sizeof(MATRIX));
+				memcpy(world[bone_index], local, sizeof(MATRIX));
 			}
 			else
 			{
 				matrix_rotation_xy(local, bone->swing * sinf(t * 3.0f + phase + bone->phase), 0.0f, bone->offset);
-				matrix_multiply(world[b], local, world[bone->parent]);
+				matrix_multiply(world[bone_index], local, world[bone->parent]);
 			}
 
 			MATRIX mesh_local, bone_screen, local_screen;
@@ -407,10 +647,10 @@ static void build_frame(int ctx, int frame, int figures)
 			mesh_local[12] = bone->centre[0];
 			mesh_local[13] = bone->centre[1];
 			mesh_local[14] = bone->centre[2];
-			matrix_multiply(bone_screen, world[b], s_view_screen);
+			matrix_multiply(bone_screen, world[bone_index], s_view_screen);
 			matrix_multiply(local_screen, mesh_local, bone_screen);
 
-			block_fill(&blocks[BLOCK_QW * used], FIGURE_COLOURS[f % 4], 128.0f, world[b], local_screen, 0.3f);
+			block_fill(&blocks[BLOCK_QW * used], grey, 128.0f, world[bone_index], local_screen, 0.3f);
 			chain_mesh(chain, &s_ellipsoid, KIND_LIT_TEXTURED, &blocks[BLOCK_QW * used]);
 			used++;
 		}
@@ -431,16 +671,79 @@ static void build_frame(int ctx, int frame, int figures)
 			used++;
 		}
 
-		MATRIX root_screen;
-		matrix_multiply(root_screen, world[0], s_view_screen);
-		figure_logic(f, figures, root_screen);
+		qword_t* dust = direct;
+		direct = figure_dust(direct, f);
+		chain_direct(chain, dust, (int)(direct - dust));
 	}
+
+	// The glow pass, after everything else is drawn.
+	chain_direct(chain, s_post[target], s_post_qw);
 
 	// Wait for VU1 and PATH1 before the DMA ends, so "DMA done" means "frame drawn".
 	packet2_chain_open_end(chain, 0, 0);
 	packet2_vif_flush(chain, 0);
 	packet2_vif_nop(chain, 0);
 	packet2_chain_close_tag(chain);
+}
+
+// ------------------------------------------------------------------ the glow pass
+
+static qword_t* post_target(qword_t* q, u32 address, int width, int height, u32 texture, int tex_width, int tex_height)
+{
+	q = gif_ad_tag(q, 4, 0);
+	q = gif_ad(q, GS_REG_FRAME, GS_SET_FRAME(address >> 11, width >> 6, GS_PSM_32, 0));
+	q = gif_ad(q, GS_REG_SCISSOR, GS_SET_SCISSOR(0, width - 1, 0, height - 1));
+	q = gif_ad(q, GS_REG_TEX0, GS_SET_TEX0(texture >> 6, tex_width >> 6, GS_PSM_32, log2_ceil(tex_width), log2_ceil(tex_height), 0,
+								   TEXTURE_FUNCTION_DECAL, 0, 0, 0, 0, 0));
+	q = gif_ad(q, GS_REG_TEXFLUSH, 1);
+	return q;
+}
+
+// Blurs the source target into the destination: clear, then four offset copies at a quarter each.
+static qword_t* post_blur(qword_t* q, u32 dest, u32 source)
+{
+	q = post_target(q, dest, GLOW_W, GLOW_H, source, GLOW_W, GLOW_H);
+	q = gif_sprite(q, 0, 0, 0, 0, GLOW_W, GLOW_H, 0, 0, 0, 0, 0, 0, 0);
+	q = gif_ad_tag(q, 1, 0);
+	q = gif_ad(q, GS_REG_ALPHA, GS_SET_ALPHA(0, 2, 2, 1, 0x20));
+	static const float offsets[4][2] = {{-1.5f, -1.5f}, {1.5f, -1.5f}, {-1.5f, 1.5f}, {1.5f, 1.5f}};
+	for (int i = 0; i < 4; i++)
+	{
+		const float dx = offsets[i][0], dy = offsets[i][1];
+		q = gif_sprite(q, 1, 1, dx, dy, GLOW_W + dx, GLOW_H + dy, 0, 0, GLOW_W, GLOW_H, 128, 128, 128);
+	}
+	return q;
+}
+
+static void build_post(int draw)
+{
+	qword_t* q = s_post[draw];
+	q = gif_ad_tag(q, 4, 0);
+	q = gif_ad(q, GS_REG_TEST, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, ZTEST_METHOD_ALLPASS));
+	q = gif_ad(q, GS_REG_ZBUF, GS_SET_ZBUF(s_z.address >> 11, s_z.zsm, 1));
+	q = gif_ad(q, GS_REG_CLAMP, GS_SET_CLAMP(1, 1, 0, 0, 0, 0));
+	q = gif_ad(q, GS_REG_TEX1, GS_SET_TEX1(1, 0, 1, 1, 0, 0, 0));
+
+	// Half-size copy of the frame, then two blurs.
+	q = post_target(q, s_glow[0], GLOW_W, GLOW_H, s_frame[draw].address, SCREEN_W, SCREEN_H);
+	q = gif_sprite(q, 1, 0, 0, 0, GLOW_W, GLOW_H, 0, 0, SCREEN_W, SCREEN_H, 128, 128, 128);
+	q = post_blur(q, s_glow[1], s_glow[0]);
+	q = post_blur(q, s_glow[0], s_glow[1]);
+
+	// Added back over the frame.
+	q = post_target(q, s_frame[draw].address, SCREEN_W, SCREEN_H, s_glow[0], GLOW_W, GLOW_H);
+	q = gif_ad_tag(q, 1, 0);
+	q = gif_ad(q, GS_REG_ALPHA, GS_SET_ALPHA(0, 2, 2, 1, 0x30));
+	q = gif_sprite(q, 1, 1, 0, 0, SCREEN_W, SCREEN_H, 0, 0, GLOW_W, GLOW_H, 128, 128, 128);
+
+	// The 3D state for the next frame.
+	q = gif_ad_tag(q, 5, 1);
+	q = gif_ad(q, GS_REG_TEST, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, ZTEST_METHOD_GREATER_EQUAL));
+	q = gif_ad(q, GS_REG_ZBUF, GS_SET_ZBUF(s_z.address >> 11, s_z.zsm, 0));
+	q = gif_ad(q, GS_REG_ALPHA, GS_SET_ALPHA(0, 1, 0, 1, 0x80));
+	q = gif_ad(q, GS_REG_CLAMP, GS_SET_CLAMP(0, 0, 0, 0, 0, 0));
+	q = gif_ad(q, GS_REG_SCISSOR, GS_SET_SCISSOR(0, SCREEN_W - 1, 0, SCREEN_H - 1));
+	s_post_qw = (int)(q - s_post[draw]);
 }
 
 // ------------------------------------------------------------------ GS and VU setup
@@ -463,7 +766,7 @@ static void upload_vu1_program(void)
 	packet2_free(p);
 }
 
-static void upload_texture(void)
+static void upload_floor_texture(void)
 {
 	// 64 x 64 RGBA: a two-tone check with a darker border on each tile.
 	u32* pixels = (u32*)memalign(128, 64 * 64 * 4);
@@ -481,12 +784,43 @@ static void upload_texture(void)
 	}
 	FlushCache(0);
 	packet2_t* p = packet2_create(50, P2_TYPE_NORMAL, P2_MODE_CHAIN, 0);
-	packet2_update(p, draw_texture_transfer(p->next, pixels, 64, 64, GS_PSM_32, s_tex.address, s_tex.width));
+	packet2_update(p, draw_texture_transfer(p->next, pixels, 64, 64, GS_PSM_32, s_floor_tex.address, s_floor_tex.width));
 	packet2_update(p, draw_texture_flush(p->next));
 	dma_channel_send_packet2(p, DMA_CHANNEL_GIF, 1);
 	dma_channel_wait(DMA_CHANNEL_GIF, 0);
 	packet2_free(p);
 	free(pixels);
+}
+
+// The figures' texture: 8-bit indices (rings and stripes); its four palettes change every frame.
+static void init_figure_texture(void)
+{
+	s_figure_pixels = (u8*)memalign(128, 128 * 128);
+	for (int y = 0; y < 128; y++)
+	{
+		for (int x = 0; x < 128; x++)
+		{
+			const int dx = x - 64, dy = y - 64;
+			const int ring = (int)(sqrtf((float)(dx * dx + dy * dy)) * 4.0f);
+			s_figure_pixels[y * 128 + x] = (u8)((ring + ((x >> 3) & 1) * 64) & 255);
+		}
+	}
+	s_palettes = (u32*)memalign(128, 4 * 256 * 4);
+}
+
+static void update_palettes(int frame)
+{
+	for (int p = 0; p < 4; p++)
+	{
+		for (int i = 0; i < 256; i++)
+		{
+			const int level = 96 + ((i + frame * 2) & 127);
+			const u32 r = (u32)(PALETTE_HUES[p][0] * level) >> 8;
+			const u32 g = (u32)(PALETTE_HUES[p][1] * level) >> 8;
+			const u32 b = (u32)(PALETTE_HUES[p][2] * level) >> 8;
+			s_palettes[p * 256 + i] = 0x80000000u | (b << 16) | (g << 8) | r;
+		}
+	}
 }
 
 static void init_gs(void)
@@ -502,22 +836,27 @@ static void init_gs(void)
 	s_z.enable = DRAW_ENABLE;
 	s_z.mask = 0;
 	s_z.method = ZTEST_METHOD_GREATER_EQUAL;
-	s_z.zsm = GS_ZBUF_24;
-	s_z.address = graph_vram_allocate(SCREEN_W, SCREEN_H, GS_ZBUF_24, GRAPH_ALIGN_PAGE);
+	s_z.zsm = GS_ZBUF_16;
+	s_z.address = graph_vram_allocate(SCREEN_W, SCREEN_H, GS_ZBUF_16, GRAPH_ALIGN_PAGE);
+	for (int i = 0; i < 2; i++)
+		s_glow[i] = graph_vram_allocate(GLOW_W, GLOW_H, GS_PSM_32, GRAPH_ALIGN_PAGE);
 
-	s_tex.width = 64;
-	s_tex.psm = GS_PSM_32;
-	s_tex.address = graph_vram_allocate(64, 64, GS_PSM_32, GRAPH_ALIGN_BLOCK);
-	s_tex.info.width = draw_log2(64);
-	s_tex.info.height = draw_log2(64);
-	s_tex.info.components = TEXTURE_COMPONENTS_RGBA;
-	s_tex.info.function = TEXTURE_FUNCTION_MODULATE;
+	s_floor_tex.width = 64;
+	s_floor_tex.psm = GS_PSM_32;
+	s_floor_tex.address = graph_vram_allocate(64, 64, GS_PSM_32, GRAPH_ALIGN_BLOCK);
+	s_floor_tex.info.width = draw_log2(64);
+	s_floor_tex.info.height = draw_log2(64);
+	s_floor_tex.info.components = TEXTURE_COMPONENTS_RGBA;
+	s_floor_tex.info.function = TEXTURE_FUNCTION_MODULATE;
+	s_figure_tex = graph_vram_allocate(128, 128, GS_PSM_8, GRAPH_ALIGN_BLOCK);
+	for (int i = 0; i < 4; i++)
+		s_clut[i] = graph_vram_allocate(16, 16, GS_PSM_32, GRAPH_ALIGN_BLOCK);
 
-	s_clut.storage_mode = CLUT_STORAGE_MODE1;
-	s_clut.start = 0;
-	s_clut.psm = 0;
-	s_clut.load_method = CLUT_NO_LOAD;
-	s_clut.address = 0;
+	s_no_clut.storage_mode = CLUT_STORAGE_MODE1;
+	s_no_clut.start = 0;
+	s_no_clut.psm = 0;
+	s_no_clut.load_method = CLUT_NO_LOAD;
+	s_no_clut.address = 0;
 
 	s_lod.calculation = LOD_USE_K;
 	s_lod.max_level = 0;
@@ -541,23 +880,33 @@ static void init_gs(void)
 
 	packet2_t* p = packet2_create(20, P2_TYPE_NORMAL, P2_MODE_NORMAL, 0);
 	packet2_update(p, draw_setup_environment(p->next, 0, &s_frame[0], &s_z));
-	packet2_update(p, draw_primitive_xyoffset(p->next, 0, 2048 - SCREEN_W / 2, 2048 - SCREEN_H / 2));
+	packet2_update(p, draw_primitive_xyoffset(p->next, 0, OFFSET_X, OFFSET_Y));
 	packet2_update(p, draw_finish(p->next));
 	dma_channel_send_packet2(p, DMA_CHANNEL_GIF, 1);
 	dma_channel_wait(DMA_CHANNEL_GIF, 0);
 	packet2_free(p);
 }
 
-// Points the GS at the frame to draw, clears it and sets the texture and blending state.
+// Uploads the figures' texture and palettes again (PATH3), points the GS at the frame to draw,
+// clears it and sets the floor's texture and the blending state.
 static void begin_gs_frame(int draw)
 {
+	packet2_t* u = s_uploads;
+	packet2_reset(u, 0);
+	packet2_update(u, draw_texture_transfer(u->next, s_figure_pixels, 128, 128, GS_PSM_8, s_figure_tex, 128));
+	for (int i = 0; i < 4; i++)
+		packet2_update(u, draw_texture_transfer(u->next, s_palettes + 256 * i, 16, 16, GS_PSM_32, s_clut[i], 64));
+	packet2_update(u, draw_texture_flush(u->next));
+	dma_channel_send_packet2(u, DMA_CHANNEL_GIF, 1);
+	dma_channel_wait(DMA_CHANNEL_GIF, 0);
+
 	packet2_t* p = s_gs_setup;
 	packet2_reset(p, 0);
 	packet2_update(p, draw_framebuffer(p->next, 0, &s_frame[draw]));
 	packet2_update(p, draw_disable_tests(p->next, 0, &s_z));
-	packet2_update(p, draw_clear(p->next, 0, 2048.0f - SCREEN_W / 2, 2048.0f - SCREEN_H / 2, SCREEN_W, SCREEN_H, 0x30, 0x38, 0x48));
+	packet2_update(p, draw_clear(p->next, 0, OFFSET_X, OFFSET_Y, SCREEN_W, SCREEN_H, 0x30, 0x38, 0x48));
 	packet2_update(p, draw_enable_tests(p->next, 0, &s_z));
-	packet2_update(p, draw_texturebuffer(p->next, 0, &s_tex, &s_clut));
+	packet2_update(p, draw_texturebuffer(p->next, 0, &s_floor_tex, &s_no_clut));
 	packet2_update(p, draw_texture_sampling(p->next, 0, &s_lod));
 	packet2_update(p, draw_texture_wrapping(p->next, 0, &s_wrap));
 	packet2_update(p, draw_alpha_blending(p->next, 0, &s_blend));
@@ -638,27 +987,26 @@ int main(int argc, char* argv[])
 	upload_vu1_program();
 	init_gs();
 	init_interrupts();
-	upload_texture();
+	upload_floor_texture();
+	init_figure_texture();
 	build_ellipsoid();
 	build_floor();
 	build_view_screen();
 
-	for (int i = 0; i < 32; i++)
-	{
-		s_probe_in[i][0] = sinf(i * 0.7f) * 0.3f;
-		s_probe_in[i][1] = i * 0.06f;
-		s_probe_in[i][2] = cosf(i * 0.7f) * 0.2f;
-		s_probe_in[i][3] = 1.0f;
-	}
-
-	// Per batch 4 tags; per frame at most 1 + MAX_FIGURES * (BONES + 1) meshes.
+	// Per batch 4 tags; per figure 2 x 3 tags for the PATH2 packets; the glow pass; the end.
 	const int max_batches = s_floor.batches + MAX_FIGURES * (BONES + 1) * s_ellipsoid.batches;
 	for (int i = 0; i < 2; i++)
 	{
 		s_blocks[i] = (qword_t*)memalign(64, sizeof(qword_t) * BLOCK_QW * MAX_BLOCKS);
-		s_chain[i] = packet2_create(4 * max_batches + 4, P2_TYPE_NORMAL, P2_MODE_CHAIN, 1);
+		s_direct[i] = (qword_t*)memalign(64, sizeof(qword_t) * DIRECT_QW_PER_FIGURE * MAX_FIGURES);
+		s_chain[i] = packet2_create(4 * max_batches + 6 * MAX_FIGURES + 8, P2_TYPE_NORMAL, P2_MODE_CHAIN, 1);
+		s_post[i] = (qword_t*)memalign(64, sizeof(qword_t) * 128);
 	}
+	build_post(0);
+	build_post(1);
 	s_gs_setup = packet2_create(64, P2_TYPE_NORMAL, P2_MODE_NORMAL, 0);
+	s_uploads = packet2_create(64, P2_TYPE_NORMAL, P2_MODE_CHAIN, 0);
+	FlushCache(0);
 
 	int ctx = 0, draw = 0, last_figures = 0;
 	for (int frame = 0;; frame++)
@@ -671,7 +1019,8 @@ int main(int argc, char* argv[])
 		}
 
 		// Build this frame while VU1 and the GS still draw the previous one.
-		build_frame(ctx, frame, figures);
+		build_frame(ctx, frame, figures, draw ^ 1);
+		update_palettes(frame);
 		FlushCache(0);
 
 		if (frame > 0)

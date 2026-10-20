@@ -12,6 +12,7 @@
 //   --port N            serve.py port on 127.0.0.1 (default 8120)
 //   --query Q           extra query string for index.html (for example "gpu=0")
 //   --disc FILE         serve this disc image (read-only, serve.py --disc) and boot it with ?disc=
+//   --elf FILE          serve this PS2 program (read-only, serve.py --elf) and boot it with ?elf=
 //   --frames N          stop once N frames were presented (default 600); 0 runs until --timeout
 //   --duration S        stop normally S seconds after the page loaded (with --frames 0)
 //   --capture N,M,...   read back the first frame the page received at vsync N or later (frames are
@@ -82,6 +83,7 @@ function parseArgs(argv) {
 		else if (a === "--bios-dir") o.biosDir = path.resolve(v());
 		else if (a === "--bios") o.bios = v();
 		else if (a === "--disc") o.disc = path.resolve(v());
+		else if (a === "--elf") o.elf = path.resolve(v());
 		else if (a === "--port") o.port = Number(v());
 		else if (a === "--query") o.query = v();
 		else if (a === "--frames") o.frames = Number(v());
@@ -266,7 +268,8 @@ async function main() {
 	let status = 2;
 	try {
 		const server = spawn("python3", [path.join(REPO, "tools/wasm/serve.py"), "--port", String(o.port), "--quiet",
-			"--bios-dir", o.biosDir, ...(o.disc ? ["--disc", o.disc] : []), o.root], { stdio: ["ignore", "ignore", "inherit"] });
+			"--bios-dir", o.biosDir, ...(o.disc ? ["--disc", o.disc] : []),
+			...(o.elf ? ["--elf", o.elf] : []), o.root], { stdio: ["ignore", "ignore", "inherit"] });
 		children.push(server);
 
 		const flags = ["--headless=new", `--user-data-dir=${profile}`, "--remote-debugging-port=0", "--no-first-run",
@@ -357,6 +360,8 @@ async function main() {
 		query.set("bios", `dev-bios/${o.bios}`);
 		if (o.disc)
 			query.set("disc", `dev-disc/${path.basename(o.disc)}`);
+		if (o.elf)
+			query.set("elf", `dev-elf/${path.basename(o.elf)}`);
 		if (o.capture.length) query.set("capture", o.capture.join(","));
 		const url = `http://127.0.0.1:${o.port}/index.html?${query}`;
 		print(`[driver] open ${url}`);
