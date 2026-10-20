@@ -5885,9 +5885,10 @@
 	// reads something above 1 (3.29 on an 8BitDo in D mode).
 	const HAT_VALUES = [-1, -5 / 7, -3 / 7, -1 / 7, 1 / 7, 3 / 7, 5 / 7, 1];
 	const HAT_DIRS = [['Up'], ['Up', 'Right'], ['Right'], ['Down', 'Right'], ['Down'], ['Down', 'Left'], ['Left'], ['Up', 'Left']];
-	const MAP_HOLD_MS = 350; // after a prompt appears, or the last control was let go, nothing counts
-	const MAP_CAPTURE_MS = 300; // from the first sign of a press, what moves is collected
+	// A prompt listens at once: what is held when it appears counts only once let go and pressed again.
+	const MAP_CAPTURE_MS = 300; // from the first sign of a press, what moves is collected until it is let go
 	const MAP_RELEASE_MS = 2500; // longest wait for the control to be let go
+	const MAP_REST = 0.25; // how close to where it started an axis must come back to be let go
 	// The prompts, in order. kind: button, trigger (an axis or a button), dpad (buttons, or a hat for all four),
 	// stickx and sticky (an axis; Y is asked pushed up).
 	const MAP_PROMPTS = [
@@ -6048,7 +6049,7 @@
 		const draft = g.map ? JSON.parse(JSON.stringify(g.map)) : { buttons: {}, sticks: {} };
 		draft.buttons = draft.buttons || {};
 		draft.sticks = draft.sticks || {};
-		g.mapper = { steps, i: 0, draft, phase: 'hold', until: performance.now() + MAP_HOLD_MS, snap: null, cap: null, skip: new Set(), last: '' };
+		g.mapper = { steps, i: 0, draft, phase: 'start', until: 0, snap: null, cap: null, skip: new Set(), last: '' };
 		g.state.fill(0);
 		syncPads();
 		renderMapUi(g);
@@ -6059,8 +6060,7 @@
 		m.i = to;
 		while (m.i < m.steps.length && m.skip.has(m.steps[m.i].id))
 			m.i++;
-		m.phase = 'hold';
-		m.until = performance.now() + MAP_HOLD_MS;
+		m.phase = 'start';
 		m.cap = null;
 		if (m.i >= m.steps.length) {
 			g.map = m.draft;
@@ -6100,11 +6100,16 @@
 	function mapperFrame(g, gp, now) {
 		const m = g.mapper;
 		const step = m.steps[m.i];
-		if (m.phase === 'hold') {
-			if (now < m.until)
-				return;
-			m.snap = { buttons: gp.buttons.map((b) => b.pressed || b.value > 0.5), axes: [...gp.axes] };
+		const held = (b) => b.pressed || b.value > 0.5;
+		if (m.phase === 'start') {
+			m.snap = { buttons: gp.buttons.map(held), axes: [...gp.axes] };
 			m.phase = 'wait';
+		}
+		if (m.phase === 'wait') {
+			gp.buttons.forEach((b, i) => {
+				if (m.snap.buttons[i] && !held(b))
+					m.snap.buttons[i] = false; // let go: its next press counts
+			});
 		}
 		const found = mapActivity(step.kind, gp, m.snap);
 		if (m.phase === 'wait') {
@@ -6124,7 +6129,7 @@
 						m.cap.axes.set(f.i, f.v);
 				}
 			}
-			if (now < m.until)
+			if (found.length && now < m.until)
 				return;
 			const binding = bindingFrom(step, m.cap, m.snap);
 			mapperStore(g, step, binding);
@@ -6134,7 +6139,10 @@
 			renderMapUi(g);
 			return;
 		}
-		if (m.phase === 'release' && (!found.length || now >= m.until))
+		// The next prompt starts once the control is let go, axes back near where they started, so that a
+		// stick or trigger on its way back does not count for it.
+		const back = () => [...m.cap.axes.keys()].every((i) => Math.abs(gp.axes[i] - m.snap.axes[i]) < MAP_REST);
+		if (m.phase === 'release' && ((!found.length && back()) || now >= m.until))
 			mapperAdvance(g, m.i + 1);
 	}
 

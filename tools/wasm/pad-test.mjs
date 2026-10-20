@@ -187,7 +187,10 @@ const TEST = `(async () => {
 	const startBtn = document.querySelector('#gp-list .gp-map-start');
 	r['the Map controls button is shown'] = !!startBtn && !startBtn.closest('.gp-map').hidden;
 	startBtn.click();
-	const press = async (apply, release) => { await wait(450); apply(); await wait(450); release(); await wait(200); };
+	// At a quick pace, as people map: each prompt listens at once, so a control pressed 100 ms after the last
+	// one was let go counts. Quick taps and long holds alternate.
+	let nth = 0;
+	const press = async (apply, release) => { await wait(100); apply(); await wait(nth++ % 2 ? 60 : 450); release(); await wait(20); };
 	const btn = (i) => [() => set(nm, i, 1), () => set(nm, i, 0)];
 	const axis = (i, v, rest) => [() => { nm.axes[i] = v; }, () => { nm.axes[i] = rest; }];
 	const both2 = (a, b) => [() => { a[0](); b[0](); }, () => { a[1](); b[1](); }];
