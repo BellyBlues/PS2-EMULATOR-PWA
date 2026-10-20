@@ -480,6 +480,26 @@ __ri void _nVifUnpackLoop(const u8* data)
 	pxAssume(vif.cl == 0);
 	//pxAssume (vifRegs.cycle.wl > 0);
 
+#ifdef ARCH_WASM
+	// Unmasked V4-32 with CL == WL (the common way to upload vertices, STCYCL 1,1) writes each input
+	// quadword unchanged to consecutive VU addresses: copy them without the per-quadword call through
+	// VIFfuncTable (call_indirect on wasm), with the same address wrap and the same final state.
+	if (!doMode && !isFill && !(vif.cmd & 0x10) && upkNum == 0x0C && vifRegs.cycle.cl == vifRegs.cycle.wl)
+	{
+		const uint wl = vifRegs.cycle.wl ? vifRegs.cycle.wl : 256;
+		const uint num = vifRegs.num;
+		for (uint i = 0; i < num; i++)
+		{
+			std::memcpy(getVUptr(idx, vif.tag.addr), data, 16);
+			vif.tag.addr += 16;
+			data += 16;
+		}
+		vif.cl = num % wl;
+		vifRegs.num = 0;
+		return;
+	}
+#endif
+
 	do
 	{
 		u8* dest = getVUptr(idx, vif.tag.addr);
