@@ -22,10 +22,11 @@ The number of figures steps through 1, 25, 50, 75 and 100, 300 frames each, then
 each step the program prints `BENCH phase N=<figures> frame=<frame>`, and at the end of a phase
 `BENCH load ...`: how many vsyncs a frame took and how the EE's time split between building
 frames, waiting for VU1 and the GS, and waiting for vsync (from its cycle counter). One vsync per
-frame means a PS2 keeps up; the emulator then has to do all of the phase's work every vsync. It draws at most one frame per
-vsync and sleeps on interrupts while it waits, like a game, so with the frame limiter off the
-emulator's speed shows how much faster than a PS2 it runs; with it on, anything under 100 % is
-what a player would see as slowdown.
+frame means a PS2 keeps up; the emulator then has to do all of the phase's work every vsync.
+
+The program draws at most one frame per vsync and sleeps on interrupts while it waits, like a
+game, so with the frame limiter off the emulator's speed shows how much faster than a PS2 it runs;
+with it on, anything under 100 % is what a player would see as slowdown.
 
 It is a stand-in, not a copy of any game: it does not reproduce everything a game does (no sound,
 no streaming from disc, one VU1 program, little game logic), so a gain here is a gain in the paths

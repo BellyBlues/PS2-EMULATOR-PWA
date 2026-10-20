@@ -1300,11 +1300,24 @@
 		}
 	}
 
+	// Where each presented pixel costs CPU time or a GPU readback, the GS presents at most this many
+	// lines (about the PS2's own) and CSS scales the canvas up: the 2D path scales every frame on the
+	// CPU, and Firefox's transferToImageBitmap() on a WebGPU canvas waits for the GPU and copies the
+	// frame back (measured in Zen 1.22 on an M1 Max: 9.6 ms a frame at 1960x1470, 2.9 ms at 640x512;
+	// Chrome: 0.02 ms at any size, so it keeps the full size).
+	const SURFACE_CAP_LINES = 512;
+	const SURFACE_CAPPED = IS_FIREFOX || !GPU_ALLOWED || !HAS_JSPI || !navigator.gpu;
+
 	function feedSurfaceSize(width, height, scale) {
 		if (TEST_SURFACE) {
 			width = Number(TEST_SURFACE[1]);
 			height = Number(TEST_SURFACE[2]);
 			scale = 1;
+		} else if (SURFACE_CAPPED && height > SURFACE_CAP_LINES) {
+			const f = SURFACE_CAP_LINES / height;
+			width = Math.max(1, Math.round(width * f));
+			height = SURFACE_CAP_LINES;
+			scale *= f;
 		}
 		if (width > 0 && height > 0) {
 			surfaceFeed.width = width;

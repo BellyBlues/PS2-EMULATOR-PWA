@@ -223,7 +223,11 @@ WebGPU is used only where the browser has both WebGPU and JSPI. In a browser wit
 The page receives a `MessagePort` once (`Module.tstFramePort`) and shows every `ImageBitmap`
 posted on it with a `bitmaprenderer` context, at the canvas's backing size, which it reports with
 `pcsx2web_surface_size()` (the device presents at most 4096 pixels on a side, and never more than
-the adapter's largest texture; the page scales a smaller frame to the canvas). **Crisp** switches
+the adapter's largest texture; the page scales a smaller frame to the canvas). In Firefox, and on
+the 2D path, the page reports at most 512 lines instead (keeping the canvas's shape) and CSS scales
+the frame up: there each presented pixel costs a GPU readback (Firefox's `transferToImageBitmap()`
+on a WebGPU canvas: 9.6 ms a frame at 1960x1470 in Zen 1.22 on an M1 Max, 2.9 ms at 640x512) or CPU
+time (the 2D path's scaling). **Crisp** switches
 the device between nearest and bilinear filtering (`pcsx2web_set_crisp()`); on the 2D path it
 switches the canvas's CSS scaling instead.
 
