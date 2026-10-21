@@ -30,6 +30,8 @@ namespace EEJit
 	// Statistics (-eejit-stats): counts executions of the instructions that fall back to the interpreter.
 	extern bool g_stats;
 	extern u32 g_dbgmask; // debugging: COP2 kinds (bit per EEJit.cpp C2 value, 0x10000 LQC2/SQC2) left to the interpreter
+	// Idle loops (EEJit.cpp): iterations that change nothing are skipped up to the next event (-eejit-spin 0: off).
+	extern bool g_spin;
 	void PrintStats();
 	// Time spent building and compiling modules so far, in nanoseconds.
 	u64 CompileNs();

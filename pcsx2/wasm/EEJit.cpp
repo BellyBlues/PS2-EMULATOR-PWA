@@ -54,6 +54,7 @@
 #include "common/Timer.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -76,6 +77,7 @@ namespace EEJit
 	u64 g_trace_from = ~0ull, g_trace_to = 0;
 	bool g_stats = false;
 	u32 g_dbgmask = 0;
+	bool g_spin = true;
 } // namespace EEJit
 
 namespace CodeWrites
@@ -351,6 +353,465 @@ namespace
 		if (k >= Kind::LB && k <= Kind::SQC2 && CHECK_CACHE)
 			k = Kind::Fallback;
 		return {&op, k};
+	}
+
+	// ------------------------------------------------------------------------------------------------------------
+	// Idle loops
+	//
+	// Games wait for interrupts in loops that only read memory and compare: GTA San Andreas spends a third of the EE
+	// thread polling two counters that a DMA interrupt advances. Memory changes only in event tests (DMA, interrupts,
+	// the IOP; all on the EE thread), and events only run at branch tests once cpuRegs.cycle reaches nextEventCycle.
+	// So when one iteration of such a loop leaves every register as it found it, every further iteration until the
+	// next event is the same iteration, and only the cycle counters move: they are advanced by what those iterations
+	// would add (SpinSkip()), and the iteration whose branch test runs the event runs normally. Nothing else changes:
+	// the state at every branch test is the one the loop would have had (-eejit-trace hashes each of them).
+	//
+	// A site is a taken backward branch whose loop [target, branch + 4] has at most 32 words of register ALU ops,
+	// loads, branches and jumps (BlockCompiler::AddSpinSite()). At the site, SpinTry() runs one iteration on the
+	// interpreter (intJitExecOne()), checked instruction by instruction: ALU ops, conditional branches on GPRs and
+	// aligned loads of main RAM or the scratchpad only. If it changed nothing, the site remembers the registers it
+	// started from and the values it loaded: the same registers and the same values make the same iteration, so the
+	// next time it skips without running it.
+
+	struct SpinWord
+	{
+		u32 code;
+		Kind kind;
+		u32 cycles; // opcode table cycles, before the Config factor
+	};
+
+	// The part of cpuRegs a branch test hashes (EEJit::TraceStep()). An iteration changes only the GPRs, HI and LO
+	// (kSpinRegs bytes), pc and code; it reads COP0 Config (the cycle factor). Event tests change other COP0
+	// registers (Count), which the loop does not read.
+	constexpr size_t kSpinSnap = offsetof(cpuRegisters, code) + 4;
+	constexpr size_t kSpinRegs = offsetof(cpuRegisters, CP0);
+	using SpinSnap = std::array<u8, kSpinSnap>;
+
+	// Whether the iteration-relevant state in `snap` is the current one.
+	bool SpinSameRegs(const SpinSnap& snap)
+	{
+		const cpuRegisters& r = *reinterpret_cast<const cpuRegisters*>(snap.data());
+		return std::memcmp(&cpuRegs, snap.data(), kSpinRegs) == 0 && cpuRegs.pc == r.pc && cpuRegs.code == r.code &&
+			   cpuRegs.CP0.n.Config == r.CP0.n.Config;
+	}
+
+	// A branch test in the iteration.
+	struct SpinTest
+	{
+		u32 add; // cpuBlockCycles added since the previous test
+		bool end; // a taken branch's end (else the test of a branch not taken)
+		bool twice; // the end updates the cycles twice (a wait loop not skipped, _doBranch_afterDelaySlot())
+	};
+
+	struct SpinLoad
+	{
+		u32 addr;
+		u32 size;
+		u64 value;
+	};
+
+	struct SpinSite
+	{
+		u32 target = 0;
+		std::vector<SpinWord> words; // target .. branch + 4
+		u32 fails = 0;
+		u32 wait = 0;
+		// The last iteration found to change nothing: its registers, tests, the states at its tests (with -eejit-trace)
+		// and loads.
+		bool memo = false;
+		bool wait_loop = false; // EmuConfig.Speedhacks.WaitLoop when it was made
+		SpinSnap start;
+		std::vector<SpinTest> tests;
+		std::vector<SpinSnap> snaps;
+		std::vector<SpinLoad> loads;
+		u64 calls = 0, tries = 0, skips = 0, iters = 0; // -eejit-stats
+	};
+
+	std::vector<std::unique_ptr<SpinSite>> s_spin_sites;
+	std::unordered_map<u32, u32> s_spin_index; // branch PC -> s_spin_sites index
+	bool s_spin_off = false;
+	u64 s_spin_tries = 0, s_spin_hits = 0, s_spin_skips = 0, s_spin_iters = 0, s_spin_cycles = 0, s_spin_why[7] = {};
+
+	enum class SpinClass : u8
+	{
+		Other,
+		Alu,
+		Load,
+		Branch, // conditional, no link
+		Jump,
+	};
+
+	SpinClass SpinClassOf(Kind k)
+	{
+		switch (k)
+		{
+			case Kind::Nop:
+			case Kind::SLL: case Kind::SRL: case Kind::SRA: case Kind::DSLL: case Kind::DSRL: case Kind::DSRA:
+			case Kind::DSLL32: case Kind::DSRL32: case Kind::DSRA32: case Kind::SLLV: case Kind::SRLV: case Kind::SRAV:
+			case Kind::DSLLV: case Kind::DSRLV: case Kind::DSRAV: case Kind::ADDU: case Kind::SUBU: case Kind::DADDU:
+			case Kind::DSUBU: case Kind::AND: case Kind::OR: case Kind::XOR: case Kind::NOR: case Kind::SLT:
+			case Kind::SLTU: case Kind::MOVZ: case Kind::MOVN: case Kind::MFHI: case Kind::MFLO: case Kind::ADDIU:
+			case Kind::DADDIU: case Kind::SLTI: case Kind::SLTIU: case Kind::ANDI: case Kind::ORI: case Kind::XORI:
+			case Kind::LUI:
+				return SpinClass::Alu;
+			case Kind::LB: case Kind::LBU: case Kind::LH: case Kind::LHU: case Kind::LW: case Kind::LWU: case Kind::LD:
+				return SpinClass::Load;
+			case Kind::BEQ: case Kind::BNE: case Kind::BLEZ: case Kind::BGTZ: case Kind::BEQL: case Kind::BNEL:
+			case Kind::BLEZL: case Kind::BGTZL: case Kind::BLTZ: case Kind::BGEZ: case Kind::BLTZL: case Kind::BGEZL:
+				return SpinClass::Branch;
+			case Kind::J: case Kind::JAL: case Kind::JR: case Kind::JALR:
+				return SpinClass::Jump;
+			default:
+				return SpinClass::Other;
+		}
+	}
+
+	// The host address of the instruction word at pc, if it is in memory (not a handler).
+	const u32* SpinWordPtr(u32 pc)
+	{
+		const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
+		if (vmv.isHandler(pc))
+			return nullptr;
+		return reinterpret_cast<const u32*>(vmv.assumePtr(pc));
+	}
+
+	// Reads what the load `w` reads with the current registers, if that is aligned main RAM or scratchpad (no
+	// handler, no exception).
+	bool SpinRead(const SpinWord& w, SpinLoad* load)
+	{
+		load->addr = cpuRegs.GPR.r[(w.code >> 21) & 31].UL[0] + static_cast<s16>(w.code & 0xffff);
+		switch (w.kind)
+		{
+			case Kind::LB: case Kind::LBU: load->size = 1; break;
+			case Kind::LH: case Kind::LHU: load->size = 2; break;
+			case Kind::LW: case Kind::LWU: load->size = 4; break;
+			default: load->size = 8; break;
+		}
+		if (load->addr & (load->size - 1))
+			return false;
+		const VTLBVirtual vmv = vtlbdata.vmap[load->addr >> VTLB_PAGE_BITS];
+		if (vmv.isHandler(load->addr))
+			return false;
+		const uptr host = vmv.assumePtr(load->addr);
+		const uptr main = reinterpret_cast<uptr>(eeMem->Main), scratch = reinterpret_cast<uptr>(eeMem->Scratch);
+		if ((host - main) >= Ps2MemSize::MainRam && (host - scratch) >= Ps2MemSize::Scratch)
+			return false;
+		load->value = 0;
+		std::memcpy(&load->value, reinterpret_cast<const void*>(host), load->size);
+		return true;
+	}
+
+	// The same address still reads the same value.
+	bool SpinSame(const SpinLoad& l)
+	{
+		const VTLBVirtual vmv = vtlbdata.vmap[l.addr >> VTLB_PAGE_BITS];
+		if (vmv.isHandler(l.addr))
+			return false;
+		const uptr host = vmv.assumePtr(l.addr);
+		const uptr main = reinterpret_cast<uptr>(eeMem->Main), scratch = reinterpret_cast<uptr>(eeMem->Scratch);
+		if ((host - main) >= Ps2MemSize::MainRam && (host - scratch) >= Ps2MemSize::Scratch)
+			return false;
+		u64 v = 0;
+		std::memcpy(&v, reinterpret_cast<const void*>(host), l.size);
+		return v == l.value;
+	}
+
+	bool SpinCond(Kind k, u32 code)
+	{
+		const s64 rs = cpuRegs.GPR.r[(code >> 21) & 31].SD[0], rt = cpuRegs.GPR.r[(code >> 16) & 31].SD[0];
+		switch (k)
+		{
+			case Kind::BEQ: case Kind::BEQL: return rs == rt;
+			case Kind::BNE: case Kind::BNEL: return rs != rt;
+			case Kind::BLEZ: case Kind::BLEZL: return rs <= 0;
+			case Kind::BGTZ: case Kind::BGTZL: return rs > 0;
+			case Kind::BLTZ: case Kind::BLTZL: return rs < 0;
+			default: return rs >= 0;
+		}
+	}
+
+	// intUpdateCPUCycles() with an EE cycle rate of 0.
+	void SpinUpdate(u64& cycle, u32& bc)
+	{
+		const u32 c = bc >> 3;
+		cycle += c ? c : 1;
+		bc &= 7;
+	}
+
+	bool SpinDue(u64 cycle) { return static_cast<s64>(cycle - cpuRegs.nextEventCycle) >= 0; }
+
+	// One iteration's cycles from (cycle, bc), as its tests would leave them.
+	void SpinIterate(const SpinSite& site, u64& cycle, u32& bc)
+	{
+		for (const SpinTest& t : site.tests)
+		{
+			bc += t.add;
+			if (t.end)
+			{
+				if (t.twice)
+					SpinUpdate(cycle, bc);
+				SpinUpdate(cycle, bc);
+			}
+		}
+	}
+
+	// From the loop's start with the site's memo state: skips the iterations whose last branch test comes before the
+	// next event (a test with an earlier cycle cannot be due when the last one is not).
+	void SpinSkip(SpinSite& site)
+	{
+		u32* const bcp = intJitBlockCycles();
+		const u64 cycle0 = cpuRegs.cycle;
+		u64 cycle = cycle0;
+		u32 bc = *bcp;
+		u64 n = 0;
+		if (!EEJit::g_trace)
+		{
+			u64 c = cycle;
+			u32 b = bc;
+			SpinIterate(site, c, b);
+			if (SpinDue(c))
+				return;
+			n = 1;
+			if (b == bc)
+			{
+				// Each iteration then adds the same cycles.
+				const u64 delta = c - cycle;
+				const u64 more = (cpuRegs.nextEventCycle - c - 1) / delta;
+				c += more * delta;
+				n += more;
+			}
+			else
+			{
+				for (;;)
+				{
+					u64 c2 = c;
+					u32 b2 = b;
+					SpinIterate(site, c2, b2);
+					if (SpinDue(c2) || n >= (1u << 20))
+						break;
+					c = c2;
+					b = b2;
+					n++;
+				}
+			}
+			cycle = c;
+			bc = b;
+		}
+		else
+		{
+			// Each skipped test with the state the loop would have had there, for the trace's hashes.
+			SpinSnap entry;
+			std::memcpy(entry.data(), &cpuRegs, kSpinSnap);
+			for (;;)
+			{
+				u64 c = cycle;
+				u32 b = bc;
+				SpinIterate(site, c, b);
+				if (SpinDue(c) || n >= (1u << 20))
+					break;
+				c = cycle;
+				b = bc;
+				for (size_t i = 0; i < site.tests.size(); i++)
+				{
+					const SpinTest& t = site.tests[i];
+					b += t.add;
+					if (t.end)
+					{
+						if (t.twice)
+							SpinUpdate(c, b);
+						SpinUpdate(c, b);
+					}
+					const cpuRegisters& r = *reinterpret_cast<const cpuRegisters*>(site.snaps[i].data());
+					std::memcpy(&cpuRegs, &r, kSpinRegs);
+					cpuRegs.pc = r.pc;
+					cpuRegs.code = r.code;
+					cpuRegs.cycle = c;
+					EEJit::TraceStep();
+				}
+				cycle = c;
+				bc = b;
+				n++;
+			}
+			std::memcpy(&cpuRegs, entry.data(), kSpinSnap);
+			if (!n)
+			{
+				cpuRegs.cycle = cycle0;
+				return;
+			}
+		}
+		cpuRegs.cycle = cycle;
+		*bcp = bc;
+		s_spin_skips++;
+		s_spin_iters += n;
+		s_spin_cycles += cycle - cycle0;
+		site.skips++;
+		site.iters += n;
+	}
+
+	// Called by generated code after the end of a taken branch that is a site (index `index`).
+	void SpinTry(u32 index)
+	{
+		if (s_spin_off || !EEJit::g_spin || *intJitBiosHooksActive() || EmuConfig.Speedhacks.EECycleRate != 0 ||
+			CHECK_CACHE)
+			return;
+		SpinSite& site = *s_spin_sites[index];
+		site.calls++;
+		const u32 L = site.target;
+		if (cpuRegs.pc != L || cpuRegs.branch != 0 || *intJitLastBranchTo() != L)
+			return;
+		for (size_t i = 0; i < site.words.size(); i++)
+		{
+			const u32* word = SpinWordPtr(L + static_cast<u32>(i) * 4);
+			if (!word || *word != site.words[i].code)
+				return;
+		}
+
+		// The remembered iteration: same registers, same loaded values.
+		if (site.memo && site.wait_loop == EmuConfig.Speedhacks.WaitLoop && SpinSameRegs(site.start) &&
+			std::all_of(site.loads.begin(), site.loads.end(), SpinSame))
+		{
+			s_spin_hits++;
+			SpinSkip(site);
+			return;
+		}
+		if (site.wait)
+		{
+			site.wait--;
+			return;
+		}
+		s_spin_tries++;
+		site.tries++;
+		site.memo = false;
+		auto fail = [&](int why) {
+			s_spin_why[why]++;
+			site.fails = std::min<u32>(site.fails + 1, 8);
+			site.wait = 1u << site.fails;
+		};
+
+		std::memcpy(site.start.data(), &cpuRegs, kSpinSnap);
+		u32* const bcp = intJitBlockCycles();
+		const u32 factor = 2 - ((cpuRegs.CP0.n.Config >> 18) & 1);
+		const bool trace = EEJit::g_trace;
+		u64 cycle = cpuRegs.cycle;
+		u32 bc = *bcp;
+		u32 add = 0;
+		site.tests.clear();
+		site.snaps.clear();
+		site.loads.clear();
+
+		// One iteration, for real, on the interpreter.
+		for (u32 steps = 0;; steps++)
+		{
+			const u32 pc = cpuRegs.pc;
+			const u32 i = (pc - L) >> 2;
+			if (steps >= 64 || (pc & 3) || i >= site.words.size())
+				return fail(0);
+			const SpinWord& w = site.words[i];
+			const SpinClass cls = SpinClassOf(w.kind);
+			if (cls == SpinClass::Alu || cls == SpinClass::Load)
+			{
+				if (cls == SpinClass::Load)
+				{
+					SpinLoad l;
+					if (!SpinRead(w, &l))
+						return fail(1);
+					site.loads.push_back(l);
+				}
+				bc += w.cycles * factor;
+				add += w.cycles * factor;
+				intJitExecOne();
+				continue;
+			}
+			if (cls != SpinClass::Branch)
+				return fail(2);
+
+			const bool likely = w.kind == Kind::BEQL || w.kind == Kind::BNEL || w.kind == Kind::BLEZL ||
+								w.kind == Kind::BGTZL || w.kind == Kind::BLTZL || w.kind == Kind::BGEZL;
+			const bool taken = SpinCond(w.kind, w.code);
+			const u32 target = pc + 4 + (static_cast<s16>(w.code & 0xffff) << 2);
+			SpinTest t = {};
+			bc += w.cycles * factor;
+			add += w.cycles * factor;
+			if (taken)
+			{
+				// The delay slot runs inside the branch's step: check it now (the branch changes no register).
+				if (i + 1 >= site.words.size())
+					return fail(3);
+				const SpinWord& ds = site.words[i + 1];
+				const SpinClass dcls = SpinClassOf(ds.kind);
+				if (dcls == SpinClass::Load)
+				{
+					SpinLoad l;
+					if (!SpinRead(ds, &l))
+						return fail(3);
+					site.loads.push_back(l);
+				}
+				else if (dcls != SpinClass::Alu)
+					return fail(3);
+				bc += ds.cycles * factor;
+				add += ds.cycles * factor;
+				t.end = true;
+				if (*intJitLastBranchTo() == target && EmuConfig.Speedhacks.WaitLoop)
+				{
+					// _doBranch_afterDelaySlot()'s wait loop: skipped (to the next event) or one more update.
+					const u32 after = pc + 8;
+					bool can_skip = true;
+					if (target != 0x81fc0)
+					{
+						if ((after - target) < 4 * 10)
+						{
+							for (u32 a = target; a < after; a += 4)
+							{
+								if (PSM(a) != 0)
+								{
+									can_skip = false;
+									break;
+								}
+							}
+						}
+						else
+							can_skip = false;
+					}
+					if (can_skip)
+						return fail(5); // the interpreter skips this one to the next event itself
+					t.twice = true;
+					SpinUpdate(cycle, bc);
+				}
+				SpinUpdate(cycle, bc);
+			}
+			else if (!likely && w.kind != Kind::BEQ && w.kind != Kind::BNE)
+			{
+				// BLEZ, BGTZ, BLTZ, BGEZ not taken: no test.
+				intJitExecOne();
+				continue;
+			}
+			if (SpinDue(cycle))
+				return void(s_spin_why[6]++); // the event runs: left to generated code
+			intJitExecOne();
+			if (cpuRegs.cycle != cycle || *bcp != bc)
+			{
+				Console.Error("EE JIT: idle loop at %08x: cycle model mismatch, idle loops off.", pc);
+				s_spin_off = true;
+				return;
+			}
+			t.add = add;
+			add = 0;
+			site.tests.push_back(t);
+			if (trace)
+			{
+				site.snaps.emplace_back();
+				std::memcpy(site.snaps.back().data(), &cpuRegs, kSpinSnap);
+			}
+			if (taken && target == L)
+				break;
+		}
+		if (std::memcmp(site.start.data(), &cpuRegs, kSpinSnap) != 0 || cpuRegs.branch != 0 ||
+			*intJitLastBranchTo() != L)
+			return fail(4);
+		site.fails = 0;
+		site.memo = true;
+		site.wait_loop = EmuConfig.Speedhacks.WaitLoop;
+		SpinSkip(site);
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
@@ -2529,6 +2990,42 @@ namespace
 			m_fn.call(kFnBranchEnd);
 		}
 
+		// Whether the backward branch at pc to target closes a loop that may be idle (see SpinTry()): up to 32 words
+		// of register ALU ops, loads, branches and jumps (this page and the one before). Records it as a site.
+		s32 AddSpinSite(u32 pc, u32 target)
+		{
+			// 0x81fc0: the kernel's idle loop, which the interpreter's wait loop skip handles.
+			if (target > pc || pc + 4 >= m_page + 4096 || pc + 8 - target > 4 * 32 || target == 0x81fc0)
+				return -1;
+			std::vector<SpinWord> words;
+			for (u32 a = target; a <= pc + 4; a += 4)
+			{
+				const u32* word = SpinWordPtr(a);
+				if (!word)
+					return -1;
+				const u32 code = *word;
+				const Decoded d = Decode(code);
+				if (SpinClassOf(d.kind) == SpinClass::Other)
+					return -1;
+				words.push_back({code, d.kind, d.op->cycles});
+			}
+			auto [it, added] = s_spin_index.try_emplace(pc, static_cast<u32>(s_spin_sites.size()));
+			if (added)
+				s_spin_sites.push_back(std::make_unique<SpinSite>());
+			SpinSite& site = *s_spin_sites[it->second];
+			if (site.target != target || site.words.size() != words.size() ||
+				!std::equal(words.begin(), words.end(), site.words.begin(),
+					[](const SpinWord& a, const SpinWord& b) { return a.code == b.code; }))
+			{
+				site.target = target;
+				site.words = std::move(words);
+				site.memo = false;
+				site.fails = 0;
+				site.wait = 0;
+			}
+			return static_cast<s32>(it->second);
+		}
+
 		// Emits the branch at pc. Returns true if the block goes on (at m_next_pc) after the branch not taken.
 		bool EmitBranch(u32 pc, u32 code, const Decoded& d, std::vector<u32>* next)
 		{
@@ -2554,6 +3051,13 @@ namespace
 				FlushCycles();
 				WritebackAll();
 				EmitBranchEnd(target);
+				if (const s32 site = target == btarget && SpinClassOf(d.kind) == SpinClass::Branch ? AddSpinSite(pc, btarget) : -1;
+					site >= 0)
+				{
+					f.i32_const(site);
+					f.i32_const(static_cast<s32>(FnIndex(&SpinTry)));
+					f.call_indirect(m_tiv, 0);
+				}
 				Leave(target, false);
 				m_pending = saved_pending;
 				m_cyc_dirty = saved_dirty;
@@ -3382,8 +3886,31 @@ void EEJit::PrintStats()
 		s_compile_ns / 1e6, s_max_module_ns / 1e6, static_cast<unsigned long long>(s_invalidations), static_cast<unsigned long long>(s_flushes),
 		static_cast<unsigned long long>(s_interp_steps), static_cast<unsigned long long>(s_native_instrs),
 		static_cast<unsigned long long>(s_guest_instrs));
+	Console.WriteLn("EE JIT: idle loops: %zu sites, %llu tries, %llu remembered, %llu skips of %llu iterations (%llu cycles)%s",
+		s_spin_sites.size(), static_cast<unsigned long long>(s_spin_tries), static_cast<unsigned long long>(s_spin_hits),
+		static_cast<unsigned long long>(s_spin_skips),
+		static_cast<unsigned long long>(s_spin_iters), static_cast<unsigned long long>(s_spin_cycles),
+		g_spin ? (s_spin_off ? ", turned off" : "") : ", off");
 	if (!g_stats)
 		return;
+	Console.WriteLn("EE JIT: idle loop fails: %llu left, %llu load, %llu op, %llu delay slot, %llu changed, %llu wait loops; %llu events due",
+		static_cast<unsigned long long>(s_spin_why[0]), static_cast<unsigned long long>(s_spin_why[1]),
+		static_cast<unsigned long long>(s_spin_why[2]), static_cast<unsigned long long>(s_spin_why[3]),
+		static_cast<unsigned long long>(s_spin_why[4]), static_cast<unsigned long long>(s_spin_why[5]),
+		static_cast<unsigned long long>(s_spin_why[6]));
+	{
+		std::vector<std::pair<u64, u32>> sv;
+		for (const auto& [pc, index] : s_spin_index)
+			sv.emplace_back(s_spin_sites[index]->calls, pc);
+		std::sort(sv.rbegin(), sv.rend());
+		for (size_t i = 0; i < std::min<size_t>(sv.size(), 10); i++)
+		{
+			const SpinSite& site = *s_spin_sites[s_spin_index[sv[i].second]];
+			Console.WriteLn("  idle loop %08x -> %08x: %llu calls, %llu tries, %llu skips of %llu iterations", sv[i].second,
+				site.target, static_cast<unsigned long long>(site.calls), static_cast<unsigned long long>(site.tries),
+				static_cast<unsigned long long>(site.skips), static_cast<unsigned long long>(site.iters));
+		}
+	}
 	std::vector<std::pair<u64, std::string>> v;
 	for (size_t i = 0; i < s_stat_names.size(); i++)
 		v.emplace_back(s_stat_counts[i], s_stat_names[i]);
