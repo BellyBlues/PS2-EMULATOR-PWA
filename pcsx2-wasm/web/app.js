@@ -2977,7 +2977,7 @@
 	const PIPE_SAVE_MS = 15000;
 	const pipes = {
 		serial: '', session: -1, staleSession: -1, read: 0, version: null, used: [], usedSet: new Set(),
-		stored: null, handOver: null, dirty: false, lastRead: 0, lastSave: 0, saving: false, warned: false,
+		stored: null, handOver: null, dirty: false, lastRead: 0, lastSave: 0, writes: Promise.resolve(), warned: false,
 	};
 
 	function pipeIdbOpen() {
@@ -3101,9 +3101,9 @@
 
 	// Stores this session's keys, in the order draws first asked for them, then the stored keys of the same
 	// version it has not used, up to PIPE_CAPACITY.
-	async function pipeSave() {
+	function pipeSave() {
 		pipeRead();
-		if (!pipes.dirty || pipes.saving || !pipes.serial || !pipes.version)
+		if (!pipes.dirty || !pipes.serial || !pipes.version)
 			return;
 		const serial = pipes.serial;
 		const version = pipes.version;
@@ -3121,17 +3121,11 @@
 		keys.forEach((k, i) => out.set(k, i * PIPE_KEY_BYTES));
 		const rec = { version, keys: out.buffer, savedAt: Date.now() };
 		pipes.dirty = false;
-		pipes.saving = true;
+		pipes.stored = rec;
 		pipes.lastSave = performance.now();
-		try {
-			await pipeIdb('readwrite', (s) => s.put(rec, serial));
-			if (pipes.serial === serial)
-				pipes.stored = rec;
-		} catch (err) {
-			pipeWarn('store the list', err);
-		} finally {
-			pipes.saving = false;
-		}
+		// One write after another, so that an older list never lands after a newer one.
+		pipes.writes = pipes.writes.then(() => pipeIdb('readwrite', (s) => s.put(rec, serial)))
+			.catch((err) => pipeWarn('store the list', err));
 	}
 
 	function pipeTick() {
