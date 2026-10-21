@@ -58,6 +58,89 @@ per-op register sets would avoid (it matters for EFU-heavy code); flag liveness 
 still computes every flag; a loop whose exit carries an entry from the pass's entry (a short loop with FDIV or EFU
 latencies longer than a pass) still goes through the dispatcher at every pass.
 
+**Status (2026-10-21, modules).** Blocks now go to each other inside generated code, for game code that branches
+a lot. Guitar Hero (PAL) in a song was limited by the VU thread (Chrome: VU 100% busy, EE 64%): its VU1 programs left
+generated code about every 9 instructions, at nearly every block boundary, and are a state machine of computed jumps
+(JR to 5 or more targets).
+
+- **Modules** (`CompileModule`, VU1 only): one wasm function holds the blocks reachable from an entry block through
+  static branches, fall-throughs and learned jump targets, up to 1024 blocks and 8192 instructions; its argument is
+  the block to start at, so the dispatcher can enter it at any of them. Layout is reverse postorder: a block's code
+  follows the end of its own wasm `block`, so going to a later block is a `br`, and going back goes through a dispatch
+  `loop` with a `br_table` (§5.7's step-1 shape; natural loops as wasm `loop`s are not done). A block that loops on
+  itself keeps `EmitLoopBack`. `CompileBlock` (VU0) is the one-block case. `VU1JIT_NOCHAIN` gives one block per module.
+- **An edge does the dispatcher's work** (`EmitEdge`): the budget test for the next block (exit if its last
+  instruction would start past the budget), then `ApplyExit` and `NormalizeRings` for the only timing fields the next
+  exit does not write again: pipe entries pending since the block's entry move from their ring slot to their place in
+  ring order, the ones the block added get every field from the model (`EmitEdgeState`), the snapshot locals rotate,
+  and the next block's base is set. Registers, flags and snapshots stay in locals; the cycle, ring positions, VI
+  backup window, TPC and control state are written by the exit that finally leaves. Every exit sets its id and
+  branches to one exit sequence after the dispatch loop (the shared stub of §5.3).
+- **Learned jump targets and merging** (§6.4): the dispatcher records each JR/JALR's targets (16 at most, per block
+  and signature). A module that leaves for other modules 1024 times is compiled again from its entry (`Merge`), with
+  its own blocks and the entries of the modules it goes to as more roots and other modules' blocks included, so that
+  a program ends up in one module instead of copies (copies of hot code in several modules cost more in instruction
+  cache than the exits they save); a JR compares the target with each learned one that is a block of the module (an
+  exact TPC match, so TPC stays the interpreter's). Modules the new one holds entirely are dropped. A merged module is
+  merged again only when its jumps have learned more targets (after 4× more exits each time); at most 6 merges per
+  entry, counted across the modules that replace each other, while merges took less than 250 ms plus 1% of the
+  thread's time. `VU1JIT_MERGE_EXITS` lowers the threshold and lifts the time budget (the fuzzer uses 1);
+  `VU1JIT_EXITS` lists the exits that left generated code most often, and each merge.
+- **A branch or an XGKICK in a branch's delay slot** (after a static branch, VU1): before, generated code stopped
+  before the branch and the interpreter ran both instructions. A branch there (the interpreter's `takedelaybranch`)
+  ends the block with four exits (both taken, the first, the second, neither; `EmitBranchInDelayEnd`); when the
+  first is taken, its target's first instruction is a block of its own entered in the delay slot of the second
+  (listed in the module only, never a dispatcher entry), and BAL there links past that instruction as `_vuBAL` does.
+  An XGKICK there needs the pending branch only in its busy-kick exit, which takes it from the branch's condition;
+  exits can now leave a branch pending (`BlockExit::branch`), for the interpreter's next step. Guitar Hero's most
+  frequent exit was `IBEQ` with an XGKICK in its delay slot (about 1,070 per vsync, each with two interpreter steps
+  and an entry). `VU1JIT_NOBDS` turns both off.
+- **The kick is fed where it matters** (§7.7, as designed, which the first implementation did at every instruction):
+  before VU memory stores, at an XGKICK (then the busy test), before op bodies, and by the exits after a block's last
+  instruction at that instruction's cycle; going from block to block feeds nothing. Each feed adds the cycles since
+  the previous one, so the GS receives the same bytes and tags. `xgkickenable` is kept in a local, reloaded after the
+  helper calls that can end a kick. In Guitar Hero this cut the C++ catch-up calls from 221 M to 45 M per 1500 vsyncs.
+- **Branch hints**: the kick feed, the busy-kick test and the budget exits are marked unlikely in a
+  `metadata.code.branch_hint` section (`Function::if_unlikely`), so that TurboFan moves the spills a call needs out of
+  the fast path (before, about 30 values were stored to the stack before every kick test). V8 13.6 (Node 24) reads it
+  only with `--experimental-wasm-branch-hinting` (Guitar Hero, from the savestate: 9.02 → 8.45 ms per vsync with
+  it); whether Chrome 155 reads it by default was not measured.
+- **VURegs fields are addressed from a base register** (`Addr`), loaded from memory in the prologue so that V8 does
+  not fold it back into a 32-bit address built at every access; VU data memory the same way.
+
+Measured headless (Node 24.19, V8 13.6, branch hints off as Node ships, M1 Max shared with other jobs), Guitar Hero
+in "I Love Rock & Roll" (silent, `-renderer null -unlimited`), VU1 execute time from `-vu1jit-stats`:
+
+| | Before | Modules | + delay slots |
+| --- | --- | --- | --- |
+| From a savestate at vsync 7500, vsyncs 100–1480 (1.26 M instructions per vsync in every run), 2 runs | 15.02 / 14.86 ms per vsync, 11.9 / 11.8 ns per instruction | 8.94 / 8.98 ms, 7.1 ns | 8.38 ms, 6.7 ns (1 run) |
+| ... entries into generated code, block exits, interpreter steps (1500 vsyncs) | 225 M, 222 M, 2.47 M | 2.50 M, 18 k, 2.47 M | 1.02 M, 17 k, 178 k |
+| From boot to vsync 9000, vsyncs 7600–8980 (1.0–1.4 M instructions per vsync, timing-dependent), 2 runs | 12.14 / 11.96 ns per instruction; block exits 450 M / 434 M | 7.18 / 7.20 ns; 81 k / 81 k | not measured |
+| Headless speed at the end of the song (unlimited) | 146% / 103% | 215% / 180% | |
+
+Step by step on the savestate run: blocks in one module 15.1 → 11.4 ms (in-module transitions 226 M, entries 225 →
+14 M), the kick fed where it matters 9.1 → 8.9 ms (C++ catch-up calls 221 → 45 M), learned targets and merging
+(entries → 2.5 M, ~no time change until the copies of hot code were removed), base-register addressing and the kick
+in a local 8.9 ms, delay slots 8.4 ms. The crowd benchmark (one self-looping VU1 program, EE-bound) is unchanged:
+headless N = 1 / 100 / 200 at 1979 / 187 / 113% before and 1978 / 189 / 115% after (median of 3 similar), 6.5 ns
+per VU1 instruction both; Chrome was not measured for this change.
+
+Verified: the fuzzer at 0 differences (10^5 programs with the timing oracle; 3 × 10^4 under `--no-liftoff`; 3 × 10^4
+with a merge after every exit to another module, 16,135 merges; 3 × 10^4 with branch hints on; 2 × 10^4 on VU0); it now
+also writes chains of 3-instruction blocks branching forward and back (some conditional, FMAC, FDIV and EFU results
+pending across the edges) and loops whose back branch is a JR or JALR to a target set before the loop. Lockstep at 0
+differences on Guitar Hero in a song (829,380 runs over 1500 vsyncs from a savestate), on the benchmark (2.9 M runs
+over 1500 frames with `-mtvu-sync`) and on the BIOS boot. Screenshots byte-identical to before (`-renderer sw
+-mtvu-sync`): Guitar Hero at 4 vsyncs of the song, the benchmark at frames 400, 700, 1000 and 1400, the BIOS boot at 4
+vsyncs. (The benchmark in lockstep with `-unlimited` stops at frame 771 with every thread waiting, before this change
+too.)
+
+Not done: back edges between blocks go through the dispatch `br_table` (21% of the block-to-block transitions in
+Guitar Hero), where natural loops as wasm `loop`s would keep values in registers; a JR/JALR before an XGKICK or a
+branch in its delay slot, and a branch at the first instruction of a block entered in a delay slot, still go to the
+interpreter; on ARM64, `i8x16.bitmask` and `i32x4.bitmask` (MAC and status flags) are about 10 instructions each; the
+earlier items above.
+
 **How to read this.** "Verified" means read in this tree at `a65e4ea5cd`; paths are relative to the
 repository root and line numbers are those of that commit. "Measured" means observed by the spike (Node
 24.19.0 with V8 13.6, and Chrome 155, on a Ryzen 7 PRO 7840U shared with other jobs, so ±30% between
