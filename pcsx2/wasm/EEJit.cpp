@@ -160,6 +160,7 @@ namespace
 	uptr s_vmap_base = 0;
 
 	// Statistics.
+	u64 s_dispatches = 0; // blocks called by the C++ dispatcher
 	u64 s_blocks_compiled = 0, s_groups_compiled = 0, s_invalidations = 0, s_flushes = 0, s_interp_steps = 0;
 	u64 s_compile_ns = 0, s_max_module_ns = 0, s_wasm_bytes = 0, s_guest_instrs = 0, s_native_instrs = 0;
 	std::vector<std::string> s_stat_names;
@@ -387,11 +388,25 @@ namespace
 	constexpr size_t kSpinRegs = offsetof(cpuRegisters, CP0);
 	using SpinSnap = std::array<u8, kSpinSnap>;
 
+	// memcmp() == 0 for multiples of 4 bytes (musl's memcmp() goes byte by byte).
+	bool SpinEqual(const void* a, const void* b, size_t n)
+	{
+		u32 diff = 0;
+		for (size_t i = 0; i < n; i += 4)
+		{
+			u32 x, y;
+			std::memcpy(&x, static_cast<const u8*>(a) + i, 4);
+			std::memcpy(&y, static_cast<const u8*>(b) + i, 4);
+			diff |= x ^ y;
+		}
+		return diff == 0;
+	}
+
 	// Whether the iteration-relevant state in `snap` is the current one.
 	bool SpinSameRegs(const SpinSnap& snap)
 	{
 		const cpuRegisters& r = *reinterpret_cast<const cpuRegisters*>(snap.data());
-		return std::memcmp(&cpuRegs, snap.data(), kSpinRegs) == 0 && cpuRegs.pc == r.pc && cpuRegs.code == r.code &&
+		return SpinEqual(&cpuRegs, snap.data(), kSpinRegs) && cpuRegs.pc == r.pc && cpuRegs.code == r.code &&
 			   cpuRegs.CP0.n.Config == r.CP0.n.Config;
 	}
 
@@ -414,6 +429,7 @@ namespace
 	{
 		u32 target = 0;
 		std::vector<SpinWord> words; // target .. branch + 4
+		std::vector<u32> codes; // their instruction words
 		u32 fails = 0;
 		u32 wait = 0;
 		// The last iteration found to change nothing: its registers, tests, the states at its tests (with -eejit-trace)
@@ -561,56 +577,61 @@ namespace
 	{
 		u32* const bcp = intJitBlockCycles();
 		const u64 cycle0 = cpuRegs.cycle;
+		const u32 bc0 = *bcp;
 		u64 cycle = cycle0;
-		u32 bc = *bcp;
+		u32 bc = bc0;
 		u64 n = 0;
-		if (!EEJit::g_trace)
-		{
+		// One iteration more, unless its last test would run the event.
+		auto step = [&] {
 			u64 c = cycle;
 			u32 b = bc;
 			SpinIterate(site, c, b);
 			if (SpinDue(c))
-				return;
-			n = 1;
-			if (b == bc)
-			{
-				// Each iteration then adds the same cycles.
-				const u64 delta = c - cycle;
-				const u64 more = (cpuRegs.nextEventCycle - c - 1) / delta;
-				c += more * delta;
-				n += more;
-			}
-			else
-			{
-				for (;;)
-				{
-					u64 c2 = c;
-					u32 b2 = b;
-					SpinIterate(site, c2, b2);
-					if (SpinDue(c2) || n >= (1u << 20))
-						break;
-					c = c2;
-					b = b2;
-					n++;
-				}
-			}
+				return false;
 			cycle = c;
 			bc = b;
-		}
-		else
+			n++;
+			return true;
+		};
+		// cpuBlockCycles' low bits after each iteration are a function of their value before it, so after 7
+		// iterations they repeat with a period of at most 8, each period adding the same cycles: whole periods are
+		// skipped at once.
+		bool more = true;
+		for (int i = 0; i < 8 && more; i++)
+			more = step();
+		if (more)
 		{
-			// Each skipped test with the state the loop would have had there, for the trace's hashes.
+			u64 c = cycle;
+			u32 b = bc;
+			u32 period = 0;
+			do
+			{
+				SpinIterate(site, c, b);
+				period++;
+			} while (b != bc && period < 8);
+			if (b == bc)
+			{
+				const u64 periods = (cpuRegs.nextEventCycle - 1 - cycle) / (c - cycle);
+				cycle += periods * (c - cycle);
+				n += periods * period;
+			}
+			while (n < (1u << 30) && step())
+			{
+			}
+		}
+		if (!n)
+			return;
+
+		if (EEJit::g_trace)
+		{
+			// Each skipped test with the state the loop would have had there, for the trace's hashes; the
+			// iterations one by one must end where the periods did.
 			SpinSnap entry;
 			std::memcpy(entry.data(), &cpuRegs, kSpinSnap);
-			for (;;)
+			u64 c = cycle0;
+			u32 b = bc0;
+			for (u64 k = 0; k < n; k++)
 			{
-				u64 c = cycle;
-				u32 b = bc;
-				SpinIterate(site, c, b);
-				if (SpinDue(c) || n >= (1u << 20))
-					break;
-				c = cycle;
-				b = bc;
 				for (size_t i = 0; i < site.tests.size(); i++)
 				{
 					const SpinTest& t = site.tests[i];
@@ -628,15 +649,14 @@ namespace
 					cpuRegs.cycle = c;
 					EEJit::TraceStep();
 				}
-				cycle = c;
-				bc = b;
-				n++;
 			}
 			std::memcpy(&cpuRegs, entry.data(), kSpinSnap);
-			if (!n)
+			if (c != cycle || b != bc || SpinDue(c))
 			{
-				cpuRegs.cycle = cycle0;
-				return;
+				Console.Error("EE JIT: idle loop skip: %llu iterations end at %llu/%u, not %llu/%u.",
+					static_cast<unsigned long long>(n), static_cast<unsigned long long>(c), b,
+					static_cast<unsigned long long>(cycle), bc);
+				s_spin_off = true;
 			}
 		}
 		cpuRegs.cycle = cycle;
@@ -659,10 +679,16 @@ namespace
 		const u32 L = site.target;
 		if (cpuRegs.pc != L || cpuRegs.branch != 0 || *intJitLastBranchTo() != L)
 			return;
-		for (size_t i = 0; i < site.words.size(); i++)
+		// The same code (in at most two pages).
+		const size_t nwords = site.codes.size();
+		const size_t first = std::min<size_t>(nwords, (4096 - (L & 4095)) / 4);
+		const u32* words = SpinWordPtr(L);
+		if (!words || !SpinEqual(words, site.codes.data(), first * 4))
+			return;
+		if (first < nwords)
 		{
-			const u32* word = SpinWordPtr(L + static_cast<u32>(i) * 4);
-			if (!word || *word != site.words[i].code)
+			words = SpinWordPtr(L + static_cast<u32>(first) * 4);
+			if (!words || !SpinEqual(words, site.codes.data() + first, (nwords - first) * 4))
 				return;
 		}
 
@@ -805,7 +831,7 @@ namespace
 			if (taken && target == L)
 				break;
 		}
-		if (std::memcmp(site.start.data(), &cpuRegs, kSpinSnap) != 0 || cpuRegs.branch != 0 ||
+		if (!SpinEqual(site.start.data(), &cpuRegs, kSpinSnap) || cpuRegs.branch != 0 ||
 			*intJitLastBranchTo() != L)
 			return fail(4);
 		site.fails = 0;
@@ -3018,6 +3044,9 @@ namespace
 					[](const SpinWord& a, const SpinWord& b) { return a.code == b.code; }))
 			{
 				site.target = target;
+				site.codes.clear();
+				for (const SpinWord& w : words)
+					site.codes.push_back(w.code);
 				site.words = std::move(words);
 				site.memo = false;
 				site.fails = 0;
@@ -3777,6 +3806,7 @@ void EEJit::Execute()
 		if (slot)
 		{
 			entry = true;
+			s_dispatches++;
 			if (reinterpret_cast<BlockFn>(static_cast<uptr>(slot))() == 0) [[likely]]
 			{
 				if (*block_cycles >= (1u << 20)) [[unlikely]]
@@ -3893,6 +3923,7 @@ void EEJit::PrintStats()
 		g_spin ? (s_spin_off ? ", turned off" : "") : ", off");
 	if (!g_stats)
 		return;
+	Console.WriteLn("EE JIT: %llu blocks called by the dispatcher", static_cast<unsigned long long>(s_dispatches));
 	Console.WriteLn("EE JIT: idle loop fails: %llu left, %llu load, %llu op, %llu delay slot, %llu changed, %llu wait loops; %llu events due",
 		static_cast<unsigned long long>(s_spin_why[0]), static_cast<unsigned long long>(s_spin_why[1]),
 		static_cast<unsigned long long>(s_spin_why[2]), static_cast<unsigned long long>(s_spin_why[3]),
