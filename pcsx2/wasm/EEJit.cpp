@@ -20,7 +20,7 @@
 // - Other instructions: ALU, shifts, HI/LO moves, multiplies, the aligned loads and stores of RAM/ROM/scratchpad and
 //   LDL/LDR/SDL/SDR there, and with VU0 idle the common COP2 ops (FMAC ops with their flags, moves, LQC2/SQC2,
 //   QMFC2/QMTC2, CFC2/CTC2) the FPU's moves, compares, BC1x branches and arithmetic (FPU.cpp's clamping and flags;
-//   not DIV, SQRT, RSQRT) are emitted; everything else (COP0, other FPU and COP2 ops, MMI, divides, other unaligned
+//   DIV but not SQRT, RSQRT) are emitted; everything else (COP0, other FPU and COP2 ops, MMI, divides, other unaligned
 //   and I/O accesses, traps, syscalls) calls the interpreter's function for that opcode with cpuRegs.pc and cpuRegs.code set as execI() sets
 //   them. After such a call, a changed PC (an exception) leaves the block.
 // - Dispatch: a block that ends goes on to the next one itself (Leave()): a tail call to the target's function when
@@ -222,7 +222,7 @@ namespace
 		COP2,
 		// COP1 (FPU.cpp).
 		MFC1, MTC1, CFC1, CTC1, ADD_S, SUB_S, MUL_S, ADDA_S, SUBA_S, MULA_S, MADD_S, MSUB_S, MADDA_S, MSUBA_S,
-		ABS_S, NEG_S, MOV_S, MAX_S, MIN_S, C_F, C_EQ, C_LT, C_LE, CVT_S, CVT_W,
+		ABS_S, NEG_S, MOV_S, MAX_S, MIN_S, C_F, C_EQ, C_LT, C_LE, CVT_S, CVT_W, DIV_S,
 		// Branches.
 		J, JAL, JR, JALR, BEQ, BNE, BLEZ, BGTZ, BEQL, BNEL, BLEZL, BGTZL,
 		BLTZ, BGEZ, BLTZL, BGEZL, BLTZAL, BGEZAL, BLTZALL, BGEZALL,
@@ -324,7 +324,7 @@ namespace
 			{COP1::MSUBA_S, Kind::MSUBA_S}, {COP1::ABS_S, Kind::ABS_S}, {COP1::NEG_S, Kind::NEG_S},
 			{COP1::MOV_S, Kind::MOV_S}, {COP1::MAX_S, Kind::MAX_S}, {COP1::MIN_S, Kind::MIN_S}, {COP1::C_F, Kind::C_F},
 			{COP1::C_EQ, Kind::C_EQ}, {COP1::C_LT, Kind::C_LT}, {COP1::C_LE, Kind::C_LE}, {COP1::CVT_S, Kind::CVT_S},
-			{COP1::CVT_W, Kind::CVT_W},
+			{COP1::CVT_W, Kind::CVT_W}, {COP1::DIV_S, Kind::DIV_S},
 			{COP1::BC1F, Kind::BC1F}, {COP1::BC1T, Kind::BC1T}, {COP1::BC1FL, Kind::BC1FL}, {COP1::BC1TL, Kind::BC1TL},
 			{SYNC, Kind::Nop}, {PREF, Kind::Nop},
 			{J, Kind::J}, {JAL, Kind::JAL}, {JR, Kind::JR}, {JALR, Kind::JALR}, {BEQ, Kind::BEQ}, {BNE, Kind::BNE},
@@ -1512,7 +1512,7 @@ namespace
 				case Kind::MUL_S: case Kind::ADDA_S: case Kind::SUBA_S: case Kind::MULA_S: case Kind::MADD_S:
 				case Kind::MSUB_S: case Kind::MADDA_S: case Kind::MSUBA_S: case Kind::ABS_S: case Kind::NEG_S:
 				case Kind::MOV_S: case Kind::MAX_S: case Kind::MIN_S: case Kind::C_F: case Kind::C_EQ: case Kind::C_LT:
-				case Kind::C_LE: case Kind::CVT_S: case Kind::CVT_W:
+				case Kind::C_LE: case Kind::CVT_S: case Kind::CVT_W: case Kind::DIV_S:
 					EmitFpu(code, d.kind);
 					break;
 
@@ -1915,6 +1915,87 @@ namespace
 					else if (k == Kind::SUB_S || k == Kind::SUBA_S) f.f32_sub();
 					else f.f32_mul();
 					FpuStoreChecked(a ? acc : FPR(fd));
+					return;
+				}
+				case Kind::DIV_S:
+				{
+					// checkDivideByZero(): a divisor with exponent 0 gives the signed maximum and sets D | SD (I | SI
+					// for a dividend with exponent 0 too); else fpuDouble(fs) / fpuDouble(ft) through checkOverflow()
+					// and checkUnderflow() without flags. The divide-by-zero path needs proper testing (GTA hashes only).
+					const u32 sv = ILocal(2), tv = ILocal(3);
+					f.i32_const(0);
+					f.i32_load(FPR(fs));
+					f.local_set(sv);
+					f.i32_const(0);
+					f.i32_load(FPR(ft));
+					f.local_set(tv);
+					f.local_get(tv);
+					f.i32_const(0x7f800000);
+					f.i32_and();
+					f.i32_eqz();
+					f.if_();
+					{
+						f.i32_const(0);
+						f.i32_const(0);
+						f.i32_load(FCR31());
+						f.i32_const(0x00020000 | 0x00000040); // I | SI
+						f.i32_const(0x00010000 | 0x00000020); // D | SD
+						f.local_get(sv);
+						f.i32_const(0x7f800000);
+						f.i32_and();
+						f.i32_eqz();
+						f.select();
+						f.i32_or();
+						f.i32_store(FCR31());
+						f.i32_const(0);
+						f.local_get(tv);
+						f.local_get(sv);
+						f.i32_xor();
+						f.i32_const(static_cast<s32>(0x80000000u));
+						f.i32_and();
+						f.i32_const(0x7f7fffff);
+						f.i32_or();
+						f.i32_store(FPR(fd));
+					}
+					f.else_();
+					{
+						f.local_get(sv);
+						FpuDouble();
+						f.local_get(tv);
+						FpuDouble();
+						f.f32_div();
+						f.i32_reinterpret_f32();
+						f.local_set(sv);
+						f.i32_const(0);
+						// infinity: sign | max; exponent 0 with a mantissa: the signed zero; else as is
+						f.local_get(sv);
+						f.i32_const(static_cast<s32>(0x80000000u));
+						f.i32_and();
+						f.local_tee(tv);
+						f.i32_const(0x7f7fffff);
+						f.i32_or();
+						f.local_get(tv);
+						f.local_get(sv);
+						f.local_get(sv);
+						f.i32_const(0x7f800000);
+						f.i32_and();
+						f.i32_eqz();
+						f.local_get(sv);
+						f.i32_const(0x007fffff);
+						f.i32_and();
+						f.i32_const(0);
+						f.i32_ne();
+						f.i32_and();
+						f.select();
+						f.local_get(sv);
+						f.i32_const(0x7fffffff);
+						f.i32_and();
+						f.i32_const(0x7f800000);
+						f.i32_eq();
+						f.select();
+						f.i32_store(FPR(fd));
+					}
+					f.end();
 					return;
 				}
 				case Kind::MADD_S: case Kind::MSUB_S:
