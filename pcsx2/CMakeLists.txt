@@ -1130,6 +1130,7 @@ set(pcsx2wasmHeaders
 	wasm/CodeWrites.h
 	wasm/EEJit.h
 	wasm/IopJit.h
+	wasm/RegCache.h
 	wasm/WasmEmitter.h
 	wasm/WasmJitRuntime.h
 	)

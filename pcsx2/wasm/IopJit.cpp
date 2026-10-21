@@ -19,6 +19,9 @@
 //   emitted; everything else (divides, unaligned and I/O accesses, GTE, RFE, SYSCALL, BREAK, J to an import stub)
 //   calls the interpreter's function with psxRegs.pc and psxRegs.code as execI() sets them. After such a call, a
 //   changed PC (an exception) leaves the block.
+// - Registers: the GPRs, HI and LO a block uses live in wasm locals (RegCache.h), loaded on first use and written
+//   back to psxRegs before every call into C++ and at every exit; after a call, the locals of the registers it may
+//   write are dropped.
 // - Self-modifying code (module loads): each block checks, on entry after a write to its page (write tracking,
 //   CodeWrites.h), its instruction words against the values it was compiled from, and is recompiled when they
 //   differ. Code that changes the rest of its own block while it runs is not detected (the interpreter would see
@@ -33,6 +36,7 @@
 #include "wasm/CodeWrites.h"
 #include "wasm/IopJit.h"
 #include "wasm/JitHeat.h"
+#include "wasm/RegCache.h"
 #include "wasm/WasmEmitter.h"
 #include "wasm/WasmJitRuntime.h"
 
@@ -101,6 +105,8 @@ namespace
 	}
 
 	u32 GPR(u32 r) { return Addr(&psxRegs.GPR.r[r]); }
+	// The GPRs, then HI (32) and LO (33), in psxRegs.GPR.r[] and in the blocks' locals (RegCache.h).
+	constexpr u32 kHI = 32, kLO = 33, kNumRegs = 34;
 
 	enum class Kind
 	{
@@ -226,6 +232,7 @@ namespace
 			, m_page(page_vaddr)
 			, m_host(host_page)
 			, m_fn(0)
+			, m_regs(m_fn, ValType::I32, kNumRegs, &GPR)
 		{
 			m_a = m_fn.local(ValType::I32);
 			m_m = m_fn.local(ValType::I32);
@@ -405,10 +412,11 @@ namespace
 			m_fn.call_indirect(m_tvv, 0);
 		}
 
-		// Leaves the block (returning 0) if psxRegs.pc is not `expected`.
+		// Leaves the block (returning 0) if psxRegs.pc is not `expected` (after a call: nothing to write back).
 		void CheckPc(u32 expected)
 		{
 			Function& f = m_fn;
+			WASMJIT_CHECK(m_regs.state().dirty == 0);
 			f.i32_const(0);
 			f.i32_load(Addr(&psxRegs.pc));
 			f.i32_const(static_cast<s32>(expected));
@@ -422,6 +430,7 @@ namespace
 		void ExitTo(u32 pc)
 		{
 			Function& f = m_fn;
+			m_regs.WritebackAll();
 			StoreCycle();
 			f.i32_const(0);
 			f.i32_const(static_cast<s32>(pc));
@@ -436,13 +445,35 @@ namespace
 			f.return_();
 		}
 
-		// The interpreter's function for the instruction (its cycle already counted).
+		// The interpreter's function for the instruction (its cycle already counted), with every register written
+		// back. The caller then invalidates those it may have written.
 		void CallInterpreter(u32 pc, u32 code)
 		{
 			StorePcCode(pc, code);
 			StoreCycle();
+			m_regs.WritebackAll();
 			CallVoid(FnIndex(psxBSC[code >> 26]));
 			ReloadCycle();
+		}
+
+		// The registers (bits as in RegCache) the interpreter's function for the non-branch `code` may write: its
+		// rd, rt or HI/LO by instruction format; all of them for anything else.
+		static u64 FallbackWrites(u32 code)
+		{
+			const u64 rt = 1ull << Rt(code), rd = 1ull << Rd(code), hilo = (1ull << kHI) | (1ull << kLO);
+			switch (code >> 26)
+			{
+				case 0x00: // SPECIAL
+				{
+					const u32 fn = code & 0x3f;
+					return (fn == 0x0c || fn == 0x0d) ? ~0ull : (rd | hilo); // SYSCALL, BREAK: anything
+				}
+				case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f: return rt;
+				case 0x10: case 0x12: return rt; // COP0, GTE: MFC0/CFC0, MFC2/CFC2
+				case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: return rt; // loads
+				case 0x28: case 0x29: case 0x2a: case 0x2b: case 0x2e: case 0x32: case 0x3a: return 0; // stores, LWC2, SWC2
+				default: return ~0ull;
+			}
 		}
 
 		// A whole instruction through the interpreter. A branch (`branch`) that was taken has run its delay slot and
@@ -453,6 +484,8 @@ namespace
 			m_k++;
 			Note(code);
 			CallInterpreter(pc, code);
+			// A branch's delay slot ran inside, and a J to an import stub may run an HLE function.
+			m_regs.Invalidate(branch ? ~0ull : FallbackWrites(code));
 			if (branch)
 			{
 				f.i32_const(0);
@@ -478,7 +511,7 @@ namespace
 		static u32 Sa(u32 c) { return (c >> 6) & 31; }
 		static s32 Imm(u32 c) { return static_cast<s16>(c & 0xffff); }
 
-		void Load(u32 r) { m_fn.i32_const(0); m_fn.i32_load(GPR(r)); }
+		void Load(u32 r) { m_regs.Get(r); }
 
 		// Emits one non-branch instruction.
 		void EmitInstruction(u32 pc, u32 code, Kind k, bool in_delay_slot)
@@ -491,9 +524,8 @@ namespace
 			auto set = [&](u32 r, auto&& expr) {
 				if (r == 0)
 					return;
-				f.i32_const(0);
 				expr();
-				f.i32_store(GPR(r));
+				m_regs.Set(r);
 			};
 
 			switch (k)
@@ -532,28 +564,24 @@ namespace
 					});
 					break;
 				case Kind::MULT: case Kind::MULTU:
-					f.i32_const(0);
-					if (k == Kind::MULT) f.i64_load32_s(GPR(rs)); else f.i64_load32_u(GPR(rs));
-					f.i32_const(0);
-					if (k == Kind::MULT) f.i64_load32_s(GPR(rt)); else f.i64_load32_u(GPR(rt));
+					Load(rs);
+					if (k == Kind::MULT) f.i64_extend_i32_s(); else f.i64_extend_i32_u();
+					Load(rt);
+					if (k == Kind::MULT) f.i64_extend_i32_s(); else f.i64_extend_i32_u();
 					f.i64_mul();
-					f.local_set(m_v);
-					// lo (r[33]) then hi (r[32]): one 64-bit store of hi:lo does not fit (hi is first)
-					f.i32_const(0);
-					f.local_get(m_v);
+					f.local_tee(m_v);
 					f.i32_wrap_i64();
-					f.i32_store(GPR(33));
-					f.i32_const(0);
+					m_regs.Set(kLO);
 					f.local_get(m_v);
 					f.i64_const(32);
 					f.i64_shr_u();
 					f.i32_wrap_i64();
-					f.i32_store(GPR(32));
+					m_regs.Set(kHI);
 					break;
-				case Kind::MFHI: set(rd, [&] { Load(32); }); break;
-				case Kind::MFLO: set(rd, [&] { Load(33); }); break;
-				case Kind::MTHI: f.i32_const(0); Load(rs); f.i32_store(GPR(32)); break;
-				case Kind::MTLO: f.i32_const(0); Load(rs); f.i32_store(GPR(33)); break;
+				case Kind::MFHI: set(rd, [&] { Load(kHI); }); break;
+				case Kind::MFLO: set(rd, [&] { Load(kLO); }); break;
+				case Kind::MTHI: Load(rs); m_regs.Set(kHI); break;
+				case Kind::MTLO: Load(rs); m_regs.Set(kLO); break;
 
 				case Kind::ADDIU: set(rt, [&] { Load(rs); f.i32_const(imm); f.i32_add(); }); break;
 				case Kind::SLTI: set(rt, [&] { Load(rs); f.i32_const(imm); f.i32_lt_s(); }); break;
@@ -597,6 +625,11 @@ namespace
 			Note(code);
 			s_native_instrs++;
 
+			// The registers both paths need, so that they start from the same state.
+			m_regs.Ensure(rs);
+			if (store)
+				m_regs.Ensure(rt);
+			const WasmJit::RegCache::State pre = m_regs.state();
 			Load(rs);
 			f.i32_const(Imm(code));
 			f.i32_add();
@@ -651,7 +684,6 @@ namespace
 				else
 				{
 					f.local_set(m_a);
-					f.i32_const(0);
 					f.local_get(m_a);
 					switch (k)
 					{
@@ -661,12 +693,17 @@ namespace
 						case Kind::LHU: f.i32_load16_u(0, 0); break;
 						default: f.i32_load(0, 0); break;
 					}
-					f.i32_store(GPR(rt));
+					m_regs.Set(rt);
 				}
 			}
 			f.else_();
 			// I/O and the rest: the interpreter, which raises no exceptions for these.
+			const WasmJit::RegCache::State fast = m_regs.state();
+			m_regs.state() = pre;
 			CallInterpreter(pc, code);
+			if (!store)
+				m_regs.Invalidate(1ull << rt);
+			m_regs.Reconcile(fast);
 			f.end();
 		}
 
@@ -683,23 +720,29 @@ namespace
 
 			auto in_page = [&](u32 a) { return a >= m_page && a < m_page + 4096 && !(a & 3); };
 			auto link = [&](u32 r) {
-				f.i32_const(0);
 				f.i32_const(static_cast<s32>(pc + 8));
-				f.i32_store(GPR(r));
+				m_regs.Set(r);
 			};
 			// Taken: doBranch() with the delay slot in between, then leave.
 			auto taken = [&](bool from_local, u32 target) {
 				const u32 saved_k = m_k;
 				const u32 saved_code = m_last_code;
+				const WasmJit::RegCache::State saved_regs = m_regs.state();
 				auto push_target = [&] {
 					if (from_local)
 						f.local_get(m_j);
 					else
 						f.i32_const(static_cast<s32>(target));
 				};
+				// doBranchStart() reads no register, and writes $a0 for one target (IOPBOOT's memory size).
+				const bool a0 = from_local || target == 0xbfc4a000u;
+				if (a0)
+					m_regs.Writeback(4);
 				push_target();
 				f.i32_const(static_cast<s32>(FnIndex(&psxJitBranchStart)));
 				f.call_indirect(m_tiv, 0);
+				if (a0)
+					m_regs.Invalidate(1ull << 4);
 				const u32 ds = pc + 4, ds_code = Word(ds);
 				const Kind dk = Decode(ds_code);
 				s_guest_instrs++;
@@ -707,6 +750,7 @@ namespace
 				if (dk != Kind::Fallback)
 					StorePcCode(ds, ds_code); // what execI() leaves (a fallback set them itself, and may raise)
 				StoreCycle();
+				m_regs.WritebackAll();
 				push_target();
 				f.i32_const(static_cast<s32>(FnIndex(&psxJitBranchEnd)));
 				f.call_indirect(m_tiv, 0);
@@ -714,6 +758,7 @@ namespace
 				f.return_();
 				m_k = saved_k;
 				m_last_code = saved_code;
+				m_regs.state() = saved_regs;
 			};
 
 			switch (k)
@@ -777,6 +822,7 @@ namespace
 		u32 m_page;
 		const u32* m_host;
 		Function m_fn;
+		WasmJit::RegCache m_regs;
 		u32 m_a, m_m, m_j, m_c0, m_v;
 		u32 m_k = 0; // instructions counted so far (psxRegs.cycle = m_c0 + m_k)
 		u32 m_last_code = 0;

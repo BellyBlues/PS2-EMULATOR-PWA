@@ -46,12 +46,18 @@ namespace WasmJit
 		V128Const = 0x0c,
 		I8x16Shuffle = 0x0d,
 		I8x16Swizzle = 0x0e,
+		I8x16Splat = 0x0f,
+		I16x8Splat = 0x10,
 		I32x4Splat = 0x11,
 		F32x4Splat = 0x13,
 		I32x4ExtractLane = 0x1b,
 		I32x4ReplaceLane = 0x1c,
 		F32x4ExtractLane = 0x1f,
 		F32x4ReplaceLane = 0x20,
+		I8x16Eq = 0x23,
+		I8x16GtS = 0x27,
+		I16x8Eq = 0x2d,
+		I16x8GtS = 0x31,
 		I32x4Eq = 0x37,
 		I32x4Ne = 0x38,
 		I32x4LtS = 0x39,
@@ -79,7 +85,16 @@ namespace WasmJit
 		V128Store32Lane = 0x5a,
 		I8x16Bitmask = 0x64,
 		I8x16NarrowI16x8S = 0x65,
+		I8x16Add = 0x6e,
+		I8x16Sub = 0x71,
 		I16x8NarrowI32x4S = 0x85,
+		I16x8Shl = 0x8b,
+		I16x8ShrS = 0x8c,
+		I16x8ShrU = 0x8d,
+		I16x8Add = 0x8e,
+		I16x8Sub = 0x91,
+		I16x8MinS = 0x96,
+		I16x8MaxS = 0x98,
 		I32x4AllTrue = 0xa3,
 		I32x4Bitmask = 0xa4,
 		I32x4Shl = 0xab,
@@ -523,6 +538,13 @@ namespace WasmJit
 			m_bodies.push_back(f.finish(&m_hints.back()));
 			return m_num_imported_funcs + static_cast<u32>(m_func_types.size() - 1);
 		}
+		// A function name for profilers (the name section).
+		void name_function(u32 index, std::string_view name)
+		{
+			m_names.uleb(index);
+			m_names.name(name);
+			m_num_names++;
+		}
 		void export_function(std::string_view name, u32 index)
 		{
 			m_exports.name(name);
@@ -595,6 +617,18 @@ namespace WasmJit
 			for (const ByteBuffer& b : m_bodies)
 				s.sized(b);
 			section(m, 10, s);
+
+			if (m_num_names)
+			{
+				ByteBuffer sub;
+				sub.uleb(m_num_names);
+				sub.bytes(m_names.data.data(), m_names.data.size());
+				s.data.clear();
+				s.name("name");
+				s.byte(1); // function names
+				s.sized(sub);
+				section(m, 0, s);
+			}
 			return std::move(m.data);
 		}
 
@@ -621,6 +655,8 @@ namespace WasmJit
 		std::vector<std::vector<std::pair<u32, u8>>> m_hints; // per defined function: body offset, value
 		ByteBuffer m_exports;
 		u32 m_num_exports = 0;
+		ByteBuffer m_names; // ascending function indices
+		u32 m_num_names = 0;
 	};
 
 } // namespace WasmJit

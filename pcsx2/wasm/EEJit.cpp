@@ -26,6 +26,10 @@
 // - Dispatch: a block that ends goes on to the next one itself (Leave()): a tail call to the target's function when
 //   it is in the same module, else a lookup of the dispatcher's cache in wasm, so that the C++ dispatcher (Execute())
 //   only runs for compiles, invalidations and the straight-line event test. -eejit-link 0 turns that off.
+// - Registers: the low doublewords of the GPRs, HI and LO that a block uses live in wasm locals (RegCache.h), loaded
+//   on first use and written back to cpuRegs before every call into C++ (interpreter functions, slow paths of
+//   memory accesses, which may raise an exception or longjmp out, the branch end and event test) and at every exit;
+//   after a call, the locals of the registers it may write are dropped. 128-bit accesses go through cpuRegs.
 // - Self-modifying code: each block checks, on entry, its page's vtlb mapping (TLB changes) and, after a write to
 //   its page (write tracking, CodeWrites.h), its instruction words against the values it was compiled from, and is
 //   recompiled when they differ. Code that changes the rest of its own block while it runs is not detected (the
@@ -42,6 +46,7 @@
 #include "wasm/CodeWrites.h"
 #include "wasm/EEJit.h"
 #include "wasm/JitHeat.h"
+#include "wasm/RegCache.h"
 #include "wasm/WasmEmitter.h"
 #include "wasm/WasmJitRuntime.h"
 
@@ -59,6 +64,8 @@
 using namespace R5900;
 using namespace R5900::Interpreter::OpcodeImpl;
 using namespace vtlb_private;
+
+#define EEJIT_CHECK(c) WASMJIT_CHECK(c)
 
 namespace EEJit
 {
@@ -126,11 +133,12 @@ namespace
 	using BlockFn = int (*)();
 	constexpr u32 kAnyPc = 1; // Leave(): an exit to whatever cpuRegs.pc is
 
-	// Each module's first functions: the branch end and branch test (EmitBranchEndFunction() and
-	// EmitBranchTestFunction()), then its blocks, then the lookup (EmitLookup()).
+	// Each module's first functions: the branch end, branch test and its condition (EmitBranchEndFunction(),
+	// EmitBranchTestFunction() and EmitBranchDueFunction()), then its blocks, then the lookup (EmitLookup()).
 	constexpr u32 kFnBranchEnd = 0;
 	constexpr u32 kFnBranchTest = 1;
-	constexpr u32 kFnFirstBlock = 2;
+	constexpr u32 kFnBranchDue = 2;
+	constexpr u32 kFnFirstBlock = 3;
 
 	struct Group
 	{
@@ -156,6 +164,12 @@ namespace
 	std::vector<std::string> s_stat_names;
 	std::unordered_map<std::string, u32> s_stat_index;
 	u64 s_stat_counts[512];
+	// -eejit-stats: runs of each compiled block (entry PC, count), and the guest instructions they ran.
+	constexpr u32 kMaxBlockStats = 1u << 16;
+	u32 s_block_stat_pc[kMaxBlockStats];
+	u64 s_block_stat_count[kMaxBlockStats];
+	u32 s_block_stats = 0;
+	std::unordered_map<u32, u64> s_interp_pcs; // -eejit-stats: PCs run by the interpreter
 
 	u32 StatIndex(const char* name)
 	{
@@ -195,6 +209,9 @@ namespace
 		// rd = rs op rt.
 		ADDU, SUBU, DADDU, DSUBU, AND, OR, XOR, NOR, SLT, SLTU, MOVZ, MOVN,
 		MULT, MULTU, MFHI, MFLO, MTHI, MTLO, MFSA, MTSA,
+		MFHI1, MFLO1, MTHI1, MTLO1, MTSAB, MTSAH, ADDI, MFC0, MTC0,
+		// MMI ops on whole registers (EmitMmi()), and QFSRV.
+		Mmi, QFSRV,
 		// rt = rs op imm.
 		ADDIU, DADDIU, SLTI, SLTIU, ANDI, ORI, XORI, LUI,
 		// Memory.
@@ -216,6 +233,57 @@ namespace
 		Kind kind;
 	};
 
+	// MMI ops (MMI.cpp) that generated code runs on whole 128-bit registers: rd = rs op rt lane by lane, rt shifted
+	// lane by lane by sa, or a byte shuffle of rt (lanes 0-15) and rs (16-31). Each does nothing when rd is $zero.
+	struct MmiDesc
+	{
+		void (*f)();
+		enum Form : u8 { Bin, Nor, Shift, Shuffle } form;
+		WasmJit::Simd op; // Bin, Shift
+		u8 sa_mask; // Shift
+		u8 lanes[16]; // Shuffle
+	};
+
+	const MmiDesc* MmiOp(void (*f)())
+	{
+		using S = WasmJit::Simd;
+		static const MmiDesc table[] = {
+			{MMI::PADDW, MmiDesc::Bin, S::I32x4Add}, {MMI::PSUBW, MmiDesc::Bin, S::I32x4Sub},
+			{MMI::PADDH, MmiDesc::Bin, S::I16x8Add}, {MMI::PSUBH, MmiDesc::Bin, S::I16x8Sub},
+			{MMI::PADDB, MmiDesc::Bin, S::I8x16Add}, {MMI::PSUBB, MmiDesc::Bin, S::I8x16Sub},
+			{MMI::PCGTW, MmiDesc::Bin, S::I32x4GtS}, {MMI::PCGTH, MmiDesc::Bin, S::I16x8GtS},
+			{MMI::PCGTB, MmiDesc::Bin, S::I8x16GtS}, {MMI::PCEQW, MmiDesc::Bin, S::I32x4Eq},
+			{MMI::PCEQH, MmiDesc::Bin, S::I16x8Eq}, {MMI::PCEQB, MmiDesc::Bin, S::I8x16Eq},
+			{MMI::PMAXW, MmiDesc::Bin, S::I32x4MaxS}, {MMI::PMINW, MmiDesc::Bin, S::I32x4MinS},
+			{MMI::PMAXH, MmiDesc::Bin, S::I16x8MaxS}, {MMI::PMINH, MmiDesc::Bin, S::I16x8MinS},
+			{MMI::PAND, MmiDesc::Bin, S::V128And}, {MMI::POR, MmiDesc::Bin, S::V128Or},
+			{MMI::PXOR, MmiDesc::Bin, S::V128Xor}, {MMI::PNOR, MmiDesc::Nor, S::V128Or},
+			{MMI::PSLLH, MmiDesc::Shift, S::I16x8Shl, 0xf}, {MMI::PSRLH, MmiDesc::Shift, S::I16x8ShrU, 0xf},
+			{MMI::PSRAH, MmiDesc::Shift, S::I16x8ShrS, 0xf}, {MMI::PSLLW, MmiDesc::Shift, S::I32x4Shl, 0x1f},
+			{MMI::PSRLW, MmiDesc::Shift, S::I32x4ShrU, 0x1f}, {MMI::PSRAW, MmiDesc::Shift, S::I32x4ShrS, 0x1f},
+			{MMI::PEXTLB, MmiDesc::Shuffle, {}, 0, {0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23}},
+			{MMI::PEXTUB, MmiDesc::Shuffle, {}, 0, {8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31}},
+			{MMI::PEXTLH, MmiDesc::Shuffle, {}, 0, {0, 1, 16, 17, 2, 3, 18, 19, 4, 5, 20, 21, 6, 7, 22, 23}},
+			{MMI::PEXTUH, MmiDesc::Shuffle, {}, 0, {8, 9, 24, 25, 10, 11, 26, 27, 12, 13, 28, 29, 14, 15, 30, 31}},
+			{MMI::PEXTLW, MmiDesc::Shuffle, {}, 0, {0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23}},
+			{MMI::PEXTUW, MmiDesc::Shuffle, {}, 0, {8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31}},
+			{MMI::PPACB, MmiDesc::Shuffle, {}, 0, {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30}},
+			{MMI::PPACH, MmiDesc::Shuffle, {}, 0, {0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21, 24, 25, 28, 29}},
+			{MMI::PPACW, MmiDesc::Shuffle, {}, 0, {0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27}},
+			{MMI::PCPYLD, MmiDesc::Shuffle, {}, 0, {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23}},
+			{MMI::PCPYUD, MmiDesc::Shuffle, {}, 0, {24, 25, 26, 27, 28, 29, 30, 31, 8, 9, 10, 11, 12, 13, 14, 15}},
+			{MMI::PCPYH, MmiDesc::Shuffle, {}, 0, {0, 1, 0, 1, 0, 1, 0, 1, 8, 9, 8, 9, 8, 9, 8, 9}},
+			{MMI::PEXCH, MmiDesc::Shuffle, {}, 0, {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15}},
+			{MMI::PEXCW, MmiDesc::Shuffle, {}, 0, {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15}},
+		};
+		for (const MmiDesc& e : table)
+		{
+			if (e.f == f)
+				return &e;
+		}
+		return nullptr;
+	}
+
 	Kind Classify(const OPCODE& op)
 	{
 		using FP = void (*)();
@@ -233,6 +301,9 @@ namespace
 			{OR, Kind::OR}, {XOR, Kind::XOR}, {NOR, Kind::NOR}, {SLT, Kind::SLT}, {SLTU, Kind::SLTU},
 			{MOVZ, Kind::MOVZ}, {MOVN, Kind::MOVN}, {MULT, Kind::MULT}, {MULTU, Kind::MULTU}, {MFHI, Kind::MFHI},
 			{MFLO, Kind::MFLO}, {MTHI, Kind::MTHI}, {MTLO, Kind::MTLO}, {MFSA, Kind::MFSA}, {MTSA, Kind::MTSA},
+			{MFHI1, Kind::MFHI1}, {MFLO1, Kind::MFLO1}, {MTHI1, Kind::MTHI1}, {MTLO1, Kind::MTLO1},
+			{MTSAB, Kind::MTSAB}, {MTSAH, Kind::MTSAH}, {ADDI, Kind::ADDI}, {COP0::MFC0, Kind::MFC0},
+			{COP0::MTC0, Kind::MTC0}, {MMI::QFSRV, Kind::QFSRV},
 			{ADDIU, Kind::ADDIU}, {DADDIU, Kind::DADDIU}, {SLTI, Kind::SLTI}, {SLTIU, Kind::SLTIU},
 			{ANDI, Kind::ANDI}, {ORI, Kind::ORI}, {XORI, Kind::XORI}, {LUI, Kind::LUI},
 			{LB, Kind::LB}, {LBU, Kind::LBU}, {LH, Kind::LH}, {LHU, Kind::LHU}, {LW, Kind::LW}, {LWU, Kind::LWU},
@@ -260,6 +331,8 @@ namespace
 			if (op.interpret == e.f)
 				return e.k;
 		}
+		if (MmiOp(op.interpret))
+			return Kind::Mmi;
 		return Kind::Fallback;
 	}
 
@@ -295,6 +368,7 @@ namespace
 			, m_host(host_page)
 			, m_vmap_raw(vmap_raw)
 			, m_fn(0)
+			, m_regs(m_fn, ValType::I64, kNumRegs, &RegAddr)
 		{
 			m_a = m_fn.local(ValType::I32);
 			m_j = m_fn.local(ValType::I32);
@@ -491,6 +565,32 @@ namespace
 			f.local_set(m_cyc);
 		}
 
+		// ---- guest registers in locals (RegCache.h) -------------------------------------------------------
+		// The low doublewords (UD[0]) of the GPRs, HI and LO live in i64 locals while the block runs. The upper
+		// doublewords stay in cpuRegs: instructions using all 128 bits go through it (Writeback() before a read,
+		// Invalidate() after a write).
+		static constexpr u32 kHI = 32, kLO = 33, kNumRegs = 34;
+		using RegState = WasmJit::RegCache::State;
+
+		static u32 RegAddr(u32 r)
+		{
+			return r < 32 ? GPR(r) : r == kHI ? Addr(&cpuRegs.HI.UD[0]) : Addr(&cpuRegs.LO.UD[0]);
+		}
+		RegState& Regs() { return m_regs.state(); }
+		void Get64(u32 r) { m_regs.Get(r); }
+		void Get32(u32 r)
+		{
+			m_regs.Get(r);
+			m_fn.i32_wrap_i64();
+		}
+		void Ensure(u32 r) { m_regs.Ensure(r); }
+		void Set64(u32 r) { m_regs.Set(r); }
+		void Writeback(u32 r) { m_regs.Writeback(r); }
+		void WritebackAll() { m_regs.WritebackAll(); }
+		void Invalidate(u32 r) { m_regs.Invalidate(1ull << r); }
+		void InvalidateAll() { m_regs.Invalidate(~0ull); }
+		void Reconcile(const RegState& target) { m_regs.Reconcile(target); }
+
 		// ---- helpers ------------------------------------------------------------------------------------------
 		void StorePcCode(u32 pc, u32 code)
 		{
@@ -509,10 +609,11 @@ namespace
 			m_fn.call_indirect(m_tvv, 0);
 		}
 
-		// Leaves the block if an exception moved the PC.
+		// Leaves the block if an exception moved the PC (after a call: every register is written back).
 		void CheckPc(u32 expected)
 		{
 			Function& f = m_fn;
+			EEJIT_CHECK(Regs().dirty == 0);
 			f.i32_const(0);
 			f.i32_load(Addr(&cpuRegs.pc));
 			f.i32_const(static_cast<s32>(expected));
@@ -527,6 +628,7 @@ namespace
 		{
 			Function& f = m_fn;
 			FlushCycles();
+			WritebackAll();
 			f.i32_const(0);
 			f.i32_const(static_cast<s32>(pc));
 			f.i32_store(Addr(&cpuRegs.pc));
@@ -543,6 +645,7 @@ namespace
 		void Leave(u32 target, bool pc_known)
 		{
 			Function& f = m_fn;
+			WritebackAll();
 			if (!s_link)
 			{
 				f.i32_const(0);
@@ -584,13 +687,48 @@ namespace
 			f.i64_store(a);
 		}
 
+		// The cached registers (bits as in RegState) the interpreter's function for `code` may write: its rd, rt,
+		// HI/LO or $ra by instruction format; all of them for anything else (SYSCALL changes argument registers).
+		static u64 FallbackWrites(u32 code)
+		{
+			const u64 rt = 1ull << Rt(code), rd = 1ull << Rd(code), ra = 1ull << 31;
+			const u64 hilo = (1ull << kHI) | (1ull << kLO);
+			const u32 op = code >> 26;
+			switch (op)
+			{
+				case 0x00: // SPECIAL
+				{
+					const u32 fn = code & 0x3f;
+					if (fn == 0x0c || fn == 0x0d) // SYSCALL, BREAK
+						return ~0ull;
+					return rd | hilo;
+				}
+				case 0x01: return ra; // REGIMM: BxxAL, traps, MTSAB/MTSAH
+				case 0x02: case 0x03: return ra; // J, JAL
+				case 0x04: case 0x05: case 0x06: case 0x07: case 0x14: case 0x15: case 0x16: case 0x17: return 0;
+				case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+				case 0x18: case 0x19: return rt; // immediate ALU
+				case 0x10: case 0x11: case 0x12: return rt; // COP0/1/2: MFC0, MFC1, CFC1, QMFC2, CFC2
+				case 0x1c: return rd | hilo; // MMI
+				case 0x1a: case 0x1b: case 0x1e: return rt; // LDL, LDR, LQ
+				case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: return rt;
+				case 0x31: case 0x36: case 0x37: return rt; // LWC1, LQC2, LD
+				case 0x28: case 0x29: case 0x2a: case 0x2b: case 0x2c: case 0x2d: case 0x2e: case 0x2f: return 0; // stores, CACHE
+				case 0x33: case 0x39: case 0x3e: case 0x3f: return 0; // PREF, SWC1, SQC2, SD
+				default: return ~0ull;
+			}
+		}
+
 		void EmitFallback(u32 pc, u32 code, const Decoded& d, bool in_delay_slot)
 		{
 			m_pending += d.op->cycles;
 			CountStat(d.op->Name);
 			StorePcCode(pc, code);
 			FlushCycles();
+			WritebackAll();
 			CallVoid(FnIndex(d.op->interpret));
+			const u64 writes = FallbackWrites(code);
+			m_regs.Invalidate(writes); // not dirty: written back before the call
 			if ((code >> 26) == 0x10) // COP0: MTC0 may change Config
 				RefreshFactor();
 			if (!in_delay_slot)
@@ -605,8 +743,8 @@ namespace
 		static s32 Imm(u32 c) { return static_cast<s16>(c & 0xffff); }
 		static u32 ImmU(u32 c) { return c & 0xffff; }
 
-		void LoadGPR64(u32 r) { m_fn.i32_const(0); m_fn.i64_load(GPR(r)); }
-		void LoadGPR32(u32 r) { m_fn.i32_const(0); m_fn.i32_load(GPR(r)); }
+		void LoadGPR64(u32 r) { Get64(r); }
+		void LoadGPR32(u32 r) { Get32(r); }
 
 		// Emits one non-branch instruction.
 		void EmitInstruction(u32 pc, u32 code, const Decoded& d, bool in_delay_slot)
@@ -627,16 +765,14 @@ namespace
 
 			// rd.UD = <i64 expression>
 			auto store64 = [&](u32 r, auto&& expr) {
-				f.i32_const(0);
 				expr();
-				f.i64_store(GPR(r));
+				Set64(r);
 			};
 			// rd.SD = (s32)<i32 expression>
 			auto store32s = [&](u32 r, auto&& expr) {
-				f.i32_const(0);
 				expr();
 				f.i64_extend_i32_s();
-				f.i64_store(GPR(r));
+				Set64(r);
 			};
 
 			switch (d.kind)
@@ -724,48 +860,42 @@ namespace
 					break;
 				case Kind::MOVZ: case Kind::MOVN:
 					if (dst0(rd)) return;
+					// rd = (rt == 0) != MOVN ? rs : rd
+					LoadGPR64(rs);
+					LoadGPR64(rd);
 					LoadGPR64(rt);
 					f.i64_eqz();
 					if (d.kind == Kind::MOVN)
 						f.i32_eqz();
-					f.if_();
-					store64(rd, [&] { LoadGPR64(rs); });
-					f.end();
+					f.select();
+					Set64(rd);
 					break;
 				case Kind::MULT: case Kind::MULTU:
 				{
-					const u32 lo = Addr(&cpuRegs.LO.UD[0]), hi = Addr(&cpuRegs.HI.UD[0]);
-					f.i32_const(0);
-					if (d.kind == Kind::MULT) f.i64_load32_s(GPR(rs)); else f.i64_load32_u(GPR(rs));
-					f.i32_const(0);
-					if (d.kind == Kind::MULT) f.i64_load32_s(GPR(rt)); else f.i64_load32_u(GPR(rt));
+					LoadGPR32(rs);
+					if (d.kind == Kind::MULT) f.i64_extend_i32_s(); else f.i64_extend_i32_u();
+					LoadGPR32(rt);
+					if (d.kind == Kind::MULT) f.i64_extend_i32_s(); else f.i64_extend_i32_u();
 					f.i64_mul();
-					f.local_set(m_v);
-					f.i32_const(0);
-					f.local_get(m_v);
+					f.local_tee(m_v);
 					f.i64_extend32_s();
-					f.i64_store(lo);
-					f.i32_const(0);
+					Set64(kLO);
 					f.local_get(m_v);
 					f.i64_const(32);
 					f.i64_shr_s();
 					f.i64_extend32_s();
-					f.i64_store(hi);
+					Set64(kHI);
 					if (rd)
-						store64(rd, [&] { f.local_get(m_v); f.i64_extend32_s(); });
+						store64(rd, [&] { Get64(kLO); });
 					break;
 				}
 				case Kind::MFHI: case Kind::MFLO:
 					if (dst0(rd)) return;
-					store64(rd, [&] {
-						f.i32_const(0);
-						f.i64_load(d.kind == Kind::MFHI ? Addr(&cpuRegs.HI.UD[0]) : Addr(&cpuRegs.LO.UD[0]));
-					});
+					store64(rd, [&] { Get64(d.kind == Kind::MFHI ? kHI : kLO); });
 					break;
 				case Kind::MTHI: case Kind::MTLO:
-					f.i32_const(0);
 					LoadGPR64(rs);
-					f.i64_store(d.kind == Kind::MTHI ? Addr(&cpuRegs.HI.UD[0]) : Addr(&cpuRegs.LO.UD[0]));
+					Set64(d.kind == Kind::MTHI ? kHI : kLO);
 					break;
 				case Kind::MFSA:
 					if (dst0(rd)) return;
@@ -776,6 +906,59 @@ namespace
 					LoadGPR32(rs);
 					f.i32_store(Addr(&cpuRegs.sa));
 					break;
+
+				case Kind::MFHI1: case Kind::MFLO1:
+					if (dst0(rd)) return;
+					store64(rd, [&] {
+						f.i32_const(0);
+						f.i64_load(d.kind == Kind::MFHI1 ? Addr(&cpuRegs.HI.UD[1]) : Addr(&cpuRegs.LO.UD[1]));
+					});
+					break;
+				case Kind::MTHI1: case Kind::MTLO1:
+					f.i32_const(0);
+					LoadGPR64(rs);
+					f.i64_store(d.kind == Kind::MTHI1 ? Addr(&cpuRegs.HI.UD[1]) : Addr(&cpuRegs.LO.UD[1]));
+					break;
+				case Kind::MTSAB: case Kind::MTSAH:
+				{
+					const u32 m = d.kind == Kind::MTSAB ? 0xf : 0x7;
+					f.i32_const(0);
+					LoadGPR32(rs);
+					f.i32_const(m);
+					f.i32_and();
+					f.i32_const(imm & m);
+					f.i32_xor();
+					if (d.kind == Kind::MTSAH)
+					{
+						f.i32_const(1);
+						f.i32_shl();
+					}
+					f.i32_store(Addr(&cpuRegs.sa));
+					break;
+				}
+				case Kind::MFC0:
+					if (!EmitMfc0(rt, rd))
+					{
+						EmitFallback(pc, code, d, in_delay_slot);
+						return;
+					}
+					break;
+				case Kind::MTC0:
+					if (!EmitMtc0(rt, rd))
+					{
+						EmitFallback(pc, code, d, in_delay_slot);
+						return;
+					}
+					break;
+				case Kind::Mmi:
+					EmitMmi(code, *MmiOp(d.op->interpret));
+					break;
+				case Kind::ADDI:
+					EmitAddi(pc, code, d, in_delay_slot);
+					return;
+				case Kind::QFSRV:
+					EmitQfsrv(pc, code, d, in_delay_slot);
+					return;
 
 				case Kind::ADDIU:
 					if (dst0(rt)) return;
@@ -840,6 +1023,224 @@ namespace
 			}
 			m_pending += d.op->cycles;
 			s_native_instrs++;
+		}
+
+		// ---- COP0 moves (COP0.cpp) ----------------------------------------------------------------------------
+		// MFC0 of anything but the debug and performance counter registers (24, 25). False: the interpreter.
+		bool EmitMfc0(u32 rt, u32 rd)
+		{
+			Function& f = m_fn;
+			if (rd == 24 || rd == 25)
+				return false;
+			if (rd == 9)
+			{
+				// Count += max(cycle - lastCOP0Cycle, 1); lastCOP0Cycle = cycle (even with rt $zero)
+				const u32 count = Addr(&cpuRegs.CP0.n.Count), last = Addr(&cpuRegs.lastCOP0Cycle);
+				f.i32_const(0);
+				f.i32_const(0);
+				f.i64_load(Addr(&cpuRegs.cycle));
+				f.i32_const(0);
+				f.i64_load(last);
+				f.i64_sub();
+				f.local_tee(m_k);
+				f.i32_wrap_i64();
+				f.local_get(m_k);
+				f.i64_eqz();
+				f.i32_add();
+				f.i32_const(0);
+				f.i32_load(count);
+				f.i32_add();
+				f.i32_store(count);
+				f.i32_const(0);
+				f.i32_const(0);
+				f.i64_load(Addr(&cpuRegs.cycle));
+				f.i64_store(last);
+				if (rt == 0)
+					return true;
+				f.i32_const(0);
+				f.i64_load32_s(count);
+				Set64(rt);
+				return true;
+			}
+			if (rt == 0)
+				return true;
+			f.i32_const(0);
+			f.i32_load(Addr(&cpuRegs.CP0.r[rd]));
+			if (rd == 12)
+			{
+				f.i32_const(static_cast<s32>(0xf0c79c1fu));
+				f.i32_and();
+			}
+			f.i64_extend_i32_s();
+			Set64(rt);
+			return true;
+		}
+
+		// MTC0 to registers that are plain stores (not Status, Config, 24, 25). False: the interpreter.
+		bool EmitMtc0(u32 rt, u32 rd)
+		{
+			Function& f = m_fn;
+			if (rd == 12 || rd == 16 || rd == 24 || rd == 25)
+				return false;
+			if (rd == 9)
+			{
+				f.i32_const(0);
+				f.i32_const(0);
+				f.i64_load(Addr(&cpuRegs.cycle));
+				f.i64_store(Addr(&cpuRegs.lastCOP0Cycle));
+			}
+			f.i32_const(0);
+			LoadGPR32(rt);
+			f.i32_store(Addr(&cpuRegs.CP0.r[rd]));
+			return true;
+		}
+
+		// ---- MMI (MMI.cpp) ------------------------------------------------------------------------------------
+		// Through cpuRegs: the operands written back, rd stored whole and dropped from the locals.
+		void LoadQ(u32 r)
+		{
+			m_fn.i32_const(0);
+			m_fn.v128_load(GPR(r));
+		}
+
+		void EmitMmi(u32 code, const MmiDesc& m)
+		{
+			using S = WasmJit::Simd;
+			Function& f = m_fn;
+			const u32 rs = Rs(code), rt = Rt(code), rd = Rd(code);
+			if (rd == 0)
+				return;
+			bool uses_rs = m.form != MmiDesc::Shift;
+			if (m.form == MmiDesc::Shuffle)
+				uses_rs = std::any_of(std::begin(m.lanes), std::end(m.lanes), [](u8 l) { return l >= 16; });
+			if (uses_rs)
+				Writeback(rs);
+			Writeback(rt);
+			f.i32_const(0);
+			switch (m.form)
+			{
+				case MmiDesc::Bin:
+					LoadQ(rs);
+					LoadQ(rt);
+					SimdOp(m.op);
+					break;
+				case MmiDesc::Nor:
+					LoadQ(rs);
+					LoadQ(rt);
+					SimdOp(S::V128Or);
+					SimdOp(S::V128Not);
+					break;
+				case MmiDesc::Shift:
+					LoadQ(rt);
+					f.i32_const(static_cast<s32>(Sa(code) & m.sa_mask));
+					SimdOp(m.op);
+					break;
+				case MmiDesc::Shuffle:
+					LoadQ(rt);
+					LoadQ(uses_rs ? rs : rt);
+					f.shuffle(m.lanes);
+					break;
+			}
+			f.v128_store(GPR(rd));
+			Invalidate(rd);
+		}
+
+		// The slow path of an instruction emitted with a fast path in `block block <fast> br 1 end`: the interpreter's
+		// function, from the register state `pre` the fast path started from, joining the fast path's state.
+		// `writes`: the cached registers the function may write.
+		void EmitSlowPath(u32 pc, u32 code, const Decoded& d, bool in_delay_slot, const RegState& pre, u64 writes)
+		{
+			const RegState fast = Regs();
+			Regs() = pre;
+			StorePcCode(pc, code);
+			FlushCyclesSlowPath();
+			WritebackAll();
+			CallVoid(FnIndex(d.op->interpret));
+			if (!in_delay_slot)
+				CheckPc(pc + 4);
+			m_regs.Invalidate(writes);
+			Reconcile(fast);
+		}
+
+		// ADDI: the interpreter only when the 32-bit sum overflows (it raises the exception).
+		void EmitAddi(u32 pc, u32 code, const Decoded& d, bool in_delay_slot)
+		{
+			Function& f = m_fn;
+			const u32 rs = Rs(code), rt = Rt(code);
+			m_pending += d.op->cycles;
+			s_native_instrs++;
+			Ensure(rs);
+			const RegState pre = Regs();
+			f.block(); // done
+			f.block(); // slow
+			LoadGPR32(rs);
+			f.i64_extend_i32_s();
+			f.i64_const(Imm(code));
+			f.i64_add();
+			f.local_tee(m_v);
+			f.local_get(m_v);
+			f.i64_extend32_s();
+			f.i64_ne();
+			f.br_if(0);
+			EEJIT_CHECK(Regs() == pre);
+			if (rt != 0)
+			{
+				f.local_get(m_v);
+				Set64(rt);
+			}
+			f.br(1);
+			f.end(); // slow
+			EmitSlowPath(pc, code, d, in_delay_slot, pre, 1ull << rt);
+			f.end(); // done
+			if (m_pending || m_cyc_dirty)
+				m_cyc_dirty = true;
+		}
+
+		// QFSRV: rd = bytes sa..sa+15 of rt:rs (rt first) for sa < 16; the interpreter for any other sa (MTSA).
+		void EmitQfsrv(u32 pc, u32 code, const Decoded& d, bool in_delay_slot)
+		{
+			using S = WasmJit::Simd;
+			Function& f = m_fn;
+			const u32 rs = Rs(code), rt = Rt(code), rd = Rd(code);
+			m_pending += d.op->cycles;
+			s_native_instrs++;
+			if (rd == 0)
+				return;
+			Writeback(rs);
+			Writeback(rt);
+			const RegState pre = Regs();
+			const u32 idx = VLocal(0);
+			f.block(); // done
+			f.block(); // slow
+			Ld32(Addr(&cpuRegs.sa));
+			f.local_tee(m_a);
+			f.i32_const(16);
+			f.i32_ge_u();
+			f.br_if(0);
+			f.i32_const(0);
+			static constexpr u8 iota[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+			f.v128_pooled(iota);
+			f.local_get(m_a);
+			SimdOp(S::I8x16Splat);
+			SimdOp(S::I8x16Add);
+			f.local_set(idx);
+			LoadQ(rt);
+			f.local_get(idx);
+			SimdOp(S::I8x16Swizzle); // indices 16 and up give 0
+			LoadQ(rs);
+			f.local_get(idx);
+			Splat(0x10101010u);
+			SimdOp(S::I8x16Sub); // indices below 16 wrap to 240 and up
+			SimdOp(S::I8x16Swizzle);
+			SimdOp(S::V128Or);
+			f.v128_store(GPR(rd));
+			Invalidate(rd);
+			f.br(1);
+			f.end(); // slow
+			EmitSlowPath(pc, code, d, in_delay_slot, pre, 1ull << rd);
+			f.end(); // done
+			if (m_pending || m_cyc_dirty)
+				m_cyc_dirty = true;
 		}
 
 		// ---- COP1 (FPU.cpp) --------------------------------------------------------------------------------
@@ -973,9 +1374,8 @@ namespace
 					if (rt == 0)
 						return;
 					f.i32_const(0);
-					f.i32_const(0);
 					f.i64_load32_s(FPR(fs));
-					f.i64_store(GPR(rt));
+					Set64(rt);
 					return;
 				case Kind::MTC1:
 					f.i32_const(0);
@@ -985,7 +1385,6 @@ namespace
 				case Kind::CFC1:
 					if (rt == 0)
 						return;
-					f.i32_const(0);
 					if (fs == 31)
 					{
 						f.i32_const(0);
@@ -993,7 +1392,7 @@ namespace
 					}
 					else
 						f.i64_const(fs == 0 ? 0x2E00 : 0);
-					f.i64_store(GPR(rt));
+					Set64(rt);
 					return;
 				case Kind::CTC1:
 					if (fs != 31)
@@ -1428,11 +1827,13 @@ namespace
 						f.i32_const(0);
 						LdV(Addr(&VU0.VF[fs]));
 						f.v128_store(GPR(rt));
+						Invalidate(rt); // all 128 bits written
 					}
 					return;
 				case C2::QMTC2:
 					if (fs != 0)
 					{
+						EEJIT_CHECK(!m_regs.IsDirty(rt)); // EmitCop2() wrote it back
 						f.i32_const(0);
 						LdV(GPR(rt));
 						f.v128_store(Addr(&VU0.VF[fs]));
@@ -1443,18 +1844,22 @@ namespace
 						return;
 					if (fs == REG_R)
 					{
-						f.i32_const(0);
+						// UL[0] only
+						Get64(rt);
+						f.i64_const(static_cast<s64>(0xffffffff00000000ull));
+						f.i64_and();
 						Ld32(Addr(&VU0.VI[REG_R].UL));
 						f.i32_const(0x7fffff);
 						f.i32_and();
-						f.i32_store(GPR(rt));
+						f.i64_extend_i32_u();
+						f.i64_or();
+						Set64(rt);
 					}
 					else
 					{
 						f.i32_const(0);
-						f.i32_const(0);
 						f.i64_load32_s(Addr(&VU0.VI[fs].UL));
-						f.i64_store(GPR(rt));
+						Set64(rt);
 					}
 					return;
 				case C2::CTC2:
@@ -1607,6 +2012,15 @@ namespace
 				return false;
 			m_pending += d.op->cycles;
 			s_native_instrs++;
+			// The registers both paths need, so that the slow path starts from the state of every br_if to it.
+			const u32 rt = Rt(code);
+			if (lq || sq)
+				Ensure(Rs(code));
+			else if (o.type == C2::QMTC2)
+				Writeback(rt);
+			else if (o.type == C2::CTC2 || (o.type == C2::CFC2 && rt != 0))
+				Ensure(rt);
+			const RegState pre = Regs();
 			f.block(); // done
 			f.block(); // slow
 			Ld32(Addr(&VU0.VI[REG_VPU_STAT].UL));
@@ -1615,7 +2029,7 @@ namespace
 			f.br_if(0);
 			if (lq || sq)
 			{
-				const u32 rs = Rs(code), rt = Rt(code);
+				const u32 rs = Rs(code);
 				LoadGPR32(rs);
 				f.i32_const(Imm(code));
 				f.i32_add();
@@ -1632,6 +2046,7 @@ namespace
 				f.i64_const(0);
 				f.i64_lt_s();
 				f.br_if(0);
+				EEJIT_CHECK(Regs() == pre);
 				if (lq)
 				{
 					if (rt != 0)
@@ -1656,11 +2071,17 @@ namespace
 				EmitCop2Body(code, o);
 			f.br(1);
 			f.end(); // slow
+			const RegState fast = Regs();
+			Regs() = pre;
 			StorePcCode(pc, code);
 			FlushCyclesSlowPath();
+			WritebackAll();
 			CallVoid(FnIndex(d.op->interpret));
 			if (!in_delay_slot)
 				CheckPc(pc + 4);
+			if (o.type == C2::QMFC2 || o.type == C2::CFC2) // the GPRs the interpreter's function writes
+				Invalidate(rt);
+			Reconcile(fast);
 			f.end(); // done
 			if (m_pending || m_cyc_dirty)
 				m_cyc_dirty = true;
@@ -1705,7 +2126,6 @@ namespace
 			{
 				case Kind::LDL: // rt = (rt & LDL_MASK) | (mem << LDL_SHIFT)
 				case Kind::LDR: // rt = (rt & LDR_MASK) | (mem >> LDR_SHIFT)
-					f.i32_const(0);
 					LoadGPR64(rt);
 					mask(kind == Kind::LDL);
 					f.i64_and();
@@ -1716,7 +2136,7 @@ namespace
 					else
 						f.i64_shr_u();
 					f.i64_or();
-					f.i64_store(GPR(rt));
+					Set64(rt);
 					break;
 				case Kind::SDL: // mem = (rt >> SDL_SHIFT) | (mem & SDL_MASK)
 				case Kind::SDR: // mem = (rt << SDR_SHIFT) | (mem & SDR_MASK)
@@ -1760,10 +2180,20 @@ namespace
 				default: break;
 			}
 
+			// The registers both paths need, so that the slow path starts from the state of every br_if to it.
+			const bool is_load = (d.kind >= Kind::LB && d.kind <= Kind::LQ) || d.kind == Kind::LDL || d.kind == Kind::LDR;
+			Ensure(rs);
+			if (d.kind == Kind::SQ)
+				Writeback(rt); // stored from cpuRegs, all 128 bits
+			else if (!is_load || d.kind == Kind::LDL || d.kind == Kind::LDR)
+			{
+				if (d.kind != Kind::LWC1 && d.kind != Kind::SWC1)
+					Ensure(rt);
+			}
+			const RegState pre = Regs();
 			f.block(); // done
 			f.block(); // slow
-			f.i32_const(0);
-			f.i32_load(GPR(rs));
+			LoadGPR32(rs);
 			f.i32_const(Imm(code));
 			f.i32_add();
 			if (quad)
@@ -1796,24 +2226,28 @@ namespace
 			f.i64_const(0);
 			f.i64_lt_s();
 			f.br_if(0);
+			EEJIT_CHECK(Regs() == pre);
 
 			auto host = [&] { f.local_get(m_v); f.i32_wrap_i64(); };
 			switch (d.kind)
 			{
-				case Kind::LB: f.i32_const(0); host(); f.i32_load8_s(0); f.i64_extend_i32_s(); f.i64_store(GPR(rt)); break;
-				case Kind::LBU: f.i32_const(0); host(); f.i64_load8_u(0); f.i64_store(GPR(rt)); break;
-				case Kind::LH: f.i32_const(0); host(); f.i32_load16_s(0); f.i64_extend_i32_s(); f.i64_store(GPR(rt)); break;
-				case Kind::LHU: f.i32_const(0); host(); f.i32_load16_u(0); f.i64_extend_i32_u(); f.i64_store(GPR(rt)); break;
-				case Kind::LW: f.i32_const(0); host(); f.i64_load32_s(0); f.i64_store(GPR(rt)); break;
-				case Kind::LWU: f.i32_const(0); host(); f.i64_load32_u(0); f.i64_store(GPR(rt)); break;
-				case Kind::LD: f.i32_const(0); host(); f.i64_load(0); f.i64_store(GPR(rt)); break;
-				case Kind::LQ: f.i32_const(0); host(); f.v128_load(0); f.v128_store(GPR(rt)); break;
+				case Kind::LB: host(); f.i32_load8_s(0); f.i64_extend_i32_s(); Set64(rt); break;
+				case Kind::LBU: host(); f.i64_load8_u(0); Set64(rt); break;
+				case Kind::LH: host(); f.i32_load16_s(0); f.i64_extend_i32_s(); Set64(rt); break;
+				case Kind::LHU: host(); f.i32_load16_u(0); f.i64_extend_i32_u(); Set64(rt); break;
+				case Kind::LW: host(); f.i64_load32_s(0); Set64(rt); break;
+				case Kind::LWU: host(); f.i64_load32_u(0); Set64(rt); break;
+				case Kind::LD: host(); f.i64_load(0); Set64(rt); break;
+				case Kind::LQ: f.i32_const(0); host(); f.v128_load(0); f.v128_store(GPR(rt)); Invalidate(rt); break;
 				case Kind::LWC1: f.i32_const(0); host(); f.i32_load(0); f.i32_store(Addr(&fpuRegs.fpr[rt].UL)); break;
 				case Kind::SB: host(); LoadGPR32(rt); f.i32_store8(0); break;
 				case Kind::SH: host(); LoadGPR32(rt); f.i32_store16(0); break;
 				case Kind::SW: host(); LoadGPR32(rt); f.i32_store(0); break;
 				case Kind::SD: host(); LoadGPR64(rt); f.i64_store(0); break;
-				case Kind::SQ: host(); f.i32_const(0); f.v128_load(GPR(rt)); f.v128_store(0); break;
+				case Kind::SQ:
+					EEJIT_CHECK(!m_regs.IsDirty(rt));
+					host(); f.i32_const(0); f.v128_load(GPR(rt)); f.v128_store(0);
+					break;
 				case Kind::SWC1: host(); f.i32_const(0); f.i32_load(Addr(&fpuRegs.fpr[rt].UL)); f.i32_store(0); break;
 				case Kind::LDL: case Kind::LDR: case Kind::SDL: case Kind::SDR: EmitUnaligned64(d.kind, rt); break;
 				default: break;
@@ -1823,11 +2257,17 @@ namespace
 				EmitNoteWrite();
 			f.br(1);
 			f.end(); // slow
+			const RegState fast = Regs();
+			Regs() = pre;
 			StorePcCode(pc, code);
 			FlushCyclesSlowPath();
+			WritebackAll();
 			CallVoid(FnIndex(d.op->interpret));
 			if (!in_delay_slot)
 				CheckPc(pc + 4);
+			if (is_load) // the interpreter's function wrote rt
+				Invalidate(rt);
+			Reconcile(fast);
 			f.end(); // done
 			if (m_pending || m_cyc_dirty)
 				m_cyc_dirty = true;
@@ -1845,9 +2285,6 @@ namespace
 			m_fn.i32_store(Addr(&cpuRegs.branch));
 			EmitInstruction(pc, code, d, true);
 		}
-
-		// intBranchTest() where the interpreter runs it (EmitBranchTestFunction()).
-		void EmitBranchTest() { m_fn.call(kFnBranchTest); }
 
 		// A taken branch after its delay slot, with cpuBlockCycles written: intJitBranchEnd(target)
 		// (EmitBranchEndFunction()). `target` is the branch target, or kAnyPc for m_j's.
@@ -1872,21 +2309,23 @@ namespace
 
 			auto in_page = [&](u32 a) { return a >= m_page && a < m_page + 4096 && !(a & 3); };
 			auto link = [&](u32 r) {
-				f.i32_const(0);
 				f.i64_const(static_cast<s64>(static_cast<u64>(pc + 8)));
-				f.i64_store(GPR(r));
+				Set64(r);
 			};
 			// Taken: delay slot, then the interpreter's branch end, then leave. `target`: btarget, jtarget (also in
 			// m_j), or kAnyPc for m_j's.
 			auto taken = [&](u32 target) {
 				const u32 saved_pending = m_pending;
 				const bool saved_dirty = m_cyc_dirty;
+				const RegState saved_regs = Regs();
 				EmitDelaySlot(pc + 4);
 				FlushCycles();
+				WritebackAll();
 				EmitBranchEnd(target);
 				Leave(target, false);
 				m_pending = saved_pending;
 				m_cyc_dirty = saved_dirty;
+				Regs() = saved_regs;
 			};
 
 			switch (d.kind)
@@ -1969,8 +2408,17 @@ namespace
 				f.i32_const(static_cast<s32>(code));
 				f.i32_store(Addr(&cpuRegs.code));
 				FlushCycles();
-				EmitBranchTest();
+				// intJitBranchTest() when it has something to do (EmitBranchDueFunction()), with the registers
+				// written back before and read again after (BIOS hooks, savestates).
+				f.call(kFnBranchDue);
+				f.if_unlikely();
+				const RegState saved_regs = Regs();
+				WritebackAll();
+				CallVoid(FnIndex(&intJitBranchTest));
 				CheckPc(resume);
+				InvalidateAll();
+				Reconcile(saved_regs);
+				f.end();
 			}
 			m_next_pc = resume;
 			return true;
@@ -1993,6 +2441,17 @@ namespace
 			const u32 end = Scan(start);
 			EmitEntryChecks(start, end);
 			RefreshFactor();
+			if (EEJit::g_stats && s_block_stats < kMaxBlockStats)
+			{
+				const u32 a = Addr(&s_block_stat_count[s_block_stats]);
+				s_block_stat_pc[s_block_stats++] = start;
+				f.i32_const(0);
+				f.i32_const(0);
+				f.i64_load(a);
+				f.i64_const(1);
+				f.i64_add();
+				f.i64_store(a);
+			}
 
 			u32 pc = start;
 			u32 count = 0;
@@ -2045,6 +2504,7 @@ namespace
 		u64 m_vmap_raw;
 		u32* m_checked; // the page generation this block's code was last compared at
 		Function m_fn;
+		WasmJit::RegCache m_regs;
 		u32 m_a, m_j, m_cyc, m_f;
 		u32 m_vloc[8] = {};
 		u32 m_t = 0;
@@ -2170,6 +2630,26 @@ namespace
 		f.i32_const(7);
 		f.i32_and();
 		f.i32_store(bc);
+	}
+
+	// Whether intBranchTest() has something to do: the trace, an event due, or the BIOS hooks. () -> (i32).
+	Function EmitBranchDueFunction()
+	{
+		Function f(0);
+		f.i32_const(0);
+		f.i32_load8_u(Addr(&EEJit::g_trace));
+		f.i32_const(0);
+		f.i32_load8_u(Addr(intJitBiosHooksActive()));
+		f.i32_or();
+		f.i32_const(0);
+		f.i64_load(Addr(&cpuRegs.cycle));
+		f.i32_const(0);
+		f.i64_load(Addr(&cpuRegs.nextEventCycle));
+		f.i64_sub();
+		f.i64_const(0);
+		f.i64_ge_s();
+		f.i32_or();
+		return f;
 	}
 
 	// intBranchTest(), as intJitBranchTest(): called only when it has something to do (the trace, an event due, or
@@ -2420,6 +2900,13 @@ namespace
 		const u32 nblocks = static_cast<u32>(pcs.size());
 		m.add_function(t_i_v, EmitBranchEndFunction(t_v_v, t_i_v));
 		m.add_function(t_v_v, EmitBranchTestFunction(t_v_v));
+		m.add_function(t_v_i, EmitBranchDueFunction());
+		if (EEJit::g_stats)
+		{
+			m.name_function(kFnBranchEnd, "ee_branch_end");
+			m.name_function(kFnBranchTest, "ee_branch_test");
+			m.name_function(kFnBranchDue, "ee_branch_due");
+		}
 		for (u32 i = 0; i < nblocks; i++)
 		{
 			Function& fn = blocks[i]->Body();
@@ -2433,8 +2920,15 @@ namespace
 			char name[16];
 			std::snprintf(name, sizeof(name), "b%u", i);
 			m.export_function(name, index);
+			if (EEJit::g_stats)
+			{
+				std::snprintf(name, sizeof(name), "ee_%08x", pcs[i]);
+				m.name_function(index, name);
+			}
 		}
-		m.add_function(t_v_i, EmitLookup(t_v_i));
+		const u32 lookup = m.add_function(t_v_i, EmitLookup(t_v_i));
+		if (EEJit::g_stats)
+			m.name_function(lookup, "ee_lookup");
 		blocks.clear();
 
 		const std::vector<u8> bytes = m.finish();
@@ -2576,6 +3070,8 @@ void EEJit::Execute()
 			if (s_failed)
 				return;
 			s_interp_steps++;
+			if (g_stats)
+				s_interp_pcs[pc]++;
 			intJitExecOne();
 			entry = cpuRegs.pc != pc + 4;
 		}
@@ -2670,4 +3166,36 @@ void EEJit::PrintStats()
 	Console.WriteLn("EE JIT: %llu interpreter calls", static_cast<unsigned long long>(total));
 	for (size_t i = 0; i < std::min<size_t>(v.size(), 40); i++)
 		Console.WriteLn("  %-12s %12llu", v[i].second.c_str(), static_cast<unsigned long long>(v[i].first));
+	std::vector<std::pair<u64, u32>> ip;
+	for (const auto& [pc, n] : s_interp_pcs)
+		ip.emplace_back(n, pc);
+	std::sort(ip.rbegin(), ip.rend());
+	for (size_t i = 0; i < std::min<size_t>(ip.size(), 16); i++)
+		Console.WriteLn("  interpreted %08x %12llu %s", ip[i].second, static_cast<unsigned long long>(ip[i].first),
+			vtlbdata.vmap[ip[i].second >> VTLB_PAGE_BITS].isHandler(ip[i].second) ? "(handler)" : "");
+	// The blocks run most, by entries (a block compiled again counts separately), with their instructions as they
+	// are in memory now.
+	std::vector<std::pair<u64, u32>> b;
+	for (u32 i = 0; i < s_block_stats; i++)
+		b.emplace_back(s_block_stat_count[i], s_block_stat_pc[i]);
+	std::sort(b.rbegin(), b.rend());
+	for (size_t i = 0; i < std::min<size_t>(b.size(), 12); i++)
+	{
+		const u32 pc = b[i].second;
+		std::string ops;
+		const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
+		if (!vmv.isHandler(pc))
+		{
+			const u32* host = reinterpret_cast<const u32*>(vmv.assumePtr(pc));
+			for (u32 k = 0; k < 24 && ((pc + k * 4) & 4095) >= (pc & 4095); k++)
+			{
+				const OPCODE& op = R5900::GetInstruction(host[k]);
+				ops += ' ';
+				ops += op.Name;
+				if (k > 0 && (op.flags & IS_BRANCH) == 0 && IsNativeBranch(Decode(host[k - 1]).kind))
+					break;
+			}
+		}
+		Console.WriteLn("  block %08x %12llu:%s", pc, static_cast<unsigned long long>(b[i].first), ops.c_str());
+	}
 }
