@@ -210,6 +210,7 @@ namespace VU1Jit
 			};
 			std::vector<Range> ranges; // one per block: the block's PC and size
 			std::vector<Signature> sigs; // one per block: its entry signature
+			std::vector<u8> entries; // one per block: whether the dispatcher may start there (not in a delay slot)
 			std::vector<u8> bytes; // the micro memory it was compiled from, range after range
 			u64 pages; // 256-byte pages of the micro memory it covers
 			bool needs_compare; // a Clear touched its pages since it was last compared
@@ -630,7 +631,7 @@ namespace VU1Jit
 		source.ctx = this;
 		const bool have_code = CompileModule(pc, sig, source, &cm);
 		if (!have_code)
-			cm.blocks.push_back(CompiledModule::Block{pc, sig, 1, 0}); // a marker: the interpreter runs its instruction
+			cm.blocks.push_back(CompiledModule::Block{pc, sig, 1, 0, true}); // a marker: the interpreter runs its instruction
 		// An entry merged before (whose merged module was dropped since) keeps its count: merges stay bounded.
 		u32 generation = 0;
 		for (const MergedEntry& e : m_merged_entries)
@@ -652,6 +653,7 @@ namespace VU1Jit
 			const u32 size = b.instrs * 8;
 			m->ranges.push_back(Module::Range{b.pc, size});
 			m->sigs.push_back(b.sig);
+			m->entries.push_back(b.entry);
 			m->bytes.insert(m->bytes.end(), &VU1.Micro[b.pc], &VU1.Micro[b.pc] + size);
 			const u32 first = b.pc >> 8, last = (b.pc + size - 1) >> 8;
 			m->pages |= ((last == 63) ? ~u64(0) : ((u64(1) << (last + 1)) - 1)) & ~((u64(1) << first) - 1);
@@ -698,6 +700,8 @@ namespace VU1Jit
 		for (u32 k = 0; k < cm.blocks.size(); k++)
 		{
 			const CompiledModule::Block& b = cm.blocks[k];
+			if (!b.entry)
+				continue; // entered in a branch delay slot, from the module only
 			std::vector<Program*>& list = m_by_pc[b.pc >> 3];
 			if (list.size() >= MAX_VERSIONS_PER_PC)
 			{
@@ -798,6 +802,8 @@ namespace VU1Jit
 		// replaces it. It is not merged again in any case.
 		for (size_t k = 1; k < old->ranges.size(); k++)
 		{
+			if (!old->entries[k])
+				continue; // entered in a delay slot: reached from the others
 			const std::pair<u32, Signature> root(old->ranges[k].start, old->sigs[k]);
 			if (std::find(source.roots.begin(), source.roots.end(), root) == source.roots.end())
 				source.roots.push_back(root);
@@ -824,12 +830,17 @@ namespace VU1Jit
 		{
 			if (m.get() == merged || !m->fn.IsLoaded())
 				continue;
+			// (Its entry blocks: the others, entered in a delay slot, are reached from them.)
 			bool all = true;
 			for (size_t k = 0; k < m->ranges.size() && all; k++)
 			{
+				if (!m->entries[k])
+					continue;
 				bool found = false;
 				for (size_t j = 0; j < merged->ranges.size() && !found; j++)
-					found = merged->ranges[j].start == m->ranges[k].start && merged->sigs[j] == m->sigs[k];
+				{
+					found = merged->entries[j] && merged->ranges[j].start == m->ranges[k].start && merged->sigs[j] == m->sigs[k];
+				}
 				all = found;
 			}
 			if (all)
@@ -1179,7 +1190,7 @@ namespace VU1Jit
 				Console.WriteLn(fmt::format("VU1 JIT exit: {} times, module at {:#06x} ({} blocks), block {:#06x} exit {} after {} reason {} {} tpc {:#06x} sig {}: {}{}",
 					x->count, m->ranges[0].start, m->ranges.size(), x->x.block_pc, static_cast<int>(x - m->exits.data()), x->x.instrs,
 					reasons[static_cast<u32>(x->x.reason)], x->x.dynamic_tpc ? "dynamic" : "static", tpc, x->x.sig.ToString(),
-					x->x.dynamic_tpc ? "" : Disassemble(w[0], w[1]), targets));
+					x->x.dynamic_tpc ? "" : Disassemble(w[0], w[1]) + " | " + Disassemble(w[2], w[3]), targets));
 			}
 		}
 		if (s_oracle)

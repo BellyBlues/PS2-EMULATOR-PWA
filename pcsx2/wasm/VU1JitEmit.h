@@ -70,6 +70,12 @@ namespace VU1Jit
 		bool mbit = false; // VU0: the last instruction had the M bit (VUFLAG_MFLAGSET)
 		bool chain = false; // sig is valid: the dispatcher may enter the next block without deriving it
 		Signature sig = {};
+		// A branch is pending (a branch in a branch delay slot, VU1): the instruction at tpc is the delay slot of a
+		// branch to branchpc. The dispatcher then steps the interpreter; sig_valid says whether sig describes the pipes,
+		// for a block of the module entered in that delay slot.
+		u32 branch = 0;
+		u32 branchpc = 0;
+		bool sig_valid = false;
 		u32 block_pc = 0; // the entry of the block it leaves
 		u32 block = 0; // ... and its index in the module
 	};
@@ -99,6 +105,7 @@ namespace VU1Jit
 			Signature sig;
 			u32 instrs;
 			u32 last_start;
+			bool entry; // false: a block entered in a branch delay slot, from the module only
 		};
 		std::vector<u8> wasm;
 		std::vector<BlockExit> exits;

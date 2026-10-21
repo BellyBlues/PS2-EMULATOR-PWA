@@ -188,7 +188,9 @@ namespace VU1Jit
 		R.VIRegNumber = m.VIRegNumber;
 		if (!x.dynamic_tpc)
 			R.VI[REG_TPC].UL = x.tpc;
-		R.branch = 0;
+		R.branch = x.branch;
+		if (x.branch)
+			R.branchpc = x.branchpc;
 		R.takedelaybranch = false;
 		R.ebit = x.ebit;
 		if (x.mbit)
@@ -220,8 +222,10 @@ namespace VU1Jit
 
 		bool IsBranch(Lower op) { return (GetLowerFlags(op) & LOWER_BRANCH) != 0; }
 
-		// Whether generated code may run this instruction in this control state (section 8).
-		bool Allowed(const Plan& p, int vu)
+		// Whether generated code may run this instruction in this control state (section 8). after_static_branch: this
+		// is the delay slot of a static branch in the same block (VU1, PlanBlock), where a static branch or an XGKICK
+		// may stand: the exits there know the pending branch.
+		bool Allowed(const Plan& p, int vu, bool after_static_branch = false)
 		{
 			const Instruction& ins = p.ins;
 			if (!ins.IsValid() || ins.DBit() || ins.TBit())
@@ -229,7 +233,9 @@ namespace VU1Jit
 			const bool branch = !ins.IBit() && IsBranch(ins.lo);
 			if (p.pre_ctl.branch != 0) // a branch delay slot
 			{
-				if (branch || ins.EBit() || (!ins.IBit() && ins.lo == L::XGKICK))
+				const bool static_branch = branch && !(GetLowerFlags(ins.lo) & LOWER_DYNAMIC);
+				const bool kick = !ins.IBit() && ins.lo == L::XGKICK;
+				if ((branch && !(after_static_branch && static_branch)) || ins.EBit() || (kick && !after_static_branch))
 					return false;
 			}
 			if (p.pre_ctl.ebit != 0 && branch) // an E-bit delay slot
@@ -299,6 +305,7 @@ namespace VU1Jit
 				m_looped = m_f.local(ValType::I32);
 				m_next = m_f.local(ValType::I32);
 				m_exit = m_f.local(ValType::I32);
+				m_cond1 = m_f.local(ValType::I32);
 				m_acc = m_f.local(ValType::I32);
 				m_edges = m_f.local(ValType::I32);
 				m_base = m_f.local(ValType::I64);
@@ -429,12 +436,46 @@ namespace VU1Jit
 			}
 			void EndLoop() { m_f.end(); }
 
-			void EmitInstruction(const Plan& p, s32 busy_kick_exit, bool last);
+			void EmitInstruction(const Plan& p, s32 busy_kick_exit, s32 busy_kick_untaken, bool last);
 			void FlushAllAtEnd(const Plan& p, const int end_flagreg[4]);
 			// loop: whether the taken exit is the loop exit of BeginLoop. next_taken, next_fall: the blocks of the
 			// module the exits go to, or -1; jumps: a JR/JALR's targets (TPC) that are blocks of the module.
 			void EmitBranchEnd(const Plan& branch, u32 exit_taken, u32 exit_fall, u32 exit_dyn, bool loop, u32 last_start,
 				s32 next_taken, s32 next_fall, const std::vector<std::pair<u32, s32>>& jumps);
+			// A branch whose delay slot holds a branch: its condition, before the second one's (m_i[4]) replaces it.
+			void SaveBranchCondition()
+			{
+				m_f.local_get(m_i[4]);
+				m_f.local_set(m_cond1);
+			}
+			// The end of a block whose last instruction is a branch in the delay slot of the one before (the interpreter's
+			// takedelaybranch): the exits for both taken, the first only, the second only and neither, or -1 (cond1,
+			// cond2: whether each branch is conditional), and the blocks of the module they go to (-1: exit).
+			void EmitBranchInDelayEnd(bool cond1, bool cond2, const s32 exits[4], const s32 next[4])
+			{
+				const auto second = [&](u32 k) { // exits k (second taken) and k + 1 (not)
+					if (!cond2)
+					{
+						EmitEdgeOrExit(static_cast<u32>(exits[k]), next[k]);
+						return;
+					}
+					m_f.local_get(m_i[4]);
+					m_f.if_();
+					EmitEdgeOrExit(static_cast<u32>(exits[k]), next[k]);
+					m_f.end();
+					EmitEdgeOrExit(static_cast<u32>(exits[k + 1]), next[k + 1]);
+				};
+				if (!cond1)
+				{
+					second(0);
+					return;
+				}
+				m_f.local_get(m_cond1);
+				m_f.if_();
+				second(0);
+				m_f.end();
+				second(2);
+			}
 			// Exit exit_id, or go to block next of the module instead (-1: exit).
 			void EmitEdgeOrExit(u32 exit_id, s32 next)
 			{
@@ -816,6 +857,7 @@ namespace VU1Jit
 			u32 m_snap_tmp[12] = {};
 			u32 m_next = 0; // the block the dispatch loop goes to
 			u32 m_exit = 0; // the exit the shared exit code returns
+			u32 m_cond1 = 0; // the condition of a branch whose delay slot holds a branch (SaveBranchCondition)
 			u32 m_stub_level = 0; // levels (Function::depth) of the exits' block, the dispatch loop and a block's loop
 			u32 m_dispatch_level = 0;
 			u32 m_loop_level = 0;
@@ -2254,7 +2296,18 @@ namespace VU1Jit
 					m_out->native_ops++;
 					return true;
 				case L::BAL:
-					if (it)
+					if (it && p.pre_ctl.branch == 1)
+					{
+						// In the delay slot of a branch (PlanBlock): if that branch is taken, the link is the instruction
+						// after its target's first (_vuBAL, VUops.cpp:1611-1619). Its condition is in m_cond1.
+						SetVI(it, [&] {
+							m_f.i32_const(static_cast<s32>((p.pre_ctl.branchpc + 8) / 8));
+							m_f.i32_const(static_cast<s32>((p.pc + 16) / 8));
+							m_f.local_get(m_cond1);
+							m_f.select();
+						});
+					}
+					else if (it)
 						SetVI(it, [&] { m_f.i32_const(static_cast<s32>((p.pc + 16) / 8)); });
 					m_f.i32_const(1);
 					m_f.local_set(m_i[4]);
@@ -2316,7 +2369,7 @@ namespace VU1Jit
 			}
 		}
 
-		void Emitter::EmitInstruction(const Plan& p, s32 busy_kick_exit, bool last)
+		void Emitter::EmitInstruction(const Plan& p, s32 busy_kick_exit, s32 busy_kick_untaken, bool last)
 		{
 			const StepInfo& info = p.info;
 			const u32 delta = p.cyc + info.op_cycle; // R.cycle at the op, relative to the entry
@@ -2329,11 +2382,22 @@ namespace VU1Jit
 			if (m_vu && busy_kick_exit >= 0)
 			{
 				// A kick still running at an XGKICK, once fed up to this cycle: the interpreter takes the instruction,
-				// whose own feed then adds nothing (section 7.7).
+				// whose own feed then adds nothing (section 7.7). In the delay slot of a conditional branch, the exit
+				// depends on whether it was taken (m_i[4]).
 				KickCatchUp(delta);
 				m_f.local_get(m_kick);
 				m_f.if_unlikely();
-				EmitExit(static_cast<u32>(busy_kick_exit));
+				if (busy_kick_untaken >= 0)
+				{
+					m_f.local_get(m_i[4]);
+					m_f.if_();
+					EmitExit(static_cast<u32>(busy_kick_exit));
+					m_f.else_();
+					EmitExit(static_cast<u32>(busy_kick_untaken));
+					m_f.end();
+				}
+				else
+					EmitExit(static_cast<u32>(busy_kick_exit));
 				m_f.end();
 			}
 
@@ -2495,6 +2559,19 @@ namespace VU1Jit
 			s32 next_taken = -1;
 			s32 next_fall = -1;
 			std::vector<std::pair<u32, s32>> jumps; // learned JR/JALR targets (TPC) that are blocks of the module
+			// A block entered in a branch delay slot (from the module only): its one instruction, then the branch to
+			// ds_target (the taken exit).
+			bool ds = false;
+			u32 ds_target = 0;
+			// A block that ends with a branch in the delay slot of the branch before it (the interpreter's
+			// takedelaybranch): its exits for both taken, the first only, the second only and neither (bds_has: which
+			// can happen), and the blocks of the module they go to.
+			bool bds = false;
+			bool bds_cond1 = false;
+			bool bds_cond2 = false;
+			BlockExit bds_exits[4];
+			bool bds_has[4] = {};
+			s32 bds_next[4] = {-1, -1, -1, -1};
 
 			u32 Instrs() const { return static_cast<u32>(plans.size()); }
 			u32 LastStart() const { return plans.back().cyc; }
@@ -2545,18 +2622,28 @@ namespace VU1Jit
 			       !x.dynamic_tpc && x.ebit == 0 && x.tpc < VU1_PROGSIZE;
 		}
 
-		// Runs the timing model over the block at pc for an entry with signature sig and no branch or E bit pending.
-		// False when there is nothing to compile: the first instruction must run on the interpreter.
-		bool PlanBlock(int vu, u32 pc, const Signature& sig, BlockPlan* out)
+		// A static branch in the delay slot of a static branch compiled (VU1). Off with VU1JIT_NOBDS, to bisect.
+		static bool BranchInDelayEnabled()
+		{
+			static const bool enabled = !std::getenv("VU1JIT_NOBDS");
+			return enabled;
+		}
+
+		// Runs the timing model over the block at pc for an entry with signature sig and no branch or E bit pending,
+		// or (delay_slot) in the delay slot of a branch to delay_slot->branchpc. False when there is nothing to
+		// compile: the first instruction must run on the interpreter.
+		bool PlanBlock(int vu, u32 pc, const Signature& sig, BlockPlan* out, const Control* delay_slot = nullptr)
 		{
 			BlockPlan& b = *out;
 			b = {};
 			b.pc = pc;
 			b.sig = sig;
+			b.ds = delay_slot != nullptr;
+			b.ds_target = delay_slot ? delay_slot->branchpc : 0;
 			VURegs& R = vu ? VU1 : VU0;
 			const u32 progsize = vu ? VU1_PROGSIZE : VU0_PROGSIZE;
 			TimingModel model(vu);
-			model.Load(sig, Control{});
+			model.Load(sig, delay_slot ? *delay_slot : Control{});
 			b.efu_entry_cycle = static_cast<s32>(model.State().efu.Cycle);
 			b.efu_at_entry = model.State().efu.enable != 0;
 
@@ -2573,8 +2660,17 @@ namespace VU1Jit
 				p.pre_ctl = model.GetControl();
 				p.pre = CaptureImage(model.State());
 				p.cyc = cyc;
-				if (!Allowed(p, vu))
+				// A branch or an XGKICK in this delay slot: the branch before it (the one that set it) must be static.
+				bool after_static_branch = false;
+				if (vu == 1 && BranchInDelayEnabled() && p.pre_ctl.branch == 1 && !plans.empty())
 				{
+					const Instruction& prev = plans.back().ins;
+					after_static_branch = !prev.IBit() && IsBranch(prev.lo) && !(GetLowerFlags(prev.lo) & LOWER_DYNAMIC);
+				}
+				if (!Allowed(p, vu, after_static_branch))
+				{
+					if (plans.empty())
+						return false; // a delay slot entry whose instruction the interpreter runs
 					if (p.pre_ctl.branch != 0)
 					{
 						// Not in a branch delay slot: stop before the branch.
@@ -2638,7 +2734,50 @@ namespace VU1Jit
 			b.final_ctl = model.GetControl();
 			const u32 n = b.Instrs();
 			const Plan& last = plans.back();
-			if (b.branch_end)
+			if (b.ds)
+			{
+				// The delay slot ran: the branch goes to its target (VU1microInterp.cpp:194-199).
+				b.taken = MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, b.final_ctl, b.ds_target);
+				b.has_taken = true;
+			}
+			else if (b.branch_end && !last.ins.IBit() && IsBranch(last.ins.lo))
+			{
+				// A branch in the delay slot of the branch before it (_setBranch, VUops.cpp:1473-1477, and the step's
+				// end, VU1microInterp.cpp:194-206). If the first is taken, the second's delay slot is the first's target
+				// (one instruction, then the second's target if it is taken too); if not, the second is an ordinary
+				// branch. The timing does not depend on which: the model ran it with both taken.
+				const Plan& b1 = plans[n - 2];
+				b.bds = true;
+				b.bds_cond1 = (GetLowerFlags(b1.ins.lo) & LOWER_COND) != 0;
+				b.bds_cond2 = (GetLowerFlags(last.ins.lo) & LOWER_COND) != 0;
+				const u32 t1 = StaticBranchTarget(b1.pc, b1.ins.lower) & (progsize - 1);
+				const u32 t2 = StaticBranchTarget(last.pc, last.ins.lower) & (progsize - 1);
+				Control clean = b.final_ctl;
+				clean.branch = 0;
+				clean.branchpc = 0;
+				clean.takedelaybranch = false;
+				clean.delaybranchpc = 0;
+				const auto make = [&](u32 tpc, bool pending) {
+					BlockExit x = MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, clean, tpc);
+					if (pending)
+					{
+						x.branch = 1;
+						x.branchpc = t2;
+						x.sig_valid = x.chain;
+						x.chain = false; // the dispatcher steps the delay slot on the interpreter
+					}
+					return x;
+				};
+				b.bds_exits[0] = make(t1, true);
+				b.bds_has[0] = true;
+				b.bds_exits[1] = make(t1, false);
+				b.bds_has[1] = b.bds_cond2;
+				b.bds_exits[2] = make(last.pc + 8, true);
+				b.bds_has[2] = b.bds_cond1;
+				b.bds_exits[3] = make(last.pc + 8, false);
+				b.bds_has[3] = b.bds_cond1 && b.bds_cond2;
+			}
+			else if (b.branch_end)
 			{
 				// A branch's exits, and whether the taken one comes back to this block with the same signature: a loop
 				// generated code runs by itself.
@@ -2693,20 +2832,49 @@ namespace VU1Jit
 			for (u32 i = 0; i < n; i++)
 			{
 				const Plan& p = b.plans[i];
-				s32 busy = -1;
+				s32 busy = -1, busy_untaken = -1;
 				if (vu && !p.ins.IBit() && p.ins.lo == L::XGKICK && !p.info.discarded)
 				{
-					// The interpreter's state before this instruction: TPC is its own address.
-					busy = static_cast<s32>(add(MakeExit(vu, b, ExitKind::Boundary, ExitReason::BusyKick, i, p.pre, p.pre_ctl, p.pc)));
+					// The interpreter's state before this instruction: TPC is its own address. In a branch's delay slot
+					// the branch is pending if it was taken (busy), not if a conditional one was not (busy_untaken).
+					BlockExit x = MakeExit(vu, b, ExitKind::Boundary, ExitReason::BusyKick, i, p.pre, p.pre_ctl, p.pc);
+					if (p.pre_ctl.branch == 1)
+					{
+						x.branch = 1;
+						x.branchpc = p.pre_ctl.branchpc;
+					}
+					busy = static_cast<s32>(add(x));
+					if (p.pre_ctl.branch == 1 && (GetLowerFlags(b.plans[i - 1].ins.lo) & LOWER_COND))
+					{
+						x.branch = 0;
+						x.branchpc = 0;
+						busy_untaken = static_cast<s32>(add(x));
+					}
 				}
-				em.EmitInstruction(p, busy, i + 1 == n);
+				em.EmitInstruction(p, busy, busy_untaken, i + 1 == n);
 				if (i + 1 == n && b.ended)
 					em.FlushAllAtEnd(p, b.end_flagreg);
+				if (i + 2 == n && b.bds)
+					em.SaveBranchCondition();
 			}
 
 			if (b.ended)
 			{
 				em.EmitExit(add(MakeExit(vu, b, ExitKind::End, ExitReason::Block, n, b.final_img, b.final_ctl, last.pc + 8)));
+			}
+			else if (b.ds)
+			{
+				em.EmitEdgeOrExit(add(b.taken), next(b.next_taken));
+			}
+			else if (b.bds)
+			{
+				s32 ids[4], nexts[4];
+				for (u32 j = 0; j < 4; j++)
+				{
+					ids[j] = b.bds_has[j] ? static_cast<s32>(add(b.bds_exits[j])) : -1;
+					nexts[j] = b.bds_has[j] ? next(b.bds_next[j]) : -1;
+				}
+				em.EmitBranchInDelayEnd(b.bds_cond1, b.bds_cond2, ids, nexts);
 			}
 			else if (b.branch_end)
 			{
@@ -2782,7 +2950,7 @@ namespace VU1Jit
 		{
 			bool have = false;
 			for (const BlockPlan& b : blocks)
-				have |= b.pc == rpc && b.sig == rsig;
+				have |= !b.ds && b.pc == rpc && b.sig == rsig;
 			BlockPlan nb;
 			if (have || blocks.size() >= MODULE_BLOCKS || !PlanBlock(1, rpc, rsig, &nb) || total + nb.Instrs() > MODULE_INSTRS)
 				continue;
@@ -2793,27 +2961,44 @@ namespace VU1Jit
 
 		// Discovery (section 4.3): the blocks the exits go to, breadth first, unless another module holds them (when
 		// source.known says so) or there is nothing to compile there.
-		std::vector<std::pair<u32, Signature>> refused;
+		// A block is (PC, signature) and, for one entered in a branch delay slot, the branch's target.
+		struct Key
+		{
+			u32 pc;
+			Signature sig;
+			bool ds;
+			u32 ds_target;
+		};
+		std::vector<Key> refused;
 		const bool chain = ChainEnabled();
 		const auto successor = [&](const BlockExit& x) -> s32 {
-			if (!chain || !CanChain(x))
+			const bool ds = x.branch != 0;
+			if (!chain)
 				return -1;
+			if (ds ? !(x.kind == ExitKind::Boundary && x.reason == ExitReason::Block && x.sig_valid && x.ebit == 0 &&
+						 x.tpc < VU1_PROGSIZE) :
+					 !CanChain(x))
+				return -1;
+			const u32 ds_target = ds ? x.branchpc : 0;
 			for (size_t i = 0; i < blocks.size(); i++)
 			{
-				if (blocks[i].pc == x.tpc && blocks[i].sig == x.sig)
+				if (blocks[i].pc == x.tpc && blocks[i].sig == x.sig && blocks[i].ds == ds && blocks[i].ds_target == ds_target)
 					return static_cast<s32>(i);
 			}
-			for (const auto& [rpc, rsig] : refused)
+			for (const Key& r : refused)
 			{
-				if (rpc == x.tpc && rsig == x.sig)
+				if (r.pc == x.tpc && r.sig == x.sig && r.ds == ds && r.ds_target == ds_target)
 					return -1;
 			}
-			if (blocks.size() >= MODULE_BLOCKS || (source.known && source.known(source.ctx, x.tpc, x.sig)))
+			if (blocks.size() >= MODULE_BLOCKS || (!ds && source.known && source.known(source.ctx, x.tpc, x.sig)))
 				return -1;
+			Control delay_slot;
+			delay_slot.branch = 1;
+			delay_slot.branchpc = ds_target;
 			BlockPlan nb;
-			if (!PlanBlock(1, x.tpc, x.sig, &nb) || total + nb.Instrs() > MODULE_INSTRS)
+			if (!PlanBlock(1, x.tpc, x.sig, &nb, ds ? &delay_slot : nullptr) || total + nb.Instrs() > MODULE_INSTRS)
 			{
-				refused.emplace_back(x.tpc, x.sig);
+				refused.push_back(Key{x.tpc, x.sig, ds, ds_target});
 				return -1;
 			}
 			total += nb.Instrs();
@@ -2822,6 +3007,14 @@ namespace VU1Jit
 		};
 		for (size_t i = 0; i < blocks.size(); i++)
 		{
+			for (u32 j = 0; j < 4; j++)
+			{
+				if (!blocks[i].bds_has[j])
+					continue;
+				const BlockExit x = blocks[i].bds_exits[j];
+				const s32 t = successor(x);
+				blocks[i].bds_next[j] = t;
+			}
 			if (blocks[i].has_taken && !blocks[i].loop)
 			{
 				const BlockExit x = blocks[i].taken;
@@ -2870,11 +3063,13 @@ namespace VU1Jit
 				{
 					const u32 v = stack.back().first;
 					const u32 c = stack.back().second;
-					if (c < 2 + blocks[v].jumps.size())
+					if (c < 6 + blocks[v].jumps.size())
 					{
 						stack.back().second++;
-						const s32 s = c == 0 ? blocks[v].next_taken : c == 1 ? blocks[v].next_fall :
-						                                                       blocks[v].jumps[c - 2].second;
+						const BlockPlan& b = blocks[v];
+						const s32 s = c == 0 ? b.next_taken : c == 1 ? b.next_fall :
+						                                  c < 6      ? b.bds_next[c - 2] :
+						                                               b.jumps[c - 6].second;
 						if (s >= 0 && !seen[s])
 						{
 							seen[s] = 1;
@@ -2926,8 +3121,10 @@ namespace VU1Jit
 		for (u32 k = 0; k < nb; k++)
 		{
 			const BlockPlan& b = blocks[order[k]];
-			out->blocks.push_back(CompiledModule::Block{b.pc, b.sig, b.Instrs(), b.LastStart()});
+			out->blocks.push_back(CompiledModule::Block{b.pc, b.sig, b.Instrs(), b.LastStart(), !b.ds});
 			out->edges += (b.next_taken >= 0) + (b.next_fall >= 0) + static_cast<u32>(b.jumps.size());
+			for (const s32 s : b.bds_next)
+				out->edges += s >= 0;
 		}
 		return true;
 	}
