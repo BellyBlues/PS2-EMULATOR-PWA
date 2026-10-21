@@ -120,7 +120,12 @@ simpler distant figures), so each row compares one version with itself.
 
 ## In progress
 
-Nothing running. The next candidates are below.
+- **GTA San Andreas: EE throughput** (started 2026-10-21). The owner's recording of 285 s of gameplay
+  shows the EE thread 100 % busy throughout, with GS at 4-10 % and VU1 at 7-37 %. Speed is 57-92 %,
+  78 % on average. Compiling and pipelines are negligible there.
+  - A profile of GTA's EE thread in gameplay (from a savestate, silently in Node) to find which game
+    code and which emulator paths take the time.
+  - Then exact fixes for the largest items, checked with state hashes and pixels.
 
 ## Known to be left
 
