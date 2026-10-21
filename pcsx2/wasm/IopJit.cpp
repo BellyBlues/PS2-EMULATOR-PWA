@@ -14,7 +14,8 @@
 //   does the same with blocks, falling back to one instruction at a time near that limit so that it ends at the same
 //   instruction.
 // - Taken branches: psxJitBranchStart(), the delay slot, then psxJitBranchEnd(): the interpreter's own doBranch()
-//   around its delay slot (the BIOS hooks, the idle loop skip, the event test).
+//   around its delay slot (the BIOS hooks, the idle loop skip, the event test). Their stores are inline where
+//   nothing else can happen: a known target without a hook, a delay slot that is not a NOP (no idle loop).
 // - Other instructions: ALU, shifts, multiplies, HI/LO and COP0 moves, and the loads and stores of main RAM are
 //   emitted; everything else (divides, unaligned and I/O accesses, GTE, RFE, SYSCALL, BREAK, J to an import stub)
 //   calls the interpreter's function with psxRegs.pc and psxRegs.code as execI() sets them. After such a call, a
@@ -734,15 +735,32 @@ namespace
 					else
 						f.i32_const(static_cast<s32>(target));
 				};
-				// doBranchStart() reads no register, and writes $a0 for one target (IOPBOOT's memory size).
-				const bool a0 = from_local || target == 0xbfc4a000u;
-				if (a0)
-					m_regs.Writeback(4);
-				push_target();
-				f.i32_const(static_cast<s32>(FnIndex(&psxJitBranchStart)));
-				f.call_indirect(m_tiv, 0);
-				if (a0)
-					m_regs.Invalidate(1ull << 4);
+				if (!from_local && target != 0 && target != 0x890 && target != 0xbfc4a000u)
+				{
+					// doBranchStart() for a target it has nothing else to do for: branch2 = iopIsDelaySlot = true;
+					// branchPC = target.
+					f.i32_const(0);
+					f.i32_const(1);
+					f.i32_store8(Addr(psxJitBranchFlag()));
+					f.i32_const(0);
+					f.i32_const(1);
+					f.i32_store8(Addr(&iopIsDelaySlot));
+					f.i32_const(0);
+					f.i32_const(static_cast<s32>(target));
+					f.i32_store(Addr(psxJitBranchPC()));
+				}
+				else
+				{
+					// doBranchStart() reads no register, and writes $a0 for one target (IOPBOOT's memory size).
+					const bool a0 = from_local || target == 0xbfc4a000u;
+					if (a0)
+						m_regs.Writeback(4);
+					push_target();
+					f.i32_const(static_cast<s32>(FnIndex(&psxJitBranchStart)));
+					f.call_indirect(m_tiv, 0);
+					if (a0)
+						m_regs.Invalidate(1ull << 4);
+				}
 				const u32 ds = pc + 4, ds_code = Word(ds);
 				const Kind dk = Decode(ds_code);
 				s_guest_instrs++;
@@ -751,9 +769,24 @@ namespace
 					StorePcCode(ds, ds_code); // what execI() leaves (a fallback set them itself, and may raise)
 				StoreCycle();
 				m_regs.WritebackAll();
-				push_target();
-				f.i32_const(static_cast<s32>(FnIndex(&psxJitBranchEnd)));
-				f.call_indirect(m_tiv, 0);
+				if (ds_code != 0)
+				{
+					// doBranchEnd() when psxRegs.code (the delay slot) is not 0, so not an idle loop:
+					// iopIsDelaySlot = false; psxRegs.pc = branchPC (the target); iopEventTest().
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i32_store8(Addr(&iopIsDelaySlot));
+					f.i32_const(0);
+					push_target();
+					f.i32_store(Addr(&psxRegs.pc));
+					CallVoid(FnIndex(&iopEventTest));
+				}
+				else
+				{
+					push_target();
+					f.i32_const(static_cast<s32>(FnIndex(&psxJitBranchEnd)));
+					f.call_indirect(m_tiv, 0);
+				}
 				f.i32_const(0);
 				f.return_();
 				m_k = saved_k;

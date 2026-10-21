@@ -342,6 +342,12 @@ bool* psxJitBranchFlag()
 	return &branch2;
 }
 
+// For the JIT's inline copy of doBranchStart() with a known target.
+u32* psxJitBranchPC()
+{
+	return &branchPC;
+}
+
 // One instruction of that run, as intExecuteBlock() runs it; true when the run ends.
 bool psxJitExecOne(u64 last_cycle)
 {

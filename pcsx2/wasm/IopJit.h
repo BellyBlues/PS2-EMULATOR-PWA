@@ -33,4 +33,5 @@ void psxJitBranchStart(u32 tar);
 void psxJitBranchEnd(u32 tar);
 bool psxJitBranched();
 bool* psxJitBranchFlag();
+u32* psxJitBranchPC();
 bool psxJitExecOne(u64 last_cycle);

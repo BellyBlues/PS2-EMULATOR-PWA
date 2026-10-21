@@ -133,12 +133,11 @@ namespace
 	using BlockFn = int (*)();
 	constexpr u32 kAnyPc = 1; // Leave(): an exit to whatever cpuRegs.pc is
 
-	// Each module's first functions: the branch end, branch test and its condition (EmitBranchEndFunction(),
-	// EmitBranchTestFunction() and EmitBranchDueFunction()), then its blocks, then the lookup (EmitLookup()).
+	// Each module's first functions: the branch end and the branch test's condition (EmitBranchEndFunction() and
+	// EmitBranchDueFunction()), then its blocks, then the lookup (EmitLookup()).
 	constexpr u32 kFnBranchEnd = 0;
-	constexpr u32 kFnBranchTest = 1;
-	constexpr u32 kFnBranchDue = 2;
-	constexpr u32 kFnFirstBlock = 3;
+	constexpr u32 kFnBranchDue = 1;
+	constexpr u32 kFnFirstBlock = 2;
 
 	struct Group
 	{
@@ -2632,48 +2631,29 @@ namespace
 		f.i32_store(bc);
 	}
 
-	// Whether intBranchTest() has something to do: the trace, an event due, or the BIOS hooks. () -> (i32).
+	// Pushes whether intBranchTest() has something to do: the trace, an event due, or the BIOS hooks.
+	void EmitBranchDue(Function& f)
+	{
+		f.i32_const(0);
+		f.i32_load8_u(Addr(&EEJit::g_trace));
+		f.i32_const(0);
+		f.i32_load8_u(Addr(intJitBiosHooksActive()));
+		f.i32_or();
+		f.i32_const(0);
+		f.i64_load(Addr(&cpuRegs.cycle));
+		f.i32_const(0);
+		f.i64_load(Addr(&cpuRegs.nextEventCycle));
+		f.i64_sub();
+		f.i64_const(0);
+		f.i64_ge_s();
+		f.i32_or();
+	}
+
+	// EmitBranchDue() as a function. () -> (i32).
 	Function EmitBranchDueFunction()
 	{
 		Function f(0);
-		f.i32_const(0);
-		f.i32_load8_u(Addr(&EEJit::g_trace));
-		f.i32_const(0);
-		f.i32_load8_u(Addr(intJitBiosHooksActive()));
-		f.i32_or();
-		f.i32_const(0);
-		f.i64_load(Addr(&cpuRegs.cycle));
-		f.i32_const(0);
-		f.i64_load(Addr(&cpuRegs.nextEventCycle));
-		f.i64_sub();
-		f.i64_const(0);
-		f.i64_ge_s();
-		f.i32_or();
-		return f;
-	}
-
-	// intBranchTest(), as intJitBranchTest(): called only when it has something to do (the trace, an event due, or
-	// the BIOS hooks). () -> ().
-	Function EmitBranchTestFunction(u32 type_v_v)
-	{
-		Function f(0);
-		f.i32_const(0);
-		f.i32_load8_u(Addr(&EEJit::g_trace));
-		f.i32_const(0);
-		f.i32_load8_u(Addr(intJitBiosHooksActive()));
-		f.i32_or();
-		f.i32_const(0);
-		f.i64_load(Addr(&cpuRegs.cycle));
-		f.i32_const(0);
-		f.i64_load(Addr(&cpuRegs.nextEventCycle));
-		f.i64_sub();
-		f.i64_const(0);
-		f.i64_ge_s();
-		f.i32_or();
-		f.if_();
-		f.i32_const(static_cast<s32>(FnIndex(&intJitBranchTest)));
-		f.call_indirect(type_v_v, 0);
-		f.end();
+		EmitBranchDue(f);
 		return f;
 	}
 
@@ -2783,7 +2763,12 @@ namespace
 		f.i32_const(0);
 		f.i32_store(Addr(&cpuRegs.branch));
 		EmitUpdateCycles(f, t);
-		f.call(kFnBranchTest);
+		// intBranchTest(), as intJitBranchTest(), when it has something to do.
+		EmitBranchDue(f);
+		f.if_();
+		f.i32_const(static_cast<s32>(FnIndex(&intJitBranchTest)));
+		f.call_indirect(type_v_v, 0);
+		f.end();
 		f.return_();
 		f.end(); // slow
 		f.local_get(target);
@@ -2899,12 +2884,10 @@ namespace
 		// Block i is function kFnFirstBlock + i; the next one returns 0 (links to blocks outside the module).
 		const u32 nblocks = static_cast<u32>(pcs.size());
 		m.add_function(t_i_v, EmitBranchEndFunction(t_v_v, t_i_v));
-		m.add_function(t_v_v, EmitBranchTestFunction(t_v_v));
 		m.add_function(t_v_i, EmitBranchDueFunction());
 		if (EEJit::g_stats)
 		{
 			m.name_function(kFnBranchEnd, "ee_branch_end");
-			m.name_function(kFnBranchTest, "ee_branch_test");
 			m.name_function(kFnBranchDue, "ee_branch_due");
 		}
 		for (u32 i = 0; i < nblocks; i++)
