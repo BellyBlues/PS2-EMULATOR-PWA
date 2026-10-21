@@ -59,6 +59,7 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | MTGS spins briefly for each VU1 program's XGKICK before sleeping. A sleeping thread costs the VU1 thread a JavaScript `Atomics.notify` per program, which was 13 % of its time. The spin adapts its length. | `pcsx2/MTGS.cpp` | Chrome, 100 figures: 102 → 104-110 % | `0715f8848` |
 | Unmasked V4-32 VIF unpacks are copied straight into VU memory instead of through a function call per 16 bytes, later in at most two `memcpy`s. | `pcsx2/Vif_Unpack.cpp` | Chrome, 300 figures: 145 → 157.5 % | `b982eb59e`, `acb0eab2b` |
 | The EE and VU threads' hot fields sit on separate 128-byte cache lines (Apple Silicon's line size). | `pcsx2/MTVU.h`, `common/Pcsx2Defs.h` | 0.16 ms per vsync on each thread | `be7b868ff` |
+| The frame limiter keeps the time late frames lost (up to three frames), so lighter frames catch it up instead of sleeping. PCSX2's limiter forgives a whole frame as soon as one runs a frame late; GTA San Andreas alternates heavy and light vsyncs (35-60 ms, then 5-15 ms) and hit that every other vsync, so it ran at 85-95 % although its average work fits. Only real-time pacing changes, not emulation; after a stall the game runs up to about 108 % for a moment while it catches up. | `pcsx2/VMManager.cpp` | GTA SA gameplay, headless with the limiter on: 90.0 → 96.3 %. Replaying the owner's page recording: 94.8 → 98-99 % average, worst second 78 → 87 % | `5d2e6ebaa` |
 
 ### VU1 JIT (vertex processing)
 
@@ -123,11 +124,12 @@ simpler distant figures), so each row compares one version with itself.
 | Naruto: menus, scene changes, special moves | long freezes on first appearance | first boot short skips; later boots smooth |
 | Naruto intro video, Chrome | 82-84 % (measured by the owner before the EE register work) | not yet measured in the page; headless it runs about 24 % faster |
 | GTA San Andreas on foot, headless (median of 3, from vsync 600 of 2400) | 34.7 VPS (69 %) | 50.8 VPS (101.5 %); the owner's page recording before this was 78 % on average (57-92 %), EE-bound. In one build with the features switched (a busier machine, medians of 3 interleaved): 31.1 VPS with both off, 43.8 with the idle loop skip, 47.8 with the VU0 JIT too |
+| GTA San Andreas on foot, in the page (the owner's recording, after the idle loop skip and the VU0 JIT, before the limiter change) | 78 % average | 94.8 % average in gameplay, 59 % of the time at 99 % or more; dips to 76-85 % where the EE is busy |
 
 ## In progress
 
-- **GTA San Andreas in the page.** The idle loop skip and the VU0 JIT take it from 69 % to about
-  101 % headless; the owner is to check it in Zen and Chrome with the Recorder.
+- **GTA San Andreas in the page** after the limiter change: the owner is to record again. What is
+  left in the dips is EE throughput (see below): the heavy vsyncs are 35-60 ms of EE work.
 
 ## Known to be left
 
