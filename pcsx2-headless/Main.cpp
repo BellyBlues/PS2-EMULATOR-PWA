@@ -176,8 +176,8 @@ static bool InitializeConfig()
 	// The VU1 JIT is on (docs/web-port/VU1-JIT-DESIGN.md): -set EmuCore/CPU/Recompiler/EnableVU1=false
 	// runs the VU1 interpreter instead.
 	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", true);
-	// The same for the VU0 micro-mode JIT: -set EmuCore/CPU/Recompiler/EnableVU0=true.
-	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", false);
+	// The same for the VU0 micro-mode JIT: -set EmuCore/CPU/Recompiler/EnableVU0=false.
+	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", true);
 #endif
 
 	// Headless: no renderer output, no audio. Pad 1 keeps the default keyboard bindings only for an input
@@ -508,7 +508,7 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         timing model at every instruction, 'jit' compares the interpreter and the JIT, 'both' does both.\n"
 								 "  -vu1jit-oracle checks the timing model at every VU1 instruction the JIT's dispatcher runs.\n"
 								 "  -vu1jit-lockstep runs every VU1 program on the JIT and on the interpreter and compares them.\n"
-								 "  -vu0jit-lockstep does the same for VU0 micro programs (EnableVU0=true).\n"
+								 "  -vu0jit-lockstep does the same for VU0 micro programs (the VU0 JIT is on by default, off with EnableVU0=false).\n"
 								 "  -vu1jit-stats writes per-vsync VU1 statistics (runs, cycles, execute time, PATH1 hash) as CSV.\n"
 								 "  -mtvu-sync makes the EE wait for the VU thread at each check, so whole runs repeat exactly.\n");
 #endif

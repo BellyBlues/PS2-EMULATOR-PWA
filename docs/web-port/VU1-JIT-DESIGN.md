@@ -12,7 +12,7 @@ VU state kept in `VURegs` memory rather than locals, the timing model's decision
 the FMAC family, FTOI/ITOF, ABS, CLIP, moves, integer ops, loads/stores and branches, the interpreter's op bodies for the
 rest. BT3 fight: 0 lockstep differences over 1000 vsyncs (3.1 M programs), 0 differences over 10^5 random programs
 (Liftoff and TurboFan), 100% of VU1 instructions in generated code, VU1 execute time about 5x lower. The same code
-generator also runs VU0 micro mode (`pcsx2/wasm/VU0Jit.cpp`, `EnableVU0`, off by default).
+generator also runs VU0 micro mode (`pcsx2/wasm/VU0Jit.cpp`, `EnableVU0`, on by default since 2026-10-21).
 
 **Status (2026-10-21).** Cheaper per instruction on game-like code (the crowd benchmark, `tools/wasm/bench/`, whose
 VU1 program is a paired, software-pipelined vertex loop):
