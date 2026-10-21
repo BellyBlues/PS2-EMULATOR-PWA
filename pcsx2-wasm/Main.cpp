@@ -66,11 +66,13 @@
 #include "pcsx2/ImGui/ImGuiManager.h"
 #include "pcsx2/Input/InputManager.h"
 #include "pcsx2/MTGS.h"
+#include "pcsx2/MTVU.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/SIO/Pad/Pad.h"
 #include "pcsx2/SIO/Pad/PadBase.h"
 #include "pcsx2/SIO/Sio.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/wasm/PerfCounters.h"
 #include "pcsx2/wasm/EEJit.h"
 #include "pcsx2/wasm/IopJit.h"
 #include "pcsx2/ps2/BiosTools.h"
@@ -119,6 +121,15 @@ static std::atomic<bool> s_vu1jit_enabled{true};
 static std::atomic<bool> s_cpu_thread_ready{false};
 static std::atomic<float> s_speed{0.0f};
 static std::atomic<float> s_vps{0.0f};
+// The per-vsync recorder (pcsx2web_perf_ring()): one record per vsync in a ring the page reads.
+// Each record is PERF_FIELDS doubles: vsync number, wall time (ms), cumulative busy time (ms) of the
+// EE, GS and VU1 threads, cumulative JIT compile time (ms), cumulative time waiting for GPU pipelines
+// (ms) and their count, and the emulated vsync rate (Hz) the record's speed is relative to.
+static constexpr u32 PERF_RECORDS = 8192;
+static constexpr u32 PERF_FIELDS = 9;
+alignas(8) static double s_perf_ring[PERF_RECORDS * PERF_FIELDS];
+static std::atomic<u32> s_perf_written{0};
+
 // EE, GS and VU thread usage in percent (busy wall time; see Threading::ScopedWaitTimer).
 static std::atomic<float> s_thread_usage[3] = {0.0f, 0.0f, 0.0f};
 
@@ -1947,6 +1958,18 @@ EMSCRIPTEN_KEEPALIVE float pcsx2web_vps(void)
 	return s_vps.load(std::memory_order_relaxed);
 }
 
+/// The per-vsync recorder's ring (PERF_RECORDS records of PERF_FIELDS doubles, see s_perf_ring) and
+/// how many records have been written so far: record i is at index i % PERF_RECORDS.
+EMSCRIPTEN_KEEPALIVE const double* pcsx2web_perf_ring(void)
+{
+	return s_perf_ring;
+}
+
+EMSCRIPTEN_KEEPALIVE unsigned int pcsx2web_perf_written(void)
+{
+	return s_perf_written.load(std::memory_order_acquire);
+}
+
 /// How busy a thread was over the last measurement, in percent: 0 the EE (CPU) thread, 1 the GS thread,
 /// 2 the VU1 thread (0 without MTVU). Busy means not waiting for another thread.
 EMSCRIPTEN_KEEPALIVE float pcsx2web_thread_usage(int thread)
@@ -2135,10 +2158,28 @@ EMSCRIPTEN_KEEPALIVE const void* pcsx2web_vu1jit_stats(void)
 // Host callbacks
 //////////////////////////////////////////////////////////////////////////
 
+static void RecordPerfVsync(u32 vsync)
+{
+	static const Threading::ThreadHandle ee = Threading::ThreadHandle::GetForCallingThread();
+	const u32 n = s_perf_written.load(std::memory_order_relaxed);
+	double* r = &s_perf_ring[(n % PERF_RECORDS) * PERF_FIELDS];
+	r[0] = vsync;
+	r[1] = emscripten_get_now();
+	r[2] = ee.GetCPUTime() / 1000.0;
+	r[3] = MTGS::GetThreadHandle().GetCPUTime() / 1000.0;
+	r[4] = THREAD_VU1 ? vu1Thread.GetThreadHandle().GetCPUTime() / 1000.0 : 0.0;
+	r[5] = PerfCounters::jit_compile_ns.load(std::memory_order_relaxed) / 1e6;
+	r[6] = PerfCounters::gpu_pipeline_ns.load(std::memory_order_relaxed) / 1e6;
+	r[7] = PerfCounters::gpu_pipelines.load(std::memory_order_relaxed);
+	r[8] = VMManager::GetFrameRate();
+	s_perf_written.store(n + 1, std::memory_order_release);
+}
+
 void Host::PumpMessagesOnCPUThread()
 {
 	// Called once per vsync.
 	const u32 vsync = s_vsync_count.fetch_add(1, std::memory_order_relaxed) + 1;
+	RecordPerfVsync(vsync);
 	ProcessKeyEvents();
 	RunCPUThreadQueue();
 	CheckStopRequest();

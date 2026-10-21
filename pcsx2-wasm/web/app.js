@@ -308,6 +308,21 @@
 		btnCrisp: $('btn-crisp'),
 		btnKeys: $('btn-keys'),
 		btnLog: $('btn-log'),
+		btnRec: $('btn-rec'),
+		recDrawer: $('rec-drawer'),
+		recStatus: $('rec-status'),
+		recToggle: $('rec-toggle'),
+		recToggleLabel: $('rec-toggle-label'),
+		recCopy: $('rec-copy'),
+		recCopyLabel: $('rec-copy-label'),
+		recDownload: $('rec-download'),
+		recClose: $('rec-close'),
+		recEmpty: $('rec-empty'),
+		recChart: $('rec-chart'),
+		recCrop: $('rec-crop'),
+		recFrom: $('rec-from'),
+		recTo: $('rec-to'),
+		recSummary: $('rec-summary'),
 		btnFs: $('btn-fs'),
 		btnFsIcon: $('btn-fs-icon'),
 		btnFsLabel: $('btn-fs-label'),
@@ -401,7 +416,7 @@
 		fatal: null, // { kind, what, detail, line }
 		env: null, // environmentProblem() when unsupported
 		drag: '', // '' | 'ok' | 'blocked'
-		drawer: '', // '' | 'keys' | 'log'
+		drawer: '', // '' | 'keys' | 'log' | 'rec'
 		fsByPage: false, // the page itself is leaving fullscreen
 		keepChrome: false,
 		slowSince: 0,
@@ -837,6 +852,8 @@
 			speed: () => M._pcsx2web_speed(),
 			vps: () => M._pcsx2web_vps(),
 			threadUsage: (i) => (M._pcsx2web_thread_usage ? M._pcsx2web_thread_usage(i) : 0),
+			perfRing: () => (M._pcsx2web_perf_ring ? M._pcsx2web_perf_ring() >>> 0 : 0),
+			perfWritten: () => (M._pcsx2web_perf_written ? M._pcsx2web_perf_written() >>> 0 : 0),
 			keyCode: (name) => M.ccall('pcsx2web_key_code', 'number', ['string'], [name]),
 			key: (code, pressed) => M._pcsx2web_key(code, pressed ? 1 : 0),
 			padInput: (name) => M.ccall('pcsx2web_pad_input', 'number', ['string'], [name]),
@@ -1366,6 +1383,8 @@
 		page.vps = Number.isFinite(vps) ? vps : 0;
 		if (SHOW_THREADS)
 			page.threads = [0, 1, 2].map((i) => api.threadUsage(i));
+		if (rec.recording)
+			recDrain();
 
 		const prev = page.vmState;
 		if (state !== prev)
@@ -6824,16 +6843,301 @@
 		}
 	}
 
+	// ------------------------------------------------------------------ recorder (?threads=1)
+	// The CPU thread writes one record per vsync into a ring (pcsx2web_perf_ring(), PERF_FIELDS
+	// doubles each: vsync, wall ms, cumulative busy ms of the EE, GS and VU1 threads, cumulative JIT
+	// compile ms, cumulative GPU pipeline ms and count, vsync rate in Hz). While recording, poll()
+	// drains it into rows, one per vsync: its speed (the PS2's frame time over the wall time it
+	// took), each thread's busy share and what was compiled during it. A drop shorter than the
+	// readout's averaging window shows here. Up to 10 minutes are kept.
+	const PERF_RECORDS = 8192;
+	const PERF_FIELDS = 9;
+	const REC_MAX_ROWS = 30000;
+	// With the frame limiter on, single vsyncs jitter around their target (the limiter sleeps in whole
+	// milliseconds), so the chart and the summary lead with the speed over the last REC_WINDOW vsyncs.
+	const REC_WINDOW = 10;
+	const rec = { recording: false, rows: [], read: 0, prev: null, t0: 0, from: 0, to: 0, startedAt: 0, info: null, drag: null };
+
+	function recStart() {
+		rec.rows = [];
+		rec.prev = null;
+		rec.t0 = 0;
+		rec.read = api ? api.perfWritten() : 0;
+		rec.from = rec.to = 0;
+		rec.startedAt = performance.now();
+		rec.recording = true;
+		const mode = gpu.mode;
+		rec.info = {
+			game: disc.runTitle || '(BIOS)', serial: disc.runSerial || '',
+			renderer: mode ? `${mode.hw ? 'hardware' : 'software'} renderer${mode.webgpu ? ' on WebGPU' : ' on a 2D canvas'}` : 'unknown renderer',
+			browser: navigator.userAgent, date: new Date().toISOString(),
+		};
+		recRender();
+	}
+
+	function recStop() {
+		recDrain();
+		rec.recording = false;
+		rec.from = 0;
+		rec.to = Math.max(0, rec.rows.length - 1);
+		recRender();
+		if (rec.rows.length)
+			els.recFrom.focus({ preventScroll: true });
+	}
+
+	function recDrain() {
+		if (!api)
+			return;
+		const ptr = api.perfRing(), buf = heapBuffer();
+		if (!ptr || !buf)
+			return;
+		const ring = new Float64Array(buf, ptr, PERF_RECORDS * PERF_FIELDS);
+		const written = api.perfWritten();
+		// Records more than a ring behind were overwritten; keep a margin for the one being written.
+		let i = Math.max(rec.read, written - PERF_RECORDS + 16);
+		for (; i < written; i++) {
+			const o = (i % PERF_RECORDS) * PERF_FIELDS;
+			const r = { v: ring[o], t: ring[o + 1], ee: ring[o + 2], gs: ring[o + 3], vu: ring[o + 4], jit: ring[o + 5],
+				gpu: ring[o + 6], pipes: ring[o + 7], hz: ring[o + 8] };
+			const p = rec.prev;
+			rec.prev = r;
+			if (!rec.t0)
+				rec.t0 = r.t; // row times count from the first record
+			if (!p || r.v !== p.v + 1 || !(r.t > p.t))
+				continue; // the first record, or a gap (a reboot, or records lost): no row
+			const ms = r.t - p.t;
+			const pct = (a, b) => Math.max(0, Math.min(100, ((a - b) / ms) * 100));
+			rec.rows.push({
+				v: r.v, t: (p.t - rec.t0) / 1000, ms, speed: r.hz > 0 ? (1000 / r.hz / ms) * 100 : 0,
+				ee: pct(r.ee, p.ee), gs: pct(r.gs, p.gs), vu: pct(r.vu, p.vu),
+				jit: Math.max(0, r.jit - p.jit), gpu: Math.max(0, r.gpu - p.gpu), pipes: Math.max(0, r.pipes - p.pipes), hz: r.hz,
+			});
+			const row = rec.rows[rec.rows.length - 1];
+			const win = rec.rows.slice(-REC_WINDOW);
+			row.speed10 = r.hz > 0 ? ((win.length * 1000) / r.hz / win.reduce((a, w) => a + w.ms, 0)) * 100 : 0;
+			if (rec.rows.length >= REC_MAX_ROWS) {
+				rec.read = written;
+				recStop();
+				return;
+			}
+		}
+		rec.read = written;
+		if (page.drawer === 'rec')
+			recRender();
+	}
+
+	function recSelection() {
+		return rec.rows.slice(rec.from, rec.to + 1);
+	}
+
+	function recStats(rows) {
+		const n = rows.length;
+		if (!n)
+			return null;
+		const mean = (k, rs = rows) => rs.reduce((a, r) => a + r[k], 0) / rs.length;
+		const bySpeed = [...rows].sort((a, b) => a.speed10 - b.speed10);
+		const worst = bySpeed.slice(0, Math.max(1, Math.round(n * 0.05)));
+		const jitRows = rows.filter((r) => r.jit > 0.05), gpuRows = rows.filter((r) => r.pipes > 0);
+		return {
+			n, seconds: rows.reduce((a, r) => a + r.ms, 0) / 1000,
+			min: bySpeed[0].speed10, minRaw: Math.min(...rows.map((r) => r.speed)),
+			mean: (n * 100) / rows.reduce((a, r) => a + 100 / Math.max(r.speed, 0.001), 0),
+			under90: rows.filter((r) => r.speed10 < 90).length, under75: rows.filter((r) => r.speed10 < 75).length,
+			slowest: bySpeed[0], ee: mean('ee'), gs: mean('gs'), vu: mean('vu'),
+			worstEe: mean('ee', worst), worstGs: mean('gs', worst), worstVu: mean('vu', worst), worstN: worst.length,
+			jitMs: rows.reduce((a, r) => a + r.jit, 0), jitVsyncs: jitRows.length,
+			gpuMs: rows.reduce((a, r) => a + r.gpu, 0), pipes: rows.reduce((a, r) => a + r.pipes, 0), gpuVsyncs: gpuRows.length,
+		};
+	}
+
+	const fmt0 = (x) => x.toFixed(0), fmt1 = (x) => x.toFixed(1), fmt2 = (x) => x.toFixed(2);
+
+	function recSummaryText(st, rows) {
+		if (!st)
+			return '';
+		const t0 = rows[0].t, t1 = rows[rows.length - 1].t + rows[rows.length - 1].ms / 1000;
+		return `${fmt2(t0)} s to ${fmt2(t1)} s: ${st.n} vsyncs\n` +
+			`speed over ${REC_WINDOW} vsyncs: overall ${fmt0(st.mean)}%, lowest ${fmt0(st.min)}% (ending at vsync ${st.slowest.v}), ` +
+			`${st.under90} vsyncs under 90%, ${st.under75} under 75%; slowest single vsync ${fmt0(st.minRaw)}%\n` +
+			`busy, mean: EE ${fmt0(st.ee)}%  GS ${fmt0(st.gs)}%  VU ${fmt0(st.vu)}%; ` +
+			`in the slowest ${st.worstN}: EE ${fmt0(st.worstEe)}%  GS ${fmt0(st.worstGs)}%  VU ${fmt0(st.worstVu)}%\n` +
+			`compiling: JITs ${fmt1(st.jitMs)} ms over ${st.jitVsyncs} vsyncs; GPU pipelines ${st.pipes} (${fmt1(st.gpuMs)} ms) over ${st.gpuVsyncs} vsyncs`;
+	}
+
+	const REC_COLUMNS = 'vsync,time_s,ms,speed_pct,speed10_pct,ee_pct,gs_pct,vu_pct,jit_ms,gpu_pipeline_ms,gpu_pipelines';
+	const recRowCsv = (r) => [r.v, fmt2(r.t), fmt2(r.ms), fmt1(r.speed), fmt1(r.speed10), fmt0(r.ee), fmt0(r.gs), fmt0(r.vu), fmt1(r.jit), fmt1(r.gpu),
+		r.pipes].join(',');
+
+	// For pasting into a message: the context, the summary and the cropped vsyncs (averaged in groups
+	// when there are more than 1500, so the text stays short).
+	function recText() {
+		const rows = recSelection();
+		const st = recStats(rows);
+		if (!st)
+			return '';
+		const i = rec.info;
+		const lines = ['TabStationToo recording', `game: ${i.game}${i.serial ? ` (${i.serial})` : ''}; ${i.renderer}; ${i.date}`,
+			`browser: ${i.browser}`, recSummaryText(st, rows)];
+		const group = Math.ceil(rows.length / 1500);
+		lines.push(group > 1 ? `per ${group} vsyncs (averaged; the lowest speed of each group in min_speed_pct):` : 'per vsync:');
+		lines.push(group > 1 ? `${REC_COLUMNS},min_speed_pct` : REC_COLUMNS);
+		for (let k = 0; k < rows.length; k += group) {
+			const g = rows.slice(k, k + group);
+			if (group === 1) {
+				lines.push(recRowCsv(g[0]));
+				continue;
+			}
+			const sum = (key) => g.reduce((a, r) => a + r[key], 0);
+			const ms = sum('ms');
+			const speed = (g.length * 100) / g.reduce((a, r) => a + 100 / Math.max(r.speed, 0.001), 0);
+			lines.push([g[0].v, fmt2(g[0].t), fmt2(ms / g.length), fmt1(speed), fmt1(speed),
+				fmt0(sum('ee') / g.length), fmt0(sum('gs') / g.length), fmt0(sum('vu') / g.length), fmt1(sum('jit')), fmt1(sum('gpu')),
+				sum('pipes'), fmt1(Math.min(...g.map((r) => r.speed)))].join(','));
+		}
+		return lines.join('\n');
+	}
+
+	function recDownload() {
+		const rows = recSelection();
+		if (!rows.length)
+			return;
+		const text = [REC_COLUMNS, ...rows.map(recRowCsv)].join('\n') + '\n';
+		const url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+		const a = document.createElement('a');
+		const name = (rec.info.serial || rec.info.game || 'bios').replace(/[^A-Za-z0-9._-]+/g, '-');
+		a.href = url;
+		a.download = `tabstationtoo-recording-${name}-${rec.info.date.slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+		document.body.append(a);
+		a.click();
+		a.remove();
+		setTimeout(() => URL.revokeObjectURL(url), 1000);
+	}
+
+	function recRender() {
+		const has = rec.rows.length > 0;
+		const done = has && !rec.recording;
+		setText(els.recToggleLabel, rec.recording ? 'Stop' : 'Record');
+		els.recCopy.disabled = !done;
+		els.recDownload.disabled = !done;
+		if (rec.recording)
+			setText(els.recStatus, `recording, ${fmt0((performance.now() - rec.startedAt) / 1000)} s, ${rec.rows.length} vsyncs`);
+		else
+			setText(els.recStatus, has ? `${fmt1(rec.rows.reduce((a, r) => a + r.ms, 0) / 1000)} s, ${rec.rows.length} vsyncs` : '');
+		els.recEmpty.hidden = has;
+		els.recChart.hidden = !has;
+		els.recCrop.hidden = !done;
+		if (done) {
+			for (const input of [els.recFrom, els.recTo])
+				input.max = String(rec.rows.length - 1);
+			els.recFrom.value = String(rec.from);
+			els.recTo.value = String(rec.to);
+			els.recFrom.setAttribute('aria-valuetext', `vsync ${rec.rows[rec.from].v}, ${fmt2(rec.rows[rec.from].t)} s`);
+			els.recTo.setAttribute('aria-valuetext', `vsync ${rec.rows[rec.to].v}, ${fmt2(rec.rows[rec.to].t)} s`);
+		}
+		const rows = done ? recSelection() : rec.rows;
+		const st = recStats(rows);
+		setText(els.recSummary, done ? recSummaryText(st, rows) : '');
+		els.recChart.setAttribute('aria-label', st ? `Speed over ${REC_WINDOW} vsyncs, lowest ${fmt0(st.min)}%, ${st.under90} vsyncs under 90%` : 'No recording yet');
+		if (has && page.drawer === 'rec')
+			recDrawChart();
+	}
+
+	function recDrawChart() {
+		const canvas = els.recChart;
+		const dpr = window.devicePixelRatio || 1;
+		const w = Math.max(1, Math.round(canvas.clientWidth * dpr)), h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+		if (canvas.width !== w || canvas.height !== h) {
+			canvas.width = w;
+			canvas.height = h;
+		}
+		const ctx = canvas.getContext('2d');
+		const css = getComputedStyle(document.documentElement);
+		const color = (name) => css.getPropertyValue(name).trim();
+		ctx.clearRect(0, 0, w, h);
+		const rows = rec.rows, n = rows.length;
+		const x = (i) => (n > 1 ? (i / (n - 1)) * (w - 1) : 0);
+		const top = 4 * dpr, bottom = h - 8 * dpr; // the bottom strip holds the compile marks
+		const y = (pct) => bottom - (Math.min(Math.max(pct, 0), 150) / 150) * (bottom - top);
+		if (!rec.recording) {
+			ctx.fillStyle = 'rgb(242 181 68 / 0.12)';
+			ctx.fillRect(x(rec.from), 0, Math.max(1, x(rec.to) - x(rec.from)), h);
+		}
+		ctx.fillStyle = color('--line-2');
+		ctx.fillRect(0, Math.round(y(100)), w, Math.max(1, dpr));
+		const line = (key, stroke, width) => {
+			ctx.beginPath();
+			for (let i = 0; i < n; i++) {
+				const px = x(i), py = y(rows[i][key]);
+				if (i === 0)
+					ctx.moveTo(px, py);
+				else
+					ctx.lineTo(px, py);
+			}
+			ctx.strokeStyle = stroke;
+			ctx.lineWidth = width * dpr;
+			ctx.stroke();
+		};
+		ctx.globalAlpha = 0.7;
+		line('ee', color('--coral'), 1);
+		line('gs', color('--sand'), 1);
+		line('vu', color('--ink-2'), 1);
+		ctx.globalAlpha = 0.35;
+		line('speed', color('--amber'), 1);
+		ctx.globalAlpha = 1;
+		line('speed10', color('--amber'), 1.5);
+		for (let i = 0; i < n; i++) {
+			const r = rows[i];
+			if (r.jit > 0.05) {
+				ctx.fillStyle = color('--coral');
+				ctx.fillRect(x(i), h - 7 * dpr, Math.max(1, dpr), 3 * dpr);
+			}
+			if (r.pipes > 0) {
+				ctx.fillStyle = color('--sand');
+				ctx.fillRect(x(i), h - 3 * dpr, Math.max(1, dpr), 3 * dpr);
+			}
+		}
+	}
+
+	// Dragging across the chart selects that part, like the two sliders.
+	function recChartPointer() {
+		const index = (e) => {
+			const box = els.recChart.getBoundingClientRect();
+			const f = Math.min(Math.max((e.clientX - box.left) / Math.max(box.width, 1), 0), 1);
+			return Math.round(f * Math.max(rec.rows.length - 1, 0));
+		};
+		els.recChart.addEventListener('pointerdown', (e) => {
+			if (rec.recording || !rec.rows.length)
+				return;
+			rec.drag = index(e);
+			rec.from = rec.to = rec.drag;
+			els.recChart.setPointerCapture(e.pointerId);
+			recRender();
+		});
+		els.recChart.addEventListener('pointermove', (e) => {
+			if (rec.drag === null)
+				return;
+			const i = index(e);
+			rec.from = Math.min(rec.drag, i);
+			rec.to = Math.max(rec.drag, i);
+			recRender();
+		});
+		const end = () => {
+			rec.drag = null;
+		};
+		els.recChart.addEventListener('pointerup', end);
+		els.recChart.addEventListener('pointercancel', end);
+	}
+
 	// ------------------------------------------------------------------ drawers, menu, dialog
 
 	let drawerCloseTimer = 0;
 
 	function drawerEl(name) {
-		return name === 'keys' ? els.keysDrawer : name === 'log' ? els.logDrawer : null;
+		return name === 'keys' ? els.keysDrawer : name === 'log' ? els.logDrawer : name === 'rec' ? els.recDrawer : null;
 	}
 
 	function drawerToggle(name) {
-		return name === 'keys' ? els.btnKeys : els.btnLog;
+		return name === 'keys' ? els.btnKeys : name === 'rec' ? els.btnRec : els.btnLog;
 	}
 
 	// data-drawer (which widens the column under the screen) is cleared only here, once the
@@ -6841,7 +7145,7 @@
 	function finishDrawerClose() {
 		clearTimeout(drawerCloseTimer);
 		drawerCloseTimer = 0;
-		for (const el of [els.keysDrawer, els.logDrawer]) {
+		for (const el of [els.keysDrawer, els.logDrawer, els.recDrawer]) {
 			if (el.classList.contains('closing')) {
 				el.classList.remove('closing');
 				el.hidden = true;
@@ -6868,6 +7172,8 @@
 		setData('drawer', name);
 		if (name === 'log')
 			renderFullLog();
+		else if (name === 'rec')
+			recRender();
 		else
 			applyLayoutLabels();
 		syncScreenWidth();
@@ -7812,6 +8118,25 @@
 			flushLog();
 		});
 		els.logCopy.addEventListener('click', () => copyText(logLines.map((l) => l.text).join('\n'), els.logCopyLabel));
+
+		// Recorder (developer switch ?threads=1).
+		els.btnRec.hidden = !SHOW_THREADS;
+		els.btnRec.addEventListener('click', () => toggleDrawer('rec'));
+		els.recClose.addEventListener('click', () => closeDrawer(true));
+		els.recToggle.addEventListener('click', () => (rec.recording ? recStop() : recStart()));
+		els.recCopy.addEventListener('click', () => copyText(recText(), els.recCopyLabel));
+		els.recDownload.addEventListener('click', recDownload);
+		for (const input of [els.recFrom, els.recTo]) {
+			input.addEventListener('input', () => {
+				const a = Number(els.recFrom.value), b = Number(els.recTo.value);
+				rec.from = Math.min(a, b);
+				rec.to = Math.max(a, b);
+				recRender();
+			});
+		}
+		recChartPointer();
+		if (typeof ResizeObserver === 'function')
+			new ResizeObserver(() => { if (page.drawer === 'rec') recRender(); }).observe(els.recChart);
 
 		// The column under the screen (sill, transport, drawers, credits) follows the screen's
 		// width. When the credits rewrap, the screen settles a frame later; the "ResizeObserver

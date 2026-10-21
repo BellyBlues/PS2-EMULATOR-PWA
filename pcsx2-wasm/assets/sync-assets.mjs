@@ -34,7 +34,7 @@ const ICONS = [
 	'terminal-window', 'corners-out', 'corners-in', 'copy', 'x', 'arrow-clockwise', 'arrow-up-right',
 	'arrow-line-down', 'arrow-up', 'arrow-down', 'arrow-left', 'arrow-right', 'disc',
 	'speaker-high', 'speaker-low', 'speaker-x', 'speaker-slash', 'graphics-card', 'sim-card', 'eject',
-	'pencil-simple', 'download-simple', 'plus', 'dots-three',
+	'pencil-simple', 'download-simple', 'plus', 'dots-three', 'record', 'chart-line',
 ];
 // Phosphor Fill icons; each becomes <symbol id="i-NAME-fill">.
 const FILL_ICONS = ['sim-card'];

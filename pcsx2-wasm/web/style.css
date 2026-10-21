@@ -1428,6 +1428,62 @@ p.fine {
   border-left-color: var(--sand);
 }
 
+/* Recorder (developer switch ?threads=1): a chart of every vsync's speed and thread load, two
+   sliders that crop it, and a summary of the cropped part. */
+.drawer.rec .log-head {
+  flex-wrap: wrap;
+}
+
+.drawer.rec .log-count {
+  white-space: nowrap;
+}
+
+.rec-frame {
+  position: relative;
+  margin-top: 8px;
+  min-height: 96px;
+}
+
+.rec-chart {
+  display: block;
+  width: 100%;
+  height: clamp(96px, 55dvh - 300px, 180px);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.rec-crop {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.rec-range {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--hit);
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--ink-3);
+}
+
+.rec-range input {
+  flex: 1 1 auto;
+  accent-color: var(--amber);
+}
+
+.rec-summary {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 450;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}
+
 .log-empty {
   position: absolute;
   top: 0;
@@ -2066,7 +2122,8 @@ body[data-lights="down"] {
    the subtitle and wrap the credits. app.js keeps data-drawer until the closing drawer is gone,
    so everything resizes once. */
 body[data-drawer="keys"],
-body[data-drawer="log"] {
+body[data-drawer="log"],
+body[data-drawer="rec"] {
   --col-w: max(var(--screen-w, 100%), 920px);
 }
 

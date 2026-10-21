@@ -185,7 +185,7 @@ Switches for comparisons and tests (all optional):
 | `?renderer=sw` | Draws with PCSX2's software renderer instead of the hardware renderer on the WebGPU device (the default, `?renderer=hw`). Without a WebGPU device the GS uses the software renderer |
 | `?set=Section/Key=Value` | Overrides one setting after the defaults (repeatable), e.g. `?set=EmuCore/GS/deinterlace_mode=2` |
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
-| `?threads=1` | Adds how busy the EE, GS and VU1 threads are to the speed readout (`pcsx2web_thread_usage()`), to see which one limits a game without the developer tools, which slow WebAssembly down a lot while open |
+| `?threads=1` | Adds how busy the EE, GS and VU1 threads are to the speed readout (`pcsx2web_thread_usage()`), to see which one limits a game without the developer tools, which slow WebAssembly down a lot while open; and a Recorder button: it records every vsync (its speed, each thread's load, JIT and GPU pipeline compiling, from `pcsx2web_perf_ring()`) until stopped, then charts it, crops it to an interval and copies it as text or downloads it as CSV |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |
 | `?eejit=0` | Runs the EE (main CPU) interpreter instead of the EE JIT, which compiles EE code to WebAssembly at run time |
 | `?iopjit=0` | Runs the IOP (I/O processor) interpreter instead of the IOP JIT, which compiles IOP code to WebAssembly at run time |
@@ -462,6 +462,7 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_state()` | 0 waiting, 1 starting, 2 running, 3 stopped, 4 failed (polled every 500 ms) |
 | `pcsx2web_speed()`, `pcsx2web_vps()` | speed in percent, vertical syncs per second |
 | `pcsx2web_thread_usage(t)` | how busy the EE (0), GS (1) and VU1 (2) threads were, in percent: wall time not spent waiting for another thread (WebAssembly has no per-thread CPU clocks) |
+| `pcsx2web_perf_ring()`, `pcsx2web_perf_written()` | the per-vsync recorder's ring (8192 records of 9 doubles: vsync, wall ms, cumulative busy ms of the EE, GS and VU1 threads, cumulative JIT compile ms, cumulative GPU pipeline ms and count, vsync rate) and how many records were written |
 | `pcsx2web_key_code(name)`, `pcsx2web_key(code, pressed)` | resolve host key names once, then queue key events |
 | `pcsx2web_pad_input(name)`, `pcsx2web_pad(port, input, value)` | resolve a pad input name ("Cross", "L2", "LUp", ...) once, then queue its state (0 to 1) for port 0 or 1; 1 if queued, 0 if the queue is full. The page routes the keyboard and the gamepads to a port (UI-SPEC §13); the core has no keyboard bindings for the pads |
 | `pcsx2web_test_pad_state(port)` | test hook: the raw value (0 to 255) of each pad input of a port, four to a word, then a flags word (bit 0 connected, bit 1 analog light) |

@@ -8,6 +8,7 @@
 #include "GS/Renderers/WebGPU/GSDeviceWebGPU.h"
 #include "GS/Renderers/WebGPU/WGSLPreprocessor.h"
 #include "GS/GSPerfMon.h"
+#include "wasm/PerfCounters.h"
 
 #include "common/Console.h"
 #include "common/HashCombine.h"
@@ -564,6 +565,8 @@ WGPURenderPipeline GSDeviceWebGPU::CreateTFXPipeline(const TFXPipelineKey& key)
 	const double t0 = WebGPUHost::Now();
 	const WGPUFuture future = wgpuDeviceCreateRenderPipelineAsync(m_device, &d, cb);
 	WebGPUHost::Wait(m_instance, future, TFX_PIPELINE_TIMEOUT_MS);
+	PerfCounters::Add(PerfCounters::gpu_pipeline_ns, static_cast<u64>((WebGPUHost::Now() - t0) * 1e6));
+	PerfCounters::gpu_pipelines.fetch_add(1, std::memory_order_relaxed);
 	WGPURenderPipeline pipeline = nullptr;
 	if (!req->Take(&pipeline))
 	{

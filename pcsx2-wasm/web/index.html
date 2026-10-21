@@ -109,6 +109,10 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
         <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-keyboard"/></svg><span class="t-label">Keys</span>
         <span class="tip" aria-hidden="true">Keys <kbd>?</kbd></span>
       </button>
+      <button type="button" class="t-btn" id="btn-rec" aria-expanded="false" aria-controls="rec-drawer" hidden>
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-chart-line"/></svg><span class="t-label">Recorder</span>
+        <span class="tip" aria-hidden="true">Recorder</span>
+      </button>
       <button type="button" class="t-btn" id="btn-log" aria-expanded="false" aria-controls="log-drawer" aria-keyshortcuts="`">
         <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-terminal-window"/></svg><span class="t-label">Log</span>
         <span class="tip" aria-hidden="true">Log <kbd data-code="Backquote">`</kbd></span>
@@ -280,6 +284,27 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
     <div class="log-frame">
       <p class="log-empty" id="log-empty">No output yet.</p>
       <div class="log-body" id="log" role="log" aria-live="off" aria-labelledby="log-title" tabindex="0"></div>
+    </div>
+  </section>
+
+  <section class="drawer rec" id="rec-drawer" aria-labelledby="rec-title" hidden>
+    <div class="log-head">
+      <h2 id="rec-title">Recorder</h2>
+      <span class="log-count" id="rec-status"></span>
+      <span class="grow"></span>
+      <button type="button" class="btn-quiet" id="rec-toggle"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-record"/></svg><span id="rec-toggle-label">Record</span></button>
+      <button type="button" class="btn-quiet" id="rec-copy" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-copy"/></svg><span id="rec-copy-label">Copy</span></button>
+      <button type="button" class="btn-quiet" id="rec-download" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-download-simple"/></svg>Download</button>
+      <button type="button" class="btn-icon" id="rec-close" aria-label="Close Recorder"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-x"/></svg></button>
+    </div>
+    <div class="rec-frame">
+      <p class="log-empty" id="rec-empty">Record while you play, then stop: every vsync's speed and thread load show here, ready to crop, copy or download.</p>
+      <canvas class="rec-chart" id="rec-chart" role="img" aria-label="No recording yet" hidden></canvas>
+      <div class="rec-crop" id="rec-crop" hidden>
+        <label class="rec-range"><span>From</span><input type="range" id="rec-from" min="0" max="0" value="0" step="1"></label>
+        <label class="rec-range"><span>To</span><input type="range" id="rec-to" min="0" max="0" value="0" step="1"></label>
+      </div>
+      <p class="rec-summary" id="rec-summary"></p>
     </div>
   </section>
 

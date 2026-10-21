@@ -31,6 +31,7 @@
 //   interpreter would see the new instruction); needs proper testing with games that do that.
 
 #include "Common.h"
+#include "wasm/PerfCounters.h"
 #include "R5900OpcodeTables.h"
 #include "vtlb.h"
 #include "VUmicro.h"
@@ -2425,6 +2426,7 @@ namespace
 		s_groups_compiled++;
 		s_groups.push_back(std::move(g));
 		s_compile_ns += static_cast<u64>(timer.GetTimeNanoseconds());
+		PerfCounters::Add(PerfCounters::jit_compile_ns, static_cast<u64>(timer.GetTimeNanoseconds()));
 		return true;
 	}
 

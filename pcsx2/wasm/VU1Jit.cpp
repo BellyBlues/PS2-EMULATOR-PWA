@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Common.h"
+#include "wasm/PerfCounters.h"
 
 #include "VU1Jit.h"
 
@@ -640,7 +641,9 @@ namespace VU1Jit
 				generation = e.generation;
 		}
 		Program* entry = Install(cm, have_code, generation);
-		m_compile_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		const double compile_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		m_compile_ms += compile_ms;
+		PerfCounters::Add(PerfCounters::jit_compile_ns, static_cast<u64>(compile_ms * 1e6));
 		return entry;
 	}
 
