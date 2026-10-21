@@ -2157,6 +2157,239 @@ namespace
 			}
 		}
 
+		// ---- runs of accesses through one base register ---------------------------------------------------------
+		// Consecutive loads and stores off the same base register (a stack frame's saves and restores, the kernel's
+		// thread context) are tested once: when every address of the run is aligned and in one directly mapped
+		// page, which is when each access would take its own fast path, they all use that page's host address with
+		// constant offsets. Otherwise the run is emitted access by access (EmitMemory()).
+		struct RunOp
+		{
+			u32 code;
+			Decoded d;
+			s32 delta; // address - the first access's address
+			u32 size;
+		};
+
+		static bool RunKind(const Decoded& d, u32 code, u32* size, u32* mask, bool* quad)
+		{
+			*quad = false;
+			*mask = 0;
+			switch (d.kind)
+			{
+				case Kind::LB: case Kind::LBU: case Kind::LH: case Kind::LHU: case Kind::LW: case Kind::LWU:
+				case Kind::LD: case Kind::LQ:
+					if (Rt(code) == 0) // the interpreter's (EmitInstruction())
+						return false;
+					break;
+				case Kind::SB: case Kind::SH: case Kind::SW: case Kind::SD: case Kind::SQ: case Kind::LWC1:
+				case Kind::SWC1:
+					break;
+				default:
+					return false;
+			}
+			switch (d.kind)
+			{
+				case Kind::LB: case Kind::LBU: case Kind::SB: *size = 1; break;
+				case Kind::LH: case Kind::LHU: case Kind::SH: *size = 2; *mask = 1; break;
+				case Kind::LD: case Kind::SD: *size = 8; *mask = 7; break;
+				case Kind::LQ: case Kind::SQ: *size = 16; *quad = true; break;
+				default: *size = 4; *mask = 3; break;
+			}
+			return true;
+		}
+
+		static bool WritesGpr(Kind k) { return k >= Kind::LB && k <= Kind::LQ; }
+
+		// Instructions EmitInstruction() emits without a call or a slow path, which a run may hold between its
+		// accesses (when they do not write its base register).
+		static bool RunFiller(Kind k)
+		{
+			return k == Kind::Nop || (k >= Kind::SLL && k <= Kind::MTSAH) || k == Kind::Mmi ||
+				   (k >= Kind::ADDIU && k <= Kind::LUI) || (k >= Kind::MFC1 && k <= Kind::CVT_W);
+		}
+
+		// The accesses from pc that EmitMemoryRun() can test together (at most `limit`), or fewer than 2.
+		std::vector<RunOp> FindRun(u32 pc, u32 limit)
+		{
+			std::vector<RunOp> run;
+			u32 size, mask;
+			bool quad;
+			const u32 code0 = Word(pc);
+			const Decoded d0 = Decode(code0);
+			if (!RunKind(d0, code0, &size, &mask, &quad))
+				return run;
+			const u32 rs = Rs(code0);
+			const bool quad0 = quad;
+			s32 lo = 0, hi = 0;
+			for (u32 a = pc; a < m_page + 4096 && run.size() < limit; a += 4)
+			{
+				const u32 code = Word(a);
+				const Decoded d = Decode(code);
+				if (RunFiller(d.kind))
+				{
+					if (FallbackWrites(code) & (1ull << rs))
+						break;
+					run.push_back({code, d, 0, 0});
+					continue;
+				}
+				if (!RunKind(d, code, &size, &mask, &quad) || Rs(code) != rs || quad != quad0)
+					break;
+				const s32 delta = Imm(code) - Imm(code0);
+				// The same alignment as the first access, so that testing its address tests them all.
+				if (static_cast<u32>(delta) & (quad ? 15u : mask))
+					break;
+				const s32 nlo = std::min(lo, delta), nhi = std::max(hi, delta + static_cast<s32>(size));
+				if (nhi - nlo > 4096)
+					break;
+				lo = nlo;
+				hi = nhi;
+				run.push_back({code, d, delta, size});
+				if (WritesGpr(d.kind) && Rt(code) == rs) // the base changes
+					break;
+			}
+			while (!run.empty() && run.back().size == 0)
+				run.pop_back(); // fillers after the last access
+			if (std::count_if(run.begin(), run.end(), [](const RunOp& o) { return o.size != 0; }) < 2)
+				run.clear();
+			return run;
+		}
+
+		void EmitMemoryRun(u32 pc, const std::vector<RunOp>& run)
+		{
+			Function& f = m_fn;
+			const u32 code0 = run[0].code, rs = Rs(code0);
+			const bool quad = run[0].d.kind == Kind::LQ || run[0].d.kind == Kind::SQ;
+			u32 mask = 0;
+			s32 lo = 0, hi = 0;
+			bool stores = false;
+			for (const RunOp& o : run)
+			{
+				if (o.size == 0)
+					continue;
+				u32 size, m;
+				bool q;
+				RunKind(o.d, o.code, &size, &m, &q);
+				mask |= m;
+				lo = std::min(lo, o.delta);
+				hi = std::max(hi, o.delta + static_cast<s32>(o.size));
+				stores |= !WritesGpr(o.d.kind) && o.d.kind != Kind::LWC1;
+			}
+			if (!m_hb_ok)
+			{
+				m_hb = f.local(ValType::I32);
+				m_hb_ok = true;
+			}
+			Ensure(rs);
+			const RegState pre = Regs();
+			const u32 pending0 = m_pending;
+			const bool cyc_dirty0 = m_cyc_dirty;
+			f.block(); // done
+			f.block(); // access by access
+			// a = the first access's address; aligned, and [a + lo, a + hi) in one page
+			LoadGPR32(rs);
+			f.i32_const(Imm(code0));
+			f.i32_add();
+			if (quad)
+			{
+				f.i32_const(~0xf);
+				f.i32_and();
+			}
+			f.local_tee(m_a);
+			if (mask)
+			{
+				f.i32_const(static_cast<s32>(mask));
+				f.i32_and();
+				f.br_if(0);
+				f.local_get(m_a);
+			}
+			f.i32_const(lo);
+			f.i32_add();
+			f.local_tee(m_a); // a + lo
+			f.local_get(m_a);
+			f.i32_const(hi - lo - 1);
+			f.i32_add();
+			f.i32_xor();
+			f.i32_const(12);
+			f.i32_shr_u();
+			f.br_if(0);
+			f.local_get(m_a);
+			f.i32_const(12);
+			f.i32_shr_u();
+			f.i32_const(3);
+			f.i32_shl();
+			f.i64_load(static_cast<u32>(s_vmap_base));
+			f.local_get(m_a);
+			f.i64_extend_i32_u();
+			f.i64_add();
+			f.local_tee(m_v);
+			f.i64_const(0);
+			f.i64_lt_s();
+			f.br_if(0);
+			EEJIT_CHECK(Regs() == pre);
+			f.local_get(m_v);
+			f.i32_wrap_i64();
+			f.local_set(m_hb); // the host address of a + lo
+			for (u32 i = 0; i < run.size(); i++)
+			{
+				const RunOp& o = run[i];
+				if (o.size == 0)
+				{
+					EmitInstruction(pc + i * 4, o.code, o.d, false);
+					continue;
+				}
+				const u32 rt = Rt(o.code), off = static_cast<u32>(o.delta - lo);
+				m_pending += o.d.op->cycles;
+				s_native_instrs++;
+				auto host = [&] { f.local_get(m_hb); };
+				switch (o.d.kind)
+				{
+					case Kind::LB: host(); f.i32_load8_s(off); f.i64_extend_i32_s(); Set64(rt); break;
+					case Kind::LBU: host(); f.i64_load8_u(off); Set64(rt); break;
+					case Kind::LH: host(); f.i32_load16_s(off); f.i64_extend_i32_s(); Set64(rt); break;
+					case Kind::LHU: host(); f.i32_load16_u(off); f.i64_extend_i32_u(); Set64(rt); break;
+					case Kind::LW: host(); f.i64_load32_s(off); Set64(rt); break;
+					case Kind::LWU: host(); f.i64_load32_u(off); Set64(rt); break;
+					case Kind::LD: host(); f.i64_load(off); Set64(rt); break;
+					case Kind::LQ: f.i32_const(0); host(); f.v128_load(off); f.v128_store(GPR(rt)); Invalidate(rt); break;
+					case Kind::LWC1: f.i32_const(0); host(); f.i32_load(off); f.i32_store(Addr(&fpuRegs.fpr[rt].UL)); break;
+					case Kind::SB: host(); LoadGPR32(rt); f.i32_store8(off); break;
+					case Kind::SH: host(); LoadGPR32(rt); f.i32_store16(off); break;
+					case Kind::SW: host(); LoadGPR32(rt); f.i32_store(off); break;
+					case Kind::SD: host(); LoadGPR64(rt); f.i64_store(off); break;
+					case Kind::SQ:
+						Writeback(rt); // stored from cpuRegs, all 128 bits
+						host(); f.i32_const(0); f.v128_load(GPR(rt)); f.v128_store(off);
+						break;
+					case Kind::SWC1: host(); f.i32_const(0); f.i32_load(Addr(&fpuRegs.fpr[rt].UL)); f.i32_store(off); break;
+					default: EEJIT_CHECK(false); break;
+				}
+			}
+			if (stores)
+			{
+				f.local_get(m_hb); // one page
+				CodeWrites::EmitNoteWrite(f);
+			}
+			f.br(1);
+			f.end(); // access by access
+			const RegState fast = Regs();
+			const u32 pending = m_pending;
+			Regs() = pre;
+			m_pending = pending0;
+			m_cyc_dirty = cyc_dirty0;
+			for (u32 i = 0; i < run.size(); i++)
+			{
+				if (run[i].size == 0)
+					EmitInstruction(pc + i * 4, run[i].code, run[i].d, false);
+				else
+					EmitMemory(pc + i * 4, run[i].code, run[i].d, false);
+			}
+			EEJIT_CHECK(m_pending == pending);
+			Reconcile(fast);
+			f.end(); // done
+			if (m_pending || m_cyc_dirty)
+				m_cyc_dirty = true;
+		}
+
 		// An aligned access to directly mapped memory inline, and the unaligned LDL/LDR/SDL/SDR (the aligned
 		// doubleword they read or modify, with R5900OpcodeImpl.cpp's masks and shifts); anything else calls the
 		// interpreter's function, which redoes the whole instruction (nothing has been written yet).
@@ -2490,6 +2723,16 @@ namespace
 						next->push_back(pc + 8);
 					break;
 				}
+				const std::vector<RunOp> run = FindRun(pc, kMaxBlockInstrs - count + 1);
+				if (!run.empty())
+				{
+					EmitMemoryRun(pc, run);
+					const u32 n = static_cast<u32>(run.size());
+					count += n - 1;
+					s_guest_instrs += n - 1;
+					pc += 4 * n;
+					continue;
+				}
 				EmitInstruction(pc, code, d, false);
 				pc += 4;
 			}
@@ -2512,6 +2755,8 @@ namespace
 		bool m_t_ok = false;
 		bool m_vloc_ok[8] = {};
 		u32 m_v, m_k;
+		u32 m_hb = 0; // EmitMemoryRun(): a host address
+		bool m_hb_ok = false;
 		u32 m_pending = 0; // cycles not yet written, before the Config factor
 		bool m_cyc_dirty = false; // m_cyc may be non-zero
 	};
