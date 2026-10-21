@@ -180,11 +180,40 @@ namespace WasmJit
 
 		// Control.
 		static constexpr u8 kVoid = 0x40;
-		void block(u8 type = kVoid) { op(0x02); m_body.byte(type); }
-		void loop(u8 type = kVoid) { op(0x03); m_body.byte(type); }
-		void if_(u8 type = kVoid) { op(0x04); m_body.byte(type); }
+		void block(u8 type = kVoid)
+		{
+			op(0x02);
+			m_body.byte(type);
+			m_depth++;
+		}
+		void loop(u8 type = kVoid)
+		{
+			op(0x03);
+			m_body.byte(type);
+			m_depth++;
+		}
+		void if_(u8 type = kVoid)
+		{
+			op(0x04);
+			m_body.byte(type);
+			m_depth++;
+		}
+		// An if whose condition is rarely true (the branch hinting proposal's metadata.code.branch_hint section):
+		// engines that read it keep the code inside out of the way, with the spills a call there needs.
+		void if_unlikely(u8 type = kVoid)
+		{
+			m_hints.emplace_back(static_cast<u32>(m_body.data.size()), 0);
+			if_(type);
+		}
 		void else_() { op(0x05); }
-		void end() { op(0x0b); }
+		void end()
+		{
+			op(0x0b);
+			m_depth--;
+		}
+		// Control structures open at this point (block, loop, if): a label opened at depth() == d is reached from
+		// here with br(depth() - d).
+		u32 depth() const { return m_depth; }
 		void br(u32 depth) { op(0x0c); m_body.uleb(depth); }
 		void br_if(u32 depth) { op(0x0d); m_body.uleb(depth); }
 		void return_() { op(0x0f); }
@@ -396,7 +425,8 @@ namespace WasmJit
 			shuffle1(l, tmp);
 		}
 
-		ByteBuffer finish() const
+		// hints, if given, gets the branch hints with their offsets from the start of the returned body.
+		ByteBuffer finish(std::vector<std::pair<u32, u8>>* hints = nullptr) const
 		{
 			ByteBuffer out;
 			out.uleb(m_locals.size());
@@ -406,6 +436,12 @@ namespace WasmJit
 				out.byte(static_cast<u8>(type));
 			}
 			out.bytes(m_prologue.data.data(), m_prologue.data.size());
+			if (hints)
+			{
+				hints->clear();
+				for (const auto& [offset, value] : m_hints)
+					hints->emplace_back(static_cast<u32>(out.data.size()) + offset, value);
+			}
 			out.bytes(m_body.data.data(), m_body.data.size());
 			out.byte(0x0b); // end of the function body
 			return out;
@@ -429,6 +465,8 @@ namespace WasmJit
 		std::vector<std::pair<u32, ValType>> m_locals;
 		u32 m_next_local;
 		u32 m_count = 0;
+		u32 m_depth = 0;
+		std::vector<std::pair<u32, u8>> m_hints; // offset in m_body, value (0 unlikely)
 	};
 
 	class Module
@@ -481,7 +519,8 @@ namespace WasmJit
 		u32 add_function(u32 type, const Function& f)
 		{
 			m_func_types.push_back(type);
-			m_bodies.push_back(f.finish());
+			m_hints.emplace_back();
+			m_bodies.push_back(f.finish(&m_hints.back()));
 			return m_num_imported_funcs + static_cast<u32>(m_func_types.size() - 1);
 		}
 		void export_function(std::string_view name, u32 index)
@@ -526,6 +565,31 @@ namespace WasmJit
 				section(m, 7, s);
 			}
 
+			// Branch hints: a custom section, which engines read only before the code section.
+			u32 hinted = 0;
+			for (const auto& h : m_hints)
+				hinted += !h.empty();
+			if (hinted)
+			{
+				s.data.clear();
+				s.name("metadata.code.branch_hint");
+				s.uleb(hinted);
+				for (u32 i = 0; i < m_hints.size(); i++)
+				{
+					if (m_hints[i].empty())
+						continue;
+					s.uleb(m_num_imported_funcs + i);
+					s.uleb(m_hints[i].size());
+					for (const auto& [offset, value] : m_hints[i])
+					{
+						s.uleb(offset);
+						s.uleb(1);
+						s.byte(value);
+					}
+				}
+				section(m, 0, s);
+			}
+
 			s.data.clear();
 			s.uleb(m_bodies.size());
 			for (const ByteBuffer& b : m_bodies)
@@ -554,6 +618,7 @@ namespace WasmJit
 		u32 m_num_imported_funcs = 0;
 		std::vector<u32> m_func_types;
 		std::vector<ByteBuffer> m_bodies;
+		std::vector<std::vector<std::pair<u32, u8>>> m_hints; // per defined function: body offset, value
 		ByteBuffer m_exports;
 		u32 m_num_exports = 0;
 	};

@@ -11,8 +11,10 @@
 
 #include <emscripten/emscripten.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <utility>
 
 extern bool vu1InterpMTVURunning;
 
@@ -21,7 +23,8 @@ namespace VU1Jit
 	u64 g_block_base = 0;
 	u64 g_block_base0 = 0;
 	u64 g_budget_end = 0;
-	u32 g_block_loops = 0;
+	u32 g_chain_instrs = 0;
+	u32 g_chain_edges = 0;
 	bool g_trace = false;
 }
 
@@ -70,6 +73,7 @@ namespace VU1Jit
 	using L = Lower;
 
 	static constexpr u32 BLOCK_CAP = 512; // instructions per block
+	static u32 s_bases[2][2]; // per VU: the addresses of VURegs and of the data memory, which generated code loads (Addr)
 	static constexpr u32 EXP = 0x7f800000u;
 	static constexpr u32 SIGN = 0x80000000u;
 
@@ -247,7 +251,8 @@ namespace VU1Jit
 			u64 vf_fmac_read = 0; // read as FMAC operands (clamped)
 			u32 vi_used = 0;
 			u32 vi_written = 0;
-			bool helpers = false; // the block calls op bodies, which may write any register
+			bool helpers = false; // the module calls op bodies, which may write any register
+			std::vector<u8> block_helpers; // ... per block of the module
 		};
 		static constexpr u32 ACC_INDEX = 32;
 
@@ -289,18 +294,40 @@ namespace VU1Jit
 					for (u32& l : slot)
 						l = m_f.local(ValType::I32);
 				}
+				for (u32& t : m_snap_tmp)
+					t = m_f.local(ValType::I32);
+				m_looped = m_f.local(ValType::I32);
+				m_next = m_f.local(ValType::I32);
+				m_exit = m_f.local(ValType::I32);
+				m_acc = m_f.local(ValType::I32);
+				m_edges = m_f.local(ValType::I32);
+				m_base = m_f.local(ValType::I64);
+				m_budget = m_f.local(ValType::I64);
+				m_rb = m_f.local(ValType::I32);
+				m_mb = m_f.local(ValType::I32);
+				m_kick = m_f.local(ValType::I32);
 				m_mem = A(*R.Mem);
+				s_bases[vu][0] = A(R);
+				s_bases[vu][1] = m_mem;
 			}
 
 			const RegUse& Use() const { return m_use; }
 
 			// The registers and the flags in locals (LoadRegs, LoadFlags), and the snapshots of the FMAC entries
-			// pending at the entry, which NormalizeRings put in ring slots 0 to fmac_count - 1.
-			void EmitEntry(u32 fmac_count)
+			// pending at the entry, which NormalizeRings put in ring slots 0 to the signature's count - 1 (all four
+			// slots: the function may start at any of its blocks). On VU1, VU1.cycle at the entry and the budget.
+			void EmitPrologue()
 			{
+				m_f.i32_const(0);
+				m_f.i32_load(A(s_bases[m_vu][0]));
+				m_f.local_set(m_rb);
+				m_f.i32_const(0);
+				m_f.i32_load(A(s_bases[m_vu][1]));
+				m_f.local_set(m_mb);
+				LoadKick();
 				LoadRegs();
 				LoadFlags();
-				for (u32 i = 0; i < fmac_count; i++)
+				for (u32 i = 0; i < 4; i++)
 				{
 					Ld32(A(R.fmac[i].macflag));
 					m_f.local_set(m_snap[i][0]);
@@ -309,23 +336,87 @@ namespace VU1Jit
 					Ld32(A(R.fmac[i].clipflag));
 					m_f.local_set(m_snap[i][2]);
 				}
+				if (m_vu)
+				{
+					m_f.i32_const(0);
+					m_f.i64_load(A(g_block_base));
+					m_f.local_set(m_base);
+					m_f.i32_const(0);
+					m_f.i64_load(A(g_budget_end));
+					m_f.local_set(m_budget);
+				}
+			}
+
+			// The blocks of a module in layout order (CompileModule): a dispatch loop around one wasm block per module
+			// block, whose br_table starts at the block the function's argument names. Block k's code follows the end
+			// of wasm block k, so going to a later block is a br to the end of its wasm block, and going to the same
+			// or an earlier one goes through the dispatch loop. Around it all, the wasm block every exit leaves by
+			// (EmitExit, EndModule).
+			void BeginModule(const std::vector<u32>& last_starts)
+			{
+				m_last_starts = last_starts;
+				const u32 n = static_cast<u32>(last_starts.size());
+				m_f.local_get(0);
+				m_f.local_set(m_next);
+				m_f.block();
+				m_stub_level = m_f.depth();
+				m_f.loop();
+				m_dispatch_level = m_f.depth();
+				for (u32 k = 0; k < n; k++)
+					m_f.block();
+				std::vector<u32> depths(n);
+				for (u32 k = 0; k < n; k++)
+					depths[k] = k;
+				m_f.local_get(m_next);
+				m_f.br_table(depths, 0);
+			}
+			// The level of the wasm block whose end is block k's code.
+			u32 BlockLevel(u32 k) const { return m_dispatch_level + static_cast<u32>(m_last_starts.size()) - k; }
+			// Starts block k's code; n: its instructions.
+			void BeginBlock(u32 k, u32 n)
+			{
+				m_f.end(); // wasm block k
+				m_k = k;
+				m_block_n = n;
+				m_loop = nullptr;
+				m_exit_kick = -1;
+				ForgetClean();
+				m_cc_next = 0; // the clamped copies of earlier blocks are dead here
+			}
+			void EndModule()
+			{
+				m_f.end(); // the dispatch loop
+				m_f.end(); // the exits' block
+				// The code every exit shares (section 5.3): the registers and the flags, and the snapshots of the FMAC
+				// entries (of every ring slot: those of dead slots are never read), to memory; ApplyExit writes the
+				// rest of the timing state.
+				StoreRegs();
+				StoreFlags();
+				for (u32 s = 0; s < 4; s++)
+				{
+					St32(A(R.fmac[s].macflag), [&] { m_f.local_get(m_snap[s][0]); });
+					St32(A(R.fmac[s].statusflag), [&] { m_f.local_get(m_snap[s][1]); });
+					St32(A(R.fmac[s].clipflag), [&] { m_f.local_get(m_snap[s][2]); });
+				}
+				if (m_vu)
+				{
+					St32(A(g_chain_instrs), [&] { m_f.local_get(m_acc); });
+					St32(A(g_chain_edges), [&] { m_f.local_get(m_edges); });
+				}
+				m_f.local_get(m_exit);
+				m_f.return_();
 			}
 
 			// A block that loops (CompiledBlock::loops): its instructions run inside a wasm loop, with VU1.cycle at
-			// the entry of the current pass in a local. loop is the exit that comes back to the entry.
+			// the entry of the current pass in m_base. loop is the exit that comes back to the entry.
 			void BeginLoop(const BlockExit& loop)
 			{
 				m_loop = &loop;
-				m_base = m_f.local(ValType::I64);
-				m_looped = m_f.local(ValType::I32);
-				for (u32& t : m_snap_tmp)
-					t = m_f.local(ValType::I32);
 				m_f.i32_const(0);
-				m_f.i64_load(A(g_block_base));
-				m_f.local_set(m_base);
+				m_f.local_set(m_looped);
 				// Loop-invariant operand clamps: registers the block never writes, with no op body that could.
 				ForgetClean();
-				if (!m_use.helpers)
+				if (m_k >= m_use.block_helpers.size() || !m_use.block_helpers[m_k])
 				{
 					for (u32 r = 0; r <= ACC_INDEX; r++)
 					{
@@ -334,15 +425,26 @@ namespace VU1Jit
 					}
 				}
 				m_f.loop();
+				m_loop_level = m_f.depth();
 			}
 			void EndLoop() { m_f.end(); }
 
-			void EmitInstruction(const Plan& p, s32 busy_kick_exit);
-			void FlushAllAtEnd(const Plan& p, const VURegs& after);
-			// loop: whether the taken exit is the loop exit of BeginLoop.
-			void EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn, bool loop,
-				u32 last_start);
-			// Returns exit_id, with the flags and the pending entries' snapshots stored for it.
+			void EmitInstruction(const Plan& p, s32 busy_kick_exit, bool last);
+			void FlushAllAtEnd(const Plan& p, const int end_flagreg[4]);
+			// loop: whether the taken exit is the loop exit of BeginLoop. next_taken, next_fall: the blocks of the
+			// module the exits go to, or -1; jumps: a JR/JALR's targets (TPC) that are blocks of the module.
+			void EmitBranchEnd(const Plan& branch, u32 exit_taken, u32 exit_fall, u32 exit_dyn, bool loop, u32 last_start,
+				s32 next_taken, s32 next_fall, const std::vector<std::pair<u32, s32>>& jumps);
+			// Exit exit_id, or go to block next of the module instead (-1: exit).
+			void EmitEdgeOrExit(u32 exit_id, s32 next)
+			{
+				if (next >= 0)
+					EmitEdge(exit_id, static_cast<u32>(next));
+				else
+					EmitExit(exit_id);
+			}
+			// Leaves by exit_id: the shared exit code (EndModule) stores the registers, the flags and the snapshots,
+			// and returns it.
 			void EmitExit(u32 exit_id);
 			void Finish()
 			{
@@ -352,14 +454,60 @@ namespace VU1Jit
 			}
 
 		private:
-			// Memory access at absolute addresses.
-			void LdV(u32 addr) { m_f.i32_const(0); m_f.v128_load(addr); }
-			void Ld32(u32 addr) { m_f.i32_const(0); m_f.i32_load(addr); }
-			void Ld16u(u32 addr) { m_f.i32_const(0); m_f.i32_load16_u(addr); }
-			void Ld16s(u32 addr) { m_f.i32_const(0); m_f.i32_load16_s(addr); }
-			template <typename F> void StV(u32 addr, F&& value) { m_f.i32_const(0); value(); m_f.v128_store(addr); }
-			template <typename F> void St32(u32 addr, F&& value) { m_f.i32_const(0); value(); m_f.i32_store(addr); }
-			template <typename F> void St16(u32 addr, F&& value) { m_f.i32_const(0); value(); m_f.i32_store16(addr); }
+			// Memory access at absolute addresses. Addr pushes the address operand and returns the memarg offset:
+			// VURegs fields go from its address in a local, which the prologue loads from memory so that the engine
+			// keeps it in a register (a constant would be folded back into a 32-bit address built at every access).
+			u32 Addr(u32 addr)
+			{
+				if (addr - A(R) < sizeof(VURegs))
+				{
+					m_f.local_get(m_rb);
+					return addr - A(R);
+				}
+				m_f.i32_const(0);
+				return addr;
+			}
+			void LdV(u32 addr)
+			{
+				const u32 o = Addr(addr);
+				m_f.v128_load(o);
+			}
+			void Ld32(u32 addr)
+			{
+				const u32 o = Addr(addr);
+				m_f.i32_load(o);
+			}
+			void Ld16u(u32 addr)
+			{
+				const u32 o = Addr(addr);
+				m_f.i32_load16_u(o);
+			}
+			void Ld16s(u32 addr)
+			{
+				const u32 o = Addr(addr);
+				m_f.i32_load16_s(o);
+			}
+			template <typename F>
+			void StV(u32 addr, F&& value)
+			{
+				const u32 o = Addr(addr);
+				value();
+				m_f.v128_store(o);
+			}
+			template <typename F>
+			void St32(u32 addr, F&& value)
+			{
+				const u32 o = Addr(addr);
+				value();
+				m_f.i32_store(o);
+			}
+			template <typename F>
+			void St16(u32 addr, F&& value)
+			{
+				const u32 o = Addr(addr);
+				value();
+				m_f.i32_store16(o);
+			}
 			void St32c(u32 addr, u32 v) { St32(addr, [&] { m_f.i32_const(static_cast<s32>(v)); }); }
 			void Splat(u32 v) { m_f.v128_pooled_i32x4(v, v, v, v); }
 			void Simd(Simd o) { m_f.simd(o); }
@@ -386,8 +534,22 @@ namespace VU1Jit
 
 			void Clamp(u32 v); // local v = vuDouble(v)
 			void ScalarDouble(); // vuDouble on the i32 bits on the stack
-			void EmitLoopBack(u32 exit_id, u32 last_start, u32 depth);
+			void EmitLoopBack(u32 exit_id, u32 last_start);
 			void EmitLoopState(); // the loop exit's ApplyExit and NormalizeRings, for the pass that just ended
+			void EmitEdge(u32 exit_id, u32 next);
+			void EmitEdgeState(const BlockExit& x);
+			void RotateSnapshots(u32 readpos, u32 count);
+			void CountPass() // a block or a loop's pass completed without leaving generated code
+			{
+				m_f.local_get(m_acc);
+				m_f.i32_const(static_cast<s32>(m_block_n));
+				m_f.i32_add();
+				m_f.local_set(m_acc);
+				m_f.local_get(m_edges);
+				m_f.i32_const(1);
+				m_f.i32_add();
+				m_f.local_set(m_edges);
+			}
 
 			// VF0-VF31, ACC and VI0-VI15 as the block's native code uses them: in locals (RegUse). VI locals hold
 			// the 16-bit value; memory only ever gets its low half (i32.store16), as the interpreter writes US[0].
@@ -475,7 +637,10 @@ namespace VU1Jit
 			}
 			void MakeClampedCopy(u32 r)
 			{
-				const u32 cc = m_f.local(ValType::V128);
+				// Locals are reused from block to block: a block's copies are dead once it is left.
+				if (m_cc_next == m_cc_pool.size())
+					m_cc_pool.push_back(m_f.local(ValType::V128));
+				const u32 cc = m_cc_pool[m_cc_next++];
 				VF(r);
 				m_f.local_set(cc);
 				Clamp(cc);
@@ -569,6 +734,14 @@ namespace VU1Jit
 				for (u32 i = 0; i < 6; i++)
 					St32(addrs[i], [&] { m_f.local_get(locals[i]); });
 			}
+			// xgkickenable changes only in generated code (XGKICK) and in the helpers, which reload it after them.
+			void LoadKick()
+			{
+				if (!m_vu)
+					return;
+				Ld32(A(R.xgkickenable));
+				m_f.local_set(m_kick);
+			}
 			void Flags(u32 r, u32 dest); // MAC and status from the raw result in local r (VU_MAC_UPDATE, VU_STAT_UPDATE)
 			void Flushes(const Plan& p);
 			void FmacWriteback(u32 slot, int flagreg);
@@ -576,8 +749,18 @@ namespace VU1Jit
 			bool Upper(const Plan& p, u32 delta);
 			bool Lower(const Plan& p, u32 delta);
 			void Backup(const Plan& p);
+			void NoteHelper()
+			{
+				m_use.helpers = true;
+				if (m_use.block_helpers.size() <= m_k)
+					m_use.block_helpers.resize(m_k + 1);
+				m_use.block_helpers[m_k] = 1;
+				m_out->helper_ops++;
+			}
 			void HelperUpper(const Plan& p, u32 delta)
 			{
+				if (m_vu)
+					KickCatchUp(delta); // op bodies see the kick as the interpreter leaves it
 				StoreRegs();
 				StoreFlags();
 				m_f.i32_const(static_cast<s32>(p.ins.upper));
@@ -585,9 +768,9 @@ namespace VU1Jit
 				m_f.call(m_h_upper);
 				LoadRegs();
 				LoadFlags();
+				LoadKick();
 				ForgetClean();
-				m_use.helpers = true;
-				m_out->helper_ops++;
+				NoteHelper();
 			}
 			void HelperLower(const Plan& p, u32 delta)
 			{
@@ -599,6 +782,8 @@ namespace VU1Jit
 					m_f.i32_store8(A(R.VIBackupCycles));
 					St32c(A(R.VIRegNumber), p.info.vi_backup_cycles ? p.info.vi_backup_reg : p.pre.VIRegNumber);
 				}
+				if (m_vu)
+					KickCatchUp(delta); // op bodies see the kick as the interpreter leaves it
 				StoreRegs();
 				StoreFlags();
 				m_f.i32_const(static_cast<s32>(p.ins.lower));
@@ -606,9 +791,9 @@ namespace VU1Jit
 				m_f.call(m_h_lower);
 				LoadRegs();
 				LoadFlags();
+				LoadKick();
 				ForgetClean();
-				m_use.helpers = true;
-				m_out->helper_ops++;
+				NoteHelper();
 			}
 
 			CompiledBlock* m_out;
@@ -625,9 +810,25 @@ namespace VU1Jit
 			u32 m_pmac, m_pstat, m_pclip, m_vmac, m_vstat, m_vclip; // LoadFlags
 			u32 m_snap[4][3]; // per ring slot of the model: the FMAC entry's macflag, statusflag and clipflag
 			const BlockExit* m_loop = nullptr; // BeginLoop
-			u32 m_base = 0; // VU1.cycle at the entry of the current pass
+			u32 m_base = 0; // VU1.cycle at the entry of the current block, or of the current pass of a loop
+			u32 m_budget = 0; // g_budget_end
 			u32 m_looped = 0; // nonzero once a pass went back to the entry
 			u32 m_snap_tmp[12] = {};
+			u32 m_next = 0; // the block the dispatch loop goes to
+			u32 m_exit = 0; // the exit the shared exit code returns
+			u32 m_stub_level = 0; // levels (Function::depth) of the exits' block, the dispatch loop and a block's loop
+			u32 m_dispatch_level = 0;
+			u32 m_loop_level = 0;
+			u32 m_acc = 0; // g_chain_instrs
+			u32 m_edges = 0; // g_chain_edges
+			u32 m_rb = 0, m_mb = 0; // VURegs and the VU data memory (Addr)
+			u32 m_kick = 0; // VU1.xgkickenable, as generated code and the helpers leave it (LoadKick)
+			u32 m_k = 0; // the block being emitted
+			u32 m_block_n = 0; // its instructions
+			s32 m_exit_kick = -1; // the cycle (delta) at which exits feed the kick for the block's last instruction
+			std::vector<u32> m_last_starts; // per block of the module (BeginModule)
+			std::vector<u32> m_cc_pool; // locals for clamped copies
+			u32 m_cc_next = 0;
 			RegUse m_use;
 			u32 m_vf[ACC_INDEX + 1] = {}; // local index + 1, 0 until used
 			u8 m_clean[ACC_INDEX + 1] = {}; // dest-style lane bits (x = 8)
@@ -666,7 +867,7 @@ namespace VU1Jit
 			m_f.select(); // exponent 0 ? sign : ...
 		}
 
-		void Emitter::EmitLoopBack(u32 exit_id, u32 last_start, u32 depth)
+		void Emitter::EmitLoopBack(u32 exit_id, u32 last_start)
 		{
 			// The dispatcher's work between the loop exit and the same block again (VU1Jit.cpp, Dispatch and Run).
 			// Its budget test is made here. ApplyExit and NormalizeRings only matter to the exit that finally leaves:
@@ -680,33 +881,13 @@ namespace VU1Jit
 			m_f.local_get(m_base);
 			m_f.i64_const(pass + last_start);
 			m_f.i64_add();
-			m_f.i32_const(0);
-			m_f.i64_load(A(g_budget_end));
+			m_f.local_get(m_budget);
 			m_f.i64_ge_u();
-			m_f.if_();
+			m_f.if_unlikely();
 			EmitExit(exit_id);
 			m_f.end();
 
-			const u32 fr = m.fmacreadpos;
-			if (fr)
-			{
-				for (u32 i = 0; i < m.fmaccount; i++)
-				{
-					for (u32 j = 0; j < 3; j++)
-					{
-						m_f.local_get(m_snap[(fr + i) & 3][j]);
-						m_f.local_set(m_snap_tmp[i * 3 + j]);
-					}
-				}
-				for (u32 i = 0; i < m.fmaccount; i++)
-				{
-					for (u32 j = 0; j < 3; j++)
-					{
-						m_f.local_get(m_snap_tmp[i * 3 + j]);
-						m_f.local_set(m_snap[i][j]);
-					}
-				}
-			}
+			RotateSnapshots(m.fmacreadpos, m.fmaccount);
 
 			// The next pass: its base, for the helpers and Run too.
 			m_f.local_get(m_base);
@@ -718,12 +899,165 @@ namespace VU1Jit
 			m_f.i64_store(A(g_block_base));
 			m_f.i32_const(1);
 			m_f.local_set(m_looped);
-			St32(A(g_block_loops), [&] {
-				Ld32(A(g_block_loops));
-				m_f.i32_const(1);
-				m_f.i32_add();
-			});
-			m_f.br(depth);
+			CountPass();
+			m_f.br(m_f.depth() - m_loop_level);
+		}
+
+		void Emitter::RotateSnapshots(u32 readpos, u32 count)
+		{
+			// NormalizeRings for the snapshot locals: entry i of the ring order goes to slot i.
+			if (!readpos)
+				return;
+			for (u32 i = 0; i < count; i++)
+			{
+				for (u32 j = 0; j < 3; j++)
+				{
+					m_f.local_get(m_snap[(readpos + i) & 3][j]);
+					m_f.local_set(m_snap_tmp[i * 3 + j]);
+				}
+			}
+			for (u32 i = 0; i < count; i++)
+			{
+				for (u32 j = 0; j < 3; j++)
+				{
+					m_f.local_get(m_snap_tmp[i * 3 + j]);
+					m_f.local_set(m_snap[i][j]);
+				}
+			}
+		}
+
+		void Emitter::EmitEdge(u32 exit_id, u32 next)
+		{
+			// The dispatcher's work between exit_id and the block of the module it goes to (VU1Jit.cpp, Dispatch and
+			// Run), as EmitLoopBack does for a loop: its budget test, then ApplyExit and NormalizeRings for the timing
+			// fields that the next exit's ApplyExit does not write again (EmitEdgeState), and the next block's base.
+			// The registers and the flags stay in locals. Fields ApplyExit writes at every exit (the cycle, the ring
+			// positions, the pipes' enables, the VI backup window, TPC and the control state) are left to the exit
+			// that finally leaves; nothing reads them in memory before (op bodies that call _vuBackupVI get the window
+			// from HelperLower).
+			const BlockExit x = m_out->exits[exit_id];
+			const s64 pass = static_cast<s64>(x.pipes.cycle - TIMING_MODEL_BASE);
+
+			m_f.local_get(m_base);
+			m_f.i64_const(pass + m_last_starts[next]);
+			m_f.i64_add();
+			m_f.local_get(m_budget);
+			m_f.i64_ge_u();
+			m_f.if_unlikely();
+			EmitExit(exit_id);
+			m_f.end();
+
+			if (m_loop)
+			{
+				// The timing fields of the entries the previous pass left, as the exit would write them.
+				m_f.local_get(m_looped);
+				m_f.if_();
+				EmitLoopState();
+				m_f.end();
+			}
+			EmitEdgeState(x);
+
+			m_f.local_get(m_base);
+			m_f.i64_const(pass);
+			m_f.i64_add();
+			m_f.local_set(m_base);
+			m_f.i32_const(0);
+			m_f.local_get(m_base);
+			m_f.i64_store(A(g_block_base));
+			CountPass();
+			if (next > m_k)
+				m_f.br(m_f.depth() - BlockLevel(next));
+			else
+			{
+				m_f.i32_const(static_cast<s32>(next));
+				m_f.local_set(m_next);
+				m_f.br(m_f.depth() - m_dispatch_level);
+			}
+		}
+
+		void Emitter::EmitEdgeState(const BlockExit& x)
+		{
+			// ApplyExit then NormalizeRings for x, on the entries pending at x: the next block's entries, whose fields
+			// its exits leave to memory. Those pending since this block's entry (or its pass's) are in memory in their
+			// ring slot (NormalizeRings, an edge or EmitLoopState put them there) and move to their place in the ring
+			// order; those this block added get every field from the model. Earlier slots are written first, and
+			// every move goes to a lower slot, so no entry is overwritten before it moves.
+			const PipeImage& m = x.pipes;
+			const auto st64 = [&](u32 addr, u64 model_time) { // base + (model_time - TIMING_MODEL_BASE)
+				m_f.i32_const(0);
+				m_f.local_get(m_base);
+				m_f.i64_const(static_cast<s64>(model_time - TIMING_MODEL_BASE));
+				m_f.i64_add();
+				m_f.i64_store(addr);
+			};
+			for (u32 i = 0; i < m.fmaccount; i++)
+			{
+				const u32 s = (m.fmacreadpos + i) & 3;
+				const fmacPipe& p = m.fmac[s];
+				const fmacPipe& q = R.fmac[i];
+				if (p.sCycle < TIMING_MODEL_BASE)
+				{
+					pxAssert(s >= i);
+					if (s != i)
+					{
+						for (u32 o = 0; o < sizeof(fmacPipe); o += 16)
+							StV(A(q) + o, [&] { LdV(A(R.fmac[s]) + o); });
+					}
+					continue;
+				}
+				St32c(A(q.regupper), p.regupper);
+				St32c(A(q.reglower), p.reglower);
+				St32c(A(q.flagreg), static_cast<u32>(p.flagreg));
+				St32c(A(q.xyzwupper), p.xyzwupper);
+				St32c(A(q.xyzwlower), p.xyzwlower);
+				st64(A(q.sCycle), p.sCycle);
+				St32c(A(q.Cycle), p.Cycle);
+			}
+			for (u32 i = 0; i < m.ialucount; i++)
+			{
+				const u32 s = (m.ialureadpos + i) & 3;
+				const ialuPipe& p = m.ialu[s];
+				if (p.sCycle < TIMING_MODEL_BASE)
+				{
+					pxAssert(s >= i);
+					if (s != i)
+					{
+						for (u32 o = 0; o < sizeof(ialuPipe); o += 8)
+						{
+							m_f.i32_const(0);
+							m_f.i32_const(0);
+							m_f.i64_load(A(R.ialu[s]) + o);
+							m_f.i64_store(A(R.ialu[i]) + o);
+						}
+					}
+					continue;
+				}
+				St32c(A(R.ialu[i].reg), static_cast<u32>(p.reg));
+				st64(A(R.ialu[i].sCycle), p.sCycle);
+				St32c(A(R.ialu[i].Cycle), p.Cycle);
+			}
+			if (m.fdiv.enable && m.fdiv.sCycle >= TIMING_MODEL_BASE)
+			{
+				st64(A(R.fdiv.sCycle), m.fdiv.sCycle);
+				St32c(A(R.fdiv.Cycle), m.fdiv.Cycle);
+			}
+			if (m.efu.enable)
+			{
+				if (m.efu.sCycle >= TIMING_MODEL_BASE)
+				{
+					st64(A(R.efu.sCycle), m.efu.sCycle);
+					St32c(A(R.efu.Cycle), m.efu.Cycle);
+				}
+				else if (x.efu_cycle_adjust)
+				{
+					St32(A(R.efu.Cycle), [&] {
+						Ld32(A(R.efu.Cycle));
+						m_f.i32_const(x.efu_cycle_adjust);
+						m_f.i32_add();
+					});
+				}
+			}
+			RotateSnapshots(m.fmacreadpos, m.fmaccount);
 		}
 
 		void Emitter::EmitLoopState()
@@ -775,17 +1109,10 @@ namespace VU1Jit
 		void Emitter::EmitExit(u32 exit_id)
 		{
 			// Every exit leaves the registers and the flags in memory (LoadRegs, LoadFlags), with the snapshots of the
-			// FMAC entries pending there in their ring slots; ApplyExit writes the rest of the timing state.
-			StoreRegs();
-			StoreFlags();
-			const PipeImage& m = m_out->exits[exit_id].pipes;
-			for (u32 i = 0; i < m.fmaccount; i++)
-			{
-				const u32 s = (m.fmacreadpos + i) & 3;
-				St32(A(R.fmac[s].macflag), [&] { m_f.local_get(m_snap[s][0]); });
-				St32(A(R.fmac[s].statusflag), [&] { m_f.local_get(m_snap[s][1]); });
-				St32(A(R.fmac[s].clipflag), [&] { m_f.local_get(m_snap[s][2]); });
-			}
+			// FMAC entries pending there in their ring slots (the shared code after the dispatch loop, EndModule), and
+			// what only some exits need here; ApplyExit writes the rest of the timing state.
+			if (m_exit_kick >= 0)
+				KickCatchUp(static_cast<u32>(m_exit_kick));
 			if (m_loop)
 			{
 				m_f.local_get(m_looped);
@@ -794,7 +1121,8 @@ namespace VU1Jit
 				m_f.end();
 			}
 			m_f.i32_const(static_cast<s32>(exit_id));
-			m_f.return_();
+			m_f.local_set(m_exit);
+			m_f.br(m_f.depth() - m_stub_level);
 		}
 
 		void Emitter::Clamp(u32 v)
@@ -971,7 +1299,7 @@ namespace VU1Jit
 				St32(A(R.VI[REG_P]), [&] { Ld32(A(R.efu.reg)); });
 		}
 
-		void Emitter::FlushAllAtEnd(const Plan& p, const VURegs& after)
+		void Emitter::FlushAllAtEnd(const Plan& p, const int end_flagreg[4])
 		{
 			// _vuFlushAll (VUops.cpp:130-186).
 			if (p.info.end_fdiv)
@@ -991,16 +1319,19 @@ namespace VU1Jit
 			for (u32 k = 0; k < p.info.end_fmac_count; k++)
 			{
 				const u32 slot = (p.info.end_fmac_read + k) & 3;
-				FmacWriteback(slot, after.fmac[slot].flagreg);
+				FmacWriteback(slot, end_flagreg[slot]);
 			}
 		}
 
 		void Emitter::KickCatchUp(u32 delta)
 		{
-			Ld32(A(R.xgkickenable));
-			m_f.if_();
+			if (!m_vu)
+				return;
+			m_f.local_get(m_kick);
+			m_f.if_unlikely();
 			m_f.i32_const(static_cast<s32>(delta));
 			m_f.call(m_h_kick);
+			LoadKick(); // the kick may have ended
 			m_f.end();
 		}
 
@@ -1344,15 +1675,18 @@ namespace VU1Jit
 				SetVI(dst, value);
 				m_out->native_ops++;
 			};
-			// VU memory address of a qword index on the stack (GET_VU_MEM for VU1: & 0x3fff after * 16).
+			// VU memory address of a qword index on the stack (GET_VU_MEM for VU1: & 0x3fff after * 16), from the
+			// data memory's base in a local (Addr).
 			const auto qaddr = [&] {
 				m_f.i32_const(4);
 				m_f.i32_shl();
 				m_f.i32_const(0x3ff0);
 				m_f.i32_and();
+				m_f.local_get(m_mb);
+				m_f.i32_add();
 			};
 			const auto load_q = [&](u32 to_vf) { // VF[to_vf] <- mem[addr on stack], dest merged
-				m_f.v128_load(m_mem);
+				m_f.v128_load(0);
 				m_f.local_set(v);
 				SetVF(to_vf, v, dest);
 			};
@@ -1364,11 +1698,11 @@ namespace VU1Jit
 				if (dest != 0xf)
 				{
 					m_f.local_get(m_i[0]);
-					m_f.v128_load(m_mem);
+					m_f.v128_load(0);
 					DestConst(dest);
 					Simd(Simd::V128Bitselect);
 				}
-				m_f.v128_store(m_mem);
+				m_f.v128_store(0);
 			};
 
 			const bool vu0_memory = m_vu == 0 && ((GetLowerFlags(p.ins.lo) & LOWER_STORE) || p.ins.lo == L::LQ ||
@@ -1702,7 +2036,7 @@ namespace VU1Jit
 						else
 							VI(is);
 						qaddr();
-						m_f.i32_load16_u(m_mem + lane * 4);
+						m_f.i32_load16_u(lane * 4);
 					});
 					m_out->native_ops++;
 					return true;
@@ -1729,7 +2063,7 @@ namespace VU1Jit
 							continue;
 						m_f.local_get(m_i[0]);
 						VI(it);
-						m_f.i32_store(m_mem + lane * 4);
+						m_f.i32_store(lane * 4);
 					}
 					m_out->native_ops++;
 					return true;
@@ -1888,6 +2222,8 @@ namespace VU1Jit
 					m_f.i32_shl();
 					m_f.local_set(addr);
 					St32c(A(R.xgkickenable), 1);
+					m_f.i32_const(1);
+					m_f.local_set(m_kick);
 					St32(A(R.xgkickaddr), [&] { m_f.local_get(addr); });
 					St32(A(R.xgkickdiff), [&] {
 						m_f.i32_const(0x4000);
@@ -1980,23 +2316,33 @@ namespace VU1Jit
 			}
 		}
 
-		void Emitter::EmitInstruction(const Plan& p, s32 busy_kick_exit)
+		void Emitter::EmitInstruction(const Plan& p, s32 busy_kick_exit, bool last)
 		{
 			const StepInfo& info = p.info;
 			const u32 delta = p.cyc + info.op_cycle; // R.cycle at the op, relative to the entry
 
-			if (busy_kick_exit >= 0)
+			// The kick is fed only where the result can differ from feeding it at every instruction (section 7.7):
+			// before VU memory changes, at an XGKICK, before op bodies, and at the last instruction before any exit.
+			// Each feed adds the cycles since the previous one, so the bytes and tags the GS receives are the same.
+			// The block's last instruction is fed by the exits after it (m_exit_kick), at its own cycle, which is the
+			// same unless its ops write VU memory or start a kick; going to the next block feeds nothing.
+			if (m_vu && busy_kick_exit >= 0)
 			{
-				// A kick still running at an XGKICK: the interpreter takes it (section 7.7).
-				Ld32(A(R.xgkickenable));
-				m_f.if_();
+				// A kick still running at an XGKICK, once fed up to this cycle: the interpreter takes the instruction,
+				// whose own feed then adds nothing (section 7.7).
+				KickCatchUp(delta);
+				m_f.local_get(m_kick);
+				m_f.if_unlikely();
 				EmitExit(static_cast<u32>(busy_kick_exit));
 				m_f.end();
 			}
 
 			Flushes(p);
-			if (m_vu)
+			const bool fed = busy_kick_exit >= 0 || (!info.ibit && (GetLowerFlags(p.ins.lo) & (LOWER_STORE | LOWER_XGKICK)));
+			if (m_vu && busy_kick_exit < 0 && fed)
 				KickCatchUp(delta);
+			if (m_vu && last && !fed)
+				m_exit_kick = static_cast<s32>(delta); // from here on, EmitExit feeds it
 
 			if (info.ibit)
 			{
@@ -2070,14 +2416,24 @@ namespace VU1Jit
 				St32(A(R.efu.reg), [&] { Ld32(A(R.p)); });
 		}
 
-		void Emitter::EmitBranchEnd(const Plan& branch, const Plan& delay, u32 exit_taken, u32 exit_fall, u32 exit_dyn,
-			bool loop, u32 last_start)
+		void Emitter::EmitBranchEnd(const Plan& branch, u32 exit_taken, u32 exit_fall, u32 exit_dyn, bool loop, u32 last_start,
+			s32 next_taken, s32 next_fall, const std::vector<std::pair<u32, s32>>& jumps)
 		{
-			(void)delay;
 			const u16 flags = GetLowerFlags(branch.ins.lo);
 			if (flags & LOWER_DYNAMIC)
 			{
+				// TPC is the target as the interpreter leaves it (VI * 8, unmasked): only an exact match goes to a block
+				// of the module, whose exits write TPC again.
 				St32(A(R.VI[REG_TPC]), [&] { m_f.local_get(m_i[5]); });
+				for (const auto& [target, next] : jumps)
+				{
+					m_f.local_get(m_i[5]);
+					m_f.i32_const(static_cast<s32>(target));
+					m_f.i32_eq();
+					m_f.if_();
+					EmitEdge(exit_dyn, static_cast<u32>(next));
+					m_f.end();
+				}
 				EmitExit(exit_dyn);
 			}
 			else if (flags & LOWER_COND)
@@ -2085,114 +2441,68 @@ namespace VU1Jit
 				m_f.local_get(m_i[4]);
 				m_f.if_();
 				if (loop)
-					EmitLoopBack(exit_taken, last_start, 1);
+					EmitLoopBack(exit_taken, last_start);
 				else
-					EmitExit(exit_taken);
+					EmitEdgeOrExit(exit_taken, next_taken);
 				m_f.end();
-				EmitExit(exit_fall);
+				EmitEdgeOrExit(exit_fall, next_fall);
 			}
 			else if (loop)
-				EmitLoopBack(exit_taken, last_start, 0);
+				EmitLoopBack(exit_taken, last_start);
 			else
-				EmitExit(exit_taken);
+				EmitEdgeOrExit(exit_taken, next_taken);
 		}
-	} // namespace
 
-	bool CompileBlock(int vu, u32 pc, const Signature& sig, CompiledBlock* out)
-	{
-		*out = {};
-		VURegs& R = vu ? VU1 : VU0;
-		const u32 progsize = vu ? VU1_PROGSIZE : VU0_PROGSIZE;
-		TimingModel model(vu);
-		model.Load(sig, Control{});
-		const s32 efu_entry_cycle = static_cast<s32>(model.State().efu.Cycle);
-		const bool efu_at_entry = model.State().efu.enable != 0;
-
-		std::vector<Plan> plans;
-		plans.reserve(64);
-		bool stop_before = false; // the last planned instruction is followed by one generated code does not run
-		bool ended = false;
-		bool branch_end = false;
-		bool wrapped = false;
-		bool mbit_end = false;
-		VURegs after_end; // the model after the program end, for _vuFlushAll's write-backs
-		PipeImage stop_img = {};
-		Control stop_ctl;
-		u32 stop_pc = 0;
-		u32 cur = pc;
-		u32 cyc = 0;
-		for (;;)
+		// Blocks of a module going to each other inside generated code (EmitEdge). Off with VU1JIT_NOCHAIN, to bisect
+		// a difference: every block then is a module of its own, as before modules held several.
+		static bool ChainEnabled()
 		{
-			Plan p;
-			p.pc = cur;
-			const u32* words = reinterpret_cast<const u32*>(&R.Micro[cur]);
-			p.ins = Decode(words[0], words[1]);
-			p.pre_ctl = model.GetControl();
-			p.pre = CaptureImage(model.State());
-			p.cyc = cyc;
-			if (!Allowed(p, vu))
-			{
-				if (p.pre_ctl.branch != 0)
-				{
-					// Not in a branch delay slot: stop before the branch.
-					const Plan& b = plans.back();
-					stop_img = b.pre;
-					stop_ctl = b.pre_ctl;
-					stop_pc = b.pc;
-					plans.pop_back();
-				}
-				else
-				{
-					stop_img = p.pre;
-					stop_ctl = p.pre_ctl;
-					stop_pc = p.pc;
-				}
-				stop_before = true;
-				break;
-			}
-			StepInput in;
-			in.pc = cur;
-			in.lower = words[0];
-			in.upper = words[1];
-			in.fbrst = 0; // no D/T bits here
-			in.branch_taken = true;
-			in.jump_target = 0;
-			if (!model.Step(in, &p.info))
-				return false;
-			cyc += p.info.cycles;
-			plans.push_back(p);
-			if (p.info.end)
-			{
-				ended = true;
-				after_end = model.State();
-				break;
-			}
-			if (p.pre_ctl.branch == 1)
-			{
-				branch_end = true; // the delay slot of the previous instruction
-				break;
-			}
-			if (vu == 0 && p.ins.MBit())
-			{
-				mbit_end = true; // InterpVU0::Execute stops after it (VU0microInterp.cpp:268)
-				cur += 8;
-				break;
-			}
-			cur += 8;
-			if (cur >= progsize)
-			{
-				wrapped = true;
-				break;
-			}
-			if (plans.size() >= BLOCK_CAP && model.GetControl().branch == 0)
-				break;
+			static const bool enabled = !std::getenv("VU1JIT_NOCHAIN");
+			return enabled;
 		}
-		if (plans.empty())
-			return false;
 
-		// Exits.
-		const auto make_exit = [&](ExitKind kind, ExitReason reason, u32 instrs, const PipeImage& img, const Control& ctl,
-								   u32 tpc) {
+		// Caps per module (section 4.3): its compile time grows with its size.
+		static constexpr u32 MODULE_BLOCKS = 1024;
+		static constexpr u32 MODULE_INSTRS = 8192;
+
+		// One block: the timing model's plan for its instructions, and how it ends.
+		struct BlockPlan
+		{
+			u32 pc = 0;
+			Signature sig = {};
+			std::vector<Plan> plans;
+			bool stop_before = false; // the last planned instruction is followed by one generated code does not run
+			bool ended = false;
+			bool branch_end = false;
+			bool wrapped = false;
+			bool mbit_end = false;
+			int end_flagreg[4] = {}; // the model after the program end, for _vuFlushAll's write-backs
+			PipeImage stop_img = {};
+			Control stop_ctl;
+			u32 stop_pc = 0;
+			PipeImage final_img = {};
+			Control final_ctl;
+			s32 efu_entry_cycle = 0;
+			bool efu_at_entry = false;
+			bool loop = false; // the taken branch comes back to the entry with its signature: a loop in generated code
+			BlockExit loop_exit;
+			// The exits that may go to another block of the module: a static branch target, the fall-through and a
+			// JR/JALR, and the block of the module each goes to (an index, -1 for the dispatcher).
+			BlockExit taken, fall, dyn;
+			bool has_taken = false;
+			bool has_fall = false;
+			bool has_dyn = false;
+			s32 next_taken = -1;
+			s32 next_fall = -1;
+			std::vector<std::pair<u32, s32>> jumps; // learned JR/JALR targets (TPC) that are blocks of the module
+
+			u32 Instrs() const { return static_cast<u32>(plans.size()); }
+			u32 LastStart() const { return plans.back().cyc; }
+		};
+
+		BlockExit MakeExit(int vu, const BlockPlan& b, ExitKind kind, ExitReason reason, u32 instrs, const PipeImage& img,
+			const Control& ctl, u32 tpc)
+		{
 			BlockExit x;
 			x.kind = kind;
 			x.reason = reason;
@@ -2200,9 +2510,10 @@ namespace VU1Jit
 			x.tpc = tpc;
 			x.ebit = ctl.ebit;
 			x.pipes = img;
-			x.mbit = vu == 0 && instrs > 0 && plans[instrs - 1].ins.MBit(); // set at its fetch (VU0microInterp.cpp:40)
-			if (efu_at_entry && img.efu.enable && img.efu.sCycle < TIMING_MODEL_BASE)
-				x.efu_cycle_adjust = static_cast<s32>(img.efu.Cycle) - efu_entry_cycle;
+			x.block_pc = b.pc;
+			x.mbit = vu == 0 && instrs > 0 && b.plans[instrs - 1].ins.MBit(); // set at its fetch (VU0microInterp.cpp:40)
+			if (b.efu_at_entry && img.efu.enable && img.efu.sCycle < TIMING_MODEL_BASE)
+				x.efu_cycle_adjust = static_cast<s32>(img.efu.Cycle) - b.efu_entry_cycle;
 			if (kind == ExitKind::Boundary && ctl.ebit == 0 && ctl.branch == 0)
 			{
 				VURegs tmp;
@@ -2222,76 +2533,226 @@ namespace VU1Jit
 				tmp.cycle = img.cycle;
 				x.chain = DeriveSignature(tmp, &x.sig) == Refusal::None;
 			}
-			out->exits.push_back(x);
-			return static_cast<u32>(out->exits.size() - 1);
-		};
-
-		const PipeImage final_img = CaptureImage(model.State());
-		const Control final_ctl = model.GetControl();
-		const u32 n = static_cast<u32>(plans.size());
-		const Plan& last = plans.back();
-
-		// A branch's exits, and whether the taken one comes back to this block with the same signature: a loop
-		// generated code runs by itself.
-		u32 exit_taken = 0, exit_fall = 0, exit_dyn = 0;
-		bool loop = false;
-		BlockExit loop_exit;
-		if (branch_end)
-		{
-			const Plan& branch = plans[n - 2];
-			exit_taken = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl,
-				StaticBranchTarget(branch.pc, branch.ins.lower) & (progsize - 1));
-			exit_fall = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl, last.pc + 8);
-			exit_dyn = make_exit(ExitKind::Boundary, ExitReason::Block, n, final_img, final_ctl, 0);
-			out->exits[exit_dyn].dynamic_tpc = true;
-			const BlockExit& t = out->exits[exit_taken];
-			loop = vu == 1 && LoopsEnabled() && !(GetLowerFlags(branch.ins.lo) & LOWER_DYNAMIC) && t.chain && t.tpc == pc &&
-			       t.sig == sig && OnlyNewEntries(t.pipes);
-			if (loop)
-				loop_exit = t;
+			return x;
 		}
 
-		// Emitted twice: the first time records which registers the native code uses (RegUse), the second keeps
-		// them in locals. Both make the same exits.
-		const size_t exits_before = out->exits.size();
-		const auto emit = [&](Emitter& em) {
-			em.EmitEntry(sig.fmac_count);
-			if (loop)
-				em.BeginLoop(loop_exit);
+		// Whether generated code may go from exit x to the block at its TPC itself: the dispatcher would enter that
+		// block next with x's signature and no branch or E bit pending. A TPC past the end of micro memory is left to
+		// the dispatcher, which masks it (the interpreter keeps it unmasked until the next fetch).
+		bool CanChain(const BlockExit& x)
+		{
+			return x.kind == ExitKind::Boundary && (x.reason == ExitReason::Block || x.reason == ExitReason::Cap) && x.chain &&
+			       !x.dynamic_tpc && x.ebit == 0 && x.tpc < VU1_PROGSIZE;
+		}
+
+		// Runs the timing model over the block at pc for an entry with signature sig and no branch or E bit pending.
+		// False when there is nothing to compile: the first instruction must run on the interpreter.
+		bool PlanBlock(int vu, u32 pc, const Signature& sig, BlockPlan* out)
+		{
+			BlockPlan& b = *out;
+			b = {};
+			b.pc = pc;
+			b.sig = sig;
+			VURegs& R = vu ? VU1 : VU0;
+			const u32 progsize = vu ? VU1_PROGSIZE : VU0_PROGSIZE;
+			TimingModel model(vu);
+			model.Load(sig, Control{});
+			b.efu_entry_cycle = static_cast<s32>(model.State().efu.Cycle);
+			b.efu_at_entry = model.State().efu.enable != 0;
+
+			std::vector<Plan>& plans = b.plans;
+			plans.reserve(64);
+			u32 cur = pc;
+			u32 cyc = 0;
+			for (;;)
+			{
+				Plan p;
+				p.pc = cur;
+				const u32* words = reinterpret_cast<const u32*>(&R.Micro[cur]);
+				p.ins = Decode(words[0], words[1]);
+				p.pre_ctl = model.GetControl();
+				p.pre = CaptureImage(model.State());
+				p.cyc = cyc;
+				if (!Allowed(p, vu))
+				{
+					if (p.pre_ctl.branch != 0)
+					{
+						// Not in a branch delay slot: stop before the branch.
+						const Plan& br = plans.back();
+						b.stop_img = br.pre;
+						b.stop_ctl = br.pre_ctl;
+						b.stop_pc = br.pc;
+						plans.pop_back();
+					}
+					else
+					{
+						b.stop_img = p.pre;
+						b.stop_ctl = p.pre_ctl;
+						b.stop_pc = p.pc;
+					}
+					b.stop_before = true;
+					break;
+				}
+				StepInput in;
+				in.pc = cur;
+				in.lower = words[0];
+				in.upper = words[1];
+				in.fbrst = 0; // no D/T bits here
+				in.branch_taken = true;
+				in.jump_target = 0;
+				if (!model.Step(in, &p.info))
+					return false;
+				cyc += p.info.cycles;
+				plans.push_back(p);
+				if (p.info.end)
+				{
+					b.ended = true;
+					for (u32 i = 0; i < 4; i++)
+						b.end_flagreg[i] = model.State().fmac[i].flagreg;
+					break;
+				}
+				if (p.pre_ctl.branch == 1)
+				{
+					b.branch_end = true; // the delay slot of the previous instruction
+					break;
+				}
+				if (vu == 0 && p.ins.MBit())
+				{
+					b.mbit_end = true; // InterpVU0::Execute stops after it (VU0microInterp.cpp:268)
+					cur += 8;
+					break;
+				}
+				cur += 8;
+				if (cur >= progsize)
+				{
+					b.wrapped = true;
+					break;
+				}
+				if (plans.size() >= BLOCK_CAP && model.GetControl().branch == 0)
+					break;
+			}
+			if (plans.empty())
+				return false;
+
+			b.final_img = CaptureImage(model.State());
+			b.final_ctl = model.GetControl();
+			const u32 n = b.Instrs();
+			const Plan& last = plans.back();
+			if (b.branch_end)
+			{
+				// A branch's exits, and whether the taken one comes back to this block with the same signature: a loop
+				// generated code runs by itself.
+				const Plan& branch = plans[n - 2];
+				const u16 flags = GetLowerFlags(branch.ins.lo);
+				if (!(flags & LOWER_DYNAMIC))
+				{
+					b.taken = MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, b.final_ctl,
+						StaticBranchTarget(branch.pc, branch.ins.lower) & (progsize - 1));
+					b.has_taken = true;
+					const BlockExit& t = b.taken;
+					b.loop = vu == 1 && LoopsEnabled() && t.chain && t.tpc == pc && t.sig == sig && OnlyNewEntries(t.pipes);
+					if (b.loop)
+						b.loop_exit = t;
+				}
+				if (flags & LOWER_COND)
+				{
+					b.fall = MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, b.final_ctl, last.pc + 8);
+					b.has_fall = true;
+				}
+				if (flags & LOWER_DYNAMIC)
+				{
+					b.dyn = MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, b.final_ctl, 0);
+					b.has_dyn = true;
+				}
+			}
+			else if (!b.ended && !b.stop_before)
+			{
+				b.fall = MakeExit(vu, b, ExitKind::Boundary, (b.wrapped || b.mbit_end) ? ExitReason::Block : ExitReason::Cap, n,
+					b.final_img, b.final_ctl, last.pc + 8);
+				b.has_fall = true;
+			}
+			return true;
+		}
+
+		// Block k of the module (layout order); pos maps BlockPlan::next_* to layout positions. Exits are numbered in
+		// the order this makes them, the same in both emissions.
+		void EmitBlock(Emitter& em, int vu, const BlockPlan& b, u32 k, const std::vector<s32>& pos, std::vector<BlockExit>& exits)
+		{
+			const auto add = [&](const BlockExit& x) {
+				exits.push_back(x);
+				exits.back().block = k;
+				return static_cast<u32>(exits.size() - 1);
+			};
+			const auto next = [&](s32 i) { return i >= 0 ? pos[i] : -1; };
+			const u32 progsize = vu ? VU1_PROGSIZE : VU0_PROGSIZE;
+			const u32 n = b.Instrs();
+			const Plan& last = b.plans.back();
+			em.BeginBlock(k, n);
+			if (b.loop)
+				em.BeginLoop(b.loop_exit);
 			for (u32 i = 0; i < n; i++)
 			{
-				const Plan& p = plans[i];
+				const Plan& p = b.plans[i];
 				s32 busy = -1;
 				if (vu && !p.ins.IBit() && p.ins.lo == L::XGKICK && !p.info.discarded)
 				{
 					// The interpreter's state before this instruction: TPC is its own address.
-					busy = static_cast<s32>(make_exit(ExitKind::Boundary, ExitReason::BusyKick, i, p.pre, p.pre_ctl, p.pc));
+					busy = static_cast<s32>(add(MakeExit(vu, b, ExitKind::Boundary, ExitReason::BusyKick, i, p.pre, p.pre_ctl, p.pc)));
 				}
-				em.EmitInstruction(p, busy);
-				if (i + 1 == n && ended)
-					em.FlushAllAtEnd(p, after_end);
+				em.EmitInstruction(p, busy, i + 1 == n);
+				if (i + 1 == n && b.ended)
+					em.FlushAllAtEnd(p, b.end_flagreg);
 			}
 
-			if (ended)
+			if (b.ended)
 			{
-				em.EmitExit(make_exit(ExitKind::End, ExitReason::Block, n, final_img, final_ctl, last.pc + 8));
+				em.EmitExit(add(MakeExit(vu, b, ExitKind::End, ExitReason::Block, n, b.final_img, b.final_ctl, last.pc + 8)));
 			}
-			else if (branch_end)
+			else if (b.branch_end)
 			{
-				em.EmitBranchEnd(plans[n - 2], last, exit_taken, exit_fall, exit_dyn, loop, last.cyc);
+				const Plan& branch = b.plans[n - 2];
+				const u32 exit_taken = add(MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, b.final_ctl,
+					StaticBranchTarget(branch.pc, branch.ins.lower) & (progsize - 1)));
+				const u32 exit_fall = add(MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, b.final_ctl, last.pc + 8));
+				BlockExit dyn = MakeExit(vu, b, ExitKind::Boundary, ExitReason::Block, n, b.final_img, b.final_ctl, 0);
+				dyn.dynamic_tpc = true;
+				const u32 exit_dyn = add(dyn);
+				std::vector<std::pair<u32, s32>> jumps;
+				for (const auto& [target, i] : b.jumps)
+					jumps.emplace_back(target, next(i));
+				em.EmitBranchEnd(branch, exit_taken, exit_fall, exit_dyn, b.loop, last.cyc, next(b.next_taken), next(b.next_fall),
+					jumps);
 			}
-			else if (stop_before)
+			else if (b.stop_before)
 			{
-				em.EmitExit(make_exit(ExitKind::Boundary, ExitReason::Fallback, n, stop_img, stop_ctl, stop_pc));
+				em.EmitExit(add(MakeExit(vu, b, ExitKind::Boundary, ExitReason::Fallback, n, b.stop_img, b.stop_ctl, b.stop_pc)));
 			}
 			else
 			{
-				const u32 id = make_exit(ExitKind::Boundary, (wrapped || mbit_end) ? ExitReason::Block : ExitReason::Cap, n,
-					final_img, final_ctl, last.pc + 8);
-				em.EmitExit(id);
+				em.EmitEdgeOrExit(add(b.fall), next(b.next_fall));
 			}
-			if (loop)
+			if (b.loop)
 				em.EndLoop();
+		}
+	} // namespace
+
+	bool CompileBlock(int vu, u32 pc, const Signature& sig, CompiledBlock* out)
+	{
+		*out = {};
+		BlockPlan b;
+		if (!PlanBlock(vu, pc, sig, &b))
+			return false;
+		const std::vector<s32> pos{0};
+		const std::vector<u32> last_starts{b.LastStart()};
+
+		// Emitted twice: the first time records which registers the native code uses (RegUse), the second keeps
+		// them in locals. Both make the same exits.
+		const auto emit = [&](Emitter& em) {
+			out->exits.clear();
+			em.EmitPrologue();
+			em.BeginModule(last_starts);
+			EmitBlock(em, vu, b, 0, pos, out->exits);
+			em.EndModule();
 		};
 		RegUse use;
 		{
@@ -2299,15 +2760,175 @@ namespace VU1Jit
 			emit(first);
 			use = first.Use();
 		}
-		out->exits.resize(exits_before);
 		out->native_ops = 0;
 		out->helper_ops = 0;
 		Emitter em(out, vu, &use);
 		emit(em);
 		em.Finish();
-		out->instrs = n;
-		out->last_start = last.cyc;
-		out->loops = loop;
+		out->instrs = b.Instrs();
+		out->last_start = b.LastStart();
+		out->loops = b.loop;
+		return true;
+	}
+
+	bool CompileModule(u32 pc, const Signature& sig, const ModuleSource& source, CompiledModule* out)
+	{
+		*out = {};
+		std::vector<BlockPlan> blocks(1);
+		if (!PlanBlock(1, pc, sig, &blocks[0]))
+			return false;
+		u32 total = blocks[0].Instrs();
+		for (const auto& [rpc, rsig] : source.roots)
+		{
+			bool have = false;
+			for (const BlockPlan& b : blocks)
+				have |= b.pc == rpc && b.sig == rsig;
+			BlockPlan nb;
+			if (have || blocks.size() >= MODULE_BLOCKS || !PlanBlock(1, rpc, rsig, &nb) || total + nb.Instrs() > MODULE_INSTRS)
+				continue;
+			total += nb.Instrs();
+			blocks.push_back(std::move(nb));
+		}
+		const size_t roots = blocks.size();
+
+		// Discovery (section 4.3): the blocks the exits go to, breadth first, unless another module holds them (when
+		// source.known says so) or there is nothing to compile there.
+		std::vector<std::pair<u32, Signature>> refused;
+		const bool chain = ChainEnabled();
+		const auto successor = [&](const BlockExit& x) -> s32 {
+			if (!chain || !CanChain(x))
+				return -1;
+			for (size_t i = 0; i < blocks.size(); i++)
+			{
+				if (blocks[i].pc == x.tpc && blocks[i].sig == x.sig)
+					return static_cast<s32>(i);
+			}
+			for (const auto& [rpc, rsig] : refused)
+			{
+				if (rpc == x.tpc && rsig == x.sig)
+					return -1;
+			}
+			if (blocks.size() >= MODULE_BLOCKS || (source.known && source.known(source.ctx, x.tpc, x.sig)))
+				return -1;
+			BlockPlan nb;
+			if (!PlanBlock(1, x.tpc, x.sig, &nb) || total + nb.Instrs() > MODULE_INSTRS)
+			{
+				refused.emplace_back(x.tpc, x.sig);
+				return -1;
+			}
+			total += nb.Instrs();
+			blocks.push_back(std::move(nb));
+			return static_cast<s32>(blocks.size() - 1);
+		};
+		for (size_t i = 0; i < blocks.size(); i++)
+		{
+			if (blocks[i].has_taken && !blocks[i].loop)
+			{
+				const BlockExit x = blocks[i].taken;
+				const s32 t = successor(x);
+				blocks[i].next_taken = t;
+			}
+			if (blocks[i].has_fall)
+			{
+				const BlockExit x = blocks[i].fall;
+				const s32 t = successor(x);
+				blocks[i].next_fall = t;
+			}
+			const std::vector<u32>* targets =
+				(blocks[i].has_dyn && source.jump_targets) ? source.jump_targets(source.ctx, blocks[i].pc, blocks[i].sig) : nullptr;
+			if (targets)
+			{
+				// The targets the JR/JALR went to so far, as static exits: the jump's exit state with that TPC.
+				const std::vector<u32> copy = *targets;
+				for (const u32 target : copy)
+				{
+					BlockExit x = blocks[i].dyn;
+					x.tpc = target;
+					const s32 t = successor(x);
+					if (t >= 0)
+						blocks[i].jumps.emplace_back(target, t);
+				}
+			}
+		}
+
+		// Layout: reverse postorder from the entry, the taken branch visited first, so that most exits go forward
+		// (a br) and a fall-through usually goes to the next block; then the same from each other root.
+		const u32 nb = static_cast<u32>(blocks.size());
+		std::vector<u32> order;
+		order.reserve(nb);
+		{
+			std::vector<u8> seen(nb, 0);
+			for (size_t r = 0; r < roots; r++)
+			{
+				if (seen[r])
+					continue;
+				std::vector<u32> post;
+				std::vector<std::pair<u32, u32>> stack; // block, successors visited
+				stack.emplace_back(static_cast<u32>(r), 0);
+				seen[r] = 1;
+				while (!stack.empty())
+				{
+					const u32 v = stack.back().first;
+					const u32 c = stack.back().second;
+					if (c < 2 + blocks[v].jumps.size())
+					{
+						stack.back().second++;
+						const s32 s = c == 0 ? blocks[v].next_taken : c == 1 ? blocks[v].next_fall :
+						                                                       blocks[v].jumps[c - 2].second;
+						if (s >= 0 && !seen[s])
+						{
+							seen[s] = 1;
+							stack.emplace_back(static_cast<u32>(s), 0);
+						}
+						continue;
+					}
+					post.push_back(v);
+					stack.pop_back();
+				}
+				order.insert(order.end(), post.rbegin(), post.rend());
+			}
+		}
+		pxAssert(order.size() == nb);
+		std::vector<s32> pos(nb);
+		std::vector<u32> last_starts(nb);
+		for (u32 k = 0; k < nb; k++)
+		{
+			pos[order[k]] = static_cast<s32>(k);
+			last_starts[k] = blocks[order[k]].LastStart();
+		}
+
+		CompiledBlock scratch;
+		const auto emit = [&](Emitter& em) {
+			scratch.exits.clear();
+			em.EmitPrologue();
+			em.BeginModule(last_starts);
+			for (u32 k = 0; k < nb; k++)
+				EmitBlock(em, 1, blocks[order[k]], k, pos, scratch.exits);
+			em.EndModule();
+		};
+		RegUse use;
+		{
+			Emitter first(&scratch, 1, nullptr);
+			emit(first);
+			use = first.Use();
+		}
+		scratch.native_ops = 0;
+		scratch.helper_ops = 0;
+		Emitter em(&scratch, 1, &use);
+		emit(em);
+		em.Finish();
+
+		out->wasm = std::move(scratch.wasm);
+		out->exits = std::move(scratch.exits);
+		out->native_ops = scratch.native_ops;
+		out->helper_ops = scratch.helper_ops;
+		out->blocks.reserve(nb);
+		for (u32 k = 0; k < nb; k++)
+		{
+			const BlockPlan& b = blocks[order[k]];
+			out->blocks.push_back(CompiledModule::Block{b.pc, b.sig, b.Instrs(), b.LastStart()});
+			out->edges += (b.next_taken >= 0) + (b.next_fall >= 0) + static_cast<u32>(b.jumps.size());
+		}
 		return true;
 	}
 } // namespace VU1Jit

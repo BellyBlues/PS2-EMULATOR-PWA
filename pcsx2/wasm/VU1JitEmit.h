@@ -1,15 +1,21 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-// VU1 JIT code generation (docs/web-port/VU1-JIT-DESIGN.md sections 4, 5, 7). One block per module: a straight run
-// of instructions from an entry (PC, pipeline signature) to a branch's delay slot, the program end, or the first
+// VU1 JIT code generation (docs/web-port/VU1-JIT-DESIGN.md sections 4, 5, 7). A block is a straight run of
+// instructions from an entry (PC, pipeline signature) to a branch's delay slot, the program end, or the first
 // instruction generated code does not run. The timing model decides every stall, write-back and pipe entry at
 // compile time; generated code does only the data work. It keeps the registers it uses (VF, ACC, VI0-VI15), the
 // pending and committed flags and the pipe entries' flag snapshots in locals, and writes them to the interpreter's
 // own state in VURegs at every exit and before calling an op body without native code (which it reloads after), so
 // every exit leaves a state the interpreter continues from. The timing fields of the pipes are written at the exit,
-// from the model (ApplyExit). A block whose branch goes back to its own entry with the entry's signature (a vertex
-// loop) does the dispatcher's work for that exit itself and runs again without leaving generated code.
+// from the model (ApplyExit).
+//
+// On VU1 a module holds the blocks reachable from its entry block, through branches and fall-throughs whose target
+// (PC, signature) no other module holds: one function, whose argument is the block to start at. A block's exit to
+// another block of the module does the dispatcher's work itself (its budget test, ApplyExit's and NormalizeRings'
+// effects on the timing fields that the next exit does not write again, the next block's base) and branches there
+// without leaving generated code. A block whose branch goes back to its own entry with the entry's signature (a
+// vertex loop) runs inside a wasm loop and leaves the timing fields to the exit that finally leaves (EmitLoopBack).
 
 #pragma once
 
@@ -64,6 +70,8 @@ namespace VU1Jit
 		bool mbit = false; // VU0: the last instruction had the M bit (VUFLAG_MFLAGSET)
 		bool chain = false; // sig is valid: the dispatcher may enter the next block without deriving it
 		Signature sig = {};
+		u32 block_pc = 0; // the entry of the block it leaves
+		u32 block = 0; // ... and its index in the module
 	};
 
 	struct CompiledBlock
@@ -81,6 +89,42 @@ namespace VU1Jit
 	// reading the VU's micro memory (vu: 0 or 1). False when there is nothing to compile: the first instruction must run on the interpreter.
 	bool CompileBlock(int vu, u32 pc, const Signature& sig, CompiledBlock* out);
 
+	// A VU1 module: blocks that branch to each other inside generated code. Its function's argument is the index of
+	// the block to start at; exits are numbered across the module.
+	struct CompiledModule
+	{
+		struct Block
+		{
+			u32 pc;
+			Signature sig;
+			u32 instrs;
+			u32 last_start;
+		};
+		std::vector<u8> wasm;
+		std::vector<BlockExit> exits;
+		std::vector<Block> blocks; // blocks[0] is the entry
+		u32 native_ops = 0;
+		u32 helper_ops = 0;
+		u32 edges = 0; // block exits that go to a block of the module
+	};
+
+	struct ModuleSource
+	{
+		// Whether another module already holds the block at (pc, sig): CompileModule then leaves it to the
+		// dispatcher. Null: every block reachable goes into the module.
+		bool (*known)(void* ctx, u32 pc, const Signature& sig) = nullptr;
+		// The targets seen at run time of the JR or JALR that ends the block at (pc, sig) (TPC values, unmasked):
+		// generated code goes to those of them that are blocks of the module itself. Null: none.
+		const std::vector<u32>* (*jump_targets)(void* ctx, u32 pc, const Signature& sig) = nullptr;
+		void* ctx = nullptr;
+		// More blocks (PC, signature) to start from: merging modules into one.
+		std::vector<std::pair<u32, Signature>> roots;
+	};
+
+	// Compiles the VU1 block at pc for sig and the blocks reachable from it, through static branches, fall-throughs
+	// and learned jump targets, up to the module's caps. False when there is nothing to compile (as CompileBlock).
+	bool CompileModule(u32 pc, const Signature& sig, const ModuleSource& source, CompiledModule* out);
+
 	// After generated code returned exit x: writes the timing state, TPC and the control state. base is VU1.cycle at
 	// the entry.
 	void ApplyExit(VURegs& R, const BlockExit& x, u64 base);
@@ -94,11 +138,14 @@ namespace VU1Jit
 	extern u64 g_block_base;
 	extern u64 g_block_base0; // the same for VU0
 
-	// The dispatcher's budget (VU1): VU1.cycle at the start of its Execute plus its cycles. A looping block leaves
-	// before a pass whose last instruction would start at or after it, as the dispatcher would not enter it.
+	// The dispatcher's budget (VU1): VU1.cycle at the start of its Execute plus its cycles. Generated code leaves
+	// before a block (or a loop's pass) whose last instruction would start at or after it, as the dispatcher would
+	// not enter it.
 	extern u64 g_budget_end;
-	// Passes a looping block made back to its start since the dispatcher entered it (VU1).
-	extern u32 g_block_loops;
+	// Written by every exit of a VU1 module: the instructions of the blocks and loop passes it completed before the
+	// block that exited, and how many times it went from a block to the next (or back to its start) without leaving.
+	extern u32 g_chain_instrs;
+	extern u32 g_chain_edges;
 
 	// Debugging: log every block and interpreter step of the dispatcher.
 	extern bool g_trace;

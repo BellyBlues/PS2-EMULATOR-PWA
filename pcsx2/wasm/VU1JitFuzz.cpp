@@ -684,6 +684,78 @@ namespace VU1Jit
 					}
 					continue;
 				}
+				// Ops for the bodies below: no branch, no VI written (except by the patterns themselves).
+				static constexpr VU1Jit::Lower body_lower[] = {Lower::MOVE, Lower::MOVE, Lower::LQ, Lower::LQ, Lower::SQ,
+					Lower::DIV, Lower::SQRT, Lower::RSQRT, Lower::MR32, Lower::MFIR, Lower::ISW, Lower::WAITQ, Lower::FSSET,
+					Lower::RNEXT, Lower::ESQRT, Lower::ERSQRT, Lower::EATAN, Lower::WAITP, Lower::MFP};
+				const auto fmac_upper = [&] {
+					return UpperOpcodeBits(m_rng.Chance(50) ? Upper::MUL : Upper::ADD) | (RandomDest() << 21) | (RandomVF() << 6) |
+					       (RandomVF() << 11) | (RandomVF() << 16);
+				};
+				if (pattern >= 90 && pattern < 93 && i + 12 < length)
+				{
+					// Short blocks that branch to each other, forward and backward, conditionally or not, with FMAC,
+					// FDIV and EFU results pending at the branches (VU1JitEmit.cpp, EmitEdge): 2 to 4 blocks of 3
+					// instructions (an op, the branch, its delay slot), then a block that the chain ends on.
+					const u32 blocks = 2 + m_rng.Below(3);
+					const u32 counter = 8 + m_rng.Below(8);
+					Put(micro, pc, LowerOpcodeBits(Lower::IADDIU) | (counter << 16) | (1 + m_rng.Below(5)), MakeUpper(true));
+					for (u32 b = 0; b < blocks; b++)
+					{
+						const u32 at = i + 1 + b * 3; // instruction index of the block
+						const u32 bpc = (p.start_pc + at * 8) & VU1_PROGMASK;
+						Put(micro, bpc, MakeLower(body_lower[m_rng.Below(std::size(body_lower))]), m_rng.Chance(60) ? fmac_upper() : MakeUpper(true));
+						// The target: the next block, the one after, the chain's end, or back to an earlier block while the
+						// counter lasts (the counter's decrement is the delay slot then).
+						u32 target = at + 3 + (m_rng.Chance(30) ? 3 : 0);
+						const u32 end = i + 1 + blocks * 3;
+						target = std::min(target, end);
+						u32 lower;
+						bool back = b > 0 && m_rng.Chance(35);
+						if (back)
+						{
+							target = i + 1 + m_rng.Below(b + 1) * 3;
+							lower = LowerOpcodeBits(Lower::IBNE) | (counter << 16); // IBNE vi_counter, vi0
+						}
+						else if (m_rng.Chance(50))
+							lower = LowerOpcodeBits(Lower::B);
+						else
+						{
+							static constexpr VU1Jit::Lower conds[] = {Lower::IBEQ, Lower::IBNE, Lower::IBLTZ, Lower::IBGTZ,
+								Lower::IBLEZ, Lower::IBGEZ};
+							lower = (MakeLower(conds[m_rng.Below(std::size(conds))]) & ~0x7ffu);
+						}
+						const s32 imm = static_cast<s32>(target) - static_cast<s32>(at + 1) - 1;
+						Put(micro, bpc + 8, lower | (static_cast<u32>(imm) & 0x7ff), m_rng.Chance(50) ? fmac_upper() : MakeUpper(true));
+						const u32 delay = back ? (LowerOpcodeBits(Lower::IADDI) | (counter << 16) | (counter << 11) | (0x1fu << 6)) : MakeLower(body_lower[m_rng.Below(std::size(body_lower))]);
+						Put(micro, bpc + 16, delay, m_rng.Chance(70) ? fmac_upper() : MakeUpper(true));
+					}
+					i += blocks * 3;
+					continue;
+				}
+				if (pattern >= 93 && pattern < 96 && i + 10 < length)
+				{
+					// A loop whose back branch is a JR (or a JALR) to a target set before the loop: generated code
+					// learns the target and goes there without leaving (VU1Jit.cpp, Merge, with VU1JIT_MERGE_EXITS low).
+					const u32 counter = 8 + m_rng.Below(8);
+					const u32 target_vi = 1 + m_rng.Below(7);
+					const u32 link_vi = 1 + (target_vi % 7); // another one
+					const u32 body = 1 + m_rng.Below(3);
+					const u32 loop_pc = (p.start_pc + (i + 2) * 8) & VU1_PROGMASK;
+					Put(micro, pc, LowerOpcodeBits(Lower::IADDIU) | (counter << 16) | (1 + m_rng.Below(6)), MakeUpper(true));
+					Put(micro, pc + 8, LowerOpcodeBits(Lower::IADDIU) | (target_vi << 16) | (loop_pc / 8), MakeUpper(true));
+					for (u32 b = 0; b < body; b++)
+						Put(micro, loop_pc + b * 8, MakeLower(body_lower[m_rng.Below(std::size(body_lower))]), m_rng.Chance(60) ? fmac_upper() : MakeUpper(true));
+					const u32 e = loop_pc + body * 8; // the decrement, the exit test and its delay slot, the jump and its delay slot
+					Put(micro, e, LowerOpcodeBits(Lower::IADDI) | (counter << 16) | (counter << 11) | (0x1fu << 6), MakeUpper(m_rng.Chance(50)));
+					Put(micro, e + 8, LowerOpcodeBits(Lower::IBEQ) | (counter << 16) | 3, m_rng.Chance(50) ? fmac_upper() : MakeUpper(true));
+					Put(micro, e + 16, MakeLower(body_lower[m_rng.Below(std::size(body_lower))]), MakeUpper(m_rng.Chance(50)));
+					const u32 jump = m_rng.Chance(50) ? (LowerOpcodeBits(Lower::JR) | (target_vi << 11)) : (LowerOpcodeBits(Lower::JALR) | (link_vi << 16) | (target_vi << 11));
+					Put(micro, e + 24, jump, m_rng.Chance(50) ? fmac_upper() : MakeUpper(true));
+					Put(micro, e + 32, MakeLower(body_lower[m_rng.Below(std::size(body_lower))]), m_rng.Chance(60) ? fmac_upper() : MakeUpper(true));
+					i += 2 + body + 5 - 1;
+					continue;
+				}
 				if (pattern >= 96 && i + 6 < length)
 				{
 					// A counted loop, as a vertex loop: the counter set, a body of upper ops (some reading registers

@@ -161,28 +161,77 @@ namespace VU1Jit
 	{
 		struct Program;
 
+		// The targets a JR or JALR went to (section 6.4), per block (PC and signature) that it ends: modules compiled
+		// after they were seen go to those that are blocks of the module without leaving generated code.
+		struct Jump
+		{
+			u32 pc;
+			Signature sig;
+			std::vector<u32> targets; // TPC values (byte addresses, unmasked), in the order they were first seen
+		};
+		static constexpr u32 MAX_JUMP_TARGETS = 16;
+		// Merging: a module is compiled again after MergeExits() << (2 * generation) exits to other modules, the first
+		// time, then only if its jumps learned targets since; at most MAX_MERGES times from the same entry, and while
+		// merges took less than MERGE_BUDGET_MS plus MERGE_BUDGET_SHARE of the time since the thread's first Execute.
+		static constexpr u32 MAX_MERGES = 6;
+		static constexpr double MERGE_BUDGET_MS = 250.0;
+		static constexpr double MERGE_BUDGET_SHARE = 0.01;
+		static u64 MergeExits()
+		{
+			// VU1JIT_MERGE_EXITS: lower for the fuzzer, whose programs run once.
+			static const u64 n = [] { const char* e = std::getenv("VU1JIT_MERGE_EXITS"); return e ? std::strtoull(e, nullptr, 10) : 1024; }();
+			return n;
+		}
+
+		static bool ChainingEnabled() // VU1JitEmit.cpp's switch: without it, modules hold one block each
+		{
+			static const bool enabled = !std::getenv("VU1JIT_NOCHAIN");
+			return enabled;
+		}
+
 		struct ExitSlot
 		{
 			BlockExit x;
 			Program* next = nullptr; // the block that follows this exit, while next_epoch is current
 			u32 next_epoch = 0;
+			Jump* jump = nullptr; // a JR/JALR's learned targets, once it went to one
+			u64 count = 0; // times generated code left by it (VU1JIT_EXITS lists the most common)
+			std::vector<std::pair<u32, u64>> targets; // VU1JIT_EXITS: a JR/JALR's targets
 		};
 
-		// One block (VU1JitEmit.h): code from an entry PC for an entry signature, and the micro memory it covers.
-		// A Program without a function marks a (PC, signature) whose first instruction runs on the interpreter.
+		// A module (VU1JitEmit.h, CompileModule): the blocks it holds and the micro memory they cover. A module
+		// without a function marks a (PC, signature) whose first instruction runs on the interpreter.
+		struct Module
+		{
+			struct Range
+			{
+				u32 start;
+				u32 size;
+			};
+			std::vector<Range> ranges; // one per block: the block's PC and size
+			std::vector<Signature> sigs; // one per block: its entry signature
+			std::vector<u8> bytes; // the micro memory it was compiled from, range after range
+			u64 pages; // 256-byte pages of the micro memory it covers
+			bool needs_compare; // a Clear touched its pages since it was last compared
+			bool mismatch; // the last compare failed: other code is there, until a Clear touches its pages again
+			WasmJit::LoadedFunction fn;
+			std::vector<ExitSlot> exits;
+			u32 programs; // its blocks still listed (Program): it is released with the last one
+			// Merging (ThreadState::Merge): exits to other modules since it was compiled, how many times its entry was
+			// recompiled into the module it is, and how many targets its jumps had learned then (JumpTargetCount).
+			u64 chain_exits;
+			u32 generation;
+			u32 jump_targets;
+		};
+
+		// A block of a module, listed per entry PC: the dispatcher can start the module's function at any of them.
 		struct Program
 		{
 			u32 pc;
 			Signature sig;
-			u32 range_start;
-			u32 range_size;
-			u64 pages; // 256-byte pages of the micro memory it covers
-			std::vector<u8> bytes; // the micro memory it was compiled from
-			bool needs_compare; // a Clear touched its pages since it was last compared
-			WasmJit::LoadedFunction fn;
-			std::vector<ExitSlot> exits;
+			Module* module;
+			u32 index; // the block's index in the module
 			u32 last_start; // budget test: cycles from the entry to its last instruction
-			u32 instrs; // instructions in one pass of the block
 			u64 runs;
 		};
 
@@ -207,7 +256,10 @@ namespace VU1Jit
 			bool operator==(const SettingsKey& o) const = default;
 		};
 
-		static constexpr u32 MAX_PROGRAMS = 2000; // section 6.5; LRU eviction is step 4
+		// Section 6.5 (LRU eviction is step 4): the cache is flushed at MAX_MODULES modules or MAX_PROGRAMS blocks listed
+		// (a merged module lists all of its blocks).
+		static constexpr u32 MAX_MODULES = 2000;
+		static constexpr u32 MAX_PROGRAMS = 8192;
 		static constexpr u32 NUM_PCS = VU1_PROGSIZE / 8;
 		static constexpr u32 MAX_VERSIONS_PER_PC = 16; // blocks listed per entry PC (signatures and program versions)
 
@@ -233,8 +285,20 @@ namespace VU1Jit
 			bool SelfTest();
 			void Flush();
 			Program* Find(u32 pc, const Signature& sig);
+			Program* Lookup(u32 pc, const Signature& sig); // Find without compiling: null if no valid module has it
+			static bool Known(void* ctx, u32 pc, const Signature& sig); // for CompileModule
+			static const std::vector<u32>* JumpTargets(void* ctx, u32 pc, const Signature& sig); // for CompileModule
+			Jump* FindJump(u32 pc, const Signature& sig, bool create);
+			bool Matches(Module* m); // the module's code is the micro memory's (section 6.2)
 			Program* FindCurrent(u32 pc); // with the signature of VU1's state, null if refused
 			Program* Compile(u32 pc, const Signature& sig);
+			// Loads a compiled module and lists its blocks; returns its entry block. have_code false: a marker.
+			Program* Install(const CompiledModule& cm, bool have_code, u32 generation);
+			// Recompiles m's entry with every block reachable from it, other modules' included, and the jump targets
+			// learned since; drops the modules the new one holds entirely.
+			void Merge(Module* m);
+			bool WantsMerge(Module* m); // after m's exits to other modules reached the threshold
+			u32 JumpTargetCount(Module* m); // the targets m's jumps have learned so far
 			void Drop(Program* p);
 			const ExitSlot* Run(Program* p);
 			void StepInterpreter();
@@ -243,6 +307,18 @@ namespace VU1Jit
 			Context m_ctx = {};
 			std::array<std::vector<Program*>, NUM_PCS> m_by_pc; // most recently used first
 			std::vector<std::unique_ptr<Program>> m_programs;
+			std::vector<std::unique_ptr<Module>> m_modules;
+			std::vector<std::unique_ptr<Jump>> m_jumps_learned;
+			std::chrono::steady_clock::time_point m_started; // the first Prepare (the merges' time budget)
+			bool m_started_set = false;
+			struct MergedEntry
+			{
+				u32 pc;
+				Signature sig;
+				u32 generation;
+			};
+			std::vector<MergedEntry> m_merged_entries; // how often each entry was merged, past the modules themselves
+			u64 m_run_instrs = 0; // instructions the last Run ran
 			SettingsKey m_key = {};
 			u32 m_seen_gen = ~0u;
 			bool m_selftest_done = false;
@@ -270,7 +346,12 @@ namespace VU1Jit
 			u64 m_native_ops = 0;
 			u64 m_helper_ops = 0;
 			u64 m_jit_instructions = 0;
-			u64 m_loops = 0; // passes looping blocks made without leaving generated code
+			u64 m_edges = 0; // blocks and loop passes followed by the next without leaving generated code
+			u64 m_jumps = 0; // block exits at JR/JALR
+			u64 m_blocks_compiled = 0;
+			u64 m_module_edges = 0; // block exits that go to a block of their module
+			u64 m_merges = 0;
+			double m_merge_ms = 0;
 			u32 m_epoch = 1; // changes whenever a Program may have gone or become stale (chained exits)
 			u64 m_flushes = 0;
 		};
@@ -336,7 +417,7 @@ namespace VU1Jit
 		// A module that imports the shared memory and a C++ helper, reads a word at its constant address and is called
 		// through this thread's table (sections 3.5, 5.2, 5.3).
 		using namespace WasmJit;
-		Module m;
+		WasmJit::Module m;
 		const u32 type = m.type({ValType::I32}, {ValType::I32});
 		m.import_memory("env", "mem", 0, 65536, true);
 		const u32 helper = m.import_function("env", "h_selftest", type);
@@ -377,9 +458,12 @@ namespace VU1Jit
 
 	void ThreadState::Flush()
 	{
-		for (std::unique_ptr<Program>& p : m_programs)
-			WasmJit::Unload(&p->fn);
+		for (std::unique_ptr<Module>& m : m_modules)
+			WasmJit::Unload(&m->fn);
+		m_modules.clear();
 		m_programs.clear();
+		m_jumps_learned.clear();
+		m_merged_entries.clear();
 		for (std::vector<Program*>& list : m_by_pc)
 			list.clear();
 		m_flushes++;
@@ -396,6 +480,11 @@ namespace VU1Jit
 		}
 		if (!m_usable)
 			return false;
+		if (!m_started_set)
+		{
+			m_started_set = true;
+			m_started = std::chrono::steady_clock::now();
+		}
 
 		// Settings generated code depends on (section 7.8): the JIT runs only with both overflow clamps on.
 		if (!EmuConfig.Cpu.Recompiler.vu0Overflow || !EmuConfig.Cpu.Recompiler.vu1Overflow)
@@ -415,10 +504,13 @@ namespace VU1Jit
 		{
 			m_seen_gen = gen;
 			const u64 dirty = CpuWasmVU1.TakeDirtyPages();
-			for (std::unique_ptr<Program>& p : m_programs)
+			for (std::unique_ptr<Module>& m : m_modules)
 			{
-				if (p->pages & dirty)
-					p->needs_compare = true;
+				if (m->pages & dirty)
+				{
+					m->needs_compare = true;
+					m->mismatch = false;
+				}
 			}
 			m_epoch++;
 		}
@@ -429,8 +521,14 @@ namespace VU1Jit
 	{
 		std::vector<Program*>& list = m_by_pc[p->pc >> 3];
 		list.erase(std::find(list.begin(), list.end(), p));
-		WasmJit::Unload(&p->fn);
+		Module* m = p->module;
 		m_programs.erase(std::find_if(m_programs.begin(), m_programs.end(), [p](const auto& q) { return q.get() == p; }));
+		if (--m->programs == 0)
+		{
+			// Its other blocks are no longer listed: nothing can enter it.
+			WasmJit::Unload(&m->fn);
+			m_modules.erase(std::find_if(m_modules.begin(), m_modules.end(), [m](const auto& q) { return q.get() == m; }));
+		}
 		m_dropped++;
 		m_epoch++;
 	}
@@ -446,84 +544,308 @@ namespace VU1Jit
 		return Find(pc, sig);
 	}
 
-	Program* ThreadState::Find(u32 pc, const Signature& sig)
+	bool ThreadState::Matches(Module* m)
+	{
+		// The whole module: its blocks go to each other without the dispatcher.
+		if (m->mismatch)
+			return false;
+		if (m->needs_compare)
+		{
+			const u8* bytes = m->bytes.data();
+			for (const Module::Range& r : m->ranges)
+			{
+				if (std::memcmp(bytes, &VU1.Micro[r.start], r.size) != 0)
+				{
+					m->mismatch = true;
+					return false;
+				}
+				bytes += r.size;
+			}
+			m->needs_compare = false;
+		}
+		return true;
+	}
+
+	Program* ThreadState::Lookup(u32 pc, const Signature& sig)
 	{
 		std::vector<Program*>& list = m_by_pc[pc >> 3];
 		for (size_t i = 0; i < list.size(); i++)
 		{
 			Program* p = list[i];
-			if (p->sig != sig)
-				continue;
-			if (p->needs_compare)
+			// Overlays come back: a module for other code stays listed until it falls off the end (section 6.2).
+			if (p->sig == sig && Matches(p->module))
 			{
-				// Overlays come back: a block for other code stays listed until it falls off the end (section 6.2).
-				if (std::memcmp(p->bytes.data(), &VU1.Micro[p->range_start], p->range_size) != 0)
-					continue;
-				p->needs_compare = false;
+				if (i != 0)
+					std::rotate(list.begin(), list.begin() + i, list.begin() + i + 1);
+				return p;
 			}
-			if (i != 0)
-				std::rotate(list.begin(), list.begin() + i, list.begin() + i + 1);
-			return p;
 		}
+		return nullptr;
+	}
+
+	Program* ThreadState::Find(u32 pc, const Signature& sig)
+	{
+		if (Program* p = Lookup(pc, sig))
+			return p;
+		std::vector<Program*>& list = m_by_pc[pc >> 3];
 		if (list.size() >= MAX_VERSIONS_PER_PC)
 			Drop(list.back());
 		return Compile(pc, sig);
 	}
 
+	bool ThreadState::Known(void* ctx, u32 pc, const Signature& sig)
+	{
+		return static_cast<ThreadState*>(ctx)->Lookup(pc, sig) != nullptr;
+	}
+
+	Jump* ThreadState::FindJump(u32 pc, const Signature& sig, bool create)
+	{
+		for (const std::unique_ptr<Jump>& j : m_jumps_learned)
+		{
+			if (j->pc == pc && j->sig == sig)
+				return j.get();
+		}
+		if (!create)
+			return nullptr;
+		m_jumps_learned.push_back(std::make_unique<Jump>(Jump{pc, sig, {}}));
+		return m_jumps_learned.back().get();
+	}
+
+	const std::vector<u32>* ThreadState::JumpTargets(void* ctx, u32 pc, const Signature& sig)
+	{
+		const Jump* j = static_cast<ThreadState*>(ctx)->FindJump(pc, sig, false);
+		return j ? &j->targets : nullptr;
+	}
+
 	Program* ThreadState::Compile(u32 pc, const Signature& sig)
 	{
-		if (m_programs.size() >= MAX_PROGRAMS)
+		if (m_programs.size() >= MAX_PROGRAMS || m_modules.size() >= MAX_MODULES)
 			Flush();
 
 		const auto t0 = std::chrono::steady_clock::now();
-		CompiledBlock block;
-		const bool have_code = CompileBlock(1, pc, sig, &block);
+		CompiledModule cm;
+		ModuleSource source;
+		source.known = &Known;
+		source.jump_targets = &JumpTargets;
+		source.ctx = this;
+		const bool have_code = CompileModule(pc, sig, source, &cm);
+		if (!have_code)
+			cm.blocks.push_back(CompiledModule::Block{pc, sig, 1, 0}); // a marker: the interpreter runs its instruction
+		// An entry merged before (whose merged module was dropped since) keeps its count: merges stay bounded.
+		u32 generation = 0;
+		for (const MergedEntry& e : m_merged_entries)
+		{
+			if (e.pc == pc && e.sig == sig)
+				generation = e.generation;
+		}
+		Program* entry = Install(cm, have_code, generation);
+		m_compile_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		return entry;
+	}
 
-		auto p = std::make_unique<Program>();
-		p->pc = pc;
-		p->sig = sig;
-		p->range_start = pc;
-		p->range_size = have_code ? block.instrs * 8 : 8;
-		const u32 first = pc >> 8, last = (pc + p->range_size - 1) >> 8;
-		p->pages = ((last == 63) ? ~u64(0) : ((u64(1) << (last + 1)) - 1)) & ~((u64(1) << first) - 1);
-		p->bytes.assign(&VU1.Micro[pc], &VU1.Micro[pc] + p->range_size);
-		p->needs_compare = false;
-		p->last_start = block.last_start;
-		p->instrs = block.instrs;
-		p->runs = 0;
-		for (const BlockExit& x : block.exits)
-			p->exits.push_back(ExitSlot{x, nullptr, 0});
+	Program* ThreadState::Install(const CompiledModule& cm, bool have_code, u32 generation)
+	{
+		auto m = std::make_unique<Module>();
+		m->pages = 0;
+		for (const CompiledModule::Block& b : cm.blocks)
+		{
+			const u32 size = b.instrs * 8;
+			m->ranges.push_back(Module::Range{b.pc, size});
+			m->sigs.push_back(b.sig);
+			m->bytes.insert(m->bytes.end(), &VU1.Micro[b.pc], &VU1.Micro[b.pc] + size);
+			const u32 first = b.pc >> 8, last = (b.pc + size - 1) >> 8;
+			m->pages |= ((last == 63) ? ~u64(0) : ((u64(1) << (last + 1)) - 1)) & ~((u64(1) << first) - 1);
+		}
+		m->needs_compare = false;
+		m->mismatch = false;
+		m->programs = 0;
+		m->chain_exits = 0;
+		m->generation = generation;
+		m->jump_targets = 0; // after the load below, which may flush the learned targets
+		for (const BlockExit& x : cm.exits)
+			m->exits.push_back(ExitSlot{x});
 
 		if (have_code)
 		{
-			WasmJit::LoadResult result = WasmJit::Load(block.wasm, "run", &p->fn);
+			WasmJit::LoadResult result = WasmJit::Load(cm.wasm, "run", &m->fn);
 			if (result == WasmJit::LoadResult::OutOfMemory && !m_out_of_memory_once)
 			{
 				// Section 6.5: flush and retry once; a second failure switches the JIT off for this thread.
 				m_out_of_memory_once = true;
 				Console.Warning("VU1 JIT: out of executable memory, flushing the program cache");
 				Flush();
-				result = WasmJit::Load(block.wasm, "run", &p->fn);
+				result = WasmJit::Load(cm.wasm, "run", &m->fn);
 			}
 			if (result != WasmJit::LoadResult::Ok)
 			{
 				Console.Error(fmt::format("VU1 JIT: a module failed to load (result {}, {} bytes, pc {:#x}); VU1 runs on the interpreter",
-					static_cast<int>(result), block.wasm.size(), pc));
+					static_cast<int>(result), cm.wasm.size(), cm.blocks[0].pc));
 				m_usable = false;
 				return nullptr;
 			}
 			m_compiles++;
-			m_native_ops += block.native_ops;
-			m_helper_ops += block.helper_ops;
+			m_blocks_compiled += cm.blocks.size();
+			m_module_edges += cm.edges;
+			m_native_ops += cm.native_ops;
+			m_helper_ops += cm.helper_ops;
 		}
-		m_compile_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-		Program* raw = p.get();
-		m_programs.push_back(std::move(p));
-		std::vector<Program*>& list = m_by_pc[pc >> 3];
-		list.insert(list.begin(), raw);
+		// Every block is an entry for the dispatcher, the module's entry block first.
+		Module* raw = m.get();
+		raw->jump_targets = JumpTargetCount(raw);
+		m_modules.push_back(std::move(m));
+		Program* entry = nullptr;
+		for (u32 k = 0; k < cm.blocks.size(); k++)
+		{
+			const CompiledModule::Block& b = cm.blocks[k];
+			std::vector<Program*>& list = m_by_pc[b.pc >> 3];
+			if (list.size() >= MAX_VERSIONS_PER_PC)
+			{
+				if (k != 0 && list.back()->module == raw)
+					continue; // reached inside the module only
+				Drop(list.back());
+			}
+			auto p = std::make_unique<Program>();
+			p->pc = b.pc;
+			p->sig = b.sig;
+			p->module = raw;
+			p->index = k;
+			p->last_start = b.last_start;
+			p->runs = 0;
+			raw->programs++;
+			list.insert(list.begin(), p.get());
+			if (k == 0)
+				entry = p.get();
+			m_programs.push_back(std::move(p));
+		}
 		CpuWasmVU1.SetCommittedCache(m_compiles * 20 * _1kb); // about 20 KB per module (section 6.5)
-		return raw;
+		m_epoch++;
+		return entry;
+	}
+
+	u32 ThreadState::JumpTargetCount(Module* m)
+	{
+		u32 n = 0;
+		for (ExitSlot& slot : m->exits)
+		{
+			if (!slot.x.dynamic_tpc)
+				continue;
+			if (!slot.jump)
+				slot.jump = FindJump(m->ranges[slot.x.block].start, m->sigs[slot.x.block], false);
+			if (slot.jump)
+				n += static_cast<u32>(slot.jump->targets.size());
+		}
+		return n;
+	}
+
+	bool ThreadState::WantsMerge(Module* m)
+	{
+		if (m->generation >= MAX_MERGES || !ChainingEnabled())
+			return false;
+		// A merged module again only for targets its jumps learned since: the rest it could hold, it holds.
+		if (m->generation > 0 && JumpTargetCount(m) <= m->jump_targets)
+			return false;
+		static const bool testing = std::getenv("VU1JIT_MERGE_EXITS") != nullptr; // the fuzzer: every merge it can make
+		const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m_started).count();
+		return testing || m_merge_ms < MERGE_BUDGET_MS + MERGE_BUDGET_SHARE * elapsed;
+	}
+
+	void ThreadState::Merge(Module* old)
+	{
+		const auto t0 = std::chrono::steady_clock::now();
+		const u32 pc = old->ranges[0].start;
+		const Signature sig = old->sigs[0];
+		const u32 generation = old->generation + 1;
+		bool listed = false;
+		for (MergedEntry& e : m_merged_entries)
+		{
+			if (e.pc == pc && e.sig == sig)
+			{
+				e.generation = std::max(e.generation, generation);
+				listed = true;
+			}
+		}
+		if (!listed)
+			m_merged_entries.push_back(MergedEntry{pc, sig, generation});
+		CompiledModule cm;
+		ModuleSource source;
+		source.jump_targets = &JumpTargets;
+		source.ctx = this;
+		// The modules it goes to become one with it (their entries are roots), so that code is compiled into one
+		// module only: copies of hot code in several modules would cost instruction cache.
+		const auto add_root = [&](u32 tpc, const Signature& tsig) {
+			const Program* q = Lookup(tpc, tsig);
+			if (!q || q->module == old || !q->module->fn.IsLoaded())
+				return;
+			const std::pair<u32, Signature> root(q->module->ranges[0].start, q->module->sigs[0]);
+			if (std::find(source.roots.begin(), source.roots.end(), root) == source.roots.end())
+				source.roots.push_back(root);
+		};
+		for (const ExitSlot& slot : old->exits)
+		{
+			const BlockExit& x = slot.x;
+			if (x.kind != ExitKind::Boundary || (x.reason != ExitReason::Block && x.reason != ExitReason::Cap) || !x.chain || x.ebit)
+				continue;
+			if (!x.dynamic_tpc)
+				add_root(x.tpc & VU1_PROGMASK, x.sig);
+			else if (slot.jump)
+			{
+				for (const u32 t : slot.jump->targets)
+					add_root(t & VU1_PROGMASK, x.sig);
+			}
+		}
+		// And its own blocks (a merged module started from several roots), so that the new one holds them all and
+		// replaces it. It is not merged again in any case.
+		for (size_t k = 1; k < old->ranges.size(); k++)
+		{
+			const std::pair<u32, Signature> root(old->ranges[k].start, old->sigs[k]);
+			if (std::find(source.roots.begin(), source.roots.end(), root) == source.roots.end())
+				source.roots.push_back(root);
+		}
+		old->generation = MAX_MERGES;
+		if (!CompileModule(pc, sig, source, &cm))
+			return;
+		const Program* entry = Install(cm, true, generation);
+		m_merges++;
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		m_merge_ms += ms;
+		static const bool log_merges = std::getenv("VU1JIT_EXITS") != nullptr;
+		if (log_merges)
+			Console.WriteLn(fmt::format("VU1 JIT merge: entry {:#06x} sig {:08x} generation {}, {} roots, {} blocks, {} exits to "
+										"its own blocks, {:.1f} ms",
+				pc, sig.Hash(), generation, source.roots.size(), cm.blocks.size(), cm.edges, ms));
+		if (!entry)
+			return;
+
+		// The modules whose blocks the new one all holds: nothing would enter them any more.
+		const Module* merged = entry->module;
+		std::vector<Module*> contained;
+		for (const std::unique_ptr<Module>& m : m_modules)
+		{
+			if (m.get() == merged || !m->fn.IsLoaded())
+				continue;
+			bool all = true;
+			for (size_t k = 0; k < m->ranges.size() && all; k++)
+			{
+				bool found = false;
+				for (size_t j = 0; j < merged->ranges.size() && !found; j++)
+					found = merged->ranges[j].start == m->ranges[k].start && merged->sigs[j] == m->sigs[k];
+				all = found;
+			}
+			if (all)
+				contained.push_back(m.get());
+		}
+		for (Module* m : contained)
+		{
+			std::vector<Program*> programs;
+			for (const std::unique_ptr<Program>& p : m_programs)
+			{
+				if (p->module == m)
+					programs.push_back(p.get());
+			}
+			for (Program* p : programs)
+				Drop(p); // the last one releases the module
+		}
 	}
 
 	const ExitSlot* ThreadState::Run(Program* p)
@@ -532,18 +854,20 @@ namespace VU1Jit
 		p->runs++;
 		NormalizeRings(VU1);
 		g_block_base = VU1.cycle;
-		g_block_loops = 0;
-		const u32 id = static_cast<u32>(reinterpret_cast<s32 (*)(s32)>(static_cast<uptr>(p->fn.slot))(0));
-		if (id >= p->exits.size())
+		Module* m = p->module;
+		const u32 id = static_cast<u32>(reinterpret_cast<s32 (*)(s32)>(static_cast<uptr>(m->fn.slot))(static_cast<s32>(p->index)));
+		if (id >= m->exits.size())
 		{
 			m_bad_runs++;
 			pxFailRel("VU1 JIT: generated code returned a bad exit");
 			return nullptr;
 		}
-		const ExitSlot& x = p->exits[id];
-		ApplyExit(VU1, x.x, g_block_base); // a looping block moved the base to the pass that exited
-		const u64 instrs = x.x.instrs + static_cast<u64>(g_block_loops) * p->instrs;
-		m_loops += g_block_loops;
+		ExitSlot& x = m->exits[id];
+		x.count++;
+		ApplyExit(VU1, x.x, g_block_base); // the base of the block, or loop pass, that exited
+		const u64 instrs = x.x.instrs + static_cast<u64>(g_chain_instrs);
+		m_edges += g_chain_edges;
+		m_run_instrs = instrs;
 		m_instructions += instrs;
 		m_jit_instructions += instrs;
 		s_run_instructions += instrs;
@@ -608,7 +932,7 @@ namespace VU1Jit
 			if (!m_usable)
 				p = nullptr;
 			// The interpreter tests the budget before each instruction: the block's last one must start inside it.
-			if (!p || !p->fn.IsLoaded() || (VU1.cycle - start) + p->last_start >= cycles)
+			if (!p || !p->module->fn.IsLoaded() || (VU1.cycle - start) + p->last_start >= cycles)
 			{
 				StepInterpreter();
 				continue;
@@ -627,7 +951,8 @@ namespace VU1Jit
 			{
 				Console.WriteLn(fmt::format("  block {:#06x} sig {} cycle {} status {:#x} mac {:#x}", p->pc, p->sig.ToString(), VU1.cycle,
 					VU1.VI[REG_STATUS_FLAG].UL, VU1.VI[REG_MAC_FLAG].UL));
-				for (u32 i = 0; i < 64 && p->pc + i * 8 < p->range_start + p->range_size; i++)
+				const Module::Range& r = p->module->ranges[p->index];
+				for (u32 i = 0; i < 64 && p->pc + i * 8 < r.start + r.size; i++)
 				{
 					const u32* w = reinterpret_cast<const u32*>(&VU1.Micro[p->pc + i * 8]);
 					Console.WriteLn(fmt::format("    {:#06x}: {}", p->pc + i * 8, Disassemble(w[0], w[1])));
@@ -639,7 +964,7 @@ namespace VU1Jit
 			const BlockExit& x = xs->x;
 			if (g_trace)
 				Console.WriteLn(fmt::format("  -> exit {} kind {} reason {} instrs {} tpc {:#x} cycle {} status {:#x} mac {:#x}",
-					static_cast<int>(xs - p->exits.data()), static_cast<int>(x.kind), static_cast<int>(x.reason), x.instrs,
+					static_cast<int>(xs - p->module->exits.data()), static_cast<int>(x.kind), static_cast<int>(x.reason), m_run_instrs,
 					VU1.VI[REG_TPC].UL, VU1.cycle, VU1.VI[REG_STATUS_FLAG].UL, VU1.VI[REG_MAC_FLAG].UL));
 			if (block_check)
 			{
@@ -648,7 +973,7 @@ namespace VU1Jit
 				RestoreRunState(*m_ls_start);
 				{
 					RecordingScope scope(nullptr, nullptr, false);
-					for (u32 i = 0; i < x.instrs; i++)
+					for (u64 i = 0; i < m_run_instrs; i++)
 						CpuIntVU1.Step();
 				}
 				CaptureRunState(m_ls_ref.get());
@@ -658,7 +983,7 @@ namespace VU1Jit
 				if (!diff.empty())
 				{
 					Console.Error(fmt::format("VU1 JIT block check: block at {:#06x} sig {} exit {} ({} instrs): {}", p->pc,
-						p->sig.ToString(), static_cast<int>(xs - p->exits.data()), x.instrs, diff));
+						p->sig.ToString(), static_cast<int>(xs - p->module->exits.data()), m_run_instrs, diff));
 					for (u32 i = 0; i < std::max<u32>(x.instrs, 1) + 1 && p->pc + i * 8 < VU1_PROGSIZE; i++)
 					{
 						const u32* w = reinterpret_cast<const u32*>(&VU1.Micro[p->pc + i * 8]);
@@ -686,16 +1011,53 @@ namespace VU1Jit
 			{
 				ExitSlot& slot = const_cast<ExitSlot&>(*xs);
 				const u32 tpc = VU1.VI[REG_TPC].UL & VU1_PROGMASK;
+				Module* m = p->module;
 				if (x.dynamic_tpc)
-					next = Find(tpc, x.sig);
+				{
+					m_jumps++;
+					static const bool exit_stats = std::getenv("VU1JIT_EXITS") != nullptr;
+					if (exit_stats)
+					{
+						auto it = std::find_if(slot.targets.begin(), slot.targets.end(), [tpc](const auto& t) { return t.first == tpc; });
+						if (it != slot.targets.end())
+							it->second++;
+						else if (slot.targets.size() < 8)
+							slot.targets.emplace_back(tpc, 1);
+					}
+					// Learning (section 6.4): the target as generated code would compare it.
+					if (!slot.jump)
+						slot.jump = FindJump(m->ranges[x.block].start, m->sigs[x.block], true);
+					const u32 target = VU1.VI[REG_TPC].UL;
+					std::vector<u32>& targets = slot.jump->targets;
+					if (targets.size() < MAX_JUMP_TARGETS && std::find(targets.begin(), targets.end(), target) == targets.end())
+						targets.push_back(target);
+				}
+				// A module that often leaves for another one is compiled again with every block it reaches, its jumps'
+				// learned targets included; the exits after that go to the new module.
+				const Signature sig = x.sig;
+				const bool dynamic = x.dynamic_tpc;
+				bool merged = false;
+				if (++m->chain_exits >= (MergeExits() << (2 * m->generation)))
+				{
+					m->chain_exits = 0; // tested again after as many exits
+					if (WantsMerge(m))
+					{
+						Merge(m); // p, xs and x may be gone
+						merged = true;
+					}
+				}
+				if (merged || dynamic)
+				{
+					next = Find(tpc, sig);
+				}
 				else if (slot.next && slot.next_epoch == m_epoch)
 					next = slot.next;
 				else
 				{
-					const u64 flushes = m_flushes;
+					const u64 flushes = m_flushes, dropped = m_dropped;
 					next = Find(tpc, x.sig);
-					// Find may flush the cache, this exit's program included: remember the link only if it did not.
-					if (m_flushes == flushes)
+					// Find may flush the cache or drop this exit's module: remember the link only if it did neither.
+					if (m_flushes == flushes && m_dropped == dropped)
 					{
 						slot.next = next;
 						slot.next_epoch = m_epoch;
@@ -778,16 +1140,48 @@ namespace VU1Jit
 			if (m_exits[i])
 				exits += fmt::format("{}{} {}", exits.empty() ? "" : ", ", reasons[i], m_exits[i]);
 		}
-		Console.WriteLn(fmt::format("VU1 JIT: {} executes, {} programs compiled ({:.1f} ms), {} alive, {} dropped"
-									" (versions per PC), {} flushes; {} entries into generated code, {} bad returns; "
-									"{} instructions, {} of them on the interpreter; exits: {}; {} lookups refused for "
-									"the pipeline state; {} EE-thread Clears",
-			m_executes, m_compiles, m_compile_ms, m_programs.size(), m_dropped, m_flushes, m_entries, m_bad_runs,
-			m_instructions, m_fallback_steps, exits.empty() ? "none" : exits, m_refused, CpuWasmVU1.GetEEThreadClears()));
+		size_t learned = 0;
+		for (const std::unique_ptr<Jump>& j : m_jumps_learned)
+			learned += j->targets.size();
+		Console.WriteLn(fmt::format("VU1 JIT: {} executes, {} modules compiled ({} blocks, {} exits to a block of their module; "
+									"{:.1f} ms, {} of them merges of {:.1f} ms), {} modules and {} blocks listed, {} dropped (versions "
+									"per PC and merges), {} flushes; {} jump targets learned; {} entries into generated code, {} bad "
+									"returns; {} instructions, {} of them on the interpreter; exits: {} ({} of the block exits at "
+									"JR/JALR); {} lookups refused for the pipeline state; {} EE-thread Clears",
+			m_executes, m_compiles, m_blocks_compiled, m_module_edges, m_compile_ms + m_merge_ms, m_merges, m_merge_ms, m_modules.size(),
+			m_programs.size(), m_dropped, m_flushes, learned, m_entries, m_bad_runs, m_instructions, m_fallback_steps,
+			exits.empty() ? "none" : exits, m_jumps, m_refused, CpuWasmVU1.GetEEThreadClears()));
 		Console.WriteLn(fmt::format("VU1 JIT: {} instructions in generated code ({:.2f}%), compiled ops {} native, {} through helpers; "
-									"{} loop passes without leaving generated code",
+									"{} times a block or a loop's pass went to the next without leaving generated code",
 			m_jit_instructions, m_instructions ? 100.0 * m_jit_instructions / m_instructions : 0.0, m_native_ops, m_helper_ops,
-			m_loops));
+			m_edges));
+		if (std::getenv("VU1JIT_EXITS"))
+		{
+			// Debugging: the exits of the modules still alive that left generated code most often.
+			std::vector<std::pair<const Module*, const ExitSlot*>> all;
+			for (const std::unique_ptr<Module>& m : m_modules)
+			{
+				for (const ExitSlot& x : m->exits)
+				{
+					if (x.count)
+						all.emplace_back(m.get(), &x);
+				}
+			}
+			std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second->count > b.second->count; });
+			for (size_t i = 0; i < std::min<size_t>(all.size(), 16); i++)
+			{
+				const auto& [m, x] = all[i];
+				const u32 tpc = x->x.tpc & VU1_PROGMASK;
+				const u32* w = reinterpret_cast<const u32*>(&VU1.Micro[tpc]);
+				std::string targets;
+				for (const auto& [t, n] : x->targets)
+					targets += fmt::format(" {:#06x}:{}", t, n);
+				Console.WriteLn(fmt::format("VU1 JIT exit: {} times, module at {:#06x} ({} blocks), block {:#06x} exit {} after {} reason {} {} tpc {:#06x} sig {}: {}{}",
+					x->count, m->ranges[0].start, m->ranges.size(), x->x.block_pc, static_cast<int>(x - m->exits.data()), x->x.instrs,
+					reasons[static_cast<u32>(x->x.reason)], x->x.dynamic_tpc ? "dynamic" : "static", tpc, x->x.sig.ToString(),
+					x->x.dynamic_tpc ? "" : Disassemble(w[0], w[1]), targets));
+			}
+		}
 		if (s_oracle)
 			m_oracle.LogSummary("VU1 JIT timing oracle");
 		if (s_lockstep)
