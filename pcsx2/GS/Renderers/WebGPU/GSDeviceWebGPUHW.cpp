@@ -1557,7 +1557,8 @@ void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
 	{
 		m_skipped_draws++;
 		// A draw skipped while its pipeline is created still resolves the colour clip target as the draw
-		// would have. (A pipeline that failed keeps the old early return.)
+		// would have. (A pipeline that failed keeps the old early return.) Needs proper testing: no game
+		// tried so far skipped a colour clip draw.
 		if (!ready)
 			finish_colclip();
 		return;
