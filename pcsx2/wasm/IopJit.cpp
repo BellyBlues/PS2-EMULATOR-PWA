@@ -3,7 +3,7 @@
 
 // IOP (R3000A) JIT for WebAssembly.
 //
-// Built like the EE JIT (EEJit.cpp): blocks of one 4 KB page compiled together into one module, compiled and
+// Built like the EE JIT (EEJit.cpp): hot blocks (JitHeat.h) compiled together into one module, compiled and
 // instantiated synchronously on the EE thread (which runs the IOP) and called through its function table. A block
 // runs from its entry to an unconditional jump, a branch the JIT leaves to the interpreter, the end of the page or
 // a length cap; taken conditional branches leave it, branches not taken go on with their delay slot, as in the
@@ -32,6 +32,7 @@
 
 #include "wasm/CodeWrites.h"
 #include "wasm/IopJit.h"
+#include "wasm/JitHeat.h"
 #include "wasm/WasmEmitter.h"
 #include "wasm/WasmJitRuntime.h"
 
@@ -57,7 +58,9 @@ namespace
 
 	constexpr u32 kPageWords = 1024;
 	constexpr u32 kMaxBlockInstrs = 256;
-	constexpr u32 kMaxGroupBlocks = 32;
+	constexpr u32 kMaxGroupBlocks = 32; // blocks of the entry's page
+	constexpr u32 kMaxModuleBlocks = 64; // with warm entries of other pages
+	constexpr size_t kMaxWarm = 1u << 16;
 	constexpr size_t kMaxGroups = 3000;
 	// A block runs at most kMaxBlockInstrs + 1 instructions (a delay slot after the last).
 	constexpr u64 kRunLimit = 0x10000;
@@ -77,6 +80,7 @@ namespace
 	int* s_pages[1u << 20];
 	std::unordered_map<int, Group*> s_slot_group;
 	std::vector<std::unique_ptr<Group>> s_groups;
+	std::vector<u32> s_warm; // entries that ran JitHeat::iop.batch times, compiled with the next module, oldest first
 	bool s_flush_requested = false;
 	bool s_failed = false;
 	const uptr* s_rlut = nullptr;
@@ -782,12 +786,38 @@ namespace
 	// ------------------------------------------------------------------------------------------------------------
 	// Cache
 
-	int& SlotRef(u32 pc)
+	// A page holds the slots of its words, then their heat (JitHeat.h), as in the EE JIT.
+	int* PageRef(u32 pc)
 	{
 		int*& page = s_pages[pc >> 12];
 		if (!page)
-			page = new int[kPageWords]();
-		return page[(pc >> 2) & (kPageWords - 1)];
+			page = new int[kPageWords * 2]();
+		return page;
+	}
+
+	int& SlotRef(u32 pc)
+	{
+		return PageRef(pc)[(pc >> 2) & (kPageWords - 1)];
+	}
+
+	int& HeatRef(u32 pc)
+	{
+		return PageRef(pc)[kPageWords + ((pc >> 2) & (kPageWords - 1))];
+	}
+
+	// Counts an entry at pc that is not compiled; true once it is hot.
+	bool Warm(u32 pc)
+	{
+		int& heat = HeatRef(pc);
+		if (static_cast<u32>(heat) + 1 < JitHeat::iop.threshold)
+		{
+			heat++;
+			if (static_cast<u32>(heat) == JitHeat::iop.batch && s_warm.size() < kMaxWarm)
+				s_warm.push_back(pc);
+			return false;
+		}
+		heat = static_cast<int>(JitHeat::iop.threshold - 1);
+		return JitHeat::CanCompile();
 	}
 
 	void ReleaseSlot(int slot)
@@ -808,13 +838,21 @@ namespace
 		}
 	}
 
-	void FlushAll()
+	// keep_heat: when the cache is full, so that only hot code is compiled again.
+	void FlushAll(bool keep_heat)
 	{
 		for (int*& page : s_pages)
 		{
+			if (page && keep_heat)
+			{
+				std::fill(page, page + kPageWords, 0);
+				continue;
+			}
 			delete[] page;
 			page = nullptr;
 		}
+		if (!keep_heat)
+			s_warm.clear();
 		for (auto& [slot, g] : s_slot_group)
 			wasmjit_remove_function(slot);
 		s_slot_group.clear();
@@ -827,14 +865,11 @@ namespace
 		s_flushes++;
 	}
 
-	// Compiles the block at entry and its neighbours in the same page into one module. False if it cannot.
+	// Compiles the block at entry, its neighbours in the same page and the warm entries of any page (JitHeat.h) into
+	// one module. False if entry cannot be compiled.
 	bool CompileGroup(u32 entry)
 	{
-		if ((entry & 3) || IsIrxHookPc(entry))
-			return false;
-		const u32 page = entry & ~4095u;
-		const u32* host = CodeHost(page);
-		if (!host)
+		if ((entry & 3) || IsIrxHookPc(entry) || !CodeHost(entry & ~4095u))
 			return false;
 
 		Common::Timer timer;
@@ -845,17 +880,39 @@ namespace
 		m.import_memory("env", "mem", 0, 65536, true);
 		m.import_table("env", "table", 0);
 
-		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxGroupBlocks);
+		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxModuleBlocks);
 		std::vector<u32> pcs;
 		std::vector<u32> work{entry};
-		while (!work.empty() && pcs.size() < kMaxGroupBlocks)
+		u32 first = entry; // the entry whose neighbours `work` holds
+		size_t warm_taken = 0;
+		for (;;)
 		{
+			// The entry's page first, then each warm entry with its own warm neighbours (as in the EE JIT).
+			if (work.empty() || pcs.size() >= kMaxGroupBlocks)
+			{
+				work.clear();
+				while (warm_taken < s_warm.size() && work.empty())
+				{
+					const u32 pc = s_warm[warm_taken++];
+					if (SlotRef(pc) == 0 && static_cast<u32>(HeatRef(pc)) >= JitHeat::iop.batch &&
+						std::find(pcs.begin(), pcs.end(), pc) == pcs.end() && !IsIrxHookPc(pc) &&
+						CodeHost(pc & ~4095u))
+					{
+						work.push_back(pc);
+						first = pc;
+					}
+				}
+				if (work.empty() || pcs.size() >= kMaxModuleBlocks)
+					break;
+			}
 			const u32 pc = work.front();
 			work.erase(work.begin());
 			if (std::find(pcs.begin(), pcs.end(), pc) != pcs.end() || IsIrxHookPc(pc))
 				continue;
-			if (pc != entry && SlotRef(pc) != 0)
+			if (pc != first && (SlotRef(pc) != 0 || static_cast<u32>(HeatRef(pc)) < JitHeat::iop.neighbour))
 				continue;
+			const u32 page = pc & ~4095u;
+			const u32* host = CodeHost(page);
 			std::vector<u32> next;
 			BlockCompiler bc(t_v_v, t_i_v, page, host, &checked[pcs.size()]);
 			Function& fn = bc.Run(pc, &next);
@@ -867,6 +924,7 @@ namespace
 			for (u32 n : next)
 				work.push_back(n);
 		}
+		s_warm.erase(s_warm.begin(), s_warm.begin() + warm_taken);
 
 		const std::vector<u8> bytes = m.finish();
 		s_wasm_bytes += bytes.size();
@@ -878,7 +936,7 @@ namespace
 				wasmjit_release(module);
 			if (module < 0 || instance < 0)
 			{
-				FlushAll(); // out of executable memory: start again with an empty cache
+				FlushAll(true); // out of executable memory: start again with an empty cache
 				return false;
 			}
 			Console.Error("IOP JIT: generated code for %08x did not compile; using the interpreter.", entry);
@@ -912,8 +970,10 @@ namespace
 		s_blocks_compiled += pcs.size();
 		s_groups_compiled++;
 		s_groups.push_back(std::move(g));
-		s_compile_ns += static_cast<u64>(timer.GetTimeNanoseconds());
-		PerfCounters::Add(PerfCounters::jit_compile_ns, static_cast<u64>(timer.GetTimeNanoseconds()));
+		const u64 ns = static_cast<u64>(timer.GetTimeNanoseconds());
+		s_compile_ns += ns;
+		PerfCounters::Add(PerfCounters::jit_compile_ns, ns);
+		JitHeat::Spend(ns);
 		return true;
 	}
 } // namespace
@@ -933,42 +993,49 @@ void IopJit::Run(u64 last_cycle)
 	}
 	if (s_flush_requested || s_groups.size() > kMaxGroups || s_rlut != psxMemRLUT || s_wlut != psxMemWLUT)
 	{
-		FlushAll();
+		FlushAll(!s_flush_requested && s_rlut == psxMemRLUT && s_wlut == psxMemWLUT);
 		s_flush_requested = false;
 		s_rlut = psxMemRLUT;
 		s_wlut = psxMemWLUT;
 	}
 
 	const bool* const branched = psxJitBranchFlag();
+	// Whether the PC was reached by a jump, a taken branch or an exception, or by leaving compiled code: the
+	// places blocks start, whose runs count towards compiling them (JitHeat.h). A run starts after a branch.
+	bool entry = true;
 	for (;;)
 	{
+		const u32 pc = psxRegs.pc;
 		// Near the end of a run without a branch: one instruction at a time, so that it ends where it would.
 		if (psxRegs.cycle - last_cycle >= kRunLimit - kGuardMargin) [[unlikely]]
 		{
 			s_interp_steps++;
 			if (psxJitExecOne(last_cycle))
 				return;
+			entry = psxRegs.pc != pc + 4;
 			continue;
 		}
-		const u32 pc = psxRegs.pc;
 		int* const page = s_pages[pc >> 12];
 		const int slot = page ? page[(pc >> 2) & (kPageWords - 1)] : 0;
 		if (slot)
 		{
+			entry = true;
 			if (reinterpret_cast<BlockFn>(static_cast<uptr>(slot))() == 0) [[likely]]
 			{
 				if (*branched)
 					return;
 				continue;
 			}
-			// The code changed.
+			// The code changed: the new code has to become hot again.
 			s_invalidations++;
 			ReleaseSlot(slot);
 			page[(pc >> 2) & (kPageWords - 1)] = 0;
+			page[kPageWords + ((pc >> 2) & (kPageWords - 1))] = 0;
 		}
 		if (s_groups.size() > kMaxGroups)
-			FlushAll();
-		if (!CompileGroup(pc))
+			FlushAll(true);
+		const bool compile = JitHeat::iop.threshold <= 1 ? JitHeat::CanCompile() : (entry && Warm(pc));
+		if (!compile || !CompileGroup(pc))
 		{
 			if (s_failed)
 			{
@@ -979,8 +1046,14 @@ void IopJit::Run(u64 last_cycle)
 			s_interp_steps++;
 			if (psxJitExecOne(last_cycle))
 				return;
+			entry = psxRegs.pc != pc + 4;
 		}
 	}
+}
+
+u64 IopJit::CompileNs()
+{
+	return s_compile_ns;
 }
 
 void IopJit::PrintStats()

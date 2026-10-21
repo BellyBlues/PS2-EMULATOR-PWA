@@ -386,7 +386,7 @@ Done: `ARCH_WASM`/`SIMD_SSE` (`common/Pcsx2Defs.h`, `cmake/BuildParameters.cmake
    - A per-thread table and instance registry with caps.
    - Imports bound to raw `wasmExports`, not JS thunks.
    - Bytes copied with `slice()` before compile (Firefox 138–150 rejects SAB views).
-   - A hotness threshold.
+   - A hotness threshold (done for the EE and IOP JITs, with a per-vsync compile budget: `pcsx2/wasm/JitHeat.h`).
 2. **microVU1 → wasm, v1** (L). Keep the program cache, `microVU_Analyze.inl` and the flag-instance logic. Emit SIMD128, and fall back to the interpreter per op for anything not yet covered.
 3. **microVU1 full coverage** (XL). The x86 microVU is about 10.6k lines including macro ops, and clamping, flag instances and pipeline-state-keyed blocks must all be re-emitted. LRPS2's full AArch64 rewrite still reports VU1 at about 70 % coverage. Then enable MTVU (`THREAD_VU1` tied to `REC_VU1`).
 4. **EE JIT** (XL).

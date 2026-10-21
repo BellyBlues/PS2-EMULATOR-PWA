@@ -313,7 +313,10 @@ The headless runner has the same switches and more: `-eejit 0`, `-iopjit 0`, `-s
 `-vu1jit-fuzz SEED:COUNT[:MODE]`, `-vu1jit-oracle` (the timing model checked at every VU1
 instruction of a real run), `-vu1jit-lockstep` (every VU1 program run on the JIT and on the
 interpreter and compared), `-vu1jit-stats FILE` (per-vsync VU1 statistics as CSV) and `-mtvu-sync`
-(the EE waits for the VU thread at each check, so whole runs repeat exactly).
+(the EE waits for the VU thread at each check, so whole runs repeat exactly). The EE and IOP JITs
+compile a block once it has run 128 times, within 4 ms of compiling per vsync (`pcsx2/wasm/JitHeat.h`):
+`-eejit-hot N[,M[,B]]`, `-iopjit-hot N[,M[,B]]` and `-jit-budget US` change that, and
+`-jit-compile-stats VSYNCS` prints their compile time, total and worst vsync, every VSYNCS vsyncs.
 
 ## UI assets
 

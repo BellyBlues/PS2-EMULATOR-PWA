@@ -6,7 +6,8 @@
 // Guest code is compiled block by block into WebAssembly functions, several blocks of one 4 KB page per module,
 // compiled and instantiated synchronously on the EE thread and called through its function table
 // (WasmJitRuntime.h). A block is a superblock: it runs from its entry to an unconditional jump, a branch the JIT
-// leaves to the interpreter, the end of the page or a length cap; taken conditional branches leave it.
+// leaves to the interpreter, the end of the page or a length cap; taken conditional branches leave it. New code runs
+// on the interpreter until it is hot: JitHeat.h says when a block is compiled and what goes into its module.
 //
 // The code reproduces the interpreter (pcsx2/Interpreter.cpp) exactly, so that emulation does not change:
 // - Cycles: every instruction adds its opcode table cycles times the Config.DIE factor to cpuBlockCycles before it
@@ -31,6 +32,7 @@
 //   interpreter would see the new instruction); needs proper testing with games that do that.
 
 #include "Common.h"
+#include "Counters.h"
 #include "wasm/PerfCounters.h"
 #include "R5900OpcodeTables.h"
 #include "vtlb.h"
@@ -39,6 +41,7 @@
 
 #include "wasm/CodeWrites.h"
 #include "wasm/EEJit.h"
+#include "wasm/JitHeat.h"
 #include "wasm/WasmEmitter.h"
 #include "wasm/WasmJitRuntime.h"
 
@@ -115,7 +118,9 @@ namespace
 
 	constexpr u32 kPageWords = 1024;
 	constexpr u32 kMaxBlockInstrs = 256;
-	constexpr u32 kMaxGroupBlocks = 32;
+	constexpr u32 kMaxGroupBlocks = 32; // blocks of the entry's page
+	constexpr u32 kMaxModuleBlocks = 64; // with warm entries of other pages
+	constexpr size_t kMaxWarm = 1u << 16;
 	constexpr size_t kMaxGroups = 6000; // about 20 KB each in V8; flush everything beyond
 
 	using BlockFn = int (*)();
@@ -139,6 +144,7 @@ namespace
 	int* s_pages[1u << 20];
 	std::unordered_map<int, Group*> s_slot_group;
 	std::vector<std::unique_ptr<Group>> s_groups;
+	std::vector<u32> s_warm; // entries that ran JitHeat::ee.batch times, compiled with the next module, oldest first
 	bool s_flush_requested = false;
 	bool s_link = false; // block linking (tail calls): set by Execute() when the engine has them
 	bool s_failed = false;
@@ -2054,12 +2060,39 @@ namespace
 	// ------------------------------------------------------------------------------------------------------------
 	// Cache
 
-	int& SlotRef(u32 pc)
+	// A page holds the slots of its words, then their heat (JitHeat.h): how many times the dispatcher reached each
+	// one as a block entry while it was not compiled.
+	int* PageRef(u32 pc)
 	{
 		int*& page = s_pages[pc >> 12];
 		if (!page)
-			page = new int[kPageWords]();
-		return page[(pc >> 2) & (kPageWords - 1)];
+			page = new int[kPageWords * 2]();
+		return page;
+	}
+
+	int& SlotRef(u32 pc)
+	{
+		return PageRef(pc)[(pc >> 2) & (kPageWords - 1)];
+	}
+
+	int& HeatRef(u32 pc)
+	{
+		return PageRef(pc)[kPageWords + ((pc >> 2) & (kPageWords - 1))];
+	}
+
+	// Counts an entry at pc that is not compiled; true once it is hot.
+	bool Warm(u32 pc)
+	{
+		int& heat = HeatRef(pc);
+		if (static_cast<u32>(heat) + 1 < JitHeat::ee.threshold)
+		{
+			heat++;
+			if (static_cast<u32>(heat) == JitHeat::ee.batch && s_warm.size() < kMaxWarm)
+				s_warm.push_back(pc);
+			return false;
+		}
+		heat = static_cast<int>(JitHeat::ee.threshold - 1);
+		return JitHeat::CanCompile();
 	}
 
 	void ReleaseSlot(int slot)
@@ -2081,15 +2114,23 @@ namespace
 		}
 	}
 
-	void FlushAll()
+	// keep_heat: when the cache is full, so that only hot code is compiled again.
+	void FlushAll(bool keep_heat)
 	{
 		for (int*& page : s_pages)
 		{
 			if (!page)
 				continue;
+			if (keep_heat)
+			{
+				std::fill(page, page + kPageWords, 0);
+				continue;
+			}
 			delete[] page;
 			page = nullptr;
 		}
+		if (!keep_heat)
+			s_warm.clear();
 		for (auto& [slot, g] : s_slot_group)
 			wasmjit_remove_function(slot);
 		s_slot_group.clear();
@@ -2317,14 +2358,12 @@ namespace
 		return f;
 	}
 
-	// Compiles the block at pc and its neighbours in the same page into one module. False if pc cannot be compiled.
+	// Compiles the block at entry, its neighbours in the same page and the warm entries of any page (JitHeat.h) into
+	// one module. False if entry cannot be compiled.
 	bool CompileGroup(u32 entry)
 	{
-		const u32 page = entry & ~4095u;
-		const VTLBVirtual vmv = vtlbdata.vmap[entry >> VTLB_PAGE_BITS];
-		if (vmv.isHandler(entry))
+		if (vtlbdata.vmap[entry >> VTLB_PAGE_BITS].isHandler(entry))
 			return false;
-		const u32* host = reinterpret_cast<const u32*>(vmv.assumePtr(page));
 
 		Common::Timer timer;
 		WasmJit::Module m;
@@ -2334,18 +2373,41 @@ namespace
 		m.import_memory("env", "mem", 0, 65536, true);
 		m.import_table("env", "table", 0);
 
-		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxGroupBlocks);
+		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxModuleBlocks);
 		std::vector<u32> pcs;
 		std::vector<std::unique_ptr<BlockCompiler>> blocks;
 		std::vector<u32> work{entry};
-		while (!work.empty() && pcs.size() < kMaxGroupBlocks)
+		u32 first = entry; // the entry whose neighbours `work` holds
+		size_t warm_taken = 0;
+		for (;;)
 		{
+			// The entry's page first, then each warm entry with its own warm neighbours.
+			if (work.empty() || pcs.size() >= kMaxGroupBlocks)
+			{
+				work.clear();
+				while (warm_taken < s_warm.size() && work.empty())
+				{
+					const u32 pc = s_warm[warm_taken++];
+					if (SlotRef(pc) == 0 && static_cast<u32>(HeatRef(pc)) >= JitHeat::ee.batch &&
+						std::find(pcs.begin(), pcs.end(), pc) == pcs.end() &&
+						!vtlbdata.vmap[pc >> VTLB_PAGE_BITS].isHandler(pc))
+					{
+						work.push_back(pc);
+						first = pc;
+					}
+				}
+				if (work.empty() || pcs.size() >= kMaxModuleBlocks)
+					break;
+			}
 			const u32 pc = work.front();
 			work.erase(work.begin());
 			if (std::find(pcs.begin(), pcs.end(), pc) != pcs.end())
 				continue;
-			if (pc != entry && SlotRef(pc) != 0)
+			if (pc != first && (SlotRef(pc) != 0 || static_cast<u32>(HeatRef(pc)) < JitHeat::ee.neighbour))
 				continue;
+			const u32 page = pc & ~4095u;
+			const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
+			const u32* host = reinterpret_cast<const u32*>(vmv.assumePtr(page));
 			std::vector<u32> next;
 			blocks.push_back(std::make_unique<BlockCompiler>(t_v_v, t_i_v, page, host, vmv.raw(), &checked[pcs.size()]));
 			blocks.back()->Run(pc, &next);
@@ -2353,6 +2415,7 @@ namespace
 			for (u32 n : next)
 				work.push_back(n);
 		}
+		s_warm.erase(s_warm.begin(), s_warm.begin() + warm_taken);
 		// Block i is function kFnFirstBlock + i; the next one returns 0 (links to blocks outside the module).
 		const u32 nblocks = static_cast<u32>(pcs.size());
 		m.add_function(t_i_v, EmitBranchEndFunction(t_v_v, t_i_v));
@@ -2387,7 +2450,7 @@ namespace
 			if (module < 0 || instance < 0)
 			{
 				// Out of executable memory: start again with an empty cache.
-				FlushAll();
+				FlushAll(true);
 				return false;
 			}
 			Console.Error("EE JIT: generated code for %08x did not compile; using the interpreter.", entry);
@@ -2425,8 +2488,10 @@ namespace
 		s_blocks_compiled += pcs.size();
 		s_groups_compiled++;
 		s_groups.push_back(std::move(g));
-		s_compile_ns += static_cast<u64>(timer.GetTimeNanoseconds());
-		PerfCounters::Add(PerfCounters::jit_compile_ns, static_cast<u64>(timer.GetTimeNanoseconds()));
+		const u64 ns = static_cast<u64>(timer.GetTimeNanoseconds());
+		s_compile_ns += ns;
+		PerfCounters::Add(PerfCounters::jit_compile_ns, ns);
+		JitHeat::Spend(ns);
 		return true;
 	}
 
@@ -2456,7 +2521,7 @@ void EEJit::Execute()
 		return;
 	if (s_flush_requested || s_groups.size() > kMaxGroups || s_vmap_base != reinterpret_cast<uptr>(vtlbdata.vmap))
 	{
-		FlushAll();
+		FlushAll(!s_flush_requested && s_vmap_base == reinterpret_cast<uptr>(vtlbdata.vmap));
 		s_flush_requested = false;
 		s_vmap_base = reinterpret_cast<uptr>(vtlbdata.vmap);
 	}
@@ -2474,6 +2539,9 @@ void EEJit::Execute()
 	s_link = can_link && g_link;
 
 	u32* const block_cycles = intJitBlockCycles();
+	// Whether the PC was reached by a jump, a taken branch or an exception, or by leaving compiled code: the
+	// places blocks start, whose runs count towards compiling them (JitHeat.h).
+	bool entry = true;
 	for (;;)
 	{
 		const u32 pc = cpuRegs.pc;
@@ -2481,6 +2549,7 @@ void EEJit::Execute()
 		int slot = page ? page[(pc >> 2) & (kPageWords - 1)] : 0;
 		if (slot)
 		{
+			entry = true;
 			if (reinterpret_cast<BlockFn>(static_cast<uptr>(slot))() == 0) [[likely]]
 			{
 				if (*block_cycles >= (1u << 20)) [[unlikely]]
@@ -2494,15 +2563,20 @@ void EEJit::Execute()
 			s_invalidations++;
 			ReleaseSlot(slot);
 			page[(pc >> 2) & (kPageWords - 1)] = 0;
+			// The new code is new: it has to become hot again.
+			page[kPageWords + ((pc >> 2) & (kPageWords - 1))] = 0;
 		}
 		if (s_groups.size() > kMaxGroups)
-			FlushAll();
-		if ((pc & 3) || !CompileGroup(pc))
+			FlushAll(true);
+		const bool aligned = (pc & 3) == 0;
+		const bool compile = JitHeat::ee.threshold <= 1 ? aligned && JitHeat::CanCompile() : entry && aligned && Warm(pc);
+		if (!compile || !CompileGroup(pc))
 		{
 			if (s_failed)
 				return;
 			s_interp_steps++;
 			intJitExecOne();
+			entry = cpuRegs.pc != pc + 4;
 		}
 	}
 }
@@ -2539,6 +2613,39 @@ void EEJit::TraceFinish()
 	if (g_trace)
 		std::printf("EETRACE end %llu h=%016llx\n", static_cast<unsigned long long>(s_trace_step),
 			static_cast<unsigned long long>(s_trace_hash));
+}
+
+u64 EEJit::CompileNs()
+{
+	return s_compile_ns;
+}
+
+namespace
+{
+	uint s_budget_frame = 0;
+	u64 s_budget_spent = 0;
+} // namespace
+
+bool JitHeat::CanCompile()
+{
+	if (!budget_ns)
+		return true;
+	if (s_budget_frame != g_FrameCount)
+	{
+		s_budget_frame = g_FrameCount;
+		s_budget_spent = 0;
+	}
+	return s_budget_spent < budget_ns;
+}
+
+void JitHeat::Spend(u64 ns)
+{
+	if (s_budget_frame != g_FrameCount)
+	{
+		s_budget_frame = g_FrameCount;
+		s_budget_spent = 0;
+	}
+	s_budget_spent += ns;
 }
 
 void EEJit::PrintStats()

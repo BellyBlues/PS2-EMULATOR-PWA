@@ -31,6 +31,8 @@ namespace EEJit
 	extern bool g_stats;
 	extern u32 g_dbgmask; // debugging: COP2 kinds (bit per EEJit.cpp C2 value, 0x10000 LQC2/SQC2) left to the interpreter
 	void PrintStats();
+	// Time spent building and compiling modules so far, in nanoseconds.
+	u64 CompileNs();
 
 	// Runs guest code until the interpreter's longjmp leaves intExecute(). Returns only if the JIT could not
 	// start or had to be turned off (a generator bug); the caller then interprets.

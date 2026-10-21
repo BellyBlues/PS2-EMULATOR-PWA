@@ -48,6 +48,8 @@
 #include "pcsx2/VMManager.h"
 #include "pcsx2/wasm/EEJit.h"
 #include "pcsx2/wasm/IopJit.h"
+#include "pcsx2/wasm/JitHeat.h"
+#include "pcsx2/wasm/PerfCounters.h"
 
 #include "WavOutput.h"
 #ifdef __EMSCRIPTEN__
@@ -83,6 +85,8 @@ static bool s_disc_check = false;
 static std::string s_wav_path;
 static WavOutput::Clock s_wav_clock = WavOutput::Clock::Emulated;
 static u32 s_wav_period = 0;
+static u64 s_compile_stats_every = 0; // -jit-compile-stats: vsyncs per printed window, 0 = off
+static void PrintCompileStatsTotal();
 #ifdef __EMSCRIPTEN__
 // VU1 JIT test modes (docs/web-port/VU1-JIT-DESIGN.md section 12).
 static std::string s_vu1jit_fuzz;
@@ -410,6 +414,21 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			EEJit::g_dbgmask = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
 		else if (arg == "-eejit-stats")
 			EEJit::g_stats = true;
+		else if ((arg == "-eejit-hot" || arg == "-iopjit-hot") && has_value)
+		{
+			// N[,M[,B]]: compile block entries on their Nth run, with the neighbours that ran M times and the entries that ran B times (JitHeat.h).
+			JitHeat::Policy& policy = arg == "-eejit-hot" ? JitHeat::ee : JitHeat::iop;
+			const std::vector<std::string_view> parts = StringUtil::SplitString(argv[++i], ',', true);
+			policy.threshold = parts.empty() ? policy.threshold : StringUtil::FromChars<u32>(parts[0]).value_or(policy.threshold);
+			if (parts.size() >= 2)
+				policy.neighbour = StringUtil::FromChars<u32>(parts[1]).value_or(policy.neighbour);
+			if (parts.size() >= 3)
+				policy.batch = StringUtil::FromChars<u32>(parts[2]).value_or(policy.batch);
+		}
+		else if (arg == "-jit-budget" && has_value)
+			JitHeat::budget_ns = StringUtil::FromChars<u64>(argv[++i]).value_or(0) * 1000;
+		else if (arg == "-jit-compile-stats" && has_value)
+			s_compile_stats_every = StringUtil::FromChars<u64>(argv[++i]).value_or(0);
 		else if (arg == "-eejit-trace" && has_value)
 		{
 			// SHIFT[,FROM,TO]: print the state hash every 2^SHIFT branch tests, and every test in [FROM, TO].
@@ -444,10 +463,17 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-loadstate FILE] [-savestate FILE] [-unlimited]\n"
 								 "         [-wav FILE.wav [-wav-realtime [-wav-period FRAMES]]]\n"
 								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n"
-								 "         [-eejit 0|1] [-eejit-link 0|1] [-iopjit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n",
+								 "         [-eejit 0|1] [-eejit-link 0|1] [-iopjit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n"
+								 "         [-eejit-hot N[,M[,B]]] [-iopjit-hot N[,M[,B]]] [-jit-budget US] [-jit-compile-stats VSYNCS]\n",
 				argv[0]);
 			std::fprintf(stderr, "  -eejit 0 runs the EE interpreter instead of the EE JIT, -iopjit 0 the IOP interpreter instead of the IOP JIT;\n"
-								 "  -eejit-trace prints EE and IOP state hashes to compare runs.\n");
+								 "  -eejit-trace prints EE and IOP state hashes to compare runs.\n"
+								 "  -eejit-hot and -iopjit-hot compile a block entry on its Nth run, with the neighbours in its page that\n"
+								 "         ran M times (0: all) and the entries of any page that ran B times (default 128,1,64; 1\n"
+								 "         compiles everything on its first run). -jit-budget caps the EE and IOP JITs' compile time per\n"
+								 "         vsync, in microseconds (default 4000; 0: no cap).\n"
+								 "  -jit-compile-stats prints, every VSYNCS vsyncs and at the end, the JITs' compile time: the total and\n"
+								 "         the largest in one vsync, for the EE and IOP JITs (EE thread) and for all JITs.\n");
 #ifdef __EMSCRIPTEN__
 			std::fprintf(stderr, "         [-vu1jit-fuzz SEED:COUNT[:timing|jit|both[:hashes]]] [-vu1jit-oracle] [-vu1jit-lockstep] [-vu0jit-lockstep]\n"
 								 "         [-vu1jit-stats FILE] [-mtvu-sync]\n");
@@ -820,6 +846,8 @@ static void CPUThreadMain(std::atomic<int>* ret)
 			INFO_LOG("Headless: stopped after {} frames", s_frames);
 			EEJit::PrintStats();
 			IopJit::PrintStats();
+			if (s_compile_stats_every)
+				PrintCompileStatsTotal();
 			EEJit::TraceFinish();
 #ifdef __EMSCRIPTEN__
 			if (s_vu1jit_report)
@@ -984,10 +1012,74 @@ int main(int argc, char* argv[])
 	return thread_ret.load();
 }
 
+// -jit-compile-stats: compile time per vsync. "EE+IOP" is the EE and IOP JITs, which compile on the EE thread and so
+// stall it; "all JITs" adds the VU1 JIT (the total the page's recorder reads, PerfCounters::jit_compile_ns).
+namespace CompileStats
+{
+	struct Window
+	{
+		u64 cpu_ns = 0, all_ns = 0, cpu_max = 0, all_max = 0, cpu_max_frame = 0, all_max_frame = 0;
+		u64 over5 = 0, over10 = 0, over16 = 0; // vsyncs with more than 5, 10 and 16.7 ms of EE and IOP compiling
+
+		void Add(u64 frame, u64 cpu, u64 all)
+		{
+			cpu_ns += cpu;
+			all_ns += all;
+			if (cpu > cpu_max)
+			{
+				cpu_max = cpu;
+				cpu_max_frame = frame;
+			}
+			if (all > all_max)
+			{
+				all_max = all;
+				all_max_frame = frame;
+			}
+			over5 += cpu > 5000000;
+			over10 += cpu > 10000000;
+			over16 += cpu > 16666667;
+		}
+
+		void Print(const char* what, u64 from, u64 to) const
+		{
+			INFO_LOG("Headless: JIT compile, {} {}-{}: EE+IOP {:.1f} ms, worst vsync {:.1f} ms (vsync {}), vsyncs over "
+					 "5/10/16.7 ms: {}/{}/{}; all JITs {:.1f} ms, worst vsync {:.1f} ms (vsync {})",
+				what, from, to, cpu_ns / 1e6, cpu_max / 1e6, cpu_max_frame, over5, over10, over16, all_ns / 1e6,
+				all_max / 1e6, all_max_frame);
+		}
+	};
+
+	static Window s_window, s_total;
+	static u64 s_last_cpu = 0, s_last_all = 0, s_window_start = 1;
+
+	static void OnVsync(u64 frame)
+	{
+		const u64 cpu = EEJit::CompileNs() + IopJit::CompileNs();
+		const u64 all = PerfCounters::jit_compile_ns.load(std::memory_order_relaxed);
+		s_window.Add(frame, cpu - s_last_cpu, all - s_last_all);
+		s_total.Add(frame, cpu - s_last_cpu, all - s_last_all);
+		s_last_cpu = cpu;
+		s_last_all = all;
+		if (frame % s_compile_stats_every == 0)
+		{
+			s_window.Print("vsyncs", s_window_start, frame);
+			s_window = {};
+			s_window_start = frame + 1;
+		}
+	}
+} // namespace CompileStats
+
+static void PrintCompileStatsTotal()
+{
+	CompileStats::s_total.Print("whole run, vsyncs", 1, s_frames);
+}
+
 void Host::PumpMessagesOnCPUThread()
 {
 	// Called once per vsync.
 	s_frames++;
+	if (s_compile_stats_every)
+		CompileStats::OnVsync(s_frames);
 	WavOutput::OnVsync();
 #ifdef __EMSCRIPTEN__
 	VU1Jit::OnVsync();

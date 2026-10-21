@@ -24,6 +24,8 @@ namespace IopJit
 	void RequestFlush();
 
 	void PrintStats();
+	// Time spent building and compiling modules so far, in nanoseconds.
+	u64 CompileNs();
 } // namespace IopJit
 
 // Interpreter entry points used by the JIT (pcsx2/R3000AInterpreter.cpp).
