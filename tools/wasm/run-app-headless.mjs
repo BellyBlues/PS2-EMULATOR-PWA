@@ -34,6 +34,11 @@
 //                       and the page, saved as <out>/profile-<name>.cpuprofile
 //   --out DIR           where captures, snapshots and console.log go
 //   --profile-root DIR  where the throwaway Chrome profile is created (deleted at exit)
+//   --keep-profile DIR  use DIR as Chrome's profile and keep it (a later run with the same DIR sees what
+//                       this one stored: IndexedDB, Chrome's caches)
+//   --perf              drain the per-vsync recorder (pcsx2web_perf_ring()) during the run: the summary's
+//                       perf has the vsyncs over 25 ms, the time they lost, GPU pipeline time and the
+//                       slowest vsyncs; <out>/perf.csv has every vsync
 //   --timeout S         give up after S seconds (default 300)
 //   --gpu core|swiftshader|none|plain   Chrome's WebGPU adapter (default core: Dawn Vulkan on the GPU;
 //                       plain: no WebGPU switches, as the browser ships)
@@ -75,7 +80,7 @@ const GPU_FLAGS = {
 function parseArgs(argv) {
 	const o = { root: path.join(REPO, "build-wasm/bin"), biosDir: null, bios: null, port: 8120, query: "", frames: 600,
 		capture: [], snapshot: [], keys: [], clicks: [], rebootAt: 0, destroyAt: [], crashAt: [], gcAt: [], displayAt: [], sampleEvery: 0, profile: null, out: null, profileRoot: tmpdir(),
-		timeout: 300, duration: 0, gpu: "core", cpus: null, chrome: "/usr/bin/google-chrome", chromeFlags: [], initScript: "", quiet: false };
+		timeout: 300, duration: 0, keepProfile: null, perf: false, gpu: "core", cpus: null, chrome: "/usr/bin/google-chrome", chromeFlags: [], initScript: "", quiet: false };
 	const list = (s) => s.split(",").filter(Boolean).map(Number);
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i], v = () => argv[++i];
@@ -100,6 +105,8 @@ function parseArgs(argv) {
 		else if (a === "--profile") { const [pv, ps] = v().split(":").map(Number); o.profile = { vsync: pv, seconds: ps }; }
 		else if (a === "--out") o.out = path.resolve(v());
 		else if (a === "--profile-root") o.profileRoot = path.resolve(v());
+		else if (a === "--keep-profile") o.keepProfile = path.resolve(v());
+		else if (a === "--perf") o.perf = true;
 		else if (a === "--timeout") o.timeout = Number(v());
 		else if (a === "--duration") o.duration = Number(v());
 		else if (a === "--gpu") o.gpu = v();
@@ -249,7 +256,8 @@ async function main() {
 	const outDir = o.out;
 	if (outDir) mkdirSync(outDir, { recursive: true });
 	mkdirSync(o.profileRoot, { recursive: true });
-	const profile = mkdtempSync(path.join(o.profileRoot, "tst-chrome-"));
+	if (o.keepProfile) mkdirSync(o.keepProfile, { recursive: true });
+	const profile = o.keepProfile || mkdtempSync(path.join(o.profileRoot, "tst-chrome-"));
 	const children = [];
 	const t0 = Date.now();
 	const log = [];
@@ -261,7 +269,7 @@ async function main() {
 
 	const cleanup = () => {
 		for (const c of children) if (c.exitCode === null) c.kill("SIGKILL");
-		rmSync(profile, { recursive: true, force: true });
+		if (!o.keepProfile) rmSync(profile, { recursive: true, force: true });
 	};
 	process.on("SIGINT", () => { cleanup(); process.exit(130); });
 
@@ -392,6 +400,26 @@ async function main() {
 		};
 		let lastSubtitle = "";
 		let lastSample = 0;
+		// --perf: records drained from the page's per-vsync ring (pcsx2web_perf_ring()).
+		const perf = { read: -1, rows: [], prev: null, lastDrain: 0 };
+		const drainPerf = async () => {
+			const r = await evaluate(`(() => { const M = window.Module; if (!M || !M._pcsx2web_perf_ring) return null;
+				const ptr = M._pcsx2web_perf_ring() >>> 0, written = M._pcsx2web_perf_written() >>> 0;
+				const ring = new Float64Array(M.wasmMemory.buffer, ptr, 8192 * 9);
+				let i = ${perf.read} < 0 ? Math.max(0, written - 8192 + 16) : Math.max(${perf.read}, written - 8192 + 16);
+				const out = [];
+				for (; i < written; i++) { const o = (i % 8192) * 9; out.push(Array.from(ring.subarray(o, o + 9))); }
+				return { written, out }; })()`).catch(() => null);
+			if (!r) return;
+			perf.read = r.written;
+			for (const rec of r.out) {
+				const p = perf.prev;
+				perf.prev = rec;
+				if (!p || rec[0] !== p[0] + 1 || !(rec[1] > p[1])) continue;
+				perf.rows.push({ v: rec[0], ms: rec[1] - p[1], gpu: Math.max(0, rec[6] - p[6]), pipes: Math.max(0, rec[7] - p[7]),
+					jit: Math.max(0, rec[5] - p[5]), hz: rec[8] });
+			}
+		};
 		let gsWorker = null;
 		const sampleT0 = Date.now();
 		const loop = (async () => {
@@ -446,6 +474,10 @@ async function main() {
 					return finish(1);
 				}
 				const v = st.vsync || st.frames;
+				if (o.perf && Date.now() - perf.lastDrain > 1000) {
+					perf.lastDrain = Date.now();
+					await drainPerf();
+				}
 				while (pending.keys.length && v >= pending.keys[0].frame) {
 					const { key } = pending.keys.shift();
 					summary.events.push({ at: v, key });
@@ -570,6 +602,23 @@ async function main() {
 		})();
 		status = await finished;
 		clearTimeout(timer);
+		if (o.perf) {
+			await within(drainPerf(), 5000).catch(() => {});
+			const rows = perf.rows;
+			const slow = rows.filter((r) => r.ms > 25);
+			const sum = (rs, k) => rs.reduce((a, r) => a + r[k], 0);
+			summary.perf = {
+				vsyncs: rows.length, over25: slow.length,
+				lostMs: Math.round(slow.reduce((a, r) => a + Math.max(0, r.ms - (r.hz > 0 ? 1000 / r.hz : 0)), 0)),
+				pipelineMs: Math.round(sum(rows, "gpu")), pipelines: sum(rows, "pipes"), jitMs: Math.round(sum(rows, "jit")),
+				pipelineVsyncs: rows.filter((r) => r.pipes > 0).length,
+				worst: [...rows].sort((a, b) => b.ms - a.ms).slice(0, 10).map((r) => ({ v: r.v, ms: +r.ms.toFixed(1), gpu: +r.gpu.toFixed(1), pipes: r.pipes })),
+				worstPipeline: [...rows].sort((a, b) => b.gpu - a.gpu).slice(0, 5).map((r) => ({ v: r.v, ms: +r.ms.toFixed(1), gpu: +r.gpu.toFixed(1), pipes: r.pipes })),
+			};
+			if (outDir)
+				writeFileSync(path.join(outDir, "perf.csv"), "vsync,ms,gpu_pipeline_ms,gpu_pipelines,jit_ms,hz\n" +
+					rows.map((r) => [r.v, r.ms.toFixed(2), r.gpu.toFixed(2), r.pipes, r.jit.toFixed(2), r.hz].join(",")).join("\n") + "\n");
+		}
 		summary.ok = status === 0 && summary.errors.length === 0;
 		summary.navAt = navAt;
 		// A page that hangs must not hang the driver.
