@@ -74,6 +74,9 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 |---|---|---|---|
 | The common branch end runs in generated code, through one function per module. LDL/LDR/SDL/SDR are generated natively; they were 41 M interpreter calls per run. | `pcsx2/wasm/EEJit.cpp` | EE thread per vsync at 300 figures: 14.2 → 13.1 ms | `8a80a5fb7`, `07e93ed5b` |
 | Compile hot code only. New code runs on the interpreter until it has run 128 times. Modules are larger, and compiling has a budget of 4 ms per vsync. | `pcsx2/wasm/JitHeat.h`, `EEJit.cpp`, `IopJit.cpp` | Worst compile in one vsync: Guitar Hero 69 → 7.9 ms, Naruto menus 56.7 → 5.0 ms; total compile 1.3 → 0.34 s | `7852633ef`, `c88cd23f3` |
+| Guest registers in wasm locals. The EE keeps the low 64 bits of the 32 GPRs plus HI/LO; the IOP keeps its GPRs plus HI/LO. They load on first use and are written back before every C++ call and at exits. MMI lane ops, MFC0/MTC0 to plain registers and ADDI are now generated natively: the Naruto video's interpreter calls went from 189 M to 19 M per 600 vsyncs. | `pcsx2/wasm/RegCache.h`, `EEJit.cpp`, `IopJit.cpp` | Naruto video (headless): about +11 % | `0391d4a0d` |
+| IOP branch start and end stores emitted inline; one EE helper fewer per module | `pcsx2/wasm/IopJit.cpp`, `EEJit.cpp` | (part of the above) | `0db7d0b22` |
+| Runs of loads and stores through one base register checked once (alignment, page, mapping). This roughly halves the kernel's thread context save and restore. | `pcsx2/wasm/EEJit.cpp` | Naruto video: +7-9 % more, about +24 % in total (47 → 58.5 VPS headless); Zen at 300 figures: 133 → 150-154 % | `693c92743` |
 
 ### GPU pipelines (stutter when something new appears)
 
@@ -110,18 +113,14 @@ simpler distant figures), so each row compares one version with itself.
 | Benchmark, first version, 100 figures, Chrome | 102 % | 224 % (last measured on that version) |
 | Benchmark, first version, 100 figures, Zen | 92.5 % | about 160 % (last measured on that version) |
 | Benchmark, 300 figures, Chrome | 146 % | about 155-160 % |
-| Benchmark, 300 figures, Zen | 114 % | about 115 % (EE-bound) |
+| Benchmark, 300 figures, Zen | 114 % | 150-154 % (EE-bound) |
 | Guitar Hero in a song, Chrome, limiter on | 80-87 % | nearly always 100 %, with rare dips |
 | Naruto: menus, scene changes, special moves | long freezes on first appearance | first boot short skips; later boots smooth |
-| Naruto intro video, Chrome | | 82-84 % (EE-bound: see below) |
+| Naruto intro video, Chrome | 82-84 % (measured by the owner before the EE register work) | not yet measured in the page; headless it runs about 24 % faster |
 
 ## In progress
 
-- **EE JIT: guest registers in wasm locals** (started 2026-10-21). Guest registers stay in fast locals
-  while a block runs, instead of being loaded and stored in memory for every instruction. This is
-  what gave VU1 its largest gain. It targets everything EE-bound: Naruto's intro video, game logic,
-  and Zen at 300 figures. Checked with EE/IOP state hashes and pixels on the BIOS, Naruto and
-  Guitar Hero.
+Nothing running. The next candidates are below.
 
 ## Known to be left
 
@@ -136,9 +135,20 @@ simpler distant figures), so each row compares one version with itself.
   | 7 % | event tests |
   | 7 % | IPU decoding |
 
-  A "wait loop" skip like PCSX2's WaitLoop hack would gain a lot there, but it is a new timing hack:
-  opt-in only, not started.
-- **IOP JIT** per-block overhead: about 8 % of the EE thread in that video.
+  These shares are from before the EE register work, which made that video about 24 % faster
+  headless. A "wait loop" skip like PCSX2's WaitLoop hack would gain a lot there, but it is a new
+  timing hack: opt-in only, not started.
+- **IOP JIT**: its dispatcher and event test on every IOP branch (about 8 % of the EE thread in that
+  video). IOP block linking is not started.
+- **EE JIT**:
+  - **V8 tiering:** moderately hot functions stay in V8's baseline tier (Liftoff). The video ran
+    6.6 % faster with V8 forced to optimise everything; merging a page's blocks into one function
+    may get part of that.
+  - **Kernel thread switches:** SYSCALL, ERET and MTC0 Status still call the interpreter (about
+    6,000 thread switches per frame in the video).
+  - **The FPU's registers** are not cached in locals yet.
+  - **Generated code size:** register write-backs made the EE's wasm 39 % larger and compiling
+    38 % longer.
 - **Zen** is 20-25 % slower than Chrome on the same work. There is no automatic Zen profiler yet;
   the Recorder works there.
 - **The first time a game shows a new effect**, a draw can be skipped for a frame (by design). A
