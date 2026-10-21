@@ -152,7 +152,7 @@ namespace
 
 	// Statistics.
 	u64 s_blocks_compiled = 0, s_groups_compiled = 0, s_invalidations = 0, s_flushes = 0, s_interp_steps = 0;
-	u64 s_compile_ns = 0, s_wasm_bytes = 0, s_guest_instrs = 0, s_native_instrs = 0;
+	u64 s_compile_ns = 0, s_max_module_ns = 0, s_wasm_bytes = 0, s_guest_instrs = 0, s_native_instrs = 0;
 	std::vector<std::string> s_stat_names;
 	std::unordered_map<std::string, u32> s_stat_index;
 	u64 s_stat_counts[512];
@@ -2490,6 +2490,7 @@ namespace
 		s_groups.push_back(std::move(g));
 		const u64 ns = static_cast<u64>(timer.GetTimeNanoseconds());
 		s_compile_ns += ns;
+		s_max_module_ns = std::max(s_max_module_ns, ns);
 		PerfCounters::Add(PerfCounters::jit_compile_ns, ns);
 		JitHeat::Spend(ns);
 		return true;
@@ -2650,11 +2651,11 @@ void JitHeat::Spend(u64 ns)
 
 void EEJit::PrintStats()
 {
-	Console.WriteLn("EE JIT: %s, %llu blocks in %llu modules (%llu KB of wasm, %.1f ms to build and compile), "
+	Console.WriteLn("EE JIT: %s, %llu blocks in %llu modules (%llu KB of wasm, %.1f ms to build and compile, at most %.1f ms for one), "
 					"%llu invalidations, %llu flushes, %llu interpreted steps; %llu of %llu instructions native",
 		g_mode ? "on" : "off", static_cast<unsigned long long>(s_blocks_compiled),
 		static_cast<unsigned long long>(s_groups_compiled), static_cast<unsigned long long>(s_wasm_bytes / 1024),
-		s_compile_ns / 1e6, static_cast<unsigned long long>(s_invalidations), static_cast<unsigned long long>(s_flushes),
+		s_compile_ns / 1e6, s_max_module_ns / 1e6, static_cast<unsigned long long>(s_invalidations), static_cast<unsigned long long>(s_flushes),
 		static_cast<unsigned long long>(s_interp_steps), static_cast<unsigned long long>(s_native_instrs),
 		static_cast<unsigned long long>(s_guest_instrs));
 	if (!g_stats)
