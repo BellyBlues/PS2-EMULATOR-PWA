@@ -144,6 +144,32 @@ wait for that pause, and its failure does not count toward giving up. The copy i
 cannot finish while the page unloads, so from the first card write until the copy is done the page
 asks before it is closed or reloaded (`beforeunload`).
 
+### Pipeline lists
+
+The hardware renderer on WebGPU needs a render pipeline for each combination of TFX shader and
+state a game draws with, and the browser takes from a few to tens of milliseconds to create one.
+A draw whose pipeline does not exist yet starts creating it in the background
+(`createRenderPipelineAsync`), waits for it at most 3 ms (and at most 4 ms in all for one vsync),
+and is skipped if it is still not ready; the pipeline is collected at a later present and the
+game's later draws use it. So a new effect may be missing for its first frames instead of the game
+stalling. `?pipelines=wait` restores waiting to the end (the test switch for frames identical to
+a run without skips). The log's line `WebGPU HW: ... draws skipped for a pipeline not ready yet`
+counts the skips every 600 presents.
+
+The page also keeps, per game, the list of pipelines its draws asked for, and creates them in the
+background at the game's next boot, as soon as the game is known, so that most are ready before
+the game needs them. The renderer logs the keys of the pipelines its draws ask for
+(`pcsx2web_tfx_log()`); every 2 s the page copies new ones, and stores the list in the IndexedDB
+database `pcsx2-web-pipelines` (store `tfx`, keyed by the game's serial: `{version, keys, savedAt}`,
+`keys` 36 bytes per pipeline, at most 4096) every 15 s while it grows, when the VM stops and when
+the page is hidden. The list is this session's keys in the order the game first asked for them,
+then the stored ones it did not use. When the game's serial is known (`pcsx2web_game()`), the page
+writes the stored list into the prewarm slot (`pcsx2web_tfx_prewarm()`); the GS thread takes it at
+its next present and starts four at a time (eight in creation at once). `version` identifies what a
+key means (the key's layout, `tfx.wgsl`, the shader macros each selector bit sets, the texture
+formats); the GS thread ignores a list made by a build whose keys meant something else, and the next
+save replaces it. Only disc boots with a serial keep a list.
+
 A linked card is read from its file when it is plugged in (the file wins over the browser's copy).
 After a reload it stays plugged in only if the browser still allows the page to write the file;
 otherwise it comes back unplugged, and choosing it in the slot's menu asks for permission. A file that
@@ -191,6 +217,7 @@ Switches for comparisons and tests (all optional):
 | `?iopjit=0` | Runs the IOP (I/O processor) interpreter instead of the IOP JIT, which compiles IOP code to WebAssembly at run time |
 | `?vu1jit=0` | Runs the VU1 (vector unit 1) interpreter instead of the VU1 JIT, which compiles VU1 micro programs to WebAssembly at run time |
 | `?gsidle=block` | Keeps the GS thread's idle wait blocking with WebGPU, leaving only the device's bounded event-loop turn |
+| `?pipelines=wait` | The hardware renderer waits for every new TFX pipeline to the end, as before pipelines were created in the background, so no draw is skipped (for pixel-exact comparisons; see Pipeline lists) |
 | `?unlimited=1` | Boots with the frame limiter off (as `pcsx2-headless -unlimited`), to measure speed above 100 % |
 | `?elf=<url>` | Fetches a PS2 program (same origin only) and boots it instead of a disc or the BIOS menu, with the `?bios=` BIOS and fast boot (see below) |
 
@@ -475,6 +502,8 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_vsync_count()` | vsyncs emulated since the module started |
 | `pcsx2web_audio_start()` | start the sound worklet in `Module.pcsx2webAudioContext` (an AudioContext the page made); it calls `Module.pcsx2webAudioReady(node)` when the node exists, or with `null` if it failed; 0 if started, -1 if a start already ran or there is no context |
 | `pcsx2web_audio()` | address of the audio block: 16 u32 words (see Sound) |
+| `pcsx2web_tfx_log()` | address of the log of TFX pipeline keys the WebGPU HW renderer's draws asked for since its device started: `session, count, version lo, version hi` (u32), then `count` keys of 36 bytes; `session` changes when a new device starts a new log (see Pipeline lists) |
+| `pcsx2web_tfx_prewarm()` | address of the prewarm slot, the same layout with a state for its first word: 0 free, 1 the page is writing, 2 ready, 3 the GS thread is taking it. The page claims it by compare-exchange (0 or 2 to 1), writes the keys, count and version, then stores 2 |
 
 On the 2D path, each animation frame the page reads `seq` with `Atomics.load`; when it changed, it copies
 `width * height * 4` bytes of RGBA from `pixels` into an `ImageData` (which cannot use shared

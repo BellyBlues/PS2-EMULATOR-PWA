@@ -1032,6 +1032,8 @@
 			args.push('-surface', TEST_SURFACE[0]);
 		if (params.get('gsidle') === 'block')
 			args.push('-gs-idle', 'block');
+		if (params.get('pipelines') === 'wait')
+			args.push('-gs-pipelines', 'wait');
 		if (params.get('unlimited') === '1')
 			args.push('-unlimited');
 		if (params.get('eejit') === '0')
@@ -2922,9 +2924,12 @@
 		if (!disc.runIsDisc || !live || (title === disc.runTitle && serial === disc.runSerial))
 			return;
 		// No title for a disc PCSX2's game database does not know (Host::OnGameChanged): the file name stays.
+		const newSerial = serial !== disc.runSerial;
 		disc.runTitle = title;
 		disc.runSerial = serial;
 		pageLog(`Game: ${title || 'not in the game database'}${serial ? ` (${serial})` : ''}`);
+		if (newSerial)
+			pipeGameKnown(serial);
 		const d = disc.current;
 		if (title && d && d.title !== title) {
 			d.title = title;
@@ -2939,9 +2944,12 @@
 			readGameDetails();
 			if (page.vmState !== disc.lastVm) {
 				disc.lastVm = page.vmState;
-				if (page.vmState === STATE.STOPPED || page.vmState === STATE.FAILED)
+				if (page.vmState === STATE.STOPPED || page.vmState === STATE.FAILED) {
 					checkMemoryCards(true); // a normal Stop closed the card: keep it now
+					pipeVmStopped();
+				}
 			}
+			pipeTick();
 		}
 		checkMemoryCards(false);
 		const running = disc.runIsDisc && disc.current && pageState() === 'running';
@@ -2949,6 +2957,204 @@
 		const title = game ? `${game} · TabStationToo` : 'TabStationToo';
 		if (document.title !== title)
 			document.title = title;
+	}
+
+	// ------------------------------------------------------------------ pipeline lists
+	// The WebGPU HW renderer logs the TFX pipeline keys its draws ask for (pcsx2web_tfx_log(), 36 bytes a
+	// key). The page keeps them per game serial in IndexedDB (PIPE_IDB_NAME) and, when the same game boots
+	// again, hands the list to the GS thread (pcsx2web_tfx_prewarm()), which creates those pipelines in the
+	// background before the game asks for them (README "Pipeline lists"). Each list carries the key version
+	// of the build that made it; the GS thread ignores a list whose keys meant something else.
+	const PIPE_IDB_NAME = 'pcsx2-web-pipelines';
+	const PIPE_IDB_STORE = 'tfx';
+	const PIPE_KEY_BYTES = 36; // WebGPUHost::TFX_KEY_BYTES
+	const PIPE_CAPACITY = 4096; // WebGPUHost::TFX_KEY_CAPACITY
+	const PIPE_HEADER_BYTES = 16; // state, count, version lo, version hi
+	const PIPE_SLOT_FREE = 0;
+	const PIPE_SLOT_WRITING = 1;
+	const PIPE_SLOT_READY = 2;
+	const PIPE_READ_MS = 2000;
+	const PIPE_SAVE_MS = 15000;
+	const pipes = {
+		serial: '', session: -1, staleSession: -1, read: 0, version: null, used: [], usedSet: new Set(),
+		stored: null, handOver: null, dirty: false, lastRead: 0, lastSave: 0, saving: false, warned: false,
+	};
+
+	function pipeIdbOpen() {
+		return new Promise((resolve, reject) => {
+			if (typeof indexedDB === 'undefined') {
+				reject(new Error('IndexedDB is not available'));
+				return;
+			}
+			const req = indexedDB.open(PIPE_IDB_NAME, 1);
+			req.onupgradeneeded = () => req.result.createObjectStore(PIPE_IDB_STORE);
+			req.onsuccess = () => resolve(req.result);
+			req.onerror = () => reject(req.error);
+			req.onblocked = () => reject(new Error('IndexedDB open blocked'));
+		});
+	}
+
+	async function pipeIdb(mode, fn) {
+		const db = await pipeIdbOpen();
+		try {
+			return await new Promise((resolve, reject) => {
+				const tx = db.transaction(PIPE_IDB_STORE, mode);
+				const req = fn(tx.objectStore(PIPE_IDB_STORE));
+				let result;
+				req.onsuccess = () => { result = req.result; };
+				tx.oncomplete = () => resolve(result);
+				tx.onerror = () => reject(tx.error || req.error);
+				tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+			});
+		} finally {
+			db.close();
+		}
+	}
+
+	function pipeWarn(what, err) {
+		if (pipes.warned)
+			return;
+		pipes.warned = true;
+		pageLog(`Pipeline list: could not ${what} (${err && err.message}); the game's first frames may stutter.`, 'warn');
+	}
+
+	const pipeKeyId = (bytes) => String.fromCharCode.apply(null, bytes);
+
+	// The game's serial is known (readGameDetails()): start its list, and hand the stored one over.
+	function pipeGameKnown(serial) {
+		const M = window.Module;
+		pipes.serial = serial;
+		pipes.read = 0;
+		pipes.used = [];
+		pipes.usedSet = new Set();
+		pipes.stored = null;
+		pipes.handOver = null;
+		pipes.dirty = false;
+		if (!serial || !M || typeof M._pcsx2web_tfx_log !== 'function')
+			return;
+		pipeIdb('readonly', (s) => s.get(serial)).then((rec) => {
+			if (pipes.serial !== serial || !rec || !(rec.keys instanceof ArrayBuffer) || !Array.isArray(rec.version))
+				return;
+			pipes.stored = rec;
+			pipes.handOver = rec;
+			pipeHandOver();
+		}).catch((err) => pipeWarn('read the stored list', err));
+	}
+
+	// Writes the list into the prewarm slot, unless the GS thread is taking an earlier one (then the next
+	// tick tries again). A list it has not taken yet is replaced.
+	function pipeHandOver() {
+		const rec = pipes.handOver;
+		const buf = heapBuffer();
+		if (!rec || !buf)
+			return;
+		const ptr = window.Module._pcsx2web_tfx_prewarm() >>> 0;
+		const words = new Int32Array(buf, ptr, PIPE_HEADER_BYTES / 4);
+		if (Atomics.compareExchange(words, 0, PIPE_SLOT_FREE, PIPE_SLOT_WRITING) !== PIPE_SLOT_FREE &&
+			Atomics.compareExchange(words, 0, PIPE_SLOT_READY, PIPE_SLOT_WRITING) !== PIPE_SLOT_READY)
+			return;
+		pipes.handOver = null;
+		const n = Math.min(Math.floor(rec.keys.byteLength / PIPE_KEY_BYTES), PIPE_CAPACITY);
+		new Uint8Array(buf, ptr + PIPE_HEADER_BYTES, n * PIPE_KEY_BYTES).set(new Uint8Array(rec.keys, 0, n * PIPE_KEY_BYTES));
+		words[2] = rec.version[0] | 0;
+		words[3] = rec.version[1] | 0;
+		Atomics.store(words, 1, n);
+		Atomics.store(words, 0, PIPE_SLOT_READY);
+		pageLog(`Pipeline list: ${n} pipelines this game used before, to create in the background.`);
+	}
+
+	// Copies the keys logged since the last read (a session is one GS device's log).
+	function pipeRead() {
+		const M = window.Module;
+		const buf = heapBuffer();
+		if (!pipes.serial || !buf || !M || typeof M._pcsx2web_tfx_log !== 'function')
+			return;
+		const ptr = M._pcsx2web_tfx_log() >>> 0;
+		const words = new Uint32Array(buf, ptr, PIPE_HEADER_BYTES / 4);
+		const session = Atomics.load(words, 0);
+		if (session === pipes.staleSession)
+			return; // the log of the VM that ran before this game's
+		if (session !== pipes.session) {
+			pipes.session = session;
+			pipes.read = 0;
+		}
+		const count = Math.min(Atomics.load(words, 1), PIPE_CAPACITY);
+		const version = [Atomics.load(words, 2) >>> 0, Atomics.load(words, 3) >>> 0];
+		if (count <= pipes.read)
+			return;
+		const bytes = new Uint8Array(buf, ptr + PIPE_HEADER_BYTES + pipes.read * PIPE_KEY_BYTES,
+			(count - pipes.read) * PIPE_KEY_BYTES).slice();
+		if (Atomics.load(words, 0) !== session)
+			return; // a new log started meanwhile: the next read starts it over
+		pipes.version = version;
+		for (let o = 0; o < bytes.length; o += PIPE_KEY_BYTES) {
+			const key = bytes.subarray(o, o + PIPE_KEY_BYTES);
+			const id = pipeKeyId(key);
+			if (!pipes.usedSet.has(id)) {
+				pipes.usedSet.add(id);
+				pipes.used.push(key);
+				pipes.dirty = true;
+			}
+		}
+		pipes.read = count;
+	}
+
+	// Stores this session's keys, in the order draws first asked for them, then the stored keys of the same
+	// version it has not used, up to PIPE_CAPACITY.
+	async function pipeSave() {
+		pipeRead();
+		if (!pipes.dirty || pipes.saving || !pipes.serial || !pipes.version)
+			return;
+		const serial = pipes.serial;
+		const version = pipes.version;
+		const keys = pipes.used.slice(0, PIPE_CAPACITY);
+		const old = pipes.stored;
+		if (old && old.version[0] === version[0] && old.version[1] === version[1]) {
+			const ob = new Uint8Array(old.keys);
+			for (let o = 0; o + PIPE_KEY_BYTES <= ob.length && keys.length < PIPE_CAPACITY; o += PIPE_KEY_BYTES) {
+				const key = ob.subarray(o, o + PIPE_KEY_BYTES);
+				if (!pipes.usedSet.has(pipeKeyId(key)))
+					keys.push(key);
+			}
+		}
+		const out = new Uint8Array(keys.length * PIPE_KEY_BYTES);
+		keys.forEach((k, i) => out.set(k, i * PIPE_KEY_BYTES));
+		const rec = { version, keys: out.buffer, savedAt: Date.now() };
+		pipes.dirty = false;
+		pipes.saving = true;
+		pipes.lastSave = performance.now();
+		try {
+			await pipeIdb('readwrite', (s) => s.put(rec, serial));
+			if (pipes.serial === serial)
+				pipes.stored = rec;
+		} catch (err) {
+			pipeWarn('store the list', err);
+		} finally {
+			pipes.saving = false;
+		}
+	}
+
+	function pipeTick() {
+		if (pipes.handOver)
+			pipeHandOver();
+		const now = performance.now();
+		if (!pipes.serial || now - pipes.lastRead < PIPE_READ_MS)
+			return;
+		pipes.lastRead = now;
+		pipeRead();
+		if (pipes.dirty && now - pipes.lastSave >= PIPE_SAVE_MS)
+			pipeSave();
+	}
+
+	// The VM stopped: keep what it used, and ignore its log from now on (the next VM's device starts a new one).
+	function pipeVmStopped() {
+		const M = window.Module;
+		const buf = heapBuffer();
+		if (pipes.serial)
+			pipeSave();
+		if (buf && M && typeof M._pcsx2web_tfx_log === 'function')
+			pipes.staleSession = Atomics.load(new Uint32Array(buf, M._pcsx2web_tfx_log() >>> 0, 1), 0);
+		pipes.serial = '';
 	}
 
 	// ---- the slate, the disc menu
@@ -4733,10 +4939,15 @@
 
 		// Keep the memory card when the page goes into the background, and start the copy when it goes
 		// away (the unload guard has asked first while a write was not copied yet).
-		window.addEventListener('pagehide', () => persistMemoryCards(true));
+		window.addEventListener('pagehide', () => {
+			persistMemoryCards(true);
+			pipeSave();
+		});
 		document.addEventListener('visibilitychange', () => {
-			if (document.visibilityState === 'hidden')
+			if (document.visibilityState === 'hidden') {
 				persistMemoryCards(true);
+				pipeSave();
+			}
 		});
 	}
 

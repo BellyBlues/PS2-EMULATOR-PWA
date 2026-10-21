@@ -33,6 +33,10 @@ namespace
 	std::atomic<bool> s_given_up{false};
 	std::atomic<bool> s_test_loss_requested{false};
 	std::atomic<bool> s_idle_waits_suspend{true};
+	std::atomic<bool> s_pipelines_wait{false};
+
+	WebGPUHost::TFXKeyBlock s_tfx_key_log = {};
+	WebGPUHost::TFXKeyBlock s_tfx_prewarm_slot = {};
 
 	// GS thread
 	u32 s_posted_frames = 0;
@@ -76,6 +80,35 @@ void WebGPUHost::SetIdleWaitsSuspend(bool enabled)
 bool WebGPUHost::IdleWaitsSuspend()
 {
 	return s_idle_waits_suspend.load(std::memory_order_acquire);
+}
+
+void WebGPUHost::SetPipelinesWait(bool always)
+{
+	s_pipelines_wait.store(always, std::memory_order_release);
+}
+
+bool WebGPUHost::PipelinesWait()
+{
+	return s_pipelines_wait.load(std::memory_order_acquire);
+}
+
+WebGPUHost::TFXKeyBlock* WebGPUHost::TFXKeyLog()
+{
+	return &s_tfx_key_log;
+}
+
+WebGPUHost::TFXKeyBlock* WebGPUHost::TFXPrewarmSlot()
+{
+	return &s_tfx_prewarm_slot;
+}
+
+void WebGPUHost::ResetTFXKeyLog(u64 version)
+{
+	// A page that read the old session's count and records sees the session change and drops them.
+	s_tfx_key_log.count.store(0, std::memory_order_relaxed);
+	s_tfx_key_log.version_lo = static_cast<u32>(version);
+	s_tfx_key_log.version_hi = static_cast<u32>(version >> 32);
+	s_tfx_key_log.state.fetch_add(1, std::memory_order_release);
 }
 
 void WebGPUHost::NoteDeviceCreated()
@@ -192,6 +225,16 @@ void WebGPUHost::SleepSuspending(double ms)
 	s_suspended = true;
 	tst_sleep_suspending(ms);
 	s_suspended = false;
+}
+
+WGPUWaitStatus WebGPUHost::WaitAny(WGPUInstance instance, WGPUFutureWaitInfo* infos, u32 count, double timeout_ms)
+{
+	const u64 timeout_ns = (timeout_ms <= 0.0) ? 0 : static_cast<u64>(timeout_ms * 1e6);
+	pxAssertMsg(!InSuspendingWait(), "GS code entered while the GS thread is suspended");
+	s_suspended = (timeout_ns != 0);
+	const WGPUWaitStatus status = wgpuInstanceWaitAny(instance, count, infos, timeout_ns);
+	s_suspended = false;
+	return status;
 }
 
 bool WebGPUHost::InSuspendingWait()

@@ -83,6 +83,11 @@ list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_memcard
 	_pcsx2web_memcard_status
 )
+# Per-game TFX pipeline lists (Main.cpp, WebGPUHost.h).
+list(APPEND PCSX2_WASM_EXPORTS
+	_pcsx2web_tfx_log
+	_pcsx2web_tfx_prewarm
+)
 # Audio (Main.cpp, "Audio").
 list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_audio_start

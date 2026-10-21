@@ -1433,8 +1433,8 @@ static bool InitializeConfig()
 }
 
 // The page's switches, passed as main()'s arguments (Module.arguments): -gpu 0|1 and, for tests,
-// -set Section/Key=Value, -surface WxH, -gs-idle block and -capture N,M,... (vsync numbers of the
-// 2D path's frames to keep a copy of).
+// -set Section/Key=Value, -surface WxH, -gs-idle block, -gs-pipelines wait and -capture N,M,... (vsync
+// numbers of the 2D path's frames to keep a copy of).
 // Benchmarks (?unlimited=1): boot with the frame limiter off, as pcsx2-headless -unlimited.
 static bool s_start_unlimited = false;
 
@@ -1467,6 +1467,12 @@ static void ParseArguments(int argc, char* argv[])
 			// Tests: "block" keeps the GS thread's idle wait blocking with WebGPU, to exercise the
 			// device's bounded event-loop turn on its own.
 			WebGPUHost::SetIdleWaitsSuspend(std::string_view(argv[++i]) != "block");
+		}
+		else if (arg == "-gs-pipelines" && has_value)
+		{
+			// Tests: "wait" makes the HW renderer wait for every new TFX pipeline instead of skipping
+			// the draws that need one still being created (frames identical to a run with no skips).
+			WebGPUHost::SetPipelinesWait(std::string_view(argv[++i]) == "wait");
 		}
 		else if (arg == "-set" && has_value)
 		{
@@ -2084,6 +2090,21 @@ EMSCRIPTEN_KEEPALIVE unsigned int pcsx2web_vsync_count(void)
 EMSCRIPTEN_KEEPALIVE void pcsx2web_test_snapshot(unsigned int vsync)
 {
 	s_snapshot_vsync.store(vsync, std::memory_order_release);
+}
+
+/// Address of the log of TFX pipeline keys the WebGPU HW renderer's draws asked for since its device
+/// started (WebGPUHost::TFXKeyBlock: session, count, version lo/hi, then count 36-byte keys). The page
+/// keeps them per game to prewarm them at the game's next boot (README "Pipeline lists").
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_tfx_log(void)
+{
+	return WebGPUHost::TFXKeyLog();
+}
+
+/// Address of the slot the page writes a game's stored key list into (the same layout; its first word
+/// is the slot's state, see WebGPUHost::TFX_SLOT_*). The GS thread takes it at a present.
+EMSCRIPTEN_KEEPALIVE void* pcsx2web_tfx_prewarm(void)
+{
+	return WebGPUHost::TFXPrewarmSlot();
 }
 
 /// Test hook: the WebGPU device destroys itself at its next present, as on a device loss.

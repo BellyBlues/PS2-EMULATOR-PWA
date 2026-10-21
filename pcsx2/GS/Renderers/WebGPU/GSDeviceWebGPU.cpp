@@ -2057,6 +2057,10 @@ GSDevice::PresentResult GSDeviceWebGPU::BeginPresent(bool frame_skip)
 		return PresentResult::DeviceLost;
 	}
 
+	// TFX pipelines created in the background: collect the finished ones, start more of a stored list.
+	PollTFXPipelines();
+	PrewarmTFXPipelines();
+
 	// The page's size feed: present at the canvas's backing size.
 	u32 width, height;
 	float scale;
@@ -2130,6 +2134,11 @@ void GSDeviceWebGPU::EndPresent()
 						   "{} bind groups.",
 			m_hw_draws, m_tfx_pipelines.size(), m_tfx_vs_modules.size(), m_tfx_fs_modules.size(), m_skipped_draws,
 			m_tfx_groups[1].size() + m_tfx_groups[2].size());
+		Console.WriteLnFmt("WebGPU HW: {} draws skipped for a pipeline not ready yet; {} pipelines finished after their "
+						   "draw gave up waiting (mean {:.0f} ms); prewarmed {} of {} started ({} failed, {} asked for "
+						   "before ready); {} in creation.",
+			m_tfx_skipped_pending, m_tfx_async_ready, m_tfx_async_ready ? m_tfx_async_ms / m_tfx_async_ready : 0.0,
+			m_tfx_prewarmed, m_tfx_prewarm_started, m_tfx_prewarm_failed, m_tfx_prewarm_waited, m_tfx_pending.size());
 	}
 }
 

@@ -653,14 +653,22 @@ using it invalidates the whole command encoder, which loses the frame. Vulkan on
 (`GSDeviceVK.cpp:5233-5242`; PLAN M4 task 9). Instead, on a miss:
 
 1. Generate the WGSL if the shader module is missing.
-2. Call `createRenderPipelineAsync` (callback mode `WaitAnyOnly`) and store the future.
-3. Poll it with `Wait(future, 0)`.
-4. If it is not ready, **wait with JSPI** (up to 2 s). This hitches, like desktop PCSX2's synchronous
-   compiles, but stays correct.
-5. A failed pipeline is cached as null, and its draws are skipped with one log line (in dev builds, the
-   WGSL and `GetCompilationInfo` go to the console).
+2. Call `createRenderPipelineAsync` (callback mode `WaitAnyOnly`) and keep the request in a pending
+   table (`m_tfx_pending`). A draw asks for the pipelines of all its passes together
+   (`GetTFXPipelines()`), so the second-pass pipelines are created in parallel with the first.
+3. **Wait briefly with JSPI**: at most 3 ms (`TFX_PIPELINE_WAIT_MS`), and at most 4 ms in all for the
+   draws of one vsync (`TFX_PIPELINE_FRAME_BUDGET_MS`).
+4. If a pipeline is still not ready, **skip the whole draw** (never a draw with another pipeline) and keep
+   the request. Each present polls every pending request with `WaitAny(..., 0)` (the callbacks run in
+   that poll), moves the finished ones into the cache, and handles a request older than 10 s as a device
+   loss, as a timed-out wait was before. Device loss and `Destroy()` drop the pending table (the
+   requests free themselves in their callbacks, quietly).
+5. A failed pipeline is cached as null, and its draws are skipped with one log line.
 
-Skipping the draw instead of waiting can be offered as an option ("async shader compilation").
+Measured in Chrome on an M1 Max: a pipeline took ~28 ms (up to 1.7 s for 24 in one vsync at a scene
+change) when waited for one at a time. The test switch `-gs-pipelines wait` (`?pipelines=wait`) waits
+to the end as before, for pixel-exact comparisons; with skipping, only the frames where a pipeline
+first appears differ.
 
 **Other pipelines** are keyed the same way:
 
@@ -803,9 +811,15 @@ hardware adapter and on SwiftShader, and offline through Tint (measured, `valida
   constants (the shaders report's alternative).
 - Chrome caches compiled shaders and pipelines on disk, keyed by source and state, so a second session is
   faster with no work from us (spec of the implementation; measure).
-- **Prewarm** (PLAN M5 task 6): persist the `PipelineSelectorWebGPU` keys used per game serial (OPFS or
-  IndexedDB, through the frontend), and at boot issue `createRenderPipelineAsync` for them without
-  waiting.
+- **Prewarm** (PLAN M5 task 6, done): the device logs the TFX keys its draws ask for into a block the
+  page reads (`pcsx2web_tfx_log()`); the page keeps them per game serial in IndexedDB
+  (`pcsx2-web-pipelines`) and, when the game boots again, writes them into a slot
+  (`pcsx2web_tfx_prewarm()`) that the GS thread takes at a present. It then issues
+  `createRenderPipelineAsync` for a few of them per present (at most eight in creation) without
+  waiting. Each list carries a version that hashes what a key means (`ComputeTFXKeyVersion()`: the key
+  layout, `tfx.wgsl`, the macros each selector bit sets, the blend, depth and mask fields, the texture
+  format values, and a constant to bump when the descriptor code changes); a list of another version is
+  ignored. `pcsx2-wasm/README.md` ("Pipeline lists") has the formats.
 
 ---
 

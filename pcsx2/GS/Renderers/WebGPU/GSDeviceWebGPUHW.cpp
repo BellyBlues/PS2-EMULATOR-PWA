@@ -28,6 +28,16 @@ namespace
 	constexpr u32 VS_CB_SLOT = (VS_CB_SIZE + UNIFORM_SLOT - 1) / UNIFORM_SLOT * UNIFORM_SLOT;
 	constexpr u32 PS_CB_SLOT = (PS_CB_SIZE + UNIFORM_SLOT - 1) / UNIFORM_SLOT * UNIFORM_SLOT;
 	constexpr double TFX_PIPELINE_TIMEOUT_MS = 10000.0;
+	// A draw whose TFX pipeline is not ready waits this long for it, then is skipped while the pipeline
+	// is created in the background (WebGPUHost::PipelinesWait() restores waiting to the end) ...
+	constexpr double TFX_PIPELINE_WAIT_MS = 3.0;
+	// ... and all such waits of one vsync together take at most this long.
+	constexpr double TFX_PIPELINE_FRAME_BUDGET_MS = 4.0;
+	// Prewarming a game's stored list: pipelines in creation at once, started per present, and the
+	// GS thread's time for starting them per present.
+	constexpr u32 TFX_PREWARM_IN_FLIGHT = 8;
+	constexpr u32 TFX_PREWARM_PER_PRESENT = 4;
+	constexpr double TFX_PREWARM_MS_PER_PRESENT = 2.0;
 	constexpr size_t MAX_CACHED_GROUPS = 4096;
 
 	static_assert(VS_CB_SIZE == 48 && PS_CB_SIZE == 272, "tfx.wgsl's uniform structs follow these sizes");
@@ -111,6 +121,12 @@ bool GSDeviceWebGPU::CreateHWResources()
 		return false;
 	}
 	m_tfx_source = *source;
+
+	// The keys draws use from now on go to a fresh log (pcsx2web_tfx_keys()), stamped with what they mean.
+	static_assert(sizeof(TFXPipelineKey) == WebGPUHost::TFX_KEY_BYTES);
+	m_tfx_key_version = ComputeTFXKeyVersion();
+	m_tfx_wait_budget_ms = TFX_PIPELINE_FRAME_BUDGET_MS;
+	WebGPUHost::ResetTFXKeyLog(m_tfx_key_version);
 
 	// §8.1: group 0 the per-draw constants and the vertex ring (VS expansion), group 1 the source
 	// textures and sampler, group 2 the feedback copies.
@@ -232,10 +248,17 @@ bool GSDeviceWebGPU::CreateHWResources()
 
 void GSDeviceWebGPU::DestroyHWResources()
 {
+	// Requests in flight are dropped; their callbacks free them (when the instance is released at the latest).
+	for (auto& it : m_tfx_pending)
+		DropTFXPending(it.second);
+	m_tfx_pending.clear();
+	m_tfx_prewarm_in_flight = 0;
+	m_tfx_prewarm_queue = {};
+	m_tfx_prewarm_next = 0;
 	for (auto& it : m_tfx_pipelines)
 	{
-		if (it.second)
-			wgpuRenderPipelineRelease(it.second);
+		if (it.second.pipeline)
+			wgpuRenderPipelineRelease(it.second.pipeline);
 	}
 	m_tfx_pipelines.clear();
 	for (auto& it : m_tfx_vs_modules)
@@ -290,13 +313,9 @@ void GSDeviceWebGPU::DestroyHWResources()
 // Shaders and pipelines
 // ----------------------------------------------------------------------------
 
-WGPUShaderModule GSDeviceWebGPU::GetTFXVertexModule(GSHWDrawConfig::VSSelector sel)
+static WGSLPreprocessor::Macros TFXVertexMacros(GSHWDrawConfig::VSSelector sel)
 {
-	const auto it = m_tfx_vs_modules.find(sel.key);
-	if (it != m_tfx_vs_modules.end())
-		return it->second;
-
-	const WGSLPreprocessor::Macros macros = {
+	return {
 		{"VERTEX_SHADER", "1"},
 		{"VS_TME", std::to_string(sel.tme)},
 		{"VS_FST", std::to_string(sel.fst)},
@@ -305,22 +324,11 @@ WGPUShaderModule GSDeviceWebGPU::GetTFXVertexModule(GSHWDrawConfig::VSSelector s
 		{"VS_EXPAND", std::to_string(static_cast<int>(sel.expand))},
 		{"VS_PROVOKING_VERTEX_LAST", "0"},
 	};
-	std::string error;
-	const std::string code = WGSLPreprocessor::Process(m_tfx_source, macros, &error);
-	if (!error.empty())
-		Console.ErrorFmt("WebGPU: tfx.wgsl (vertex {:02x}): {}", sel.key, error);
-	WGPUShaderModule mod = CreateShaderModule(fmt::format("tfx vs {:02x}", sel.key).c_str(), code);
-	m_tfx_vs_modules.emplace(sel.key, mod);
-	return mod;
 }
 
-WGPUShaderModule GSDeviceWebGPU::GetTFXFragmentModule(const GSHWDrawConfig::PSSelector& sel)
+// The macro list of GSDeviceVK::GetTFXFragmentShader.
+static WGSLPreprocessor::Macros TFXFragmentMacros(const GSHWDrawConfig::PSSelector& sel)
 {
-	const auto it = m_tfx_fs_modules.find(sel);
-	if (it != m_tfx_fs_modules.end())
-		return it->second;
-
-	// The macro list of GSDeviceVK::GetTFXFragmentShader.
 	WGSLPreprocessor::Macros macros;
 	macros.reserve(64);
 	auto add = [&macros](const char* n, u32 v) { macros.emplace_back(n, std::to_string(v)); };
@@ -387,6 +395,32 @@ WGPUShaderModule GSDeviceWebGPU::GetTFXFragmentModule(const GSHWDrawConfig::PSSe
 	add("PS_ANISOTROPIC_FILTERING", sel.sw_aniso);
 	add("PS_ROV_COLOR", 0);
 	add("PS_ROV_DEPTH", 0);
+	return macros;
+}
+
+WGPUShaderModule GSDeviceWebGPU::GetTFXVertexModule(GSHWDrawConfig::VSSelector sel)
+{
+	const auto it = m_tfx_vs_modules.find(sel.key);
+	if (it != m_tfx_vs_modules.end())
+		return it->second;
+
+	const WGSLPreprocessor::Macros macros = TFXVertexMacros(sel);
+	std::string error;
+	const std::string code = WGSLPreprocessor::Process(m_tfx_source, macros, &error);
+	if (!error.empty())
+		Console.ErrorFmt("WebGPU: tfx.wgsl (vertex {:02x}): {}", sel.key, error);
+	WGPUShaderModule mod = CreateShaderModule(fmt::format("tfx vs {:02x}", sel.key).c_str(), code);
+	m_tfx_vs_modules.emplace(sel.key, mod);
+	return mod;
+}
+
+WGPUShaderModule GSDeviceWebGPU::GetTFXFragmentModule(const GSHWDrawConfig::PSSelector& sel)
+{
+	const auto it = m_tfx_fs_modules.find(sel);
+	if (it != m_tfx_fs_modules.end())
+		return it->second;
+
+	const WGSLPreprocessor::Macros macros = TFXFragmentMacros(sel);
 
 	std::string error;
 	const std::string code = WGSLPreprocessor::Process(m_tfx_source, macros, &error);
@@ -442,19 +476,19 @@ GSDeviceWebGPU::TFXPipelineKey GSDeviceWebGPU::MakeTFXKey(const GSHWDrawConfig& 
 	return key;
 }
 
-WGPURenderPipeline GSDeviceWebGPU::GetTFXPipeline(const TFXPipelineKey& key)
+std::string GSDeviceWebGPU::TFXPipelineLabel(const TFXPipelineKey& key)
 {
-	const auto it = m_tfx_pipelines.find(key);
-	if (it != m_tfx_pipelines.end())
-		return it->second;
-
-	WGPURenderPipeline pipeline = CreateTFXPipeline(key);
-	m_tfx_pipelines.emplace(key, pipeline);
-	return pipeline;
+	return fmt::format("tfx {:02x}/{:016x}_{:016x} b{:08x} d{:02x} m{:x} t{} rt{} ds{}", key.vs, key.ps.key_hi,
+		key.ps.key_lo, key.blend, key.dss, key.cms, key.topology, static_cast<int>(key.rt_format),
+		static_cast<int>(key.ds_format));
 }
 
-WGPURenderPipeline GSDeviceWebGPU::CreateTFXPipeline(const TFXPipelineKey& key)
+GSDeviceWebGPU::PendingTFXPipeline GSDeviceWebGPU::StartTFXPipeline(const TFXPipelineKey& key, bool prewarm)
 {
+	PendingTFXPipeline p = {};
+	p.prewarm = prewarm;
+	p.started = WebGPUHost::Now();
+
 	GSHWDrawConfig::VSSelector vs(key.vs);
 	GSHWDrawConfig::BlendState bs;
 	bs.key = key.blend;
@@ -465,7 +499,7 @@ WGPURenderPipeline GSDeviceWebGPU::CreateTFXPipeline(const TFXPipelineKey& key)
 	WGPUShaderModule vsm = GetTFXVertexModule(vs);
 	WGPUShaderModule fsm = GetTFXFragmentModule(key.ps);
 	if (!vsm || !fsm)
-		return nullptr;
+		return p;
 
 	static constexpr WGPUVertexAttribute attrs[] = {
 		{nullptr, WGPUVertexFormat_Float32x2, 0, 0}, // ST
@@ -526,9 +560,7 @@ WGPURenderPipeline GSDeviceWebGPU::CreateTFXPipeline(const TFXPipelineKey& key)
 		WGPUPrimitiveTopology_PointList, WGPUPrimitiveTopology_LineList, WGPUPrimitiveTopology_TriangleList};
 
 	WGPURenderPipelineDescriptor d = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-	const std::string label = fmt::format("tfx {:02x}/{:016x}_{:016x} b{:08x} d{:02x} m{:x} t{} rt{} ds{}", key.vs,
-		key.ps.key_hi, key.ps.key_lo, key.blend, key.dss, key.cms, key.topology, static_cast<int>(key.rt_format),
-		static_cast<int>(key.ds_format));
+	const std::string label = TFXPipelineLabel(key);
 	d.label = {label.data(), label.size()};
 	d.layout = m_tfx_layout;
 	d.vertex.module = vsm;
@@ -540,17 +572,19 @@ WGPURenderPipeline GSDeviceWebGPU::CreateTFXPipeline(const TFXPipelineKey& key)
 	d.depthStencil = (key.ds_format != WGPUTextureFormat_Undefined) ? &ds : nullptr;
 	d.fragment = &fs;
 
-	// §8.4: created asynchronously, then waited for (the hitch desktop PCSX2 has on a compile).
-	using Request = WebGPUHost::RequestResult<WGPURenderPipeline>;
-	Request* const req = new Request();
+	// §8.4: created asynchronously. GetTFXPipelines() waits for it briefly and PollTFXPipelines()
+	// collects it later; its callback runs inside one of their waits (WaitAnyOnly). A prewarmed
+	// pipeline (userdata2 set) that fails is dropped quietly: a draw that needs it asks again.
+	PipelineRequest* const req = new PipelineRequest();
 	WGPUCreateRenderPipelineAsyncCallbackInfo cb = WGPU_CREATE_RENDER_PIPELINE_ASYNC_CALLBACK_INFO_INIT;
 	cb.mode = WGPUCallbackMode_WaitAnyOnly;
 	cb.userdata1 = req;
-	cb.callback = [](WGPUCreatePipelineAsyncStatus status, WGPURenderPipeline pipeline, WGPUStringView message, void* u1, void*) {
-		Request* const r = Request::Arrive(u1);
+	cb.userdata2 = prewarm ? req : nullptr;
+	cb.callback = [](WGPUCreatePipelineAsyncStatus status, WGPURenderPipeline pipeline, WGPUStringView message, void* u1, void* u2) {
+		PipelineRequest* const r = PipelineRequest::Arrive(u1);
 		if (status != WGPUCreatePipelineAsyncStatus_Success || !r)
 		{
-			if (r)
+			if (r && !u2)
 			{
 				const std::string text = fmt::format("WebGPU: TFX pipeline creation failed: {}", WebGPUHost::StringViewToString(message));
 				emscripten_console_error(text.c_str());
@@ -562,23 +596,379 @@ WGPURenderPipeline GSDeviceWebGPU::CreateTFXPipeline(const TFXPipelineKey& key)
 		if (r)
 			r->value = pipeline;
 	};
-	const double t0 = WebGPUHost::Now();
-	const WGPUFuture future = wgpuDeviceCreateRenderPipelineAsync(m_device, &d, cb);
-	WebGPUHost::Wait(m_instance, future, TFX_PIPELINE_TIMEOUT_MS);
-	PerfCounters::Add(PerfCounters::gpu_pipeline_ns, static_cast<u64>((WebGPUHost::Now() - t0) * 1e6));
-	PerfCounters::gpu_pipelines.fetch_add(1, std::memory_order_relaxed);
+	p.future = wgpuDeviceCreateRenderPipelineAsync(m_device, &d, cb);
+	p.request = req;
+	return p;
+}
+
+bool GSDeviceWebGPU::TakeTFXPipeline(const TFXPipelineKey& key, PendingTFXPipeline& p)
+{
 	WGPURenderPipeline pipeline = nullptr;
-	if (!req->Take(&pipeline))
+	if (p.request)
 	{
-		Console.ErrorFmt("WebGPU: timed out creating {}", label);
-		MarkDeviceLost("a TFX pipeline creation");
-		return nullptr;
+		if (!p.request->done)
+			return false;
+		p.request->Take(&pipeline);
+		p.request = nullptr;
 	}
+
+	const double ms = WebGPUHost::Now() - p.started;
+	if (p.prewarm)
+	{
+		m_tfx_prewarm_in_flight--;
+		if (pipeline)
+			m_tfx_prewarmed++;
+		else
+			m_tfx_prewarm_failed++;
+		// A failed prewarm leaves no entry, unless a draw asked for it meanwhile.
+		if (!pipeline && !p.logged)
+			return true;
+	}
+	else if (p.skipped)
+	{
+		m_tfx_async_ready++;
+		m_tfx_async_ms += ms;
+	}
+
 	if (!pipeline)
-		Console.ErrorFmt("WebGPU: {} could not be created; its draws are skipped.", label);
-	else if (WebGPUHost::Now() - t0 > 50.0)
-		Console.WriteLnFmt("WebGPU: {} took {:.0f} ms", label, WebGPUHost::Now() - t0);
-	return pipeline;
+		Console.ErrorFmt("WebGPU: {} could not be created; its draws are skipped.", TFXPipelineLabel(key));
+	else if (ms > 250.0)
+		Console.WriteLnFmt("WebGPU: {} took {:.0f} ms", TFXPipelineLabel(key), ms);
+	m_tfx_pipelines.emplace(key, TFXPipeline{pipeline, p.logged});
+	return true;
+}
+
+void GSDeviceWebGPU::DropTFXPending(PendingTFXPipeline& p)
+{
+	if (!p.request)
+		return;
+	// A request still running frees itself in its callback (at the latest when the instance goes).
+	p.request->quiet = true;
+	WGPURenderPipeline pipeline = nullptr;
+	if (p.request->Take(&pipeline) && pipeline)
+		wgpuRenderPipelineRelease(pipeline);
+	p.request = nullptr;
+}
+
+void GSDeviceWebGPU::LogTFXKey(const TFXPipelineKey& key)
+{
+	WebGPUHost::TFXKeyBlock* const log = WebGPUHost::TFXKeyLog();
+	const u32 count = log->count.load(std::memory_order_relaxed);
+	if (count >= WebGPUHost::TFX_KEY_CAPACITY)
+		return;
+	std::memcpy(&log->records[count * WebGPUHost::TFX_KEY_BYTES], &key, sizeof(key));
+	log->count.store(count + 1, std::memory_order_release);
+}
+
+bool GSDeviceWebGPU::GetTFXPipelines(const TFXPipelineKey* keys, u32 count, WGPURenderPipeline* out)
+{
+	bool missing = false;
+	for (u32 i = 0; i < count; i++)
+	{
+		const auto it = m_tfx_pipelines.find(keys[i]);
+		if (it == m_tfx_pipelines.end())
+		{
+			missing = true;
+			continue;
+		}
+		out[i] = it->second.pipeline;
+		if (!it->second.logged)
+		{
+			it->second.logged = true;
+			LogTFXKey(keys[i]);
+		}
+	}
+	if (!missing)
+		return true;
+
+	// Start what is not being created yet. The keys are logged in the order draws first ask for them,
+	// the order a later boot of the game prewarms them in.
+	PendingTFXPipeline* wait_for[3] = {};
+	u32 waits = 0;
+	for (u32 i = 0; i < count; i++)
+	{
+		if (m_tfx_pipelines.find(keys[i]) != m_tfx_pipelines.end())
+			continue;
+		auto it = m_tfx_pending.find(keys[i]);
+		if (it == m_tfx_pending.end())
+		{
+			it = m_tfx_pending.emplace(keys[i], StartTFXPipeline(keys[i], false)).first;
+			PerfCounters::gpu_pipelines.fetch_add(1, std::memory_order_relaxed);
+		}
+		else if (it->second.prewarm && !it->second.logged)
+		{
+			m_tfx_prewarm_waited++;
+		}
+		if (!it->second.logged)
+		{
+			it->second.logged = true;
+			LogTFXKey(keys[i]);
+		}
+		wait_for[waits++] = &it->second;
+	}
+
+	// Wait for them: to the end in the test mode (WebGPUHost::PipelinesWait()), else at most
+	// TFX_PIPELINE_WAIT_MS and no longer than what is left of this vsync's budget.
+	const bool always = WebGPUHost::PipelinesWait();
+	const double t0 = WebGPUHost::Now();
+	const double limit = always ? TFX_PIPELINE_TIMEOUT_MS : std::min(TFX_PIPELINE_WAIT_MS, m_tfx_wait_budget_ms);
+	for (;;)
+	{
+		WGPUFutureWaitInfo infos[3];
+		u32 n = 0;
+		for (u32 i = 0; i < waits; i++)
+		{
+			if (wait_for[i]->request && !wait_for[i]->request->done)
+			{
+				infos[n] = WGPU_FUTURE_WAIT_INFO_INIT;
+				infos[n++].future = wait_for[i]->future;
+			}
+		}
+		if (n == 0)
+			break;
+		const double left = limit - (WebGPUHost::Now() - t0);
+		WebGPUHost::WaitAny(m_instance, infos, n, std::max(left, 0.0));
+		if (left <= 0.0)
+			break;
+	}
+	const double waited = WebGPUHost::Now() - t0;
+	PerfCounters::Add(PerfCounters::gpu_pipeline_ns, static_cast<u64>(waited * 1e6));
+	m_tfx_wait_budget_ms = std::max(m_tfx_wait_budget_ms - waited, 0.0);
+
+	bool ready = true;
+	for (u32 i = 0; i < count; i++)
+	{
+		const auto pit = m_tfx_pending.find(keys[i]);
+		if (pit != m_tfx_pending.end())
+		{
+			if (TakeTFXPipeline(keys[i], pit->second))
+			{
+				m_tfx_pending.erase(pit);
+			}
+			else if (always)
+			{
+				// As before asynchronous creation: a wait that timed out is handled as a device loss.
+				Console.ErrorFmt("WebGPU: timed out creating {}", TFXPipelineLabel(keys[i]));
+				if (pit->second.prewarm)
+					m_tfx_prewarm_in_flight--;
+				DropTFXPending(pit->second);
+				m_tfx_pending.erase(pit);
+				MarkDeviceLost("a TFX pipeline creation");
+				return false;
+			}
+			else
+			{
+				pit->second.skipped = true;
+				ready = false;
+				continue;
+			}
+		}
+		const auto it = m_tfx_pipelines.find(keys[i]);
+		out[i] = (it != m_tfx_pipelines.end()) ? it->second.pipeline : nullptr;
+	}
+	if (!ready)
+		m_tfx_skipped_pending++;
+	return ready;
+}
+
+void GSDeviceWebGPU::PollTFXPipelines()
+{
+	m_tfx_wait_budget_ms = TFX_PIPELINE_FRAME_BUDGET_MS;
+	if (m_tfx_pending.empty())
+		return;
+
+	// Completes every request whose result has arrived (their callbacks run inside this poll).
+	m_tfx_wait_infos.clear();
+	for (const auto& it : m_tfx_pending)
+	{
+		if (it.second.request && !it.second.request->done)
+		{
+			WGPUFutureWaitInfo info = WGPU_FUTURE_WAIT_INFO_INIT;
+			info.future = it.second.future;
+			m_tfx_wait_infos.push_back(info);
+		}
+	}
+	if (!m_tfx_wait_infos.empty())
+		WebGPUHost::WaitAny(m_instance, m_tfx_wait_infos.data(), static_cast<u32>(m_tfx_wait_infos.size()), 0.0);
+
+	const double now = WebGPUHost::Now();
+	bool timed_out = false;
+	for (auto it = m_tfx_pending.begin(); it != m_tfx_pending.end();)
+	{
+		if (TakeTFXPipeline(it->first, it->second))
+		{
+			it = m_tfx_pending.erase(it);
+		}
+		else if (now - it->second.started > TFX_PIPELINE_TIMEOUT_MS)
+		{
+			Console.ErrorFmt("WebGPU: timed out creating {}", TFXPipelineLabel(it->first));
+			if (it->second.prewarm)
+				m_tfx_prewarm_in_flight--;
+			DropTFXPending(it->second);
+			it = m_tfx_pending.erase(it);
+			timed_out = true;
+		}
+		else
+		{
+			++it;
+		}
+	}
+	if (timed_out)
+		MarkDeviceLost("a TFX pipeline creation");
+}
+
+bool GSDeviceWebGPU::IsUsableStoredTFXKey(const TFXPipelineKey& key) const
+{
+	// Rebuilt field by field: a stored key with padding or fields MakeTFXKey() would not write is not
+	// one this build makes.
+	TFXPipelineKey k;
+	k.ps = key.ps;
+	k.blend = key.blend;
+	k.vs = key.vs;
+	k.dss = key.dss;
+	k.cms = key.cms;
+	k.topology = key.topology;
+	k.rt_format = key.rt_format;
+	k.ds_format = key.ds_format;
+	if (!(k == key) || key.topology > 2 ||
+		(key.rt_format == WGPUTextureFormat_Undefined && key.ds_format == WGPUTextureFormat_Undefined))
+		return false;
+
+	// Only formats this device makes targets in (an unknown enum value must not reach the browser).
+	auto known = [this](WGPUTextureFormat f, bool depth) {
+		if (f == WGPUTextureFormat_Undefined)
+			return true;
+		for (u32 i = static_cast<u32>(GSTexture::Format::Color); i <= static_cast<u32>(GSTexture::Format::UInt32); i++)
+		{
+			const GSTexture::Format gf = static_cast<GSTexture::Format>(i);
+			if ((gf == GSTexture::Format::DepthStencil) == depth && LookupNativeFormat(gf) == f)
+				return true;
+		}
+		return false;
+	};
+	return known(key.rt_format, false) && known(key.ds_format, true);
+}
+
+u64 GSDeviceWebGPU::ComputeTFXKeyVersion() const
+{
+	// FNV-1a over everything that gives a stored key its meaning: the key's layout, tfx.wgsl, the macros
+	// each selector bit turns on, the blend, depth and colour mask fields each bit sets, and the texture
+	// format values. TFX_KEY_FORMAT covers the code: bump it when MakeTFXKey() or StartTFXPipeline()
+	// change how a key maps to a pipeline.
+	static constexpr u32 TFX_KEY_FORMAT = 1;
+	u64 h = 0xcbf29ce484222325ull;
+	auto bytes = [&h](const void* data, size_t size) {
+		for (size_t i = 0; i < size; i++)
+		{
+			h ^= static_cast<const u8*>(data)[i];
+			h *= 0x100000001b3ull;
+		}
+	};
+	auto value = [&bytes](u32 v) { bytes(&v, sizeof(v)); };
+	auto macros = [&](u32 bit, const WGSLPreprocessor::Macros& list) {
+		for (const auto& [name, val] : list)
+		{
+			if (val == "0")
+				continue;
+			value(bit);
+			bytes(name.data(), name.size());
+			bytes(val.data(), val.size());
+		}
+	};
+
+	value(TFX_KEY_FORMAT);
+	value(WebGPUHost::TFX_KEY_BYTES);
+	const TFXPipelineKey k;
+	const u8* base = reinterpret_cast<const u8*>(&k);
+	for (const void* field : {static_cast<const void*>(&k.ps), static_cast<const void*>(&k.blend),
+			 static_cast<const void*>(&k.vs), static_cast<const void*>(&k.dss), static_cast<const void*>(&k.cms),
+			 static_cast<const void*>(&k.topology), static_cast<const void*>(&k.rt_format),
+			 static_cast<const void*>(&k.ds_format)})
+		value(static_cast<u32>(static_cast<const u8*>(field) - base));
+	bytes(m_tfx_source.data(), m_tfx_source.size());
+
+	for (u32 bit = 0; bit < 128; bit++)
+	{
+		GSHWDrawConfig::PSSelector ps;
+		if (bit < 64)
+			ps.key_lo = 1ull << bit;
+		else
+			ps.key_hi = 1ull << (bit - 64);
+		macros(bit, TFXFragmentMacros(ps));
+	}
+	for (u32 bit = 0; bit < 8; bit++)
+		macros(bit, TFXVertexMacros(GSHWDrawConfig::VSSelector(static_cast<u8>(1u << bit))));
+	for (u32 bit = 0; bit < 32; bit++)
+	{
+		GSHWDrawConfig::BlendState bs;
+		bs.key = 1u << bit;
+		for (u32 v : {static_cast<u32>(bs.enable), static_cast<u32>(bs.constant_enable), static_cast<u32>(bs.op),
+				 static_cast<u32>(bs.src_factor), static_cast<u32>(bs.dst_factor), static_cast<u32>(bs.src_factor_alpha),
+				 static_cast<u32>(bs.dst_factor_alpha), static_cast<u32>(bs.constant)})
+			value(v);
+	}
+	for (u32 bit = 0; bit < 8; bit++)
+	{
+		const GSHWDrawConfig::DepthStencilSelector dss(static_cast<u8>(1u << bit));
+		GSHWDrawConfig::ColorMaskSelector cms;
+		cms.key = static_cast<u8>(1u << bit);
+		for (u32 v : {static_cast<u32>(dss.ztst), static_cast<u32>(dss.zwe), static_cast<u32>(dss.date),
+				 static_cast<u32>(dss.date_one), static_cast<u32>(cms.wrgba)})
+			value(v);
+	}
+	for (u32 i = 0; i <= static_cast<u32>(GSTexture::Format::Last); i++)
+		value(static_cast<u32>(LookupNativeFormat(static_cast<GSTexture::Format>(i))));
+	return h;
+}
+
+void GSDeviceWebGPU::PrewarmTFXPipelines()
+{
+	// A list the page handed over (pcsx2web_tfx_prewarm()), taken once the HW resources exist.
+	WebGPUHost::TFXKeyBlock* const slot = WebGPUHost::TFXPrewarmSlot();
+	u32 state = WebGPUHost::TFX_SLOT_READY;
+	if (m_tfx_layout && slot->state.compare_exchange_strong(state, WebGPUHost::TFX_SLOT_TAKING, std::memory_order_acquire))
+	{
+		const u32 count = std::min(slot->count.load(std::memory_order_relaxed), WebGPUHost::TFX_KEY_CAPACITY);
+		if (slot->version_lo == static_cast<u32>(m_tfx_key_version) &&
+			slot->version_hi == static_cast<u32>(m_tfx_key_version >> 32))
+		{
+			m_tfx_prewarm_queue.resize(count);
+			for (u32 i = 0; i < count; i++)
+				std::memcpy(static_cast<void*>(&m_tfx_prewarm_queue[i]), &slot->records[i * WebGPUHost::TFX_KEY_BYTES], sizeof(TFXPipelineKey));
+			m_tfx_prewarm_next = 0;
+			Console.WriteLnFmt("WebGPU: creating {} TFX pipelines this game used before, in the background.", count);
+		}
+		else
+		{
+			Console.WriteLnFmt("WebGPU: the stored list of {} TFX pipelines is for another version; ignored.", count);
+		}
+		slot->state.store(WebGPUHost::TFX_SLOT_FREE, std::memory_order_release);
+	}
+
+	// A few at a time: each costs the GS thread its shader preprocessing, and the browser compiles them
+	// alongside the ones draws ask for.
+	const double t0 = WebGPUHost::Now();
+	u32 started = 0;
+	while (m_tfx_prewarm_next < m_tfx_prewarm_queue.size() && m_tfx_prewarm_in_flight < TFX_PREWARM_IN_FLIGHT &&
+		   started < TFX_PREWARM_PER_PRESENT && WebGPUHost::Now() - t0 < TFX_PREWARM_MS_PER_PRESENT)
+	{
+		const TFXPipelineKey key = m_tfx_prewarm_queue[m_tfx_prewarm_next++];
+		if (!IsUsableStoredTFXKey(key) || m_tfx_pipelines.find(key) != m_tfx_pipelines.end() ||
+			m_tfx_pending.find(key) != m_tfx_pending.end())
+			continue;
+		const PendingTFXPipeline p = StartTFXPipeline(key, true);
+		if (!p.request)
+			continue;
+		m_tfx_pending.emplace(key, p);
+		m_tfx_prewarm_in_flight++;
+		m_tfx_prewarm_started++;
+		started++;
+	}
+	if (!m_tfx_prewarm_queue.empty() && m_tfx_prewarm_next >= m_tfx_prewarm_queue.size())
+	{
+		m_tfx_prewarm_queue = {};
+		m_tfx_prewarm_next = 0;
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -1127,11 +1517,49 @@ void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
 	};
 	upload_ps_cb();
 
-	const WGPURenderPipeline pipeline =
-		GetTFXPipeline(MakeTFXKey(config, config.ps, config.blend, config.colormask, config.depth, draw_rt, draw_ds));
+	// The pipelines of every pass of this draw: asked for together, so that they are created in parallel,
+	// and the draw is skipped whole when one of them is not ready yet.
+	GSHWDrawConfig::PSSelector mp_ps = config.ps;
+	mp_ps.no_color1 = config.blend_multi_pass.no_color1;
+	mp_ps.blend_hw = config.blend_multi_pass.blend_hw;
+	mp_ps.dither = config.blend_multi_pass.dither;
+	TFXPipelineKey keys[3];
+	WGPURenderPipeline pipelines[3] = {};
+	u32 num_keys = 0;
+	keys[num_keys++] = MakeTFXKey(config, config.ps, config.blend, config.colormask, config.depth, draw_rt, draw_ds);
+	const u32 mp_index = config.blend_multi_pass.enable ? num_keys++ : 0;
+	if (mp_index)
+		keys[mp_index] = MakeTFXKey(config, mp_ps, config.blend_multi_pass.blend, config.colormask, config.depth, draw_rt, draw_ds);
+	const u32 ap_index = config.alpha_second_pass.enable ? num_keys++ : 0;
+	if (ap_index)
+	{
+		keys[ap_index] = MakeTFXKey(config, config.alpha_second_pass.ps, config.blend, config.alpha_second_pass.colormask,
+			config.alpha_second_pass.depth, draw_rt, draw_ds);
+	}
+	auto finish_colclip = [&]() {
+		if (!colclip_rt)
+			return;
+		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);
+		if (config.colclip_mode == GSHWDrawConfig::ColClipMode::ResolveOnly ||
+			config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve)
+		{
+			const GSVector2i size = config.rt->GetSize();
+			const GSVector4 dRect(config.colclip_update_area);
+			const GSVector4 sRect = dRect / GSVector4(size.x, size.y).xyxy();
+			StretchRect(colclip_rt, sRect, config.rt, dRect, ShaderConvert::COLCLIP_RESOLVE, Nearest);
+			Recycle(colclip_rt);
+			g_gs_device->SetColorClipTexture(nullptr);
+		}
+	};
+	const bool ready = GetTFXPipelines(keys, num_keys, pipelines);
+	const WGPURenderPipeline pipeline = ready ? pipelines[0] : nullptr;
 	if (!pipeline)
 	{
 		m_skipped_draws++;
+		// A draw skipped while its pipeline is created still resolves the colour clip target as the draw
+		// would have. (A pipeline that failed keeps the old early return.)
+		if (!ready)
+			finish_colclip();
 		return;
 	}
 
@@ -1178,14 +1606,9 @@ void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
 
 	if (config.blend_multi_pass.enable)
 	{
-		GSHWDrawConfig::PSSelector ps = config.ps;
-		ps.no_color1 = config.blend_multi_pass.no_color1;
-		ps.blend_hw = config.blend_multi_pass.blend_hw;
-		ps.dither = config.blend_multi_pass.dither;
-		const WGPURenderPipeline mp = GetTFXPipeline(
-			MakeTFXKey(config, ps, config.blend_multi_pass.blend, config.colormask, config.depth, draw_rt, draw_ds));
+		const WGPURenderPipeline mp = pipelines[mp_index];
 		GSHWDrawConfig mp_config = config;
-		mp_config.ps = ps;
+		mp_config.ps = mp_ps;
 		mp_config.blend = config.blend_multi_pass.blend;
 		if (mp)
 			SendHWDraw(mp_config, mp, draw_rt, draw_ds, rt_clone, ds_clone, false, false, -1);
@@ -1198,8 +1621,7 @@ void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
 			config.cb_ps.FogColor_AREF.a = config.alpha_second_pass.ps_aref;
 			upload_ps_cb();
 		}
-		const WGPURenderPipeline ap = GetTFXPipeline(MakeTFXKey(config, config.alpha_second_pass.ps, config.blend,
-			config.alpha_second_pass.colormask, config.alpha_second_pass.depth, draw_rt, draw_ds));
+		const WGPURenderPipeline ap = pipelines[ap_index];
 		GSHWDrawConfig ap_config = config;
 		ap_config.ps = config.alpha_second_pass.ps;
 		ap_config.colormask = config.alpha_second_pass.colormask;
@@ -1212,20 +1634,7 @@ void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
 		}
 	}
 
-	if (colclip_rt)
-	{
-		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);
-		if (config.colclip_mode == GSHWDrawConfig::ColClipMode::ResolveOnly ||
-			config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve)
-		{
-			const GSVector2i size = config.rt->GetSize();
-			const GSVector4 dRect(config.colclip_update_area);
-			const GSVector4 sRect = dRect / GSVector4(size.x, size.y).xyxy();
-			StretchRect(colclip_rt, sRect, config.rt, dRect, ShaderConvert::COLCLIP_RESOLVE, Nearest);
-			Recycle(colclip_rt);
-			g_gs_device->SetColorClipTexture(nullptr);
-		}
-	}
+	finish_colclip();
 }
 
 void GSDeviceWebGPU::ClearSamplerCache()

@@ -292,8 +292,37 @@ private:
 	void DestroyHWResources();
 	WGPUShaderModule GetTFXVertexModule(GSHWDrawConfig::VSSelector sel);
 	WGPUShaderModule GetTFXFragmentModule(const GSHWDrawConfig::PSSelector& sel);
-	WGPURenderPipeline GetTFXPipeline(const TFXPipelineKey& key);
-	WGPURenderPipeline CreateTFXPipeline(const TFXPipelineKey& key);
+	/// A TFX pipeline being created (§8.4): asked for by a draw, or prewarmed from the game's stored list.
+	struct PendingTFXPipeline
+	{
+		WGPUFuture future;
+		PipelineRequest* request; ///< null once taken or dropped (or if creation could not start)
+		double started; ///< WebGPUHost::Now() when it was started
+		bool prewarm; ///< started from the stored list, not for a draw
+		bool logged; ///< a draw asked for it (its key is in the key log)
+		bool skipped; ///< a draw was skipped because it was not ready
+	};
+	struct TFXPipeline
+	{
+		WGPURenderPipeline pipeline; ///< null if creation failed (its draws are skipped)
+		bool logged;
+	};
+	/// The pipelines of a draw's passes, out[i] for keys[i] (null for one that failed). False when one
+	/// is still being created after a bounded wait: the draw is skipped.
+	bool GetTFXPipelines(const TFXPipelineKey* keys, u32 count, WGPURenderPipeline* out);
+	PendingTFXPipeline StartTFXPipeline(const TFXPipelineKey& key, bool prewarm);
+	/// If its creation finished, moves the result into m_tfx_pipelines (unless a prewarm failed) and
+	/// returns true (the caller erases it from m_tfx_pending).
+	bool TakeTFXPipeline(const TFXPipelineKey& key, PendingTFXPipeline& p);
+	void DropTFXPending(PendingTFXPipeline& p);
+	/// Once per vsync: collects finished creations and refills the wait budget.
+	void PollTFXPipelines();
+	/// Once per vsync: takes a list the page handed over and starts a few of its pipelines.
+	void PrewarmTFXPipelines();
+	void LogTFXKey(const TFXPipelineKey& key);
+	bool IsUsableStoredTFXKey(const TFXPipelineKey& key) const;
+	u64 ComputeTFXKeyVersion() const;
+	static std::string TFXPipelineLabel(const TFXPipelineKey& key);
 	WGPUBindGroup GetTFXGroup(u32 group, const TFXGroupKey& key);
 	void DropTFXGroupsUsing(std::initializer_list<WGPUTextureView> views);
 	void SetupDATE(GSTextureWebGPU* rt, GSTextureWebGPU* ds, SetDATM datm, const GSVector4i& bbox);
@@ -405,7 +434,21 @@ private:
 	WGPUBindGroup m_null_group2 = nullptr;
 	std::unordered_map<u8, WGPUShaderModule> m_tfx_vs_modules;
 	std::unordered_map<GSHWDrawConfig::PSSelector, WGPUShaderModule, GSHWDrawConfig::PSSelectorHash> m_tfx_fs_modules;
-	std::unordered_map<TFXPipelineKey, WGPURenderPipeline, TFXPipelineKeyHash> m_tfx_pipelines;
+	std::unordered_map<TFXPipelineKey, TFXPipeline, TFXPipelineKeyHash> m_tfx_pipelines;
+	std::unordered_map<TFXPipelineKey, PendingTFXPipeline, TFXPipelineKeyHash> m_tfx_pending;
+	std::vector<WGPUFutureWaitInfo> m_tfx_wait_infos;
+	double m_tfx_wait_budget_ms = 0.0;
+	u64 m_tfx_key_version = 0;
+	std::vector<TFXPipelineKey> m_tfx_prewarm_queue;
+	size_t m_tfx_prewarm_next = 0;
+	u32 m_tfx_prewarm_in_flight = 0;
+	u32 m_tfx_skipped_pending = 0; ///< draws skipped because a pipeline was not ready
+	u32 m_tfx_async_ready = 0; ///< pipelines that became ready after a draw gave up waiting
+	double m_tfx_async_ms = 0.0; ///< their total creation time
+	u32 m_tfx_prewarm_started = 0;
+	u32 m_tfx_prewarmed = 0;
+	u32 m_tfx_prewarm_failed = 0;
+	u32 m_tfx_prewarm_waited = 0; ///< prewarmed pipelines a draw asked for before they were ready
 	std::unordered_map<TFXGroupKey, WGPUBindGroup, TFXGroupKeyHash> m_tfx_groups[3];
 	GSHWDrawConfig::VSConstantBuffer m_vs_cb_cache;
 	GSHWDrawConfig::PSConstantBuffer m_ps_cb_cache;

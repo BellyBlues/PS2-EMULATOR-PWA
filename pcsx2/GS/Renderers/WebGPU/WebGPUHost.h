@@ -7,6 +7,7 @@
 
 #include <webgpu/webgpu.h>
 
+#include <atomic>
 #include <string>
 #include <utility>
 
@@ -37,6 +38,36 @@ namespace WebGPUHost
 	/// the bounded event-loop turn in EndPresent() delivers WebGPU callbacks (default true).
 	void SetIdleWaitsSuspend(bool enabled);
 	bool IdleWaitsSuspend();
+
+	/// Test switch: true makes a draw whose TFX pipeline is not created yet wait for it to the end, as
+	/// before pipelines were created in the background (for pixel-exact comparisons). The default,
+	/// false, waits a few milliseconds and skips the draw if the pipeline is still not ready.
+	void SetPipelinesWait(bool always);
+	bool PipelinesWait();
+
+	/// Per-game TFX pipeline lists (pcsx2-wasm/README.md, "Pipeline lists"): blocks of TFX pipeline keys
+	/// (GSDeviceWebGPU::TFXPipelineKey, TFX_KEY_BYTES each) shared with the page, which keeps a list per
+	/// game in IndexedDB. version_lo/hi identify what a key means (GSDeviceWebGPU::ComputeTFXKeyVersion()).
+	static constexpr u32 TFX_KEY_BYTES = 36;
+	static constexpr u32 TFX_KEY_CAPACITY = 4096;
+	struct TFXKeyBlock
+	{
+		/// The log: a session number, incremented when a device starts a new log. The prewarm slot:
+		/// TFX_SLOT_* (the page claims it with FREE -> WRITING or READY -> WRITING, then sets READY).
+		std::atomic<u32> state;
+		std::atomic<u32> count; ///< keys in records (published with release by their writer)
+		u32 version_lo;
+		u32 version_hi;
+		alignas(8) u8 records[TFX_KEY_CAPACITY * TFX_KEY_BYTES];
+	};
+	static constexpr u32 TFX_SLOT_FREE = 0;
+	static constexpr u32 TFX_SLOT_WRITING = 1;
+	static constexpr u32 TFX_SLOT_READY = 2;
+	static constexpr u32 TFX_SLOT_TAKING = 3;
+	/// The keys the GS device's draws asked for this session, in order (GS thread appends, the page reads).
+	TFXKeyBlock* TFXKeyLog();
+	/// A list the page hands over for prewarming (the page writes, the GS thread takes it at a present).
+	TFXKeyBlock* TFXPrewarmSlot();
 
 	// ---- GS thread ----
 
@@ -84,6 +115,12 @@ namespace WebGPUHost
 
 	/// Waits for a future (suspending through JSPI) for at most timeout_ms; 0 only polls.
 	WGPUWaitStatus Wait(WGPUInstance instance, WGPUFuture future, double timeout_ms);
+	/// Waits until one of the futures completes, for at most timeout_ms (then at most 64 futures); 0 only
+	/// polls, and completes every future that is ready.
+	WGPUWaitStatus WaitAny(WGPUInstance instance, WGPUFutureWaitInfo* infos, u32 count, double timeout_ms);
+
+	/// GS thread: starts a new key log for a device (TFXKeyLog()).
+	void ResetTFXKeyLog(u64 version);
 
 	/// Suspends the GS thread for ms milliseconds, letting its worker run its event loop.
 	void SleepSuspending(double ms);
@@ -140,6 +177,7 @@ namespace WebGPUHost
 		T value = {};
 		bool done = false;
 		bool abandoned = false;
+		bool quiet = false; ///< abandoned on purpose: no log when its callback runs
 
 		/// In the callback: the result to fill in, or null when the waiter has given up (the result is
 		/// freed then, and the callback releases whatever it was handed).
@@ -148,8 +186,9 @@ namespace WebGPUHost
 			RequestResult* r = static_cast<RequestResult*>(userdata);
 			if (r->abandoned)
 			{
+				if (!r->quiet)
+					NoteAbandonedRequestDone();
 				delete r;
-				NoteAbandonedRequestDone();
 				return nullptr;
 			}
 			r->done = true;
