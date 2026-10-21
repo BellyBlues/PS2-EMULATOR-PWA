@@ -14,7 +14,9 @@ limiter off when it is above 100 %.
   `run-bench.mjs` runs it in Zen or Chrome and reports each phase's speed and thread load.
 - **Real games, silently in Node** (`pcsx2-headless`, Emscripten's Node 24, no sound or window):
   Guitar Hero into a song and Naruto Shippuden Ultimate Ninja 5's menus and intro, driven by
-  scripted button presses. Game data never enters the repository.
+  scripted button presses; GTA San Andreas (PAL) on foot in Grove Street, from a savestate taken
+  after the intro, 2400 vsyncs with a scripted walk, speed counted from vsync 600 (the JITs compile
+  from cold after a savestate). Game data never enters the repository.
 - **The page**, while playing:
   - `?threads=1` adds how busy the EE, GS and VU1 threads are to the speed readout. The thread
     near 100 % is the one holding a game back.
@@ -67,6 +69,7 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | Remaining simple lower instructions generated natively | same | 15.4 → 15.2 ms; Chrome, 100 figures: 106 → 224 % | `75b98ac60` |
 | A program's blocks jump to each other inside one wasm module, with learned JR/JALR targets and cheaper XGKICK catch-up. Guitar Hero's branchy VU1 code went back to the C++ dispatcher about every 9 instructions. | `pcsx2/wasm/VU1Jit.cpp`, `VU1JitEmit.cpp` | Guitar Hero in a song: VU1 15.1 → 10.0 ms per vsync (12.1 → 7.1 ns per instruction); song opening in Chrome 87 → 130-138 % | `ced73c7b6` |
 | A branch or XGKICK in a branch's delay slot runs in generated code | same | (part of the above) | `c45dbbc50` |
+| The same generator runs VU0 micro programs, now on by default (`EnableVU0`). GTA San Andreas ran VU0 programs on the interpreter for about 13 % of the EE thread. Checked with `-vu0jit-lockstep` on GTA gameplay (600 vsyncs, 1,008,250 programs, 0 differences), the fuzzer on VU0 (about 17,000 programs each with Liftoff only, TurboFan only and default tiering, 0 differences), GTA state hashes (VU0 registers included, 1000 vsyncs) and software-renderer screenshots. | `pcsx2-wasm/Main.cpp`, `pcsx2-headless/Main.cpp` | GTA SA gameplay (headless): 46.2 → 50.2 VPS | `6c4a3d41f` |
 
 ### EE and IOP JITs (game code)
 
@@ -77,6 +80,8 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | Guest registers in wasm locals. The EE keeps the low 64 bits of the 32 GPRs plus HI/LO; the IOP keeps its GPRs plus HI/LO. They load on first use and are written back before every C++ call and at exits. MMI lane ops, MFC0/MTC0 to plain registers and ADDI are now generated natively: the Naruto video's interpreter calls went from 189 M to 19 M per 600 vsyncs. | `pcsx2/wasm/RegCache.h`, `EEJit.cpp`, `IopJit.cpp` | Naruto video (headless): about +11 % | `0391d4a0d` |
 | IOP branch start and end stores emitted inline; one EE helper fewer per module | `pcsx2/wasm/IopJit.cpp`, `EEJit.cpp` | (part of the above) | `0db7d0b22` |
 | Runs of loads and stores through one base register checked once (alignment, page, mapping). This roughly halves the kernel's thread context save and restore. | `pcsx2/wasm/EEJit.cpp` | Naruto video: +7-9 % more, about +24 % in total (47 → 58.5 VPS headless); Zen at 300 figures: 133 → 150-154 % | `693c92743` |
+| Idle loops skipped up to the next event. GTA San Andreas waits for a DMA interrupt by polling two counters (a 10-instruction loop at `0x34dfd8`, run 250 M times per 1200 vsyncs): a third of the EE thread. At a taken backward branch whose loop has only register ALU ops, loads, branches and jumps, one iteration runs on the interpreter, checked step by step; if it changed no register, the iterations whose last branch test comes before the next event only add cycles (memory changes only in event tests), so they are skipped. The site remembers the registers and the values loaded, so the same state skips without running the iteration again. Exact: `-eejit-trace` replays every skipped branch test with its state, and the hashes over 1000 GTA vsyncs (906 M branch tests, 210 M of them skipped) are the same with the skip on, off (`-eejit-spin 0`) and in the build before it; the end state of 1000 non-traced vsyncs is the same on and off. | `pcsx2/wasm/EEJit.cpp` | GTA SA gameplay (headless): 34.7 → 46.2 VPS | `0b9ac18f0`, `582755a74`, `ef46ac2fc` |
+| PEXEH, PEXEW, PREVH, PROT3W as byte shuffles, and DIV.S, generated natively: GTA's interpreter calls 21.4 M → 13.6 M per 1200 vsyncs | `pcsx2/wasm/EEJit.cpp` | within noise | `ef46ac2fc`, `035e32569` |
 
 ### GPU pipelines (stutter when something new appears)
 
@@ -117,12 +122,29 @@ simpler distant figures), so each row compares one version with itself.
 | Guitar Hero in a song, Chrome, limiter on | 80-87 % | nearly always 100 %, with rare dips |
 | Naruto: menus, scene changes, special moves | long freezes on first appearance | first boot short skips; later boots smooth |
 | Naruto intro video, Chrome | 82-84 % (measured by the owner before the EE register work) | not yet measured in the page; headless it runs about 24 % faster |
+| GTA San Andreas on foot, headless (median of 3, from vsync 600 of 2400) | 34.7 VPS (69 %) | 50.8 VPS (101.5 %); the owner's page recording before this was 78 % on average (57-92 %), EE-bound. In one build with the features switched (a busier machine, medians of 3 interleaved): 31.1 VPS with both off, 43.8 with the idle loop skip, 47.8 with the VU0 JIT too |
 
 ## In progress
 
-Nothing running. The next candidates are below.
+- **GTA San Andreas in the page.** The idle loop skip and the VU0 JIT take it from 69 % to about
+  101 % headless; the owner is to check it in Zen and Chrome with the Recorder.
 
 ## Known to be left
+
+- **GTA San Andreas** (on foot, headless, after the idle loop skip and the VU0 JIT; second half of
+  2400 vsyncs). Share of the EE thread:
+
+  | Share | What |
+  |---|---|
+  | 60 % | EE JIT code, flat: the 50 hottest blocks are 11 %, the branch end function 4 %, the lookup 1 % |
+  | 15 % | event tests, of which the IOP 5 %, SPU2 mixing 3.5 %, VIF1 3 %, GIF 1.4 % |
+  | 3 % | the idle loop skip itself (about 6,000 calls per vsync: the event that ends a skip comes every 1,000-1,500 EE cycles) |
+  | 2 % | the interpreter (code not hot yet) |
+
+  Before the skip and the VU0 JIT (whole run, from the savestate): the idle loop 33 %, VU0 micro
+  programs on the interpreter 12 %, events 10 %, the interpreter while the JITs warm up 8 %. The EE
+  JIT's interpreter calls are 21 M per 1200 vsyncs (DIV.S 4.6 M, CACHE 2.8 M, PROT3W 1.9 M, PEXEW
+  1.3 M, LWL/LWR/SWL/SWR 0.9 M each, SQRT.S 0.9 M): about 1 % of the thread.
 
 - **Naruto's intro video** runs at 82-84 % in Chrome. While the IPU decodes, the game's idle thread
   loops on a kernel syscall (RotateThreadReadyQueue), and each call saves and restores a thread
@@ -143,7 +165,8 @@ Nothing running. The next candidates are below.
 - **EE JIT**:
   - **V8 tiering:** moderately hot functions stay in V8's baseline tier (Liftoff). The video ran
     6.6 % faster with V8 forced to optimise everything; merging a page's blocks into one function
-    may get part of that.
+    may get part of that. GTA, whose EE time is spread over 20,000 blocks, ran slower with
+    `--no-liftoff` (37.9 against 46.2 VPS headless).
   - **Kernel thread switches:** SYSCALL, ERET and MTC0 Status still call the interpreter (about
     6,000 thread switches per frame in the video).
   - **The FPU's registers** are not cached in locals yet.

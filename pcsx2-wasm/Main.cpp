@@ -1388,8 +1388,9 @@ static bool InitializeConfig()
 	// The VU1 JIT is on (docs/web-port/VU1-JIT-DESIGN.md); RunVM applies the page's ?vu1jit=0
 	// (pcsx2web_vu1jit_enable).
 	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", true);
-	// The VU0 micro-mode JIT (pcsx2/wasm/VU0Jit.h) is off too.
-	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", false);
+	// The VU0 micro-mode JIT (pcsx2/wasm/VU0Jit.h) is on too: GTA San Andreas runs VU0 programs for an eighth
+	// of the EE thread on the interpreter (docs/web-port/PERFORMANCE.md).
+	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", true);
 
 	// The hardware renderer on the WebGPU device (without WebGPU the GS falls back to the software
 	// renderer into GSDeviceNull; the page's ?renderer=sw picks the software renderer), sound through

@@ -176,8 +176,8 @@ static bool InitializeConfig()
 	// The VU1 JIT is on (docs/web-port/VU1-JIT-DESIGN.md): -set EmuCore/CPU/Recompiler/EnableVU1=false
 	// runs the VU1 interpreter instead.
 	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", true);
-	// The same for the VU0 micro-mode JIT: -set EmuCore/CPU/Recompiler/EnableVU0=true.
-	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", false);
+	// The same for the VU0 micro-mode JIT: -set EmuCore/CPU/Recompiler/EnableVU0=false.
+	si.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU0", true);
 #endif
 
 	// Headless: no renderer output, no audio. Pad 1 keeps the default keyboard bindings only for an input
@@ -414,6 +414,8 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			EEJit::g_dbgmask = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
 		else if (arg == "-eejit-stats")
 			EEJit::g_stats = true;
+		else if (arg == "-eejit-spin" && has_value)
+			EEJit::g_spin = StringUtil::FromChars<int>(argv[++i]).value_or(1) != 0;
 		else if ((arg == "-eejit-hot" || arg == "-iopjit-hot") && has_value)
 		{
 			// N[,M[,B]]: compile block entries on their Nth run, with the neighbours that ran M times and the entries that ran B times (JitHeat.h).
@@ -464,10 +466,12 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-wav FILE.wav [-wav-realtime [-wav-period FRAMES]]]\n"
 								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n"
 								 "         [-eejit 0|1] [-eejit-link 0|1] [-iopjit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n"
+								 "         [-eejit-spin 0|1]\n"
 								 "         [-eejit-hot N[,M[,B]]] [-iopjit-hot N[,M[,B]]] [-jit-budget US] [-jit-compile-stats VSYNCS]\n",
 				argv[0]);
 			std::fprintf(stderr, "  -eejit 0 runs the EE interpreter instead of the EE JIT, -iopjit 0 the IOP interpreter instead of the IOP JIT;\n"
 								 "  -eejit-trace prints EE and IOP state hashes to compare runs.\n"
+								 "  -eejit-spin 0 runs idle loops iteration by iteration instead of skipping to the next event.\n"
 								 "  -eejit-hot and -iopjit-hot compile a block entry on its Nth run, with the neighbours in its page that\n"
 								 "         ran M times (0: all) and the entries of any page that ran B times (default 128,1,64; 1\n"
 								 "         compiles everything on its first run). -jit-budget caps the EE and IOP JITs' compile time per\n"
@@ -504,7 +508,7 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         timing model at every instruction, 'jit' compares the interpreter and the JIT, 'both' does both.\n"
 								 "  -vu1jit-oracle checks the timing model at every VU1 instruction the JIT's dispatcher runs.\n"
 								 "  -vu1jit-lockstep runs every VU1 program on the JIT and on the interpreter and compares them.\n"
-								 "  -vu0jit-lockstep does the same for VU0 micro programs (EnableVU0=true).\n"
+								 "  -vu0jit-lockstep does the same for VU0 micro programs (the VU0 JIT is on by default, off with EnableVU0=false).\n"
 								 "  -vu1jit-stats writes per-vsync VU1 statistics (runs, cycles, execute time, PATH1 hash) as CSV.\n"
 								 "  -mtvu-sync makes the EE wait for the VU thread at each check, so whole runs repeat exactly.\n");
 #endif
