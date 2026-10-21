@@ -277,6 +277,10 @@ namespace
 			{MMI::PCPYH, MmiDesc::Shuffle, {}, 0, {0, 1, 0, 1, 0, 1, 0, 1, 8, 9, 8, 9, 8, 9, 8, 9}},
 			{MMI::PEXCH, MmiDesc::Shuffle, {}, 0, {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15}},
 			{MMI::PEXCW, MmiDesc::Shuffle, {}, 0, {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15}},
+			{MMI::PEXEH, MmiDesc::Shuffle, {}, 0, {4, 5, 2, 3, 0, 1, 6, 7, 12, 13, 10, 11, 8, 9, 14, 15}},
+			{MMI::PEXEW, MmiDesc::Shuffle, {}, 0, {8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15}},
+			{MMI::PREVH, MmiDesc::Shuffle, {}, 0, {6, 7, 4, 5, 2, 3, 0, 1, 14, 15, 12, 13, 10, 11, 8, 9}},
+			{MMI::PROT3W, MmiDesc::Shuffle, {}, 0, {4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 12, 13, 14, 15}},
 		};
 		for (const MmiDesc& e : table)
 		{
@@ -440,6 +444,10 @@ namespace
 		std::vector<SpinTest> tests;
 		std::vector<SpinSnap> snaps;
 		std::vector<SpinLoad> loads;
+		// For each value of cpuBlockCycles (below 8) at the loop's start: the cycles one iteration adds, and
+		// cpuBlockCycles after it.
+		u32 delta[8];
+		u8 next_bc[8];
 		u64 calls = 0, tries = 0, skips = 0, iters = 0; // -eejit-stats
 	};
 
@@ -578,14 +586,15 @@ namespace
 		u32* const bcp = intJitBlockCycles();
 		const u64 cycle0 = cpuRegs.cycle;
 		const u32 bc0 = *bcp;
+		if (bc0 >= 8) // always below 8 after a branch end
+			return;
 		u64 cycle = cycle0;
 		u32 bc = bc0;
 		u64 n = 0;
 		// One iteration more, unless its last test would run the event.
 		auto step = [&] {
-			u64 c = cycle;
-			u32 b = bc;
-			SpinIterate(site, c, b);
+			const u64 c = cycle + site.delta[bc];
+			const u32 b = site.next_bc[bc];
 			if (SpinDue(c))
 				return false;
 			cycle = c;
@@ -606,7 +615,8 @@ namespace
 			u32 period = 0;
 			do
 			{
-				SpinIterate(site, c, b);
+				c += site.delta[b];
+				b = site.next_bc[b];
 				period++;
 			} while (b != bc && period < 8);
 			if (b == bc)
@@ -835,6 +845,14 @@ namespace
 			*intJitLastBranchTo() != L)
 			return fail(4);
 		site.fails = 0;
+		for (u32 b = 0; b < 8; b++)
+		{
+			u64 c = 0;
+			u32 b2 = b;
+			SpinIterate(site, c, b2);
+			site.delta[b] = static_cast<u32>(c);
+			site.next_bc[b] = static_cast<u8>(b2);
+		}
 		site.memo = true;
 		site.wait_loop = EmuConfig.Speedhacks.WaitLoop;
 		SpinSkip(site);
