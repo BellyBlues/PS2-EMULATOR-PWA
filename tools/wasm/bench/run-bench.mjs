@@ -13,6 +13,9 @@
 //
 // Options:
 //   --bios FILE          the PS2 BIOS (its directory is served read-only, serve.py --bios-dir)
+//   --disc FILE          a disc image to boot (served read-only, serve.py --disc; ?disc=)
+//   --keep-profile DIR   use DIR as the browser profile and keep it (a later run sees what this one
+//                        stored in IndexedDB and the browser's caches)
 //   --elf FILE           a PS2 program to boot (served read-only, serve.py --elf; ?elf=). Without it
 //                        the BIOS boots to its menu
 //   --browser zen|chrome default zen (WebDriver BiDi); chrome uses the DevTools protocol
@@ -46,7 +49,7 @@
 // profile is deleted; only the processes this script started are touched.
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -66,7 +69,7 @@ function usage() {
 }
 
 function parseArgs(argv) {
-	const o = { bios: null, elf: null, browser: "zen", browserPath: null, headless: false, seconds: 60, vsyncs: 0,
+	const o = { bios: null, elf: null, disc: null, keepProfile: null, browser: "zen", browserPath: null, headless: false, seconds: 60, vsyncs: 0,
 		phases: 0, sampleMs: 1000, unlimited: false, params: [], prefs: [], query: "", root: path.join(REPO, "build-wasm/bin"),
 		port: 0, out: null, bootTimeout: 120, quiet: false };
 	for (let i = 0; i < argv.length; i++) {
@@ -77,6 +80,8 @@ function parseArgs(argv) {
 		};
 		if (a === "--bios") o.bios = path.resolve(v());
 		else if (a === "--elf") o.elf = path.resolve(v());
+		else if (a === "--disc") o.disc = path.resolve(v());
+		else if (a === "--keep-profile") o.keepProfile = path.resolve(v());
 		else if (a === "--browser") o.browser = v();
 		else if (a === "--browser-path") o.browserPath = v();
 		else if (a === "--headless") o.headless = true;
@@ -371,7 +376,8 @@ function printTable(rows) {
 async function main() {
 	const o = parseArgs(process.argv.slice(2));
 	const children = [];
-	const profile = mkdtempSync(path.join(tmpdir(), `tst-bench-${o.browser}-`));
+	if (o.keepProfile) mkdirSync(o.keepProfile, { recursive: true });
+	const profile = o.keepProfile || mkdtempSync(path.join(tmpdir(), `tst-bench-${o.browser}-`));
 	const consoleLines = [];
 	const t0 = Date.now();
 	const elapsed = () => (Date.now() - t0) / 1000;
@@ -402,7 +408,7 @@ async function main() {
 		cleaned = true;
 		if (browser) await browser.close();
 		await killAll();
-		rmSync(profile, { recursive: true, force: true });
+		if (!o.keepProfile) rmSync(profile, { recursive: true, force: true });
 	};
 	process.on("SIGINT", () => { cleanup().finally(() => process.exit(130)); });
 
@@ -438,7 +444,7 @@ async function main() {
 		const port = o.port || await freePort();
 		const biosDir = path.dirname(o.bios);
 		const server = spawn("python3", [path.join(REPO, "tools/wasm/serve.py"), "--port", String(port), "--quiet",
-			"--bios-dir", biosDir, ...(o.elf ? ["--elf", o.elf] : []), o.root], { stdio: ["ignore", "pipe", "pipe"], detached: true });
+			"--bios-dir", biosDir, ...(o.elf ? ["--elf", o.elf] : []), ...(o.disc ? ["--disc", o.disc] : []), o.root], { stdio: ["ignore", "pipe", "pipe"], detached: true });
 		children.push(server);
 		await waitForOutput(server, /Press Ctrl\+C/, 10000, "serve.py");
 
@@ -446,6 +452,7 @@ async function main() {
 		const twice = (s) => encodeURIComponent(encodeURIComponent(s));
 		const query = [`bios=dev-bios/${twice(path.basename(o.bios))}`];
 		if (o.elf) query.push(`elf=dev-elf/${twice(path.basename(o.elf))}`);
+		if (o.disc) query.push(`disc=dev-disc/${twice(path.basename(o.disc))}`);
 		query.push("console=1", "mute=1");
 		if (o.unlimited) query.push("unlimited=1");
 		for (const p of o.params) {

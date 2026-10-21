@@ -154,7 +154,9 @@ and is skipped if it is still not ready; the pipeline is collected at a later pr
 game's later draws use it. So a new effect may be missing for its first frames instead of the game
 stalling. `?pipelines=wait` restores waiting to the end (the test switch for frames identical to
 a run without skips). The log's line `WebGPU HW: ... draws skipped for a pipeline not ready yet`
-counts the skips every 600 presents.
+counts the skips every 600 presents. The recorder's GPU pipeline columns (`pcsx2web_perf_ring()`)
+count the pipelines draws started creating and the time draws waited for them; prewarmed
+pipelines (below) are not counted.
 
 The page also keeps, per game, the list of pipelines its draws asked for, and creates them in the
 background at the game's next boot, as soon as the game is known, so that most are ready before
