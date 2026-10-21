@@ -347,6 +347,24 @@ compile a block once it has run 128 times, within 4 ms of compiling per vsync (`
 `-eejit-hot N[,M[,B]]`, `-iopjit-hot N[,M[,B]]` and `-jit-budget US` change that, and
 `-jit-compile-stats VSYNCS` prints their compile time, total and worst vsync, every VSYNCS vsyncs.
 
+### Disc library (a study)
+
+`library.html` is a standalone page, not linked from the player yet, for a nicer way to pick a
+game: choose (or drop) a folder, and every disc image in it becomes a disc on a shelf; click one, or
+press Enter, and it flies into the tray of a console (an original design, not a likeness of any real
+one), the tray closes and the lights go down. Nothing boots: on the player page the boot would start
+with the insert, which would cover the BIOS logos and the game's loading (`onInserted()` in
+`library/library.js` is where that goes). `library.html?demo` shows a shelf of made-up games.
+
+- `library/disc-info.js` reads the start of each file (the ISO 9660 volume at the layouts PCSX2
+  detects, then `SYSTEM.CNF`) for the serial; it also runs in Node. Titles come from
+  `game-titles.tsv`, an index of PCSX2's game database the build writes next to the page
+  (`tools/wasm/make-game-titles.py`). Served straight from `web/`, without it, titles come from the
+  file names.
+- Disc images carry no box art. A disc is printed with an image from the same folder named like
+  PCSX2's covers (`SLUS-20946.jpg`, `.png` or `.webp`, or the game's title, or the disc's file name);
+  otherwise `library/disc-art.js` draws a label from the title and serial.
+
 ## UI assets
 
 The page self-hosts everything it loads (it is cross-origin isolated and makes no requests to

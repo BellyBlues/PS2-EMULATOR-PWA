@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#121110">
+<meta name="description" content="TabStationToo's disc library: your disc images on a shelf, and a console to put them in.">
+<title>Disc library · TabStationToo</title>
+<!-- A standalone study for picking a game (not linked from index.html yet). Same-origin only, like the
+     player page: no request ever leaves this server. The page reads the start of each disc image in
+     the chosen folder to name it; nothing is uploaded and nothing boots. -->
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="library/library.css">
+<script type="module" src="library/library.js"></script>
+</head>
+<body data-mode="empty" data-lights="up" data-tray="closed" data-drag="">
+
+<header class="marquee">
+  <h1 class="wordmark"><svg class="mark" aria-hidden="true" focusable="false"><use href="icons.svg#i-mark"/></svg><span class="wm">TabStation<span class="wm-too">Too</span></span><span class="wm-page">Disc library</span></h1>
+  <p class="count" id="count" hidden></p>
+  <button type="button" class="btn-quiet" id="folder-btn" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg><span>Choose another folder…</span></button>
+</header>
+
+<main class="room" id="room">
+  <div class="stage" id="stage">
+    <div class="world" id="world">
+      <div class="console" id="console" aria-hidden="true">
+        <div class="c-face c-top"><div class="c-top-panel"></div><div class="c-vents"></div></div>
+        <div class="c-face c-left"></div>
+        <div class="c-face c-right"></div>
+        <div class="c-face c-front">
+          <div class="c-band">
+            <svg class="c-mark"><use href="icons.svg#i-mark"/></svg>
+            <div class="c-slot"></div>
+            <div class="c-buttons"><span class="c-eject"></span><span class="c-power"></span><span class="c-tally"></span></div>
+          </div>
+          <div class="c-ports"><span></span><span></span><i></i><i></i></div>
+        </div>
+        <div class="tray" id="tray">
+          <div class="t-face t-plate"><div class="t-well"></div><div class="t-spindle"></div></div>
+          <div class="t-face t-lip"></div>
+          <div class="t-face t-side t-side-l"></div>
+          <div class="t-face t-side t-side-r"></div>
+        </div>
+      </div>
+      <div class="shelf" id="shelf" role="listbox" tabindex="0" aria-label="Discs" aria-orientation="horizontal"></div>
+    </div>
+  </div>
+
+  <section class="info" id="info" aria-live="off">
+    <h2 id="info-title"></h2>
+    <p class="meta" id="info-meta"></p>
+    <p class="file" id="info-file"></p>
+    <p class="hint" id="info-hint"><kbd><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-left"/></svg><span class="vh">Left arrow</span></kbd><kbd><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-right"/></svg><span class="vh">Right arrow</span></kbd> browse <span class="sep">·</span> <kbd>Enter</kbd> puts it in</p>
+  </section>
+
+  <section class="card" id="intake" aria-labelledby="intake-title">
+    <h2 id="intake-title" tabindex="-1">Choose the folder with your games.</h2>
+    <p class="body">Each disc image in it becomes a disc on the shelf. The page reads the first few sectors of each file to name it; nothing is uploaded.</p>
+    <div class="actions">
+      <button type="button" class="btn-primary" id="intake-btn"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg>Choose a folder…</button>
+      <span class="aside" id="intake-aside">or drop it here</span>
+    </div>
+    <p class="fine" id="intake-fine">Disc art comes from images next to the discs, named like PCSX2’s covers (<span class="mono">SLUS-20946.jpg</span>, or the game’s title). Without one, the disc gets a label of its own.</p>
+    <p class="error" id="intake-error" hidden></p>
+  </section>
+
+  <section class="card card-dark" id="started" aria-labelledby="started-title" hidden>
+    <h2 id="started-title" tabindex="-1"></h2>
+    <p class="body">This page only rehearses the insert. On the player page, the game would boot while the disc goes in, and its first frame would come up here.</p>
+    <div class="actions">
+      <button type="button" class="btn-primary" id="eject-btn"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-eject"/></svg>Eject<kbd class="cap" aria-hidden="true">Esc</kbd></button>
+    </div>
+  </section>
+</main>
+
+<footer class="credits">Built on PCSX2 (GPL-3.0) <span class="sep">·</span> Not affiliated with Sony or the PCSX2 project</footer>
+
+<p class="vh" id="announce" role="status"></p>
+<input type="file" id="folder-input" webkitdirectory multiple hidden>
+</body>
+</html>
