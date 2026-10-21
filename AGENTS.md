@@ -12,6 +12,8 @@ Emscripten, plus a browser frontend. Read these before changing anything:
 - `docs/web-port/PLAN.md`: the porting plan, measurements and the decisions behind them.
 - `docs/web-port/UI-SPEC.md`: the interface design ("Cinema"); the page must follow it.
 - `pcsx2-wasm/README.md`: the browser frontend, its exported API and its testing options.
+- `docs/web-port/PERFORMANCE.md`: every optimization so far and the work in progress. Update it
+  with each optimization.
 
 Branch `wasm` is the project. `master` mirrors PCSX2 and only receives upstream updates.
 
