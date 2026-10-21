@@ -42,6 +42,77 @@ void yuv2rgb_reference(void)
 		}
 }
 
+#if defined(ARCH_WASM)
+
+#include <wasm_simd128.h>
+
+// WebAssembly has no 16-bit multiply-high, which the SSE2 version uses six times per row (Emscripten emulates each
+// with two widening multiplies and a shuffle) and then has to put its even and odd pixels back in order. This
+// version gives the same bytes for every input (tested on all Y, Cb and Cr values against yuv2rgb_sse2()).
+__ri void yuv2rgb_wasm()
+{
+	// The SSE2 version's multiplies are mulhi of (value << 8) by (coefficient << 2), that is (value * coefficient) >> 6.
+	// Here they are done as 16-bit multiplies with the common factors taken out of the coefficient and the shift:
+	// no product overflows 16 bits. Luma is widened in pixel order, so the result needs no even/odd reordering.
+	const v128_t c_bias = wasm_i16x8_splat(IPU_C_BIAS);
+	const v128_t y_bias = wasm_u8x16_splat(IPU_Y_BIAS);
+	const v128_t one = wasm_i16x8_splat(1);
+	const v128_t alpha = wasm_u8x16_splat(0x80);
+
+	for (int n = 0; n < 8; ++n)
+	{
+		const v128_t cb = wasm_i16x8_sub(wasm_u16x8_load8x8(&decoder.mb8.Cb[n][0]), c_bias);
+		const v128_t cr = wasm_i16x8_sub(wasm_u16x8_load8x8(&decoder.mb8.Cr[n][0]), c_bias);
+
+		// (Cr * 0xcc) >> 6, (Cr * -0x68) >> 6 + (Cb * -0x32) >> 6, (Cb * 0x102) >> 6
+		const v128_t rc = wasm_i16x8_shr(wasm_i16x8_mul(cr, wasm_i16x8_splat(51)), 4);
+		const v128_t gc = wasm_i16x8_add_sat(wasm_i16x8_shr(wasm_i16x8_mul(cr, wasm_i16x8_splat(-13)), 3),
+			wasm_i16x8_shr(wasm_i16x8_mul(cb, wasm_i16x8_splat(-25)), 5));
+		const v128_t bc = wasm_i16x8_shr(wasm_i16x8_mul(cb, wasm_i16x8_splat(129)), 5);
+
+		// Each chroma sample covers two horizontal pixels.
+		const v128_t rc_l = wasm_i16x8_shuffle(rc, rc, 0, 0, 1, 1, 2, 2, 3, 3);
+		const v128_t rc_h = wasm_i16x8_shuffle(rc, rc, 4, 4, 5, 5, 6, 6, 7, 7);
+		const v128_t gc_l = wasm_i16x8_shuffle(gc, gc, 0, 0, 1, 1, 2, 2, 3, 3);
+		const v128_t gc_h = wasm_i16x8_shuffle(gc, gc, 4, 4, 5, 5, 6, 6, 7, 7);
+		const v128_t bc_l = wasm_i16x8_shuffle(bc, bc, 0, 0, 1, 1, 2, 2, 3, 3);
+		const v128_t bc_h = wasm_i16x8_shuffle(bc, bc, 4, 4, 5, 5, 6, 6, 7, 7);
+
+		for (int m = 0; m < 2; ++m)
+		{
+			const v128_t y = wasm_u8x16_sub_sat(wasm_v128_load(&decoder.mb8.Y[n * 2 + m][0]), y_bias);
+			// (Y * 0x95) >> 6; at most 239 * 0x95, which fits in 16 unsigned bits
+			const v128_t y_l = wasm_u16x8_shr(wasm_i16x8_mul(wasm_u16x8_extend_low_u8x16(y), wasm_i16x8_splat(IPU_Y_COEFF)), 6);
+			const v128_t y_h = wasm_u16x8_shr(wasm_i16x8_mul(wasm_u16x8_extend_high_u8x16(y), wasm_i16x8_splat(IPU_Y_COEFF)), 6);
+
+			// round
+			const v128_t r_l = wasm_i16x8_shr(wasm_i16x8_add(wasm_i16x8_add_sat(rc_l, y_l), one), 1);
+			const v128_t r_h = wasm_i16x8_shr(wasm_i16x8_add(wasm_i16x8_add_sat(rc_h, y_h), one), 1);
+			const v128_t g_l = wasm_i16x8_shr(wasm_i16x8_add(wasm_i16x8_add_sat(gc_l, y_l), one), 1);
+			const v128_t g_h = wasm_i16x8_shr(wasm_i16x8_add(wasm_i16x8_add_sat(gc_h, y_h), one), 1);
+			const v128_t b_l = wasm_i16x8_shr(wasm_i16x8_add(wasm_i16x8_add_sat(bc_l, y_l), one), 1);
+			const v128_t b_h = wasm_i16x8_shr(wasm_i16x8_add(wasm_i16x8_add_sat(bc_h, y_h), one), 1);
+
+			const v128_t r = wasm_u8x16_narrow_i16x8(r_l, r_h);
+			const v128_t g = wasm_u8x16_narrow_i16x8(g_l, g_h);
+			const v128_t b = wasm_u8x16_narrow_i16x8(b_l, b_h);
+
+			// RGBA quads
+			const v128_t rg_l = wasm_i8x16_shuffle(r, g, 0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+			const v128_t rg_h = wasm_i8x16_shuffle(r, g, 8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+			const v128_t ba_l = wasm_i8x16_shuffle(b, alpha, 0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+			const v128_t ba_h = wasm_i8x16_shuffle(b, alpha, 8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+
+			wasm_v128_store(&decoder.rgb32.c[n * 2 + m][0], wasm_i16x8_shuffle(rg_l, ba_l, 0, 8, 1, 9, 2, 10, 3, 11));
+			wasm_v128_store(&decoder.rgb32.c[n * 2 + m][4], wasm_i16x8_shuffle(rg_l, ba_l, 4, 12, 5, 13, 6, 14, 7, 15));
+			wasm_v128_store(&decoder.rgb32.c[n * 2 + m][8], wasm_i16x8_shuffle(rg_h, ba_h, 0, 8, 1, 9, 2, 10, 3, 11));
+			wasm_v128_store(&decoder.rgb32.c[n * 2 + m][12], wasm_i16x8_shuffle(rg_h, ba_h, 4, 12, 5, 13, 6, 14, 7, 15));
+		}
+	}
+}
+
+#endif
+
 #if defined(SIMD_SSE)
 
 // Suikoden Tactics FMV speed results: Reference - ~72fps, SSE2 - ~120fps

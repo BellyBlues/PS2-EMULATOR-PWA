@@ -1426,7 +1426,8 @@ namespace R3000A
 			return 0;
 
 		std::string libname = iopMemReadString(import_table + 12, 8);
-		const char* funcname = irxImportFuncname(libname, index);
+		// The name is only logged, and finding it compares libname with every module's name: skip it when not logging.
+		const char* funcname = TraceActive(IOP.Bios) ? irxImportFuncname(libname, index) : nullptr;
 		irxHLE hle = irxImportHLE(libname, index);
 		irxDEBUG debug = irxImportDebug(libname, index);
 
