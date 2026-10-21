@@ -2318,6 +2318,21 @@ void VMManager::Internal::Throttle(bool vsync_start)
 	const u64 iEnd = GetCPUTicks(); // The current tick we actually stopped on.
 	const s64 sDeltaTime = iEnd - uExpectedEnd; // The diff between when we stopped and when we expected to.
 
+#ifdef __EMSCRIPTEN__
+	// Keep the time a late frame lost, up to a few frames, so the next lighter frames catch it up instead of
+	// sleeping. The check below forgives a whole frame as soon as one runs a frame late (at vsync start already
+	// past 1.9 frames), which games that alternate heavy and light vsyncs (GTA San Andreas: 35-60 ms then 5-15 ms)
+	// hit every other vsync: they then run at 85-95 % although their average work fits in the frame time. Only
+	// real-time pacing changes; emulation is untouched.
+	if (sDeltaTime > 0)
+	{
+		constexpr s64 max_late_frames = 3;
+		if (!vsync_start)
+			s_limiter_frame_start = std::max<s64>(uExpectedEnd, iEnd - max_late_frames * s_limiter_ticks_per_frame);
+		return;
+	}
+#endif
+
 	// If frame ran too long...
 	if (sDeltaTime >= s_limiter_ticks_per_frame)
 	{
