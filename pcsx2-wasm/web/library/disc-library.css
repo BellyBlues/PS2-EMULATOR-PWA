@@ -10,10 +10,12 @@
   initial-value: 1;
 }
 
+/* As dark as the player while a game runs (the room with its lights down), so that the library fading away
+   into the game, or back in after it, changes no colour. */
 .lib {
   position: relative;
   min-height: 0;
-  background: var(--house);
+  background: var(--house-down);
   transition: background-color 300ms var(--ease-out);
 }
 
@@ -668,7 +670,7 @@
   margin: 0;
   padding: 0;
   border: 0;
-  background: var(--house);
+  background: var(--house-down);
   color: var(--ink);
   overflow: hidden;
   opacity: 1;
@@ -681,7 +683,7 @@
 }
 
 .lib-dialog::backdrop {
-  background: var(--house);
+  background: var(--house-down);
 }
 
 .lib-dialog.is-dark {

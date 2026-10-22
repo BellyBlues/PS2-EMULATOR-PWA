@@ -604,6 +604,8 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 			return;
 		const d = discs[target];
 		skipping = false;
+		// Decided now: a disc that has to be cleaned first holds the player's boot until it is clean.
+		const cleaning = !reducedMotion.matches && (clean || Math.random() < cleanChance);
 		if (host) {
 			const why = host.blocked();
 			if (why) {
@@ -612,7 +614,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 			}
 			// Inside the press: the player starts its sound here, then opens the disc and boots it while
 			// the disc goes in.
-			host.insert(d.file, d.handle || null);
+			host.insert(d.file, d.handle || null, cleaning);
 		}
 		note('');
 		current = d;
@@ -637,8 +639,11 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		els.trayMove.append(d.el);
 		await wait(dur(160));
 		await moveTray(false, dur(760), 'cubic-bezier(.5,0,.25,1)');
-		if (!reducedMotion.matches && (clean || Math.random() < cleanChance))
+		if (cleaning) {
 			await cleanDisc(d);
+			if (host)
+				host.release(); // the clean disc reads: now the game starts
+		}
 		data.disc = 'in';
 		if (host) {
 			// The PS2 slides down out of the room at once, and the player comes in under it: its screen shows the

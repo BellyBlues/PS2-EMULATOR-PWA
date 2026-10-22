@@ -418,6 +418,7 @@
 		ranMs: 0,
 		frameSinceBoot: false,
 		litWait: false, // the disc library waits for the game's first picture (probeLit)
+		bootHeld: false, // the library's boot waits for its disc to be cleaned (PCSX2WebLibrary.release)
 		lit: false,
 		seqAtBoot: 0,
 		wasmLoaded: false,
@@ -5168,16 +5169,27 @@
 			return '';
 		},
 		// Inside the user's press: sound may start, the disc opens, and its boot is queued, as a disc
-		// chosen and Boot pressed while it opens.
-		insert(file, handle) {
+		// chosen and Boot pressed while it opens. hold: the boot waits for release() (the library's disc is
+		// being cleaned first: the game must not start under it).
+		insert(file, handle, hold) {
 			audioUnlock();
 			hideDiscMenu();
 			pageLog(`Disc library: ${file.name}`);
-			page.autoBoot = true;
+			page.autoBoot = !hold;
+			page.bootHeld = !!hold;
 			page.litWait = true;
 			page.lit = false;
 			chooseDisc({ kind: 'file', file, name: file.name, size: file.size }, handle || null);
 			ensureRuntime();
+		},
+		// The held boot goes.
+		release() {
+			if (!page.bootHeld)
+				return;
+			page.bootHeld = false;
+			page.autoBoot = true;
+			maybeAutoBoot();
+			render();
 		},
 		// What the library waits on: the page state, and the error the slate would show.
 		status: () => ({
@@ -9178,7 +9190,9 @@
 		const state = pageState();
 		setData('state', state);
 		setData('runtime', runtimeState());
-		setData('lights', state === 'running' ? 'down' : 'up');
+		// Dark while a game runs or starts, and while the library's boot waits for the runtime: as dark as the
+		// library it comes from, so that nothing changes colour as the library fades away.
+		setData('lights', state === 'running' || state === 'starting' || (state === 'queued' && page.litWait) ? 'down' : 'up');
 		setData('drag', page.drag);
 		setData('bios', page.bios ? 'set' : 'none');
 		const shown = page.frameSinceBoot && frame.presented > 0;
