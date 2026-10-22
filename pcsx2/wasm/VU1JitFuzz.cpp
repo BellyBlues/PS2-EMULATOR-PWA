@@ -1114,13 +1114,27 @@ namespace VU1Jit
 			std::memcpy(static_cast<void*>(&s_vu1_start), &VU1, sizeof(VURegs));
 			capture(&start);
 			*compared = true;
+			// A third of the programs run in short slices, as the EE runs VU0 (1 to 32 cycles each, the same ones on both):
+			// blocks then stop where a slice ends and go on from there (VU1Jit::g_vu0_slices).
+			const auto run = [&](BaseVUmicroCPU& cpu) {
+				if (p.budget % 3 != 0)
+				{
+					cpu.Execute(p.budget);
+					return;
+				}
+				u32 x = p.budget * 2654435761u;
+				for (u32 used = 0; used < p.budget && (VU0.VI[REG_VPU_STAT].UL & 1);)
+				{
+					x = x * 1664525u + 1013904223u;
+					const u32 slice = 1 + (x >> 27);
+					cpu.Execute(slice);
+					used += slice;
+				}
+			};
 			for (int pass = 0; pass < 2; pass++)
 			{
 				restore(start);
-				if (pass)
-					CpuWasmVU0.Execute(p.budget);
-				else
-					CpuIntVU0.Execute(p.budget);
+				run(pass ? static_cast<BaseVUmicroCPU&>(CpuWasmVU0) : static_cast<BaseVUmicroCPU&>(CpuIntVU0));
 				capture(pass ? &jit : &ref);
 				// VU1's registers as VU0 left them, folded into the comparison through the memory image's spare room.
 				std::memcpy(&(pass ? jit : ref).mem[VU0_MEMSIZE], VU1.VF, sizeof(VU1.VF) + sizeof(VU1.VI));

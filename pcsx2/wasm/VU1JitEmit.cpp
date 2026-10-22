@@ -23,6 +23,8 @@ namespace VU1Jit
 	u64 g_block_base = 0;
 	u64 g_block_base0 = 0;
 	u64 g_budget_end = 0;
+	u64 g_budget_end0 = 0;
+	bool g_vu0_slices = true;
 	u32 g_chain_instrs = 0;
 	u32 g_chain_edges = 0;
 	bool g_trace = false;
@@ -352,6 +354,16 @@ namespace VU1Jit
 					m_f.i64_load(A(g_budget_end));
 					m_f.local_set(m_budget);
 				}
+				else if (g_vu0_slices)
+				{
+					// VU0: the cycles left in the dispatcher's slice at the entry (EmitBudgetExit).
+					m_f.i32_const(0);
+					m_f.i64_load(A(g_budget_end0));
+					m_f.i32_const(0);
+					m_f.i64_load(A(g_block_base0));
+					m_f.i64_sub();
+					m_f.local_set(m_budget);
+				}
 			}
 
 			// The blocks of a module in layout order (CompileModule): a dispatch loop around one wasm block per module
@@ -437,6 +449,16 @@ namespace VU1Jit
 			void EndLoop() { m_f.end(); }
 
 			void EmitInstruction(const Plan& p, s32 busy_kick_exit, s32 busy_kick_untaken, bool last);
+			// VU0: leaves by exit_id when the slice has threshold cycles or fewer left at the entry (m_budget).
+			void EmitBudgetExit(u32 threshold, u32 exit_id)
+			{
+				m_f.local_get(m_budget);
+				m_f.i64_const(static_cast<s64>(threshold));
+				m_f.i64_le_s();
+				m_f.if_unlikely();
+				EmitExit(exit_id);
+				m_f.end();
+			}
 			void FlushAllAtEnd(const Plan& p, const int end_flagreg[4]);
 			// loop: whether the taken exit is the loop exit of BeginLoop. next_taken, next_fall: the blocks of the
 			// module the exits go to, or -1; jumps: a JR/JALR's targets (TPC) that are blocks of the module.
@@ -2815,6 +2837,25 @@ namespace VU1Jit
 
 		// Block k of the module (layout order); pos maps BlockPlan::next_* to layout positions. Exits are numbered in
 		// the order this makes them, the same in both emissions.
+		// VU0 slices: an instruction with no branch or E bit pending before it may be left before (a delay slot may not:
+		// the interpreter stops before it with the branch or the end pending, which an exit does not describe).
+		bool SliceExitable(const Plan& p)
+		{
+			return p.pre_ctl.branch == 0 && p.pre_ctl.ebit == 0;
+		}
+
+		// The cycles left at the entry at or below which generated code leaves before instruction i: when it would start
+		// past the slice; or, when delay slots follow it (a branch's, an E bit's, an E bit in an E bit's delay slot),
+		// when the last of them would: the interpreter may then stop among them, so it runs instruction i and those after
+		// it itself (the dispatcher steps them).
+		u32 SliceThreshold(const BlockPlan& b, u32 i)
+		{
+			u32 j = i + 1;
+			while (j < b.Instrs() && !SliceExitable(b.plans[j]))
+				j++;
+			return b.plans[j - 1].cyc;
+		}
+
 		void EmitBlock(Emitter& em, int vu, const BlockPlan& b, u32 k, const std::vector<s32>& pos, std::vector<BlockExit>& exits)
 		{
 			const auto add = [&](const BlockExit& x) {
@@ -2832,6 +2873,11 @@ namespace VU1Jit
 			for (u32 i = 0; i < n; i++)
 			{
 				const Plan& p = b.plans[i];
+				// VU0 runs in slices of the EE's cycles (InterpVU0::Execute steps while VU0.cycle - start < cycles): leave
+				// before the first instruction that would start past the slice, as the interpreter stops there.
+				if (vu == 0 && g_vu0_slices && i > 0 && SliceExitable(p))
+					em.EmitBudgetExit(SliceThreshold(b, i),
+						add(MakeExit(vu, b, ExitKind::Boundary, ExitReason::Budget, i, p.pre, p.pre_ctl, p.pc)));
 				s32 busy = -1, busy_untaken = -1;
 				if (vu && !p.ins.IBit() && p.ins.lo == L::XGKICK && !p.info.discarded)
 				{
@@ -2935,6 +2981,7 @@ namespace VU1Jit
 		em.Finish();
 		out->instrs = b.Instrs();
 		out->last_start = b.LastStart();
+		out->first_need = SliceThreshold(b, 0);
 		out->loops = b.loop;
 		return true;
 	}

@@ -53,6 +53,7 @@ namespace VU0Jit
 			WasmJit::LoadedFunction fn;
 			std::vector<ExitSlot> exits;
 			u32 last_start;
+			u32 first_need; // CompiledBlock::first_need
 		};
 
 		static constexpr u32 NUM_PCS = VU0_PROGSIZE / 8;
@@ -90,6 +91,11 @@ namespace VU0Jit
 			u64 m_ls_runs = 0, m_ls_diffs = 0;
 
 			u64 m_executes = 0, m_compiles = 0, m_entries = 0, m_jit_instrs = 0, m_steps = 0, m_flushes = 0;
+			// Why the dispatcher stepped the interpreter: forced after an exit, a branch or E bit pending, the signature
+			// refused, no code for the PC, the slice too short for the block's first instruction(s) (first_need).
+			u64 m_why[6] = {};
+			u64 m_force[static_cast<int>(ExitReason::Count)] = {};
+
 			double m_compile_ms = 0;
 		};
 
@@ -157,6 +163,7 @@ namespace VU0Jit
 		p->bytes.assign(&VU0.Micro[pc], &VU0.Micro[pc] + p->size);
 		p->needs_compare = false;
 		p->last_start = block.last_start;
+		p->first_need = block.first_need;
 		for (const BlockExit& x : block.exits)
 			p->exits.push_back(ExitSlot{x, nullptr, 0});
 		if (have_code)
@@ -185,6 +192,7 @@ namespace VU0Jit
 		VU0.VI[REG_TPC].UL <<= 3;
 		VU0.flags &= ~VUFLAG_MFLAGSET;
 		const u64 startcycles = VU0.cycle;
+		g_budget_end0 = startcycles + cycles; // generated code leaves where this slice ends (g_vu0_slices)
 		Program* next = nullptr;
 		bool force_step = false;
 		while ((VU0.cycle - startcycles) < cycles)
@@ -203,14 +211,30 @@ namespace VU0Jit
 
 			Program* p = next;
 			next = nullptr;
-			if (!force_step && !p && VU0.branch == 0 && VU0.ebit == 0)
+			const bool pending = VU0.branch != 0 || VU0.ebit != 0;
+			bool refused = false;
+			if (!force_step && !p && !pending)
 			{
 				Signature sig;
-				if (DeriveSignature(VU0, &sig) == Refusal::None)
+				refused = DeriveSignature(VU0, &sig) != Refusal::None;
+				if (!refused)
 					p = Find(VU0.VI[REG_TPC].UL & VU0_PROGMASK, sig);
 			}
-			if (force_step || !m_usable || !p || !p->fn.IsLoaded() || (VU0.cycle - startcycles) + p->last_start >= cycles)
+			const bool loaded = p && p->fn.IsLoaded();
+			// With slices, the block's code stops where the slice ends; without, the whole block must fit.
+			const bool fits = loaded && (VU0.cycle - startcycles) + (g_vu0_slices ? p->first_need : p->last_start) < cycles;
+			if (force_step || !m_usable || !fits)
 			{
+				int why = 4;
+				if (force_step)
+					why = 0;
+				else if (pending)
+					why = 1;
+				else if (refused)
+					why = 2;
+				else if (!loaded)
+					why = 3;
+				m_why[why]++;
 				force_step = false;
 				CpuIntVU0.Step();
 				m_steps++;
@@ -229,8 +253,11 @@ namespace VU0Jit
 			m_jit_instrs += x.instrs;
 			if (x.kind == ExitKind::End)
 				continue;
-			if (x.reason != ExitReason::Block && x.reason != ExitReason::Cap)
+			// A slice's end (ExitReason::Budget): the loop's test stops it, or the interpreter takes the one instruction
+			// before a delay slot that still fits (CompiledBlock::first_need of the block there).
+			if (x.reason != ExitReason::Block && x.reason != ExitReason::Cap && x.reason != ExitReason::Budget)
 			{
+				m_force[static_cast<int>(x.reason)]++;
 				force_step = true;
 				continue;
 			}
@@ -343,6 +370,10 @@ namespace VU0Jit
 		Console.WriteLn(fmt::format("VU0 JIT: {} executes, {} blocks compiled ({:.1f} ms), {} flushes, {} entries; {} instructions in "
 									"generated code, {} interpreter steps",
 			m_executes, m_compiles, m_compile_ms, m_flushes, m_entries, m_jit_instrs, m_steps));
+		Console.WriteLn(fmt::format("VU0 JIT: interpreter steps: {} after an exit ({} fallbacks, {} D/T bits), {} with a branch or E bit "
+									"pending, {} signature refused, {} no code, {} slice too short",
+			m_why[0], m_force[static_cast<int>(ExitReason::Fallback)], m_force[static_cast<int>(ExitReason::DTBit)], m_why[1], m_why[2],
+			m_why[3], m_why[4]));
 		if (s_lockstep)
 			Console.WriteLn(fmt::format("VU0 JIT lockstep: {} runs compared, {} differences", m_ls_runs, m_ls_diffs));
 	}

@@ -56,6 +56,7 @@
 #include "pcsx2/MTVU.h"
 #include "pcsx2/wasm/VU0Jit.h"
 #include "pcsx2/wasm/VU1Jit.h"
+#include "pcsx2/wasm/VU1JitEmit.h"
 #include "pcsx2/wasm/VU1JitFuzz.h"
 #include "pcsx2/wasm/VU1JitHooks.h"
 #endif
@@ -368,6 +369,8 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			VU0Jit::SetLockstep(true);
 			s_vu1jit_report = true;
 		}
+		else if (arg == "-vu0jit-slices" && has_value)
+			VU1Jit::g_vu0_slices = StringUtil::FromChars<int>(argv[++i]).value_or(1) != 0;
 		else if (arg == "-vu1jit-stats" && has_value)
 		{
 			s_vu1jit_stats_path = argv[++i];
@@ -496,7 +499,7 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "  -jit-compile-stats prints, every VSYNCS vsyncs and at the end, the JITs' compile time: the total and\n"
 								 "         the largest in one vsync, for the EE and IOP JITs (EE thread) and for all JITs.\n");
 #ifdef __EMSCRIPTEN__
-			std::fprintf(stderr, "         [-vu1jit-fuzz SEED:COUNT[:timing|jit|both[:hashes]]] [-vu1jit-oracle] [-vu1jit-lockstep] [-vu0jit-lockstep]\n"
+			std::fprintf(stderr, "         [-vu1jit-fuzz SEED:COUNT[:timing|jit|both[:hashes]]] [-vu1jit-oracle] [-vu1jit-lockstep] [-vu0jit-lockstep] [-vu0jit-slices 0|1]\n"
 								 "         [-vu1jit-stats FILE] [-mtvu-sync]\n");
 #endif
 			std::fprintf(stderr, "  With no disc image the BIOS boots to its menu. -frames 0 runs until stopped.\n");
@@ -526,6 +529,7 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "  -vu1jit-oracle checks the timing model at every VU1 instruction the JIT's dispatcher runs.\n"
 								 "  -vu1jit-lockstep runs every VU1 program on the JIT and on the interpreter and compares them.\n"
 								 "  -vu0jit-lockstep does the same for VU0 micro programs (the VU0 JIT is on by default, off with EnableVU0=false).\n"
+								 "  -vu0jit-slices 0 makes VU0 blocks run only when they fit the EE's slice whole (the interpreter steps the rest).\n"
 								 "  -vu1jit-stats writes per-vsync VU1 statistics (runs, cycles, execute time, PATH1 hash) as CSV.\n"
 								 "  -mtvu-sync makes the EE wait for the VU thread at each check, so whole runs repeat exactly.\n");
 #endif
