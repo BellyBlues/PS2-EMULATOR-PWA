@@ -181,6 +181,13 @@ Measured, exact or not, and not kept because the gain was too small for the chan
 
 ## Known to be left
 
+- **Zen against Chrome** (2026-10-22, one clean pair each, unlimited, in a quiet window): GTA from the
+  Grove Street state 108.6 % in Zen against 124.6 % in Chrome (0.87; EE-bound in both, so Firefox's engine
+  runs the EE JIT's code about 13 % slower); the crowd benchmark at 300 figures 127.5 % against 160 %
+  (0.80), where Zen's GS thread is the limit (90 % busy against 61 %), probably the copy of each frame
+  back from the GPU. Not profiled yet: one Firefox Profiler capture of GTA would show whether some
+  generated-code patterns cost more in SpiderMonkey.
+
 - **EE JIT compiling** (after `2a94d1f30`): the engine's compile and instantiation (about a quarter
   of compiling) stay on the EE thread, which runs the code; the IOP JIT still builds on the EE thread;
   modules from a code list go in when the game reaches them or in spare time; their engine compile is
