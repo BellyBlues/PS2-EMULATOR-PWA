@@ -159,6 +159,12 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   0.9 % fewer instructions retired on GTA (branch `lean-branch-end`, not merged).
 - **A lower V8 tier-up budget** (`--wasm-tiering-budget` 1 M or 200 k against 13 M): 6-8 % more
   instructions on GTA, from the extra optimising compiles.
+- **The last EE interpreter fallbacks generated natively** (2026-10-22): LWL/LWR/SWL/SWR, CACHE DXLTG,
+  EI/DI, ADD, MULT1/MULTU1/MADD/MADDU, DIV/DIVU, SQRT_S/RSQRT_S, BC0F/BC0T as branches, the saturating
+  PADD/PSUB ops. Exact (GTA, BIOS and benchmark hashes, a 1000-vsync end state, an op test against the
+  interpreter), interpreter calls 13.5 M → 1.5 M per 1,200 GTA vsyncs, but 1,043.4 G → 1,042.4 G
+  instructions retired per 2,400 vsyncs (within noise): their interpreter bodies were 0.5 % of the EE
+  thread. Branch `native-fallbacks` (`950539bc7`), not merged.
 - **Main RAM without the vtlb** (2026-10-22): accesses below 32 MB taken straight to main RAM, a range
   check instead of the table read. Exact on GTA (state hashes identical over 600 vsyncs), but 0.5 % more
   instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
