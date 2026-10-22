@@ -590,3 +590,15 @@ A second way to choose a disc, from a folder of disc images (`library/disc-libra
 **Skipping.** Three quick clicks (within 0.9 s) anywhere in the library, or three presses of Enter, Space or Esc, skip whatever is moving (the insert, the cleaning, the eject) and the wait in the dark: on the player the dialog goes at once and the boot shows as it is.
 
 **Motion.** The tray and the disc move (about 3 s in all); with reduced motion every duration is 0. Departures from §1, on purpose and only here: a photo, moving objects, a translucent disc hub, and the console's power light glowing. The photo carries no Sony or PlayStation marks: they were taken out of it (`tools/wasm/delogo-photo.py`).
+
+## 16. The console under the screen
+
+The transport (§5) is the PS2's own front: a photo of it, straightened into a level strip with a band of its top above (`library/ps2-front.webp`, Evan-Amos, public domain, its marks taken out), as wide as the screen, with a button laid over each part (`library/console-bar.css`). Under its tray lies a TV remote. A first version, to be refined with the owner; the controller plugs come later.
+
+- **Memory card slots 1 and 2:** each is Card 1 / Card 2 (§14). A plugged card is the real card (`library/memory-card.webp`), its outer end sticking out of the slot with the card's name on a paper label; plugging it slides it up into the slot, unplugging slides it back out and away. Clicking the slot or the card opens its menu as before.
+- **The blank plate** right of slot 2 is engraved with the console model from the BIOS file's name (SCPH-70004, else the BIOS's title) and opens the BIOS menu.
+- **The tray** is engraved with the game's title and opens the disc menu; with no disc it reads "Insert a disc" and opens the disc library.
+- **Reset** is Stop (while starting or running). Its power light glows green while the PS2 runs.
+- **Eject** opens the disc library (§15); while the PS2 runs the subtitle says why it can't.
+- **The remote:** VOL − and VOL + (steps of 10; the subtitle says "Volume 80%."), MUTE (`aria-pressed`, M as before), PICTURE (Crisp), MENU (Graphics, §12), WIDE (Fullscreen), KEYS (the Keys drawer), INFO (Log), REC (the Recorder, when shown). A pressed or open one has a small amber dot. The Sound menu has no button any more.
+- The sill (capture, subtitle, readout, tally) stays above the console. In fullscreen only the remote rides on the band. Under 640 px the remote wraps under the console.

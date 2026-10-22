@@ -15,6 +15,8 @@ const dialog = document.getElementById('library');
 const root = document.getElementById('library-root');
 const closeBtn = document.getElementById('library-close');
 const openers = [document.getElementById('slate-library'), document.getElementById('disc-menu-library')];
+// On the console's front (UI-SPEC §16): Eject, and the empty tray.
+const consoleOpeners = [document.getElementById('btn-eject'), document.getElementById('tray-library')];
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
 let lib = null;
@@ -53,6 +55,14 @@ if (host && dialog && root) {
 		b?.addEventListener('click', () => {
 			if (b.getAttribute('aria-disabled') !== 'true')
 				open();
+		});
+	}
+	for (const b of consoleOpeners) {
+		b?.addEventListener('click', () => {
+			if (host.canOpen())
+				open();
+			else
+				host.say(host.blocked() || 'Stop the PS2 first to change the disc.');
 		});
 	}
 	closeBtn.addEventListener('click', () => {

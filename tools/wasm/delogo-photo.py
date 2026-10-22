@@ -8,7 +8,7 @@ edge, the PlayStation logo on the tray, "SONY" beside the buttons and "MagicGate
 from its surroundings (the top's gradient and grain, the ridges beside it).
 
 Usage:
-    python3 tools/wasm/delogo-photo.py CUTOUT.webp OUTPUT.webp
+    python3 tools/wasm/delogo-photo.py CUTOUT.webp OUTPUT.webp   (2200 or 4400 px across)
 
 Needs numpy, opencv-python and Pillow (with WebP).
 """
@@ -22,7 +22,7 @@ src, dst = sys.argv[1], sys.argv[2]
 im = np.array(Image.open(src).convert("RGBA"))
 rgb = im[:, :, :3].astype(np.float32)
 alpha = im[:, :, 3]
-S = 2  # page units -> pixels
+S = im.shape[1] // 1100  # page units -> pixels (the page's photo is 2200 px, the original 4400)
 
 def box(x0, y0, x1, y1):
     return slice(y0 * S, y1 * S), slice(x0 * S, x1 * S)

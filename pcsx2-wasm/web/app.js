@@ -4715,7 +4715,7 @@
 		ui.views.confirm.setAttribute('aria-labelledby', ui.confirmQ.id);
 		ui.nameInput.maxLength = CARD_NAME_MAX;
 		ui.nameInput.setAttribute('aria-describedby', ui.errorLine.id);
-		discEls.btn.before(btn);
+		$(`bar-slot-${n}`).append(btn); // the card plugs into its slot on the console's front (UI-SPEC §16)
 		discEls.menu.before(menu);
 		wireCardUi(ui);
 		return ui;
@@ -4799,6 +4799,7 @@
 		if (ui.btn.getAttribute('aria-label') !== name)
 			ui.btn.setAttribute('aria-label', name);
 		ui.btn.dataset.label = label;
+		setText(ui.btn.querySelector('.mc-label'), c ? c.name : '');
 	}
 
 	function renderCardMenu(ui) {
@@ -5179,6 +5180,8 @@
 		},
 		// Whether the library may be opened now (its buttons are aria-disabled otherwise).
 		canOpen: () => canChangeBios() && !!page.bios,
+		// A line in the subtitle, for a library button that can't open it now (Eject while the PS2 runs).
+		say: (text) => subtitle(text),
 	});
 
 	// Read-only hooks for automated tests, next to window.PCSX2Web.
@@ -5238,6 +5241,7 @@
 		},
 		off: 'Sound off.',
 		on: 'Sound on.',
+		volume: (v) => `Volume ${v}%.`,
 		heldHint: 'Press a key or click to turn the sound on.',
 		heldNote: 'The browser holds the sound until you press a key or click.',
 		unavailable: 'This browser can’t play the emulator’s sound.',
@@ -5586,6 +5590,7 @@
 		if (soundEls.btn.getAttribute('aria-label') !== name)
 			soundEls.btn.setAttribute('aria-label', name);
 		soundEls.mute.setAttribute('aria-pressed', audio.muted ? 'true' : 'false');
+		$('remote-mute').setAttribute('aria-pressed', audio.muted ? 'true' : 'false');
 		if (Number(soundEls.volume.value) !== audio.volume)
 			soundEls.volume.value = String(audio.volume);
 		soundEls.volume.setAttribute('aria-valuetext', SOUND_COPY.valueText(audio.volume));
@@ -5673,6 +5678,15 @@
 		soundEls.volume.addEventListener('input', () => setVolume(Number(soundEls.volume.value)));
 		soundEls.volume.addEventListener('change', () => writePref(PREF_VOLUME, String(audio.volume)));
 		soundEls.mute.addEventListener('click', () => setMuted(!audio.muted, false));
+		// The remote under the console (UI-SPEC §16): volume in steps of 10, and mute.
+		const stepVolume = (d) => {
+			setVolume(audio.volume + d);
+			writePref(PREF_VOLUME, String(audio.volume));
+			subtitle(SOUND_COPY.volume(audio.volume));
+		};
+		$('remote-vol-down').addEventListener('click', () => stepVolume(-10));
+		$('remote-vol-up').addEventListener('click', () => stepVolume(10));
+		$('remote-mute').addEventListener('click', () => setMuted(!audio.muted, true));
 
 		soundEls.menu.addEventListener('beforetoggle', (e) => {
 			if (e.newState === 'open') {
@@ -8149,7 +8163,9 @@
 			hideMenu();
 			return;
 		}
-		setText(els.biosBtnName, biosTitle(b.name));
+		// On the console's model plate (UI-SPEC §16): the model when the name has one (SCPH-70004), else the title.
+		const model = /(SCPH|DTL)[-_ ]?H?\d{4,5}(?!\d)/i.exec(b.name);
+		setText(els.biosBtnName, model ? model[0].toUpperCase().replace(/[_ ]/, '-') : biosTitle(b.name));
 		setText(els.menuName, b.name);
 		rich(els.menuWhere, [...sizeParts(b.size), { sep: 1 }, storedText(b)]);
 		const locked = !canChangeBios();

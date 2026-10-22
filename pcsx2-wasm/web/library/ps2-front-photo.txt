@@ -1,0 +1,15 @@
+library/ps2-front.webp: the front of a Sony PlayStation 2 (SCPH-30001), straightened, for the bottom bar.
+library/memory-card.webp: a PlayStation 2 8 MB memory card, straightened, for the bottom bar.
+
+Photos by Evan-Amos, released into the public domain:
+https://commons.wikimedia.org/wiki/File:Sony-PlayStation-2-30001-Console-FL.jpg
+https://commons.wikimedia.org/wiki/File:PS2-8MB-Mem-Card.jpg
+
+Changed for this page (tools/wasm/console-bar-photos.py): the console's front edge and a band of its
+top straightened into a level strip, the card's face into a flat rectangle, and their Sony and
+PlayStation marks taken out (the PS2 logo and script on the top, the small logos along its front
+edge, the PlayStation logo on the tray, "SONY", "MagicGate"; on the card the PlayStation logo,
+"PlayStation 2", "MagicGate" and "SONY"). Saved as WebP.
+
+PlayStation and PS2 are trademarks of Sony Interactive Entertainment. This project isn't affiliated
+with or endorsed by Sony.

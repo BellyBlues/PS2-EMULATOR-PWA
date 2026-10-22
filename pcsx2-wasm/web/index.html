@@ -19,6 +19,7 @@
 <link rel="preload" href="fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="library/disc-library.css">
+<link rel="stylesheet" href="library/console-bar.css">
 <script src="app.js" defer></script>
 <!-- The disc library (UI-SPEC.md §15): a module, after app.js, which it talks to through
      window.PCSX2WebLibrary. It is the one part of the page that reaches another origin (disc art). -->
@@ -84,48 +85,44 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
     </div>
   </div>
 
+  <!-- The controls are the PS2's own front (a photo, straightened, logos taken out: library/ps2-front-photo.txt)
+       and a TV remote under its tray (UI-SPEC.md §16). Each part is a button laid over the photo. -->
   <div class="transport" id="transport" role="group" aria-label="Controls">
-    <div class="t-left">
-      <button type="button" class="t-btn" id="btn-stop">
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-stop"/></svg><span class="t-label">Stop</span>
+    <div class="ps2bar t-left" id="ps2bar">
+      <img class="ps2bar-photo" src="library/ps2-front.webp" alt="" width="2310" height="366" draggable="false">
+      <div class="bar-slot" id="bar-slot-1"></div>
+      <div class="bar-slot" id="bar-slot-2"></div>
+      <button type="button" class="bar-hot bar-plate bios-btn" id="bios-btn" popovertarget="bios-menu" aria-controls="bios-menu" aria-expanded="false">
+        <span class="vh">BIOS: </span><span class="bios-btn-name" id="bios-btn-name"></span>
+      </button>
+      <button type="button" class="bar-hot bar-tray bios-btn disc-btn" id="disc-btn" popovertarget="disc-menu" aria-controls="disc-menu" aria-expanded="false">
+        <span class="vh">Disc: </span><span class="bios-btn-name" id="disc-btn-name"></span>
+      </button>
+      <button type="button" class="bar-hot bar-tray bar-tray-empty" id="tray-library" aria-haspopup="dialog" aria-label="Disc library">
+        <span class="bar-tray-hint" aria-hidden="true">Insert a disc</span>
+      </button>
+      <span class="bar-led" aria-hidden="true"></span>
+      <button type="button" class="bar-hot bar-reset" id="btn-stop" aria-label="Stop">
         <span class="tip" aria-hidden="true">Stop</span>
       </button>
-      <button type="button" class="bios-btn disc-btn" id="disc-btn" popovertarget="disc-menu" aria-controls="disc-menu" aria-expanded="false">
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-disc"/></svg><span class="vh">Disc: </span><span class="bios-btn-name" id="disc-btn-name"></span><svg class="icon caret" aria-hidden="true" focusable="false"><use href="icons.svg#i-caret-up"/></svg>
-      </button>
-      <button type="button" class="bios-btn" id="bios-btn" popovertarget="bios-menu" aria-controls="bios-menu" aria-expanded="false">
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-memory"/></svg><span class="vh">BIOS: </span><span class="bios-btn-name" id="bios-btn-name"></span><svg class="icon caret" aria-hidden="true" focusable="false"><use href="icons.svg#i-caret-up"/></svg>
+      <button type="button" class="bar-hot bar-eject" id="btn-eject" aria-haspopup="dialog" aria-label="Eject: disc library">
+        <span class="tip" aria-hidden="true">Disc library</span>
       </button>
     </div>
-    <div class="t-right">
-      <button type="button" class="t-btn" id="btn-sound" popovertarget="sound-menu" aria-controls="sound-menu" aria-expanded="false" aria-keyshortcuts="M" aria-label="Sound, 100 percent">
-        <svg class="icon" aria-hidden="true" focusable="false"><use id="btn-sound-icon" href="icons.svg#i-speaker-high"/></svg><span class="t-label">Sound</span>
-        <span class="tip" aria-hidden="true">Sound <kbd>M</kbd></span>
-      </button>
-      <button type="button" class="t-btn" id="btn-gfx" popovertarget="gfx-menu" aria-controls="gfx-menu" aria-expanded="false" aria-label="Graphics">
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-graphics-card"/></svg><span class="t-label">Graphics</span>
-        <span class="tip" aria-hidden="true">Graphics</span>
-      </button>
-      <button type="button" class="t-btn" id="btn-crisp" aria-pressed="false">
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-checkerboard"/></svg><span class="t-label">Crisp</span>
-        <span class="tip" aria-hidden="true">Crisp pixels</span>
-      </button>
-      <button type="button" class="t-btn" id="btn-keys" aria-expanded="false" aria-controls="keys-drawer" aria-keyshortcuts="Shift+?">
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-keyboard"/></svg><span class="t-label">Keys</span>
-        <span class="tip" aria-hidden="true">Keys <kbd>?</kbd></span>
-      </button>
-      <button type="button" class="t-btn" id="btn-rec" aria-expanded="false" aria-controls="rec-drawer" hidden>
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-chart-line"/></svg><span class="t-label">Recorder</span>
-        <span class="tip" aria-hidden="true">Recorder</span>
-      </button>
-      <button type="button" class="t-btn" id="btn-log" aria-expanded="false" aria-controls="log-drawer" aria-keyshortcuts="`">
-        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-terminal-window"/></svg><span class="t-label">Log</span>
-        <span class="tip" aria-hidden="true">Log <kbd data-code="Backquote">`</kbd></span>
-      </button>
-      <button type="button" class="t-btn" id="btn-fs" aria-keyshortcuts="Alt+Enter">
-        <svg class="icon" aria-hidden="true" focusable="false"><use id="btn-fs-icon" href="icons.svg#i-corners-out"/></svg><span class="t-label" id="btn-fs-label">Fullscreen</span>
-        <span class="tip" aria-hidden="true"><span id="btn-fs-tip">Fullscreen</span> <kbd>Alt</kbd><kbd>Enter</kbd></span>
-      </button>
+    <div class="remote t-right" id="remote" role="group" aria-label="Remote">
+      <button type="button" class="rm-btn rm-round" id="remote-vol-down" aria-label="Volume down"><span class="rm-glyph" aria-hidden="true">−</span><span class="rm-cap" aria-hidden="true">VOL</span></button>
+      <button type="button" class="rm-btn rm-round" id="remote-vol-up" aria-label="Volume up"><span class="rm-glyph" aria-hidden="true">+</span><span class="rm-cap" aria-hidden="true">VOL</span></button>
+      <button type="button" class="rm-btn rm-round" id="remote-mute" aria-pressed="false" aria-keyshortcuts="M" aria-label="Mute"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-speaker-x"/></svg><span class="rm-cap" aria-hidden="true">MUTE</span></button>
+      <span class="rm-gap" aria-hidden="true"></span>
+      <button type="button" class="rm-btn" id="btn-crisp" aria-pressed="false" aria-label="Crisp pixels">PICTURE</button>
+      <button type="button" class="rm-btn" id="btn-gfx" popovertarget="gfx-menu" aria-controls="gfx-menu" aria-expanded="false" aria-label="Graphics">MENU</button>
+      <button type="button" class="rm-btn" id="btn-fs" aria-keyshortcuts="Alt+Enter"><span class="vh" id="btn-fs-label">Fullscreen</span><span aria-hidden="true">WIDE</span><svg class="icon vh" aria-hidden="true" focusable="false"><use id="btn-fs-icon" href="icons.svg#i-corners-out"/></svg><span class="vh" id="btn-fs-tip"></span></button>
+      <span class="rm-gap" aria-hidden="true"></span>
+      <button type="button" class="rm-btn" id="btn-keys" aria-expanded="false" aria-controls="keys-drawer" aria-keyshortcuts="Shift+?" aria-label="Keys">KEYS</button>
+      <button type="button" class="rm-btn" id="btn-log" aria-expanded="false" aria-controls="log-drawer" aria-keyshortcuts="`" aria-label="Log">INFO</button>
+      <button type="button" class="rm-btn rm-rec" id="btn-rec" aria-expanded="false" aria-controls="rec-drawer" aria-label="Recorder" hidden><span class="rm-dot" aria-hidden="true"></span>REC</button>
+      <!-- The sound menu stays for the M shortcut's state and its fine print; the remote sets the volume. -->
+      <button type="button" class="rm-btn" id="btn-sound" popovertarget="sound-menu" aria-controls="sound-menu" aria-expanded="false" aria-label="Sound, 100 percent" hidden><svg class="icon" aria-hidden="true" focusable="false"><use id="btn-sound-icon" href="icons.svg#i-speaker-high"/></svg></button>
     </div>
   </div>
 
@@ -317,6 +314,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
 
   <template id="card-template">
     <button type="button" class="bios-btn card-btn empty" aria-expanded="false">
+      <span class="mc" aria-hidden="true"><span class="mc-card"><span class="mc-label"></span></span></span>
       <svg class="icon card-icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-sim-card"/></svg><span class="card-dot" aria-hidden="true"></span><span class="bios-btn-name card-label" aria-hidden="true"><span class="card-pre">Card </span><span class="card-num">1</span><span class="card-rest"> · empty</span></span><svg class="icon caret" aria-hidden="true" focusable="false"><use href="icons.svg#i-caret-up"/></svg>
       <span class="tip" aria-hidden="true"></span>
     </button>
