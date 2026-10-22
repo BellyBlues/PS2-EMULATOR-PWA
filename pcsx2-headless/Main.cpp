@@ -417,7 +417,10 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 		else if (arg == "-eejit-mask" && has_value)
 			EEJit::g_dbgmask = StringUtil::FromChars<u32>(argv[++i]).value_or(0);
 		else if (arg == "-eejit-stats")
+		{
 			EEJit::g_stats = true;
+			IopJit::g_stats = true;
+		}
 		else if (arg == "-eejit-spin" && has_value)
 			EEJit::g_spin = StringUtil::FromChars<int>(argv[++i]).value_or(1) != 0;
 		else if (arg == "-eejit-bg" && has_value)

@@ -154,6 +154,13 @@ simpler distant figures), so each row compares one version with itself.
 
 Measured, exact or not, and not kept because the gain was too small for the change:
 
+- **32-bit values in i32 locals** (2026-10-22, measured, not built): keeping registers that hold a
+  sign-extended 32-bit value in i32 locals, to drop the `i32.wrap_i64` / `i64.extend_i32_s` pairs around
+  32-bit ops. In three of GTA's hottest modules those conversions are 2.3-3.1 % of all wasm operations
+  (a quarter of them zero extensions of addresses, which this would not touch), and 12 of the 293
+  operations (4.1 %) of the hot byte-copy loop at `0x54ec3c`, a block of nearly only 32-bit register
+  ops. Only part of them could go, and on ARM64 a wrap is free (a w register) and TurboFan folds an
+  extend followed by a wrap, so the gain in instructions retired would be well under the 5 % bar.
 - **EE JIT units** (one function per module, registers kept across blocks): no gain, slower compiling
   (`7f41a4f0a`, reverted).
 - **Lean branch ends** (no PC, code and branch flag stores after a register-only delay slot): exact,
@@ -166,13 +173,54 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   interpreter), interpreter calls 13.5 M → 1.5 M per 1,200 GTA vsyncs, but 1,043.4 G → 1,042.4 G
   instructions retired per 2,400 vsyncs (within noise): their interpreter bodies were 0.5 % of the EE
   thread. Branch `native-fallbacks` (`950539bc7`), not merged.
+- **IOP idle loops** (2026-10-22): in GTA San Andreas gameplay the IOP's hottest block (43 % of its block
+  entries, `-eejit-stats` now lists the IOP's blocks too) is the kernel's idle loop, `J self; NOP` at
+  0xbe9c, entered once per EE event test (about 6,300 times a vsync). The interpreter's wait loop skip
+  (`doBranchEnd()`) already skips its waiting to the next IOP event; what each entry costs is the IOP run
+  around it and the event test, which run anyway. The generated IOP and VU0 code together are 3.9 % of the
+  EE thread. Stepping the idle loop on the interpreter instead of calling its block (exact by
+  construction) gave the same instructions retired (996-1,000 G per 2,400 vsyncs, on and off): not kept.
+- **Cheaper SPU2 mixing** (2026-10-22): the voices' volume slide tested inline instead of a call per voice and
+  sample, and the per-voice IRQ address tests skipped when neither core has its IRQ enabled. Exact (EE/IOP state
+  hashes for GTA, the BIOS and the benchmark, the mixed output hashed per sample over 1000 GTA vsyncs, and a
+  1000-vsync GTA end state with SPU2.bin, all identical), but no gain: SPU2 stays 3.7-3.8 % of the EE thread in
+  GTA (profile share, two runs each). In GTA both cores keep their IRQ enabled all the time, about 45 % of the 48
+  voices play, the stopped ones still advance through memory at their pitch, and about 19 % of the volumes slide,
+  so the per-voice, per-sample work is what the SPU2 does, not waste. Not kept.
+- **IOP block linking** (2026-10-22): the IOP is 21-24 % of the EE thread in Naruto's intro video, DBZ BT3 and
+  Guitar Hero (helper A's survey). In Naruto's video it splits into the generated IOP code 10.4 %, the work
+  around each run of IOP code 8-9 % (`intExecuteBlock` 3.5 %, `iopEventTest` 2.7 %, the branch start and end
+  1 %, `psxJ` fallbacks 0.65 %, the counters 0.65 %), SPU2 3.3 % and the IOP's hardware registers about 1 %. The
+  IOP runs in short timeslices, one per EE event test: about 48,000 runs of IOP code per vsync, each of
+  about one block (from one taken branch to the next). Tried: after a taken branch, `iopEventTest()`'s usual
+  case and the next run of `intExecuteBlock()`'s loop done in generated code, tail-calling the target's
+  block when nothing is due and the timeslice has cycles left (with the pending but not due interrupts tested
+  as `_psxTestInterrupts()` does): it linked 28-43 M of the taken branches per 900 vsyncs and cut the runs
+  started from C++ by a third. Inline in every block it was slower (Naruto 55 against 59.7 VPS, the event test
+  inline alone 57); as one function per module it was the same as without it (Naruto 58.7-59.8 against
+  59.4-59.9 VPS, DBZ 131.5-133.7 against 131.5-132.3, Guitar Hero 186.3-187.1 against 180.1-186.2, in quiet
+  windows): each return to C++ costs about what the generated path does. Not kept.
 - **Main RAM without the vtlb** (2026-10-22): accesses below 32 MB taken straight to main RAM, a range
   check instead of the table read. Exact on GTA (state hashes identical over 600 vsyncs), but 0.5 % more
   instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
   vtlb's table read hits the cache and its branch predicts well on the M1, so a true "fastmem" would gain
   little more here, and WebAssembly cannot map memory twice or resume after a fault anyway.
+- **Copy and fill loops run natively** (2026-10-22, measured only): EE thread profile samples per
+  generated block, the blocks' code decoded from RAM. In GTA San Andreas gameplay (from vsync 720 of
+  2400), every block that branches back to its own start is 0.81 % of the EE thread, and the simple
+  memory loops among them (byte copy at `0x54ec3c`, byte and word fills, quadword copies) 0.29 %; in
+  Naruto's boot (3000 vsyncs, second half) 3.6 % and 0.57 %. Under the 2 % that would justify an
+  exact loop accelerator, so none was built: the EE time is spread over thousands of blocks (GTA's
+  hottest is 0.48 %).
 
 ## Known to be left
+
+- **Zen against Chrome** (2026-10-22, one clean pair each, unlimited, in a quiet window): GTA from the
+  Grove Street state 108.6 % in Zen against 124.6 % in Chrome (0.87; EE-bound in both, so Firefox's engine
+  runs the EE JIT's code about 13 % slower); the crowd benchmark at 300 figures 127.5 % against 160 %
+  (0.80), where Zen's GS thread is the limit (90 % busy against 61 %), probably the copy of each frame
+  back from the GPU. Not profiled yet: one Firefox Profiler capture of GTA would show whether some
+  generated-code patterns cost more in SpiderMonkey.
 
 - **EE JIT compiling** (after `2a94d1f30`): the engine's compile and instantiation (about a quarter
   of compiling) stay on the EE thread, which runs the code; the IOP JIT still builds on the EE thread;
