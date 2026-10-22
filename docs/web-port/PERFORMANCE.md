@@ -180,6 +180,13 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   around it and the event test, which run anyway. The generated IOP and VU0 code together are 3.9 % of the
   EE thread. Stepping the idle loop on the interpreter instead of calling its block (exact by
   construction) gave the same instructions retired (996-1,000 G per 2,400 vsyncs, on and off): not kept.
+- **Cheaper SPU2 mixing** (2026-10-22): the voices' volume slide tested inline instead of a call per voice and
+  sample, and the per-voice IRQ address tests skipped when neither core has its IRQ enabled. Exact (EE/IOP state
+  hashes for GTA, the BIOS and the benchmark, the mixed output hashed per sample over 1000 GTA vsyncs, and a
+  1000-vsync GTA end state with SPU2.bin, all identical), but no gain: SPU2 stays 3.7-3.8 % of the EE thread in
+  GTA (profile share, two runs each). In GTA both cores keep their IRQ enabled all the time, about 45 % of the 48
+  voices play, the stopped ones still advance through memory at their pitch, and about 19 % of the volumes slide,
+  so the per-voice, per-sample work is what the SPU2 does, not waste. Not kept.
 - **Main RAM without the vtlb** (2026-10-22): accesses below 32 MB taken straight to main RAM, a range
   check instead of the table read. Exact on GTA (state hashes identical over 600 vsyncs), but 0.5 % more
   instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
