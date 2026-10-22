@@ -21,7 +21,7 @@
 //         (sink): the player then takes the dialog away and its screen shows the boot. rise() brings the
 //         console back up when the library returns.
 //   cleanChance: how often a disc won't read and has to be cleaned first (the Easter egg, cleanDisc);
-//         index.html?clean=1 makes it every time.
+//         index.html?clean=1 makes it every time, and so does Shift held while a disc is put in.
 
 import {
 	readFolder, filesFromDrop, filesFromDirectory, onlineCover, discMeta, noDiscsText, shelfAnnouncement,
@@ -985,7 +985,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		} else if (e.key === 'End') {
 			select(discs.length - 1);
 		} else if (e.key === 'Enter' || e.key === ' ') {
-			insert();
+			insert({ clean: e.shiftKey }); // Shift: the cleaning, every time (for trying it)
 		} else if (e.key.length === 1 && /\S/.test(e.key)) {
 			// Type a title's first letters to jump to it.
 			const now = performance.now();
@@ -1064,7 +1064,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 			if (drag.disc) {
 				const i = +drag.disc.dataset.index;
 				if (i === target)
-					insert();
+					insert({ clean: e.shiftKey }); // Shift: the cleaning, every time (for trying it)
 				else
 					select(i);
 			}
