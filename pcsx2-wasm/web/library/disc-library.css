@@ -10,10 +10,12 @@
   initial-value: 1;
 }
 
+/* As dark as the player while a game runs (the room with its lights down), so that the library fading away
+   into the game, or back in after it, changes no colour. */
 .lib {
   position: relative;
   min-height: 0;
-  background: var(--house);
+  background: var(--house-down);
   transition: background-color 300ms var(--ease-out);
 }
 
@@ -32,6 +34,11 @@
 
 .lib.dragging .lib-room {
   cursor: grabbing;
+}
+
+/* Without a BIOS the library asks for one first: no shelf yet. */
+.lib[data-bios="none"] :is(.lib-shelf, .lib-info, .lib-bar) {
+  visibility: hidden;
 }
 
 .lib[data-drag="ok"] .lib-room {
@@ -430,6 +437,153 @@
 
 /* ---------------------------------------------------------------- cards: the intake, and the insert's end */
 
+/* The setup: the BIOS, then the folder of games, as two tiles side by side over the room (one above the other
+   on narrow windows). A tile has its icon, its name, a line and its button; the BIOS tile shows a check and the
+   file's name once there is one, and the games' tile waits, dimmed, until then. */
+.lib-setup {
+  position: absolute;
+  left: 50%;
+  top: var(--card-top, 14%);
+  width: min(40rem, calc(100% - 2 * var(--gutter, 24px)));
+  transform: translateX(-50%);
+}
+
+.lib-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 559px) {
+  .lib-steps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.lib-step {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas: "icon title" "icon sub" "actions actions" "error error";
+  column-gap: 14px;
+  align-content: start;
+  padding: 18px 18px 16px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: rgb(28 27 25 / 0.88);
+  backdrop-filter: blur(6px);
+  transition: opacity 240ms var(--ease-out), border-color 240ms var(--ease-out);
+}
+
+.lib-step-icon {
+  grid-area: icon;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: rgb(242 181 68 / 0.12);
+  color: var(--amber);
+}
+
+.lib-step-icon .icon {
+  grid-area: 1 / 1;
+  width: 24px;
+  height: 24px;
+}
+
+.lib-step-title {
+  grid-area: title;
+  margin: 2px 0 0;
+  font-size: 17px;
+  line-height: 22px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.lib-step-sub {
+  grid-area: sub;
+  margin: 2px 0 0;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.lib-step-actions {
+  grid-area: actions;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin-top: 14px;
+}
+
+.lib-step-aside {
+  font-size: 13px;
+  color: var(--ink-3);
+}
+
+.lib-step-aside:empty {
+  display: none;
+}
+
+.lib-step-error {
+  grid-area: error;
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--coral);
+}
+
+/* The BIOS is in: a check, its file's name, and Change. */
+.lib-step-done,
+.lib-step[data-done="true"] .lib-step-todo {
+  display: none;
+}
+
+.lib-step[data-done="true"] .lib-step-done {
+  display: block;
+}
+
+.lib-step[data-done="true"] .lib-step-icon {
+  background: rgb(110 220 150 / 0.12);
+  color: #7fd79c;
+}
+
+.lib-step[data-done="true"] .lib-step-sub {
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.lib-step[data-done="true"] .btn-quiet {
+  margin-left: -12px;
+}
+
+/* The games wait for the BIOS. */
+.lib-step.is-waiting {
+  opacity: 0.45;
+}
+
+.lib-step.is-waiting .lib-step-icon {
+  background: rgb(236 232 225 / 0.06);
+  color: var(--ink-3);
+}
+
+.lib-setup-fine {
+  margin: 14px 2px 0;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--ink-3);
+  text-wrap: pretty;
+}
+
+.lib[data-drag="ok"] .lib-step:not(.is-waiting, [data-done="true"]) {
+  border-color: var(--amber);
+}
+
 .lib-card {
   position: absolute;
   left: 50%;
@@ -516,11 +670,11 @@
   margin: 0;
   padding: 0;
   border: 0;
-  background: var(--house);
+  background: var(--house-down);
   color: var(--ink);
   overflow: hidden;
   opacity: 1;
-  transition: opacity 500ms var(--ease-out), background-color 900ms var(--ease-out);
+  transition: opacity 700ms var(--ease-out), background-color 900ms var(--ease-out);
 }
 
 .lib-dialog[open] {
@@ -528,8 +682,16 @@
   grid-template-rows: 48px minmax(0, 1fr) auto;
 }
 
+/* The backdrop fades with the dialog: else it stays over the player until the dialog closes, and the game
+   appears all at once after a fade that shows nothing. */
 .lib-dialog::backdrop {
-  background: var(--house);
+  background: var(--house-down);
+  opacity: 1;
+  transition: opacity 700ms var(--ease-out);
+}
+
+.lib-dialog.is-leaving::backdrop {
+  opacity: 0;
 }
 
 .lib-dialog.is-dark {

@@ -65,6 +65,9 @@ const TEST = `(async () => {
 	const key = (type, code, k) => window.dispatchEvent(new KeyboardEvent(type, { code, key: k, bubbles: true, cancelable: true }));
 	const r = {};
 
+	// A real gamepad on the machine running the test would hold index 0: unplug it first.
+	navigator.getGamepads = () => [null, null, null, null];
+	await wait(300);
 	const gps = [mk(0, 'Xbox 360 Controller (STANDARD GAMEPAD Vendor: 045e Product: 028e)')];
 	navigator.getGamepads = () => gps.concat([null, null, null]).slice(0, 4);
 	window.dispatchEvent(Object.assign(new Event('gamepadconnected'), { gamepad: gps[0] }));
@@ -134,8 +137,6 @@ const TEST = `(async () => {
 	await wait(400);
 	r['two gamepads, two players'] = only(state(0), { Square: 255 }) && only(state(1), { Circle: 255 });
 
-	document.getElementById('btn-keys').click();
-	await wait(300);
 	document.getElementById('tab-gamepad').click();
 	document.getElementById('gp-swap').click();
 	await wait(500);
@@ -167,6 +168,45 @@ const TEST = `(async () => {
 	gps.pop();
 	await wait(500);
 	r['unplugging lets go'] = only(state(0), {}) && /Second Pad/.test(document.getElementById('announce').textContent) === true;
+	// Changing controls on the controllers under the console (UI-SPEC.md §17). The keyboard and the first
+	// gamepad play as Player 2 now.
+	const spot = (port, name) => [...document.querySelectorAll('#pad-' + port + ' .pad-spot')].find((b) => b.getAttribute('aria-label').startsWith(name + ':'));
+	document.querySelector('#pad-2 input[value="keyboard"]').click();
+	await wait(100);
+	spot(2, 'Cross').click();
+	key('keydown', 'KeyM', 'm'); key('keyup', 'KeyM', 'm');
+	r['a key given to Cross shows on it'] = spot(2, 'Cross').textContent === 'M' && localStorage.getItem('pcsx2web.keyBinds').includes('"Cross":"M"');
+	document.getElementById('screen').focus();
+	await wait(100);
+	key('keydown', 'KeyM', 'm');
+	await wait(300);
+	r['the new key plays Cross'] = only(state(1), { Cross: 255 });
+	key('keyup', 'KeyM', 'm'); key('keydown', 'KeyK', 'k');
+	await wait(300);
+	r['the old key plays nothing'] = only(state(1), {});
+	key('keyup', 'KeyK', 'k');
+	document.querySelector('#pad-2 .pad-reset').click();
+	r['the keys reset'] = spot(2, 'Cross').textContent === 'K';
+	document.querySelector('#pad-2 input[value="0"]').click();
+	await wait(100);
+	spot(2, 'Cross').click();
+	await wait(100);
+	set(gps[0], 3, 1);
+	await wait(450);
+	set(gps[0], 3, 0);
+	await wait(400);
+	r['a gamepad button given to Cross shows on it, and swaps'] = spot(2, 'Cross').textContent === 'Y' && spot(2, 'Triangle').textContent === 'A';
+	set(gps[0], 3, 1);
+	await wait(300);
+	r['the standard gamepad plays its new layout'] = only(state(1), { Cross: 255 });
+	set(gps[0], 3, 0);
+	await wait(300);
+	document.querySelector('#pad-2 .pad-reset').click();
+	set(gps[0], 3, 1);
+	await wait(300);
+	r['its controls reset'] = spot(2, 'Cross').textContent === 'A' && only(state(1), { Triangle: 255 });
+	set(gps[0], 3, 0);
+	await wait(300);
 	// A gamepad that is not laid out in the standard way, like an 8BitDo Ultimate in D mode in Firefox:
 	// a hat D-pad on axis 0 (rest 3.29), triggers on axes 5 and 6 (rest -1) and on buttons 8 and 9.
 	gps.length = 0;

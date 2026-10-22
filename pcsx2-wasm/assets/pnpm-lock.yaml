@@ -20,6 +20,9 @@ importers:
       coi-serviceworker:
         specifier: 0.1.7
         version: 0.1.7
+      matter-js:
+        specifier: 0.20.0
+        version: 0.20.0
 
 packages:
 
@@ -35,6 +38,9 @@ packages:
   coi-serviceworker@0.1.7:
     resolution: {integrity: sha512-bjSUqEngCPOkErY2vbyWsaIGCNRODYzlNycaREVw5s12/C8SM+RnRUUeX6pZbTtov6C52ZLY/+tvHK+BDxuUuA==}
 
+  matter-js@0.20.0:
+    resolution: {integrity: sha512-iC9fYR7zVT3HppNnsFsp9XOoQdQN2tUyfaKg4CHLH8bN+j6GT4Gw7IH2rP0tflAebrHFw730RR3DkVSZRX8hwA==}
+
 snapshots:
 
   '@fontsource-variable/archivo@5.3.0': {}
@@ -44,3 +50,5 @@ snapshots:
   '@phosphor-icons/core@2.1.1': {}
 
   coi-serviceworker@0.1.7: {}
+
+  matter-js@0.20.0: {}

@@ -1,0 +1,566 @@
+/* The controls under the screen as the PS2's front (UI-SPEC.md §16): a wireframe drawn after the real one
+   (the SVG in index.html, 1000 × 120 units), with a button laid over each part, and the TV remote of the
+   first mockup lying under the tray. Loaded after style.css: it overrides the transport's old flat row.
+   Places on the drawing are percentages of it.
+   Departures from the player's rules, on purpose and asked for: a drawn console and remote, the power
+   light glowing, and a memory card that slides in and out. */
+
+#transport {
+  display: block;
+  min-height: 0;
+  /* The console grows with the screen, but no wider than this: its height follows its width, and an open
+     drawer widens the column under the screen. */
+  max-width: min(100%, 760px);
+  padding: 4px 0 8px;
+}
+
+/* With the controls open (from a port), the remote steps aside so the picture keeps its room. */
+body[data-drawer="keys"] .remote {
+  display: none;
+}
+
+#transport > .ps2bar,
+#transport > .remote {
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- the console's front */
+
+.ps2bar {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 1000 / 120;
+  container-type: inline-size;
+}
+
+.ps2bar-art {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.ps2bar-art * {
+  vector-effect: non-scaling-stroke;
+  stroke-width: 1;
+}
+
+.w-face { fill: #151413; stroke: #3d3a36; }
+.w-top { fill: #1a1917; }
+.w-groove { fill: none; stroke: #2a2825; }
+.w-hole { fill: #0b0a0a; stroke: #6f6a63; }
+.w-plate { fill: #100f0e; stroke: #3d3a36; }
+.w-tray { fill: #181716; stroke: #6f6a63; }
+.w-key { fill: #181716; stroke: #6f6a63; }
+.w-mark { fill: none; stroke: #4a4743; }
+.w-pins circle { fill: #6f6a63; stroke: none; }
+.w-icon { fill: none; stroke: #aba59c; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+
+.w-num,
+.w-print {
+  font-family: var(--sans);
+  text-anchor: middle;
+  stroke: none;
+}
+
+.w-num { fill: #77726b; font-size: 9px; font-weight: 500; }
+.w-print { fill: #5d5953; font-size: 6.5px; font-weight: 560; letter-spacing: 0.08em; }
+
+.bar-slot,
+.bar-hot,
+.bar-led {
+  position: absolute;
+}
+
+#bar-slot-1 { left: 4%; top: 36.67%; width: 15%; height: 11.67%; }
+#bar-slot-2 { left: 24%; top: 36.67%; width: 15%; height: 11.67%; }
+.ps2bar .bar-port { left: 5%; top: 71.67%; width: 13%; height: 15%; }
+.ps2bar #port-2 { left: 25%; }
+.ps2bar .bar-plate { left: 41.2%; top: 36.67%; width: 9.2%; height: 11.67%; }
+.ps2bar .bar-tray { left: 52.4%; top: 33.33%; width: 38%; height: 36.67%; }
+.ps2bar .bar-reset { left: 92.8%; top: 28.33%; width: 4.4%; height: 28.33%; }
+.ps2bar .bar-eject { left: 92.8%; top: 65%; width: 4.4%; height: 28.33%; }
+
+/* A part of the console you can press: nothing over the drawing until hovered or focused. */
+.ps2bar .bar-hot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition: background-color var(--d-line) var(--ease-out);
+}
+
+.ps2bar .bar-hot:hover,
+.ps2bar .bar-hot[aria-expanded="true"],
+.bar-slot .card-btn:hover,
+.bar-slot .card-btn[aria-expanded="true"] {
+  background: rgb(236 232 225 / 0.07);
+}
+
+.ps2bar .bar-hot:focus-visible,
+.bar-slot .card-btn:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+/* Lettering on the console: the BIOS on the plate, the game's title on the tray. */
+.ps2bar .bios-btn-name,
+.bar-tray-hint {
+  max-width: 94%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: clamp(8px, 1cqw, 11px);
+  line-height: 1.2;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  color: var(--ink-2);
+}
+
+.bar-tray .bios-btn-name,
+.bar-tray-hint {
+  font-family: var(--sans);
+  font-size: clamp(8px, 1.15cqw, 13px);
+  font-weight: 560;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* The title sits in the tray's upper half, above its groove. */
+.ps2bar .bar-tray {
+  align-items: flex-start;
+  padding-top: 0.55cqw;
+}
+
+.bar-tray-hint {
+  color: var(--ink-3);
+}
+
+body:not([data-disc="none"]) #tray-library {
+  display: none;
+}
+
+/* The power light in Reset: green while the PS2 runs. */
+.bar-led {
+  left: 93.75%;
+  top: 31%;
+  width: 2.5%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, rgb(110 255 150 / 0.85), rgb(40 200 90 / 0.3) 60%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms var(--ease-out);
+}
+
+body:is([data-state="starting"], [data-state="running"]) .bar-led {
+  opacity: 1;
+}
+
+.ps2bar .tip {
+  left: 50%;
+  translate: -50% 0;
+}
+
+.ps2bar .bar-reset .tip,
+.ps2bar .bar-eject .tip {
+  left: auto;
+  right: 0;
+  translate: none;
+}
+
+@media (hover: hover) {
+  .ps2bar .bar-hot:is(:hover, :focus-visible) .tip {
+    display: block;
+  }
+}
+
+/* ---------------------------------------------------------------- memory cards in their slots */
+
+.bar-slot .card-btn {
+  position: absolute;
+  /* The slot, and the card's end in front of it. */
+  inset: -20% 0 -150% 0;
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.bar-slot .card-btn :is(.card-icon, .card-label, .caret) {
+  display: none;
+}
+
+.bar-slot .card-dot {
+  top: 10%;
+  left: auto;
+  right: 9%;
+  z-index: 1;
+}
+
+/* The card, drawn like the console: the whole card, 42 × 56 mm, hanging from the slot's top edge (the slot is
+   7.4% down the button, which reaches 20% of the slot's height above it and 150% below). Only what is
+   out of the slot shows (.mc clips above that edge). Plugged, it is pushed in until only its end shows,
+   filling the slot's opening; plugging shows the whole card below the slot and slides it up in, unplugging
+   pulls it back down and away. The card's end is 8% of its height, the slot's height. */
+.mc {
+  position: absolute;
+  left: 6%;
+  width: 88%;
+  top: 7.4%;
+  aspect-ratio: 3 / 4;
+  z-index: 2;
+  clip-path: inset(0 -40px -400px -40px);
+  pointer-events: none;
+}
+
+.mc-card {
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--ink-3);
+  border-radius: 3px 3px 4px 4px;
+  background: #2a2825;
+  transform: translateY(-92%);
+  opacity: 1;
+  transition: transform 760ms cubic-bezier(0.3, 0, 0.15, 1), opacity 160ms var(--ease-out);
+}
+
+.card-btn.empty .mc-card {
+  transform: translateY(6%);
+  opacity: 0;
+  transition: transform 620ms cubic-bezier(0.45, 0, 0.6, 1), opacity 220ms 520ms var(--ease-in);
+}
+
+/* What is printed on it: near the end that goes in. */
+.mc-print {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 22%;
+  text-align: center;
+  font-family: var(--sans);
+  font-size: clamp(5px, 0.62cqw, 7px);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+
+/* Grip ridges along its end: what shows in the slot once it is in. */
+.mc-grip {
+  position: absolute;
+  left: 22%;
+  right: 22%;
+  bottom: 2.4%;
+  height: 3.4%;
+  border-top: 1px solid #5d5953;
+  border-bottom: 1px solid #5d5953;
+}
+
+/* The card's name, beside the slot's number above it: "1 · RPG saves". */
+.mc-name {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 1px);
+  translate: -50% 0;
+  max-width: 170%;
+  padding: 3px 4px 0;
+  overflow: hidden;
+  background: #151413;
+  font-family: var(--sans);
+  font-size: clamp(7px, 0.9cqw, 10px);
+  font-weight: 560;
+  line-height: 1.3;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--ink-2);
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 240ms 400ms var(--ease-out);
+}
+
+.mc-num {
+  color: #77726b;
+}
+
+.card-btn.empty .mc-name {
+  opacity: 0;
+  transition: opacity 160ms var(--ease-in);
+}
+
+/* ---------------------------------------------------------------- the TV remote, lying under the tray */
+
+/* The first mockup's remote turned on its side, its lettering kept upright. Fixed size: 276 × 84.
+   Left to right: the IR window; the volume rocker over MUTE and WIDE (the two together as wide as the
+   rocker and its VOL); PICTURE over MENU; REC over INFO. */
+.remote {
+  position: relative;
+  z-index: 1;
+  width: 276px;
+  height: 84px;
+  margin: -14px 9.6% 0 auto !important;
+  border-radius: 30px;
+  background: linear-gradient(180deg, #2a2927, #34322f 50%, #232220);
+  box-shadow: inset 0 0 0 1px #45423e;
+}
+
+.rm-ir {
+  position: absolute;
+  left: 12px;
+  top: 25px;
+  width: 8px;
+  height: 34px;
+  border-radius: 2px;
+  background: #0f0f0f;
+}
+
+.rm-btn {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 0;
+  border: 1px solid #4a4743;
+  background: #191817;
+  color: #ece8e1;
+  font-family: var(--sans);
+  font-size: 9px;
+  line-height: 1;
+  font-weight: 560;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background-color var(--d-line) var(--ease-out), border-color var(--d-line) var(--ease-out);
+}
+
+.rm-btn:hover {
+  background: #252321;
+  border-color: #6a665f;
+}
+
+.rm-btn:active {
+  background: #0f0f0e;
+}
+
+.rm-btn:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.rm-round {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+}
+
+.rm-round svg {
+  width: 16px;
+  height: 16px;
+}
+
+.rm-mute { left: 32px; top: 46px; }
+.rm-wide { left: 86px; top: 46px; }
+
+.rm-cap {
+  position: absolute;
+  font-family: var(--sans);
+  font-size: 7.5px;
+  line-height: 1;
+  font-weight: 500;
+  color: #968f86;
+  pointer-events: none;
+}
+
+.rm-cap-mute { left: 58px; top: 55px; }
+.rm-cap-wide { left: 113px; top: 55px; }
+.rm-cap-vol { left: 116px; top: 23px; }
+
+/* The volume rocker: one body, two halves. */
+.rm-rocker {
+  position: absolute;
+  left: 32px;
+  top: 14px;
+  width: 76px;
+  height: 24px;
+  border-radius: 12px;
+  background: #191817;
+  box-shadow: inset 0 0 0 1px #4a4743;
+}
+
+.rm-vol {
+  top: 14px;
+  width: 38px;
+  height: 24px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 16px;
+  font-weight: 400;
+}
+
+.rm-vol-down { left: 32px; border-radius: 12px 0 0 12px; }
+.rm-vol-up { left: 70px; border-radius: 0 12px 12px 0; }
+
+.rm-vol:hover {
+  background: #252321;
+  border-color: transparent;
+}
+
+.rm-pill {
+  height: 24px;
+  border-radius: 6px;
+}
+
+.rm-picture { left: 146px; top: 14px; width: 66px; }
+.rm-menu { left: 146px; top: 46px; width: 66px; }
+
+.rm-small {
+  width: 36px;
+  height: 22px;
+  border-radius: 6px;
+  font-size: 8px;
+}
+
+/* CLOCK (Underclock) over INFO; with the recorder shown, REC above them, the three closer together. */
+.rm-clock { left: 222px; top: 15px; }
+.rm-info { left: 222px; top: 47px; }
+.rm-rec { left: 222px; top: 4px; }
+
+.remote:has(#btn-rec:not([hidden])) .rm-clock {
+  top: 31px;
+}
+
+.remote:has(#btn-rec:not([hidden])) .rm-info {
+  top: 58px;
+}
+
+.rm-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--coral);
+}
+
+/* On: Mute, PICTURE (crisp pixels), and a drawer or menu that is open. */
+.rm-btn:is([aria-pressed="true"], [aria-expanded="true"], .on) {
+  border-color: var(--ink-2);
+}
+
+.rm-btn:is([aria-pressed="true"], [aria-expanded="true"], .on)::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+
+/* ---------------------------------------------------------------- the controls opened from a port */
+
+.port-pick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.port-pick > .lbl {
+  margin: 0;
+}
+
+.port-pick-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.port-opt {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink-2);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 560;
+  cursor: pointer;
+  transition: background-color var(--d-line) var(--ease-out), color var(--d-line) var(--ease-out);
+}
+
+.port-opt:hover {
+  background: var(--raise);
+  color: var(--ink);
+}
+
+/* What plays on this port: the house's amber, where the input goes. */
+.port-opt[aria-pressed="true"] {
+  border-color: var(--amber);
+  color: var(--ink);
+}
+
+.port-opt:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.port-pick-hint {
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--ink-3);
+}
+
+/* ---------------------------------------------------------------- fullscreen and phones */
+
+/* In fullscreen only the remote rides on the band over the picture. */
+.theatre:fullscreen #ps2bar {
+  display: none;
+}
+
+.theatre:fullscreen .remote {
+  margin: 0 auto !important;
+}
+
+@media (max-width: 639px) {
+  .remote {
+    margin: 4px auto 0 !important;
+    zoom: 0.92;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mc-card,
+  .card-btn.empty .mc-card {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .ps2bar .bar-hot:focus-visible,
+  .bar-slot .card-btn:focus-visible,
+  .rm-btn:focus-visible {
+    outline-color: Highlight;
+  }
+
+  .rm-btn {
+    border-color: ButtonText;
+  }
+}
