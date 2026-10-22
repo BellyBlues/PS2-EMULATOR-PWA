@@ -130,9 +130,10 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       </svg>
       <div class="bar-slot" id="bar-slot-1"></div>
       <div class="bar-slot" id="bar-slot-2"></div>
-      <!-- Controller ports: a plug in each port something plays on; each leads down to its controller. -->
-      <button type="button" class="bar-hot bar-port" id="port-1" data-port="1" aria-controls="pad-1" aria-label="Controller port 1"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
-      <button type="button" class="bar-hot bar-port" id="port-2" data-port="2" aria-controls="pad-2" aria-label="Controller port 2"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
+      <!-- Controller ports: a plug in each port something plays on, its cable down to its controller. Pressing one
+           pulls the plug out or pushes it back in. -->
+      <button type="button" class="bar-hot bar-port" id="port-1" data-port="1" aria-pressed="false" aria-label="Controller port 1"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
+      <button type="button" class="bar-hot bar-port" id="port-2" data-port="2" aria-pressed="false" aria-label="Controller port 2"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
       <button type="button" class="bar-hot bar-plate bios-btn" id="bios-btn" popovertarget="bios-menu" aria-controls="bios-menu" aria-expanded="false">
         <span class="vh">BIOS: </span><span class="bios-btn-name" id="bios-btn-name"></span>
       </button>
@@ -259,7 +260,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
           <label class="check"><input type="radio" value="1"><span>Player 1</span></label>
           <label class="check"><input type="radio" value="2"><span>Player 2</span></label>
         </fieldset>
-        <span class="gp-unused" hidden>Not used: two gamepads at most.</span>
+        <span class="gp-unused" hidden>Not plugged in.</span>
       </div>
       <div class="gp-map" hidden>
         <p class="gp-map-note"></p>
@@ -487,8 +488,8 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
   <div class="pads-row" id="pads-row"></div>
 </section>
 <svg class="cables" id="cables" aria-hidden="true" focusable="false">
-  <path class="cable-wall" id="cable-1-wall"/><path class="cable-core" id="cable-1"/>
-  <path class="cable-wall" id="cable-2-wall"/><path class="cable-core" id="cable-2"/>
+  <path class="cable-wall" id="cable-1-wall" pathLength="1"/><path class="cable-core" id="cable-1" pathLength="1"/>
+  <path class="cable-wall" id="cable-2-wall" pathLength="1"/><path class="cable-core" id="cable-2" pathLength="1"/>
 </svg>
 
 <!-- A controller, drawn as a wireframe like the console (600 × 310 units) and without any maker's marks. app.js

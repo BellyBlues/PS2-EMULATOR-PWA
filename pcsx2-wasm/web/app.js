@@ -244,8 +244,8 @@
 			gamepadMapCleared: (name) => `The mapping of ${name} is cleared.`,
 			gamepadUnused: (name) => `Gamepad connected: ${name}. Only two gamepads play, so it is not used.`,
 			gamepadDisconnected: (name) => `Gamepad disconnected: ${name}.`,
-			gamepadPlayer: (name, port) => `${name} plays as Player ${port}.`,
-			keyboardPlayer: (port) => `The keyboard plays as Player ${port}.`,
+			gamepadPlayer: (name, port) => (port ? `${name} plays as Player ${port}.` : `${name} is unplugged.`),
+			keyboardPlayer: (port) => (port ? `The keyboard plays as Player ${port}.` : 'The keyboard is unplugged.'),
 			gamepadsSwapped: (a, b) => `Players swapped. ${a.name} is Player ${a.port}. ${b.name} is Player ${b.port}.`,
 			stopped: 'Stopped.',
 			failed: 'The PS2 didn’t start.',
@@ -5837,7 +5837,7 @@
 		} else if (e.key === '?' && !PAD_CODES.has(e.code) && inShortcutScope()) {
 			action = () => {
 				if (page.drawer !== 'keys') {
-					page.keysPort = players.keyboard;
+					page.keysPort = players.keyboard || 1;
 					showPortControls();
 				}
 				toggleDrawer('keys');
@@ -6090,7 +6090,7 @@
 	const VIEW_REFRESH_MS = 16;
 
 	const players = {
-		keyboard: readPref(PREF_PAD_KEYBOARD) === '2' ? 2 : 1, // PS2 port 1 or 2
+		keyboard: ({ 0: 0, 2: 2 })[readPref(PREF_PAD_KEYBOARD)] ?? 1, // PS2 port 1 or 2, 0 while unplugged
 		first: readPref(PREF_PAD_FIRST) === '2' ? 2 : 1, // the port a first gamepad starts on
 	};
 	// Per device (the keyboard, "pad:<Gamepad.index>"): the value of every pad input, 0 to 1. The
@@ -6390,7 +6390,7 @@
 		g.port = port;
 		g.state.fill(0);
 		g.needsNeutral = true;
-		if (g.rank === 0) {
+		if (g.rank === 0 && port) {
 			players.first = port;
 			writePref(PREF_PAD_FIRST, String(port));
 		}
@@ -6448,7 +6448,8 @@
 			const who = portDevices(port);
 			const text = who.length ? who.join(' and ') : 'nothing plugged in';
 			btn.setAttribute('aria-label', `Controller port ${port}, Player ${port}: ${text}`);
-			setText(btn.querySelector('.tip'), `Player ${port} · ${who.length ? who.join(' + ') : 'empty'}`);
+			btn.setAttribute('aria-pressed', String(who.length > 0));
+			setText(btn.querySelector('.tip'), who.length ? `Player ${port} · ${who.join(' + ')} · Unplug` : `Player ${port} · Plug in`);
 		}
 		if (page.drawer === 'keys')
 			renderPortPick();
@@ -6558,8 +6559,10 @@
 		listen: null, // { port, input, g }: a control waiting for its key (g null) or its gamepad control
 		note: ['', ''], // per port: the last change, until the next
 		swallowUp: '', // the code of the key just given to a control: its keyup must not press a button
+		unplugged: [[], []], // per port: what played there when its plug was pulled, to plug back in
 		seen: false, // the controllers are on screen
 		cableFrame: 0,
+		cablesLive: false,
 	};
 
 	const letterCode = (name) => (/^[A-Z]$/.test(name) ? 'Key' + name : '');
@@ -7033,15 +7036,48 @@
 			c.style.translate = '';
 	}
 
-	// Port buttons lead down to their controller.
-	function showPad(port) {
-		const u = pads.units[port - 1];
-		if (!u)
-			return;
-		u.el.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'center' });
-		const r = u.devList.querySelector('input:checked') || u.devList.querySelector('input');
-		if (r)
-			r.focus({ preventScroll: true });
+	// A port's button pulls its plug out (whatever plays as that player stops, and is remembered) or pushes it back
+	// in (what was there, if it is free; else the keyboard or a gamepad that plays nowhere).
+	function togglePort(port) {
+		stopListening(false);
+		const free = (id) => (id === 'keyboard' ? players.keyboard === 0 : !!gamepads.get(id) && gamepads.get(id).connected && gamepads.get(id).port === 0);
+		const here = [];
+		if (players.keyboard === port)
+			here.push('keyboard');
+		for (const g of connectedGamepads())
+			if (g.port === port)
+				here.push(g.index);
+		if (here.length) {
+			pads.unplugged[port - 1] = here;
+			for (const id of here) {
+				if (id === 'keyboard')
+					setKeyboardPlayer(0);
+				else
+					setGamepadPort(gamepads.get(id), 0);
+			}
+			subtitle(`Player ${port} unplugged.`);
+		} else {
+			let ids = pads.unplugged[port - 1].filter(free);
+			if (!ids.length) {
+				const g = connectedGamepads().find((o) => o.port === 0);
+				ids = free('keyboard') ? ['keyboard'] : g ? [g.index] : [];
+			}
+			if (!ids.length) {
+				subtitle(`Nothing is free to plug in: choose what plays on Player ${port}\u2019s controller.`);
+				return;
+			}
+			for (const id of ids) {
+				if (id === 'keyboard')
+					setKeyboardPlayer(port);
+				else
+					setGamepadPort(gamepads.get(id), port);
+			}
+			pads.shown[port - 1] = ids[0];
+			subtitle(`Player ${port} plugged in: ${ids.map((id) => (id === 'keyboard' ? 'the keyboard' : gamepads.get(id).name)).join(' and ')}.`);
+		}
+		for (const r of els.kbPlayers)
+			r.checked = Number(r.value) === players.keyboard;
+		renderPads();
 	}
 
 	function scheduleCables() {
@@ -7049,41 +7085,138 @@
 			pads.cableFrame = requestAnimationFrame(drawCables);
 	}
 
-	// Each cable from its port's plug, at the console's lower edge, down to the top of its controller, in page
-	// coordinates (the cables lie behind the page).
+	// Cables, in page coordinates: they lie behind the page. Both are as long, and longer than either needs: the
+	// slack lies in S-bends across the floor between the credits and the controllers, four on each (the shorter
+	// run's wider), more where a cable needs more than its room on the screen allows. One under the other (narrow
+	// windows), the common length is what both can reach.
+	const CABLE_SLACK = 1.12; // the common length, against the longer of the two straight runs ...
+	const CABLE_EXTRA = 80; // ... plus this, in px
+	const CABLE_BENDS = [4, 6, 8, 10, 12, 14, 16]; // half-waves, fewest first
+	const CABLE_SWAY_MAX = 110; // px either side
+	const CABLE_FLOOR_GAP = 16; // px kept clear above and below the bends and from the window's sides
+
+	const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+
+	function cubicPoint(c, t) {
+		const [p0, p1, p2, p3] = c;
+		const a = lerp(p0, p1, t), b = lerp(p1, p2, t), d = lerp(p2, p3, t);
+		return lerp(lerp(a, b, t), lerp(b, d, t), t);
+	}
+
+	// A run of cubics as points about 1 px apart.
+	function runPoints(run) {
+		const pts = [run[0][0]];
+		for (const c of run) {
+			const n = Math.max(8, Math.ceil(Math.hypot(c[3][0] - c[0][0], c[3][1] - c[0][1]) * 1.5));
+			for (let i = 1; i <= n; i++)
+				pts.push(cubicPoint(c, i / n));
+		}
+		return pts;
+	}
+
+	// The run swayed sideways by up to amp px between the heights y0 and y1, in bends half-waves; they start and
+	// end along the run.
+	function sway(pts, y0, y1, amp, bends) {
+		return pts.map(([x, y]) => {
+			if (y <= y0 || y >= y1)
+				return [x, y];
+			const u = (y - y0) / (y1 - y0);
+			return [x + amp * Math.sin(bends * Math.PI * u) * Math.sin(Math.PI * u), y];
+		});
+	}
+
+	function polyLength(pts) {
+		let len = 0;
+		for (let i = 1; i < pts.length; i++)
+			len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+		return len;
+	}
+
 	function drawCables() {
 		pads.cableFrame = 0;
 		const bar = $('ps2bar').getBoundingClientRect();
 		const first = pads.units[0].art.getBoundingClientRect();
-		const f = (n) => n.toFixed(1);
-		for (const u of pads.units) {
+		const sx = window.scrollX, sy = window.scrollY;
+		// Each cable's straight run, from the plug at the console's lower edge to the top of its controller.
+		const runs = pads.units.map((u) => {
 			const pr = els.ports[u.port - 1].getBoundingClientRect();
 			const ar = u.art.getBoundingClientRect();
-			let d = '';
-			if (u.el.dataset.plugged === 'true' && pr.width && ar.width) {
-				const x0 = pr.left + pr.width / 2 + window.scrollX;
-				const y0 = bar.bottom - 1 + window.scrollY;
-				const x1 = ar.left + ar.width / 2 + window.scrollX;
-				const y1 = ar.top + ar.height * PAD_CABLE_Y / PAD_FRAME_H + window.scrollY;
-				if (u.port === 2 && ar.top > first.bottom) {
-					// One controller under the other (narrow windows): the second cable goes down the margin
-					// beside the first, not across it.
-					const xs = Math.min(document.documentElement.clientWidth - 6, first.right + 10) + window.scrollX;
-					const ya = first.top - 24 + window.scrollY;
-					const yb = ar.top - 24 + window.scrollY;
-					const k1 = Math.max(24, (ya - y0) * 0.5);
-					const k2 = Math.max(16, (y1 - yb) * 0.6);
-					d = `M${f(x0)} ${f(y0)} C${f(x0)} ${f(y0 + k1)} ${f(xs)} ${f(ya - k1)} ${f(xs)} ${f(ya)} ` +
-						`L${f(xs)} ${f(yb)} C${f(xs)} ${f(yb + k2)} ${f(x1)} ${f(y1 - k2)} ${f(x1)} ${f(y1)}`;
-				} else {
-					const k = Math.max(24, (y1 - y0) * 0.55);
-					d = `M${f(x0)} ${f(y0)} C${f(x0)} ${f(y0 + k)} ${f(x1)} ${f(y1 - k)} ${f(x1)} ${f(y1)}`;
-				}
+			if (!pr.width || !ar.width)
+				return null;
+			const x0 = pr.left + pr.width / 2 + sx;
+			const y0 = bar.bottom - 1 + sy;
+			const x1 = ar.left + ar.width / 2 + sx;
+			const y1 = ar.top + ar.height * PAD_CABLE_Y / PAD_FRAME_H + sy;
+			if (u.port === 2 && ar.top > first.bottom) {
+				// One controller under the other (narrow windows): the second cable goes down the margin beside the
+				// first, not across it.
+				const xs = Math.min(document.documentElement.clientWidth - 6, first.right + 10) + sx;
+				const ya = first.top - 24 + sy;
+				const yb = ar.top - 24 + sy;
+				const k1 = Math.max(24, (ya - y0) * 0.5);
+				const k2 = Math.max(16, (y1 - yb) * 0.6);
+				return [[[x0, y0], [x0, y0 + k1], [xs, ya - k1], [xs, ya]],
+					[[xs, ya], [xs, ya + (yb - ya) / 3], [xs, yb - (yb - ya) / 3], [xs, yb]],
+					[[xs, yb], [xs, yb + k2], [x1, y1 - k2], [x1, y1]]];
 			}
+			const k = Math.max(24, (y1 - y0) * 0.55);
+			return [[[x0, y0], [x0, y0 + k], [x1, y1 - k], [x1, y1]]];
+		});
+		const base = runs.map((run) => (run ? runPoints(run) : null));
+		const lengths = base.map((pts) => (pts ? polyLength(pts) : 0));
+		const target = Math.max(...lengths) * CABLE_SLACK + CABLE_EXTRA;
+		// The bends lie in the floor under the credits, above the controllers' shoulder labels.
+		const credits = document.querySelector('.credits').getBoundingClientRect();
+		const y0 = credits.bottom + CABLE_FLOOR_GAP + sy;
+		const y1 = first.top - CABLE_FLOOR_GAP + sy;
+		// How far each may sway: its room on the screen, at most CABLE_SWAY_MAX.
+		const left = sx + CABLE_FLOOR_GAP, right = sx + document.documentElement.clientWidth - CABLE_FLOOR_GAP;
+		const room = base.map((pts) => {
+			if (!pts || y1 - y0 < 40)
+				return 0;
+			let r = CABLE_SWAY_MAX;
+			for (const [x, y] of pts)
+				if (y > y0 && y < y1)
+					r = Math.min(r, x - left, right - x);
+			return Math.max(0, r);
+		});
+		const longest = (i) => polyLength(sway(base[i], y0, y1, room[i], CABLE_BENDS[CABLE_BENDS.length - 1]));
+		const reach = base.map((pts, i) => (pts ? longest(i) : Infinity));
+		const common = Math.min(target, ...reach);
+		pads.units.forEach((u, i) => {
+			let d = '';
+			if (base[i]) {
+				let pts = base[i];
+				if (room[i] > 0) {
+					// The fewest bends that reach the common length, and the sway that makes it exactly.
+					const bends = CABLE_BENDS.find((n) => polyLength(sway(base[i], y0, y1, room[i], n)) >= common) ||
+						CABLE_BENDS[CABLE_BENDS.length - 1];
+					let lo = 0, hi = room[i];
+					for (let k = 0; k < 40; k++) {
+						const mid = (lo + hi) / 2;
+						if (polyLength(sway(base[i], y0, y1, mid, bends)) < common)
+							lo = mid;
+						else
+							hi = mid;
+					}
+					pts = sway(base[i], y0, y1, (lo + hi) / 2, bends);
+				}
+				d = 'M' + pts.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(' L');
+			}
+			const on = String(u.el.dataset.plugged === 'true');
 			for (const p of u.cable) {
 				if (p.getAttribute('d') !== d)
 					p.setAttribute('d', d);
+				if (p.dataset.on !== on)
+					p.dataset.on = on;
 			}
+		});
+		if (!pads.cablesLive) { // nothing slides in at load: only what changes later moves
+			pads.cablesLive = true;
+			requestAnimationFrame(() => requestAnimationFrame(() => {
+				$('cables').classList.add('live');
+				$('ps2bar').classList.add('live');
+			}));
 		}
 	}
 
@@ -9070,10 +9203,9 @@
 		// The controller ports (UI-SPEC §16): the controls for that player. Another port while they are
 		// open switches to it; the same one closes them.
 		for (const btn of els.ports) {
-			btn.addEventListener('click', () => {
-				if (page.drawer === 'keys')
-					closeDrawer(false);
-				showPad(Number(btn.dataset.port));
+			btn.addEventListener('click', (e) => {
+				togglePort(Number(btn.dataset.port));
+				returnFocusAfterPointer(e);
 			});
 		}
 		els.btnLog.addEventListener('click', (e) => {
