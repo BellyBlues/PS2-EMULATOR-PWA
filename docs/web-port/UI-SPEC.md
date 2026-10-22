@@ -593,12 +593,12 @@ A second way to choose a disc, from a folder of disc images (`library/disc-libra
 
 ## 16. The console under the screen
 
-The transport (§5) is the PS2's own front: a photo of it, straightened into a level strip with a band of its top above (`library/ps2-front.webp`, Evan-Amos, public domain, its marks taken out), as wide as the screen, with a button laid over each part (`library/console-bar.css`). Under its tray lies a TV remote. A first version, to be refined with the owner; the controller plugs come later.
+The transport (§5) is the PS2's front drawn as a wireframe after the real one (an SVG in `index.html`: a sliver of the top, the front with its grooves, the memory card slots, the controller ports, a plate, the tray, Reset and Eject; thin lines in the house's greys), as wide as the screen, with a button laid over each part (`library/console-bar.css`). Under its tray lies the TV remote of the first mockup, turned on its side with its lettering upright. A first version, to be refined with the owner; the controller plugs come later.
 
-- **Memory card slots 1 and 2:** each is Card 1 / Card 2 (§14). A plugged card is the real card (`library/memory-card.webp`), its outer end sticking out of the slot with the card's name on a paper label; plugging it slides it up into the slot, unplugging slides it back out and away. Clicking the slot or the card opens its menu as before.
+- **Memory card slots 1 and 2:** each is Card 1 / Card 2 (§14). A plugged card is drawn like the console: its outer end sticks out of the slot with the card's name on it; plugging it brings it up into place, unplugging slides it back out and away. Clicking the slot or the card opens its menu as before.
 - **The blank plate** right of slot 2 is engraved with the console model from the BIOS file's name (SCPH-70004, else the BIOS's title) and opens the BIOS menu.
 - **The tray** is engraved with the game's title and opens the disc menu; with no disc it reads "Insert a disc" and opens the disc library.
 - **Reset** is Stop (while starting or running). Its power light glows green while the PS2 runs.
 - **Eject** opens the disc library (§15); while the PS2 runs the subtitle says why it can't.
-- **The remote:** VOL − and VOL + (steps of 10; the subtitle says "Volume 80%."), MUTE (`aria-pressed`, M as before), PICTURE (Crisp), MENU (Graphics, §12), WIDE (Fullscreen), KEYS (the Keys drawer), INFO (Log), REC (the Recorder, when shown). A pressed or open one has a small amber dot. The Sound menu has no button any more.
+- **The remote** (336 × 84 px, overlapping the console's bottom edge under the tray): an IR window; MUTE (`aria-pressed`, M as before) and WIDE (Fullscreen) over the VOL rocker (− and +, steps of 10; the subtitle says "Volume 80%."); PICTURE (Crisp) over MENU (Graphics, §12); REC (the Recorder, when shown) over INFO (Log); KEYS (the Keys drawer). A pressed or open one has a small amber dot. The Sound menu has no button any more.
 - The sill (capture, subtitle, readout, tally) stays above the console. In fullscreen only the remote rides on the band. Under 640 px the remote wraps under the console.

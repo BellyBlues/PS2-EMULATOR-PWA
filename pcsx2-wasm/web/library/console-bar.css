@@ -1,9 +1,9 @@
-/* The controls under the screen as the PS2's own front (UI-SPEC.md §16): a photo of it, straightened
-   (library/ps2-front.webp; library/ps2-front-photo.txt), with a button laid over each part, and a TV
-   remote under the tray. Loaded after style.css: it overrides the transport's old flat row. Places
-   on the photo are percentages of it (2310 × 366), measured on it.
-   Departures from the player's rules, on purpose and asked for: a photo, a drawn remote, the
-   power light glowing, and a memory card that slides in and out. */
+/* The controls under the screen as the PS2's front (UI-SPEC.md §16): a wireframe drawn after the real one
+   (the SVG in index.html, 1000 × 120 units), with a button laid over each part, and the TV remote of the
+   first mockup lying under the tray. Loaded after style.css: it overrides the transport's old flat row.
+   Places on the drawing are percentages of it.
+   Departures from the player's rules, on purpose and asked for: a drawn console and remote, the power
+   light glowing, and a memory card that slides in and out. */
 
 #transport {
   display: block;
@@ -22,17 +22,42 @@
   position: relative;
   display: block;
   width: 100%;
-  aspect-ratio: 2310 / 366;
+  aspect-ratio: 1000 / 120;
+  container-type: inline-size;
 }
 
-.ps2bar-photo {
+.ps2bar-art {
   display: block;
   width: 100%;
   height: 100%;
-  border-radius: 4px;
-  user-select: none;
-  -webkit-user-drag: none;
+  overflow: visible;
 }
+
+.ps2bar-art * {
+  vector-effect: non-scaling-stroke;
+  stroke-width: 1;
+}
+
+.w-face { fill: #151413; stroke: #3d3a36; }
+.w-top { fill: #1a1917; }
+.w-groove { fill: none; stroke: #2a2825; }
+.w-hole { fill: #0b0a0a; stroke: #6f6a63; }
+.w-plate { fill: #100f0e; stroke: #3d3a36; }
+.w-tray { fill: #181716; stroke: #6f6a63; }
+.w-key { fill: #181716; stroke: #6f6a63; }
+.w-mark { fill: none; stroke: #4a4743; }
+.w-pins circle { fill: #6f6a63; stroke: none; }
+.w-icon { fill: none; stroke: #aba59c; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+
+.w-num,
+.w-print {
+  font-family: var(--sans);
+  text-anchor: middle;
+  stroke: none;
+}
+
+.w-num { fill: #77726b; font-size: 9px; font-weight: 500; }
+.w-print { fill: #5d5953; font-size: 6.5px; font-weight: 560; letter-spacing: 0.08em; }
 
 .bar-slot,
 .bar-hot,
@@ -40,14 +65,14 @@
   position: absolute;
 }
 
-#bar-slot-1 { left: 5.24%; top: 43.7%; width: 13.68%; height: 9.6%; }
-#bar-slot-2 { left: 22.25%; top: 44.5%; width: 13.98%; height: 9.6%; }
-.ps2bar .bar-plate { left: 36.75%; top: 44.5%; width: 9.26%; height: 9.6%; }
-.ps2bar .bar-tray { left: 46.5%; top: 39.9%; width: 46.5%; height: 36.9%; }
-.ps2bar .bar-reset { left: 95.9%; top: 30.3%; width: 3.85%; height: 21.3%; }
-.ps2bar .bar-eject { left: 96.2%; top: 77.9%; width: 3.25%; height: 17.8%; }
+#bar-slot-1 { left: 4%; top: 36.67%; width: 15%; height: 11.67%; }
+#bar-slot-2 { left: 24%; top: 36.67%; width: 15%; height: 11.67%; }
+.ps2bar .bar-plate { left: 41.2%; top: 36.67%; width: 9.2%; height: 11.67%; }
+.ps2bar .bar-tray { left: 52.4%; top: 33.33%; width: 38%; height: 36.67%; }
+.ps2bar .bar-reset { left: 92.8%; top: 28.33%; width: 4.4%; height: 28.33%; }
+.ps2bar .bar-eject { left: 92.8%; top: 65%; width: 4.4%; height: 28.33%; }
 
-/* A part of the console you can press: nothing over the photo until hovered or focused. */
+/* A part of the console you can press: nothing over the drawing until hovered or focused. */
 .ps2bar .bar-hot {
   display: flex;
   align-items: center;
@@ -68,7 +93,7 @@
 .ps2bar .bar-hot[aria-expanded="true"],
 .bar-slot .card-btn:hover,
 .bar-slot .card-btn[aria-expanded="true"] {
-  background: rgb(255 255 255 / 0.07);
+  background: rgb(236 232 225 / 0.07);
 }
 
 .ps2bar .bar-hot:focus-visible,
@@ -77,7 +102,7 @@
   outline-offset: 2px;
 }
 
-/* Engraved lettering: the BIOS on the blank plate, the game's title on the tray. */
+/* Lettering on the console: the BIOS on the plate, the game's title on the tray. */
 .ps2bar .bios-btn-name,
 .bar-tray-hint {
   max-width: 94%;
@@ -85,31 +110,30 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--mono);
-  font-size: clamp(8px, 1.05cqw, 12px);
+  font-size: clamp(8px, 1cqw, 11px);
   line-height: 1.2;
   font-weight: 500;
-  letter-spacing: 0.06em;
-  color: #8e8982;
-  text-shadow: 0 -1px 0 #000, 0 1px 0 rgb(255 255 255 / 0.07);
-}
-
-.ps2bar {
-  container-type: inline-size;
+  letter-spacing: 0.05em;
+  color: var(--ink-2);
 }
 
 .bar-tray .bios-btn-name,
 .bar-tray-hint {
-  text-transform: uppercase;
   font-family: var(--sans);
   font-size: clamp(8px, 1.15cqw, 13px);
   font-weight: 560;
   letter-spacing: 0.12em;
-  /* On the ridge between the tray's two grooves. */
-  margin-top: -2%;
+  text-transform: uppercase;
+}
+
+/* The title sits in the tray's upper half, above its groove. */
+.ps2bar .bar-tray {
+  align-items: flex-start;
+  padding-top: 0.55cqw;
 }
 
 .bar-tray-hint {
-  color: #6e6a64;
+  color: var(--ink-3);
 }
 
 body:not([data-disc="none"]) #tray-library {
@@ -118,13 +142,12 @@ body:not([data-disc="none"]) #tray-library {
 
 /* The power light in Reset: green while the PS2 runs. */
 .bar-led {
-  left: 96.6%;
+  left: 93.75%;
   top: 31%;
-  width: 2.4%;
+  width: 2.5%;
   aspect-ratio: 1;
   border-radius: 50%;
-  background: radial-gradient(closest-side, rgb(110 255 150 / 0.9), rgb(40 200 90 / 0.35) 60%, transparent);
-  mix-blend-mode: screen;
+  background: radial-gradient(closest-side, rgb(110 255 150 / 0.85), rgb(40 200 90 / 0.3) 60%, transparent);
   opacity: 0;
   pointer-events: none;
   transition: opacity 160ms var(--ease-out);
@@ -174,120 +197,102 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 }
 
 .bar-slot .card-dot {
-  top: 68%;
+  top: 52%;
   left: auto;
-  right: 10%;
+  right: 9%;
   z-index: 1;
 }
 
-/* The card, seen from above at the console's angle: its outer end sticks out of the slot toward you.
-   .mc is the space in front of the slot (it hides what is inside); .mc-card is the whole card,
-   foreshortened, slid up so a third of it shows. */
+/* The card's end, drawn like the console, out of the slot's mouth (44% down the button). */
 .mc {
   position: absolute;
-  left: 4%;
-  width: 92%;
-  /* The slot's mouth: 70% down the slot (the button starts 20% of it above). */
-  top: calc(90% / 2.7);
-  aspect-ratio: 1 / 0.8;
+  left: 6%;
+  width: 88%;
+  top: 44.4%;
+  height: 46%;
   overflow: hidden;
   pointer-events: none;
 }
 
 .mc-card {
   position: absolute;
-  inset: 0;
-  background: url("memory-card.webp") center / 100% 100% no-repeat;
-  transform: translateY(-68%);
+  inset: 0 0 1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--ink-3);
+  border-top: 0;
+  border-radius: 0 0 5px 5px;
+  background: #1c1b19;
+  transform: translateY(0);
   opacity: 1;
   transition: transform 520ms var(--ease-out), opacity 240ms var(--ease-out);
 }
 
-/* Its end, the card's thickness. */
-.mc-card::after {
-  content: "";
-  position: absolute;
-  left: 3%;
-  right: 3%;
-  bottom: -5%;
-  height: 5%;
-  border-radius: 0 0 3px 3px;
-  background: #0d0d0f;
-}
-
-/* Out of the slot: it slides back toward you and goes. Plugging in slides it up into the slot. */
+/* Out of the slot: it moves away and goes. Plugging it in brings it back up into its place. */
 .card-btn.empty .mc-card {
-  transform: translateY(-6%);
+  transform: translateY(70%);
   opacity: 0;
   transition: transform 420ms var(--ease-in), opacity 300ms 120ms var(--ease-in);
 }
 
-/* The card's name, on a paper label on its end. */
 .mc-label {
-  position: absolute;
-  left: 16%;
-  right: 16%;
-  bottom: 7%;
-  height: 13%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  max-width: 90%;
   overflow: hidden;
-  border-radius: 1px;
-  background: #e9e3d6;
-  color: #1a1714;
   font-family: var(--sans);
-  font-size: clamp(6px, 0.75cqw, 10px);
-  font-weight: 600;
+  font-size: clamp(7px, 0.9cqw, 10px);
+  font-weight: 560;
   line-height: 1;
   white-space: nowrap;
   text-overflow: ellipsis;
+  color: var(--ink);
 }
 
-.mc-label:empty {
-  display: none;
-}
+/* ---------------------------------------------------------------- the TV remote, lying under the tray */
 
-/* ---------------------------------------------------------------- the TV remote, under the tray */
-
+/* The first mockup's remote turned on its side, its lettering kept upright. Fixed size: 336 × 84. */
 .remote {
-  display: flex;
-  flex-wrap: nowrap;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  width: fit-content;
-  max-width: 100%;
-  margin: 6px 0 0 auto !important;
-  padding: 7px 18px;
-  border-radius: 999px;
-  background: linear-gradient(180deg, #302e2b, #1c1b19);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.09), inset 0 -2px 0 rgb(0 0 0 / 0.45), 0 0 0 1px #0a0a09;
+  position: relative;
+  z-index: 1;
+  width: 336px;
+  height: 84px;
+  margin: -14px 9.6% 0 auto !important;
+  border-radius: 30px;
+  background: linear-gradient(180deg, #2a2927, #34322f 50%, #232220);
+  box-shadow: inset 0 0 0 1px #45423e;
+}
+
+.rm-ir {
+  position: absolute;
+  left: 12px;
+  top: 25px;
+  width: 8px;
+  height: 34px;
+  border-radius: 2px;
+  background: #0f0f0f;
 }
 
 .rm-btn {
-  position: relative;
+  position: absolute;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  height: 28px;
-  padding: 0 9px;
-  border: 1px solid #4a4741;
-  border-radius: 14px;
-  background: #171615;
+  gap: 3px;
+  padding: 0;
+  border: 1px solid #4a4743;
+  background: #191817;
   color: #ece8e1;
   font-family: var(--sans);
-  font-size: 10px;
+  font-size: 9px;
   line-height: 1;
-  font-weight: 640;
-  letter-spacing: 0.09em;
+  font-weight: 560;
+  letter-spacing: 0.04em;
   cursor: pointer;
   transition: background-color var(--d-line) var(--ease-out), border-color var(--d-line) var(--ease-out);
 }
 
 .rm-btn:hover {
-  background: #262421;
+  background: #252321;
   border-color: #6a665f;
 }
 
@@ -301,63 +306,103 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 }
 
 .rm-round {
-  flex-direction: column;
-  gap: 1px;
-  width: 34px;
-  height: 34px;
-  padding: 0;
+  width: 24px;
+  height: 24px;
   border-radius: 50%;
 }
 
-.rm-glyph {
-  font-size: 16px;
-  line-height: 14px;
-  font-weight: 500;
+.rm-round svg {
+  width: 16px;
+  height: 16px;
 }
 
-.rm-round .icon {
-  width: 14px;
-  height: 14px;
-}
+.rm-mute { left: 36px; top: 14px; }
+.rm-wide { left: 94px; top: 14px; }
 
 .rm-cap {
-  font-size: 6.5px;
-  letter-spacing: 0.08em;
-  color: #a9a39a;
+  position: absolute;
+  font-family: var(--sans);
+  font-size: 7.5px;
+  line-height: 1;
+  font-weight: 500;
+  color: #968f86;
+  pointer-events: none;
 }
 
-.rm-gap {
-  width: 8px;
+.rm-cap-mute { left: 64px; top: 23px; }
+.rm-cap-wide { left: 122px; top: 23px; }
+.rm-cap-vol { left: 114px; top: 59px; }
+
+/* The volume rocker: one body, two halves. */
+.rm-rocker {
+  position: absolute;
+  left: 32px;
+  top: 50px;
+  width: 76px;
+  height: 24px;
+  border-radius: 12px;
+  background: #191817;
+  box-shadow: inset 0 0 0 1px #4a4743;
+}
+
+.rm-vol {
+  top: 50px;
+  width: 38px;
+  height: 24px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 16px;
+  font-weight: 400;
+}
+
+.rm-vol-down { left: 32px; border-radius: 12px 0 0 12px; }
+.rm-vol-up { left: 70px; border-radius: 0 12px 12px 0; }
+
+.rm-vol:hover {
+  background: #252321;
+  border-color: transparent;
+}
+
+.rm-pill {
+  height: 24px;
+  border-radius: 6px;
+}
+
+.rm-picture { left: 150px; top: 14px; width: 66px; }
+.rm-menu { left: 150px; top: 46px; width: 66px; }
+.rm-keys { left: 266px; top: 30px; width: 58px; }
+
+.rm-small {
+  width: 36px;
+  height: 22px;
+  border-radius: 6px;
+  font-size: 8px;
+}
+
+.rm-rec { left: 224px; top: 15px; }
+.rm-info { left: 224px; top: 47px; }
+
+.rm-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--coral);
 }
 
 /* On: Mute, PICTURE (crisp pixels), and a drawer or menu that is open. */
 .rm-btn:is([aria-pressed="true"], [aria-expanded="true"]) {
   border-color: var(--ink-2);
-  background: #2a2826;
 }
 
 .rm-btn:is([aria-pressed="true"], [aria-expanded="true"])::after {
   content: "";
   position: absolute;
-  top: 3px;
-  right: 5px;
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--amber);
-}
-
-.rm-round:is([aria-pressed="true"])::after {
-  top: 2px;
-  right: 50%;
-  translate: 50% 0;
-}
-
-.rm-dot {
+  top: -3px;
+  right: -3px;
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--coral);
+  background: var(--amber);
 }
 
 /* ---------------------------------------------------------------- fullscreen and phones */
@@ -372,19 +417,9 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 }
 
 @media (max-width: 639px) {
-  #transport {
-    padding: 4px 0 8px;
-  }
-
   .remote {
-    flex-wrap: wrap;
-    width: 100%;
-    padding: 6px 10px;
-    border-radius: 18px;
-  }
-
-  .rm-btn {
-    padding: 0 8px;
+    margin: 4px auto 0 !important;
+    zoom: 0.92;
   }
 }
 
