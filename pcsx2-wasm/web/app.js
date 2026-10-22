@@ -3632,6 +3632,7 @@
 	const cardFile = (id) => `${id}.ps2`;
 	const cardPath = (id) => `${MEMCARD_DIR}/${cardFile(id)}`;
 	const hasFileAccess = () => typeof window.showSaveFilePicker === 'function' && typeof window.showOpenFilePicker === 'function';
+	const NEW_CARD_TO_FILE = false; // createCard(): link a new card to a file chosen in a save dialog
 
 	function newCardId() {
 		const bytes = new Uint8Array(6);
@@ -4410,7 +4411,9 @@
 	async function createCard(slot, name) {
 		const c = { id: newCardId(), name, created: Date.now(), used: Date.now(), handle: null, file: null };
 		const bytes = blankCard();
-		if (hasFileAccess()) {
+		// A new card is kept in this browser, with no save dialog first: the dialog cannot show in some places
+		// (an embedded browser, Brave) and creating then hung on it. "Save a copy to disk…" makes a file.
+		if (NEW_CARD_TO_FILE && hasFileAccess()) {
 			let handle;
 			try {
 				handle = await window.showSaveFilePicker({ suggestedName: `${name}.ps2`, types: CARD_PICKER_TYPES });
@@ -4683,6 +4686,14 @@
 		menu.id = `card-menu-${n}`;
 		btn.id = `card-btn-${n}`;
 		btn.setAttribute('popovertarget', menu.id);
+		// The first card (UI-SPEC §16): one click on an empty slot, with no card yet, makes one and plugs it
+		// in. Otherwise the slot opens its menu (the picker).
+		btn.addEventListener('click', (e) => {
+			if (cards.slots[slot] || cards.list.size || cardsLocked() || !cards.loaded)
+				return;
+			e.preventDefault(); // no menu
+			cardAction(cardUi[slot], () => createCard(slot, defaultCardName()));
+		});
 		btn.setAttribute('aria-controls', menu.id);
 		menu.setAttribute('aria-label', `Memory card ${n}`);
 		const q = (sel) => menu.querySelector(sel);
