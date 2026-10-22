@@ -7215,8 +7215,8 @@
 		['finalSmooth', 'Smoothing at the end', 0, 10, 1],
 	];
 	const CABLE_TUNE_DEFAULTS = {
-		seed1: 24301, seed2: 32220, slack: 1.5, extra: 115, link: 9, bendMin: 0, bendMax: 0.34, bend4Min: 0.14,
-		bend4Max: 0.09, memory: 0.55, memoryWaves: 5, dropWaves: 7, dropDetail: 1.4, friction: 0.12, steps: 380, smooth: 6,
+		seed1: 94464, seed2: 70011, slack: 1.5, extra: 115, link: 9, bendMin: 0, bendMax: 0.34, bend4Min: 0.14,
+		bend4Max: 0.09, memory: 0.5, memoryWaves: 5, dropWaves: 7, dropDetail: 1.4, friction: 0.12, steps: 380, smooth: 6,
 		finalSmooth: 4,
 	};
 

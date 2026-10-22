@@ -23,13 +23,13 @@ importScripts('vendor/matter.min.js');
 
 // How the cables lie. The page's cable tuner (?tune-cables) changes them live and copies them out.
 const CABLE_DEFAULTS = {
-	// Chosen by the owner with the tuner (2026-10-22).
-	seed1: 24301, seed2: 32220, // each cable's random draw
+	// Chosen by the owner with the tuner (?tune-cables), 2026-10-22.
+	seed1: 94464, seed2: 70011, // each cable's random draw
 	slack: 1.5, extra: 115, // the common length: the longer straight run times slack, plus extra px
 	link: 9, // px between links: the cable is drawn through them
 	bendMin: 0, bendMax: 0.34, // stiffness against bending over two links, at random between these per link
 	bend4Min: 0.14, bend4Max: 0.09, // and over four links
-	memory: 0.55, memoryWaves: 5, // how much it remembers being coiled, and how many changes along it
+	memory: 0.5, memoryWaves: 5, // how much it remembers being coiled, and how many changes along it
 	dropWaves: 7, dropDetail: 1.4, // the drop's random curves: how many, and how fast the smaller ones fade
 	friction: 0.12, steps: 380, // the air's drag on each link, and how long it settles
 	smooth: 6, finalSmooth: 4, // smoothing passes after settling, and after the last steps
