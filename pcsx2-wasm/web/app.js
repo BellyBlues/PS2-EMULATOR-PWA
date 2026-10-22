@@ -7086,14 +7086,16 @@
 	}
 
 	// Cables, in page coordinates: they lie behind the page. Both are as long, and longer than either needs: the
-	// slack lies in S-bends across the floor between the credits and the controllers, four on each (the shorter
-	// run's wider), more where a cable needs more than its room on the screen allows. One under the other (narrow
-	// windows), the common length is what both can reach.
-	const CABLE_SLACK = 1.12; // the common length, against the longer of the two straight runs ...
-	const CABLE_EXTRA = 80; // ... plus this, in px
-	const CABLE_BENDS = [4, 6, 8, 10, 12, 14, 16]; // half-waves, fewest first
-	const CABLE_SWAY_MAX = 110; // px either side
-	const CABLE_FLOOR_GAP = 16; // px kept clear above and below the bends and from the window's sides
+	// slack lies in round loops on the floor between the credits and the controllers, as many on each (one, or more
+	// when one would not fit), the shorter run's wider. A loop leaves and rejoins the cable along it, so the cable
+	// never bends tighter than the loop. One under the other (narrow windows), the same.
+	const CABLE_LOOP_MIN = 24; // px: the radius of the longer run's loops; the shorter run's are wider
+	const CABLE_LOOPS_MAX = 6;
+	const CABLE_LOOP_WIDE = 64; // px: wider loops only when more of them would not fit
+	const CABLE_LOOP_STEP = 0.7; // radii from one loop to the next down the cable: they overlap, like a coiled cord
+	const CABLE_FLOOR_GAP = 16; // px kept clear above and below the loops and from the window's sides
+	const CABLE_LOOP_STEPS = 360; // a loop is drawn as so many straight steps (SVG arcs measure a little long)
+	const CABLE_LOOP_LENGTH = 2 * CABLE_LOOP_STEPS * Math.sin(Math.PI / CABLE_LOOP_STEPS); // per unit radius
 
 	const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 
@@ -7114,15 +7116,26 @@
 		return pts;
 	}
 
-	// The run swayed sideways by up to amp px between the heights y0 and y1, in bends half-waves; they start and
-	// end along the run.
-	function sway(pts, y0, y1, amp, bends) {
-		return pts.map(([x, y]) => {
-			if (y <= y0 || y >= y1)
-				return [x, y];
-			const u = (y - y0) / (y1 - y0);
-			return [x + amp * Math.sin(bends * Math.PI * u) * Math.sin(Math.PI * u), y];
-		});
+	// Where the points first reach the height y.
+	function pointIndexAt(pts, y) {
+		for (let i = 1; i < pts.length - 1; i++)
+			if (pts[i][1] >= y)
+				return i;
+		return -1;
+	}
+
+	// The direction along the points at i, and the side (1 or -1) towards which a loop of radius r there fits
+	// between left and right, preferring the given side; 0 when neither does.
+	function loopSide(pts, i, r, prefer, left, right) {
+		const a = pts[i - 1], b = pts[i + 1];
+		const m = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+		const dir = [(b[0] - a[0]) / m, (b[1] - a[1]) / m];
+		const fits = (side) => {
+			const cx = pts[i][0] + side * dir[1] * r;
+			return cx - r >= left && cx + r <= right;
+		};
+		const side = fits(prefer) ? prefer : fits(-prefer) ? -prefer : 0;
+		return { dir, side };
 	}
 
 	function polyLength(pts) {
@@ -7164,44 +7177,65 @@
 		});
 		const base = runs.map((run) => (run ? runPoints(run) : null));
 		const lengths = base.map((pts) => (pts ? polyLength(pts) : 0));
-		const target = Math.max(...lengths) * CABLE_SLACK + CABLE_EXTRA;
-		// The bends lie in the floor under the credits, above the controllers' shoulder labels.
+		const longest = Math.max(...lengths);
+		// The loops lie on the floor under the credits, above the controllers' shoulder labels.
 		const credits = document.querySelector('.credits').getBoundingClientRect();
 		const y0 = credits.bottom + CABLE_FLOOR_GAP + sy;
 		const y1 = first.top - CABLE_FLOOR_GAP + sy;
-		// How far each may sway: its room on the screen, at most CABLE_SWAY_MAX.
 		const left = sx + CABLE_FLOOR_GAP, right = sx + document.documentElement.clientWidth - CABLE_FLOOR_GAP;
-		const room = base.map((pts) => {
-			if (!pts || y1 - y0 < 40)
-				return 0;
-			let r = CABLE_SWAY_MAX;
-			for (const [x, y] of pts)
-				if (y > y0 && y < y1)
-					r = Math.min(r, x - left, right - x);
-			return Math.max(0, r);
-		});
-		const longest = (i) => polyLength(sway(base[i], y0, y1, room[i], CABLE_BENDS[CABLE_BENDS.length - 1]));
-		const reach = base.map((pts, i) => (pts ? longest(i) : Infinity));
-		const common = Math.min(target, ...reach);
+		// The fewest loops each that fit, all cables with as many: n loops of radius r, a little apart down the run.
+		const plan = (n) => {
+			const target = longest + n * CABLE_LOOP_LENGTH * CABLE_LOOP_MIN;
+			const out = [];
+			for (let i = 0; i < base.length; i++) {
+				if (!base[i]) {
+					out.push(null);
+					continue;
+				}
+				const r = (target - lengths[i]) / (n * CABLE_LOOP_LENGTH);
+				const step = r * CABLE_LOOP_STEP;
+				if ((n - 1) * step + 2 * r > y1 - y0)
+					return null;
+				const loops = [];
+				for (let j = 0; j < n; j++) {
+					const k = pointIndexAt(base[i], (y0 + y1) / 2 + (j - (n - 1) / 2) * step);
+					if (k < 0)
+						return null;
+					const { dir, side } = loopSide(base[i], k, r, i === 0 ? -1 : 1, left, right);
+					if (!side)
+						return null;
+					loops.push({ k, dir, side });
+				}
+				out.push({ r, loops });
+			}
+			return out;
+		};
+		const plans = [];
+		for (let n = 1; n <= CABLE_LOOPS_MAX && y1 - y0 > 2 * CABLE_LOOP_MIN; n++)
+			plans.push(plan(n));
+		const fitting = plans.filter(Boolean);
+		const loops = fitting.find((p) => p.every((c) => !c || c.r <= CABLE_LOOP_WIDE)) || fitting[0] || null;
 		pads.units.forEach((u, i) => {
 			let d = '';
 			if (base[i]) {
-				let pts = base[i];
-				if (room[i] > 0) {
-					// The fewest bends that reach the common length, and the sway that makes it exactly.
-					const bends = CABLE_BENDS.find((n) => polyLength(sway(base[i], y0, y1, room[i], n)) >= common) ||
-						CABLE_BENDS[CABLE_BENDS.length - 1];
-					let lo = 0, hi = room[i];
-					for (let k = 0; k < 40; k++) {
-						const mid = (lo + hi) / 2;
-						if (polyLength(sway(base[i], y0, y1, mid, bends)) < common)
-							lo = mid;
-						else
-							hi = mid;
+				const f = (n) => n.toFixed(2);
+				const at = new Map(loops && loops[i] ? loops[i].loops.map((l) => [l.k, l]) : []);
+				const r = loops && loops[i] ? loops[i].r : 0;
+				d = base[i].map(([x, y], k) => {
+					let seg = `${k ? 'L' : 'M'}${f(x)} ${f(y)}`;
+					const l = at.get(k);
+					if (l) { // round, and back here going the same way
+						const n = [l.side * l.dir[1], -l.side * l.dir[0]];
+						const turn = l.dir[0] * n[1] - l.dir[1] * n[0] > 0 ? 1 : -1;
+						const cx = x + r * n[0], cy = y + r * n[1];
+						const a0 = Math.atan2(y - cy, x - cx);
+						for (let j = 1; j <= CABLE_LOOP_STEPS; j++) {
+							const a = a0 + turn * 2 * Math.PI * j / CABLE_LOOP_STEPS;
+							seg += ` L${f(cx + r * Math.cos(a))} ${f(cy + r * Math.sin(a))}`;
+						}
 					}
-					pts = sway(base[i], y0, y1, (lo + hi) / 2, bends);
-				}
-				d = 'M' + pts.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(' L');
+					return seg;
+				}).join(' ');
 			}
 			const on = String(u.el.dataset.plugged === 'true');
 			for (const p of u.cable) {

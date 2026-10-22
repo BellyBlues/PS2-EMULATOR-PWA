@@ -126,7 +126,7 @@ body[data-chrome="hidden"] .cables {
 .pads {
   width: min(100% - 2 * var(--gutter), 1080px);
   margin: 0 auto;
-  /* The floor above the controllers holds the cables' bends. */
+  /* The floor above the controllers holds the cables' loops. */
   padding: 128px 0 80px;
 }
 
@@ -141,6 +141,11 @@ body[data-chrome="hidden"] .cables {
 }
 
 @media (max-width: 719px) {
+  /* One controller under the other: the first cable has the second's way round to make up, in its loops. */
+  .pads {
+    padding-top: 240px;
+  }
+
   .pads-row {
     grid-template-columns: minmax(0, 520px);
     justify-content: center;
