@@ -123,6 +123,11 @@ namespace WasmJit
 
 		static u64 Bit(u32 r) { return 1ull << r; }
 
+		// Whether r has a local, and its index: for code that loads the locals once for several blocks (EEJit.cpp's
+		// units, whose blocks start with every register loaded and clean).
+		bool HasLocal(u32 r) const { return m_has_local & Bit(r); }
+		u32 LocalOf(u32 r) { return Local(r); }
+
 	private:
 		u32 Local(u32 r)
 		{

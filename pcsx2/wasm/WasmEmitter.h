@@ -246,6 +246,11 @@ namespace WasmJit
 		size_t return_call_patchable()
 		{
 			op(0x12);
+			return pad5();
+		}
+		// Five bytes of LEB128 zero (also a valid signed LEB128 zero), for patch_func().
+		size_t pad5()
+		{
 			const size_t at = m_body.data.size();
 			static constexpr u8 pad[5] = {0x80, 0x80, 0x80, 0x80, 0x00};
 			m_body.bytes(pad, sizeof(pad));
@@ -256,6 +261,23 @@ namespace WasmJit
 			for (int i = 0; i < 5; i++)
 				m_body.data[at + i] = static_cast<u8>(((func >> (7 * i)) & 0x7f) | (i < 4 ? 0x80 : 0));
 		}
+		// br and i32.const whose immediate (a label depth, a small non-negative value) is patched later with
+		// patch_func(): return where it is.
+		size_t br_patchable()
+		{
+			op(0x0c);
+			return pad5();
+		}
+		size_t i32_const_patchable()
+		{
+			op(0x41);
+			return pad5();
+		}
+		// An end of a structure opened outside this body (in the prologue, see append_prologue()).
+		void end_outer() { op(0x0b); }
+		const ByteBuffer& body() const { return m_body; }
+		// Code that runs before the body: after the v128 constant pool, at this point of the prologue.
+		void append_prologue(const ByteBuffer& b) { m_prologue.bytes(b.data.data(), b.data.size()); }
 		void return_call_indirect(u32 type, u32 table = 0) { op(0x13); m_body.uleb(type); m_body.uleb(table); }
 		void drop() { op(0x1a); }
 		void select() { op(0x1b); }
