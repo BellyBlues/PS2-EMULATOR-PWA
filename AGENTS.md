@@ -150,7 +150,8 @@ bring any new engineering guidance over here.
   with Sony or the PCSX2 project.
 - No Sony trademarks or trade dress: no PlayStation logos or fonts, no imitation of the PS2's own
   interface. The one exception, asked for by the owner: the disc library shows a public-domain
-  photo of a PS2 (`pcsx2-wasm/web/library/ps2-photo.txt`). Do not use screenshots of the BIOS or
+  photo of a PS2, with its Sony and PlayStation marks taken out
+  (`pcsx2-wasm/web/library/ps2-photo.txt`). Do not use screenshots of the BIOS or
   games in the repository.
 - The project is GPL-3.0. Keep upstream copyright notices.
 

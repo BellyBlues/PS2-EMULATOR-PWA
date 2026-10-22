@@ -4,7 +4,9 @@ Photo by Evan-Amos, released into the public domain:
 https://commons.wikimedia.org/wiki/File:Sony-PlayStation-2-30001-Console-FL.jpg
 
 Changed for this page: scaled to 2200 pixels across, the white background removed and its shadow
-kept as soft black (tools/wasm/cutout-photo.py), saved as WebP.
+kept as soft black (tools/wasm/cutout-photo.py), then the trademarks taken out (the PS2 logo and
+script on the top, the small logos along its front edge, the PlayStation logo on the tray, "SONY"
+beside the buttons, "MagicGate"; tools/wasm/delogo-photo.py), saved as WebP.
 
-PlayStation, PS2 and the console's design are trademarks of Sony Interactive Entertainment. This
-project isn't affiliated with or endorsed by Sony.
+PlayStation and PS2 are trademarks of Sony Interactive Entertainment. This project isn't affiliated
+with or endorsed by Sony.
