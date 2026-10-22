@@ -21,6 +21,7 @@
 <link rel="stylesheet" href="library/disc-library.css">
 <link rel="stylesheet" href="library/console-bar.css">
 <link rel="stylesheet" href="library/console-pads.css">
+<link rel="stylesheet" href="library/console-tv.css">
 <script src="app.js" defer></script>
 <!-- The disc library (UI-SPEC.md §15): a module, after app.js, which it talks to through
      window.PCSX2WebLibrary. It is the one part of the page that reaches another origin (disc art). -->
@@ -37,6 +38,28 @@
 
 <main class="theatre" id="theatre">
   <div class="stage-box" id="stage-box">
+  <!-- An old CRT television around the screen, drawn as a wireframe like the console (1120 × 1024 units, the
+       screen 1000 × 750 at 60, 84): cabinet, the tube's surround, and under it the speaker grille, a blank plate,
+       the power button and its light, the channel dial and the volume knob. Not in fullscreen or on phones. -->
+  <div class="tv" aria-hidden="true">
+    <svg class="tv-art" viewBox="0 0 1120 1024" focusable="false">
+      <path class="tv-top" d="M30 26 L58 2 H1062 L1090 26 Z"/>
+      <rect class="tv-face" x="1" y="24" width="1118" height="980" rx="36"/>
+      <rect class="tv-tube" x="38" y="62" width="1044" height="794" rx="54"/>
+      <path class="tv-grille" d="M92 898 H468 M92 910 H468 M92 922 H468 M92 934 H468 M92 946 H468 M92 958 H468 M92 970 H468"/>
+      <rect class="tv-plate" x="520" y="906" width="120" height="26" rx="4"/>
+      <rect class="tv-key" x="690" y="900" width="46" height="36" rx="7"/>
+      <circle class="tv-led" cx="768" cy="918" r="5"/>
+      <circle class="tv-knob" cx="880" cy="918" r="46"/>
+      <circle class="tv-knob-in" cx="880" cy="918" r="32"/>
+      <path class="tv-tick" d="M843.2 954.8 L837.6 960.4 M831.3 936.2 L823.8 939.0 M828.1 914.3 L820.2 913.7 M834.4 893.1 L827.3 889.2 M848.8 876.4 L844.0 870.0 M868.9 867.2 L867.2 859.4 M891.1 867.2 L892.8 859.4 M911.2 876.4 L916.0 870.0 M925.6 893.1 L932.7 889.2 M931.9 914.3 L939.8 913.7 M928.7 936.2 L936.2 939.0 M916.8 954.8 L922.4 960.4"/>
+      <path class="tv-mark" d="M880 918 L880 892"/>
+      <circle class="tv-knob" cx="1012" cy="918" r="30"/>
+      <path class="tv-mark" d="M1012 918 L1030 900"/>
+      <rect class="tv-foot" x="110" y="1003" width="120" height="20" rx="4"/>
+      <rect class="tv-foot" x="890" y="1003" width="120" height="20" rx="4"/>
+    </svg>
+  </div>
     <div class="screen" id="screen" tabindex="0" role="application"
          aria-label="PS2 screen. While it runs and this has focus, the keyboard controls the PS2. Escape releases it.">
       <canvas id="canvas" width="640" height="480"></canvas>

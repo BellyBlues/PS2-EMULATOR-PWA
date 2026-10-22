@@ -1,0 +1,77 @@
+/* The old CRT television around the screen (UI-SPEC.md §18): a wireframe like the console's (the SVG in
+   index.html, 1120 × 1024 units, the screen 1000 × 750 at 60, 84). The screen and the slate shrink to leave it
+   room: --tv-s is the screen's width, as large as lets the whole set fit the stage; they move up by the set's
+   lower panel, so that the set is centred. Their corners round like a tube's glass. Not in fullscreen, where the
+   picture fills the screen, nor under 640 px, where the screen takes the width. Loaded after style.css. */
+
+.tv {
+  display: none;
+}
+
+@media (min-width: 640px) {
+  .theatre:not(:fullscreen) :is(.tv, .screen, .slate) {
+    --tv-s: min(calc(100cqw / 1.12), calc(100cqh / 1.024));
+  }
+
+  .theatre:not(:fullscreen) .tv {
+    display: block;
+    grid-area: 1 / 1;
+    width: calc(var(--tv-s) * 1.12);
+    aspect-ratio: 1120 / 1024;
+    pointer-events: none;
+  }
+
+  .theatre:not(:fullscreen) :is(.screen, .slate) {
+    width: var(--tv-s);
+    /* the screen's centre is 53 units above the set's */
+    translate: 0 calc(var(--tv-s) * -0.053);
+    border-radius: calc(var(--tv-s) * 0.034);
+  }
+
+  .theatre:not(:fullscreen) .screen {
+    overflow: hidden;
+  }
+}
+
+.tv-art {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.tv-art * {
+  vector-effect: non-scaling-stroke;
+  stroke-width: 1;
+}
+
+.tv-face { fill: #151413; stroke: #6f6a63; }
+.tv-top { fill: #1a1917; stroke: #3d3a36; }
+.tv-tube { fill: #0b0a0a; stroke: #3d3a36; }
+.tv-grille { fill: none; stroke: #3d3a36; stroke-linecap: round; }
+.tv-art .tv-grille { stroke-width: 3; }
+.tv-plate { fill: #100f0e; stroke: #3d3a36; }
+.tv-key { fill: #1a1917; stroke: #6f6a63; }
+.tv-knob { fill: #1a1917; stroke: #6f6a63; }
+.tv-knob-in { fill: none; stroke: #3d3a36; }
+.tv-tick { fill: none; stroke: #4a4743; }
+.tv-mark { fill: none; stroke: #aba59c; stroke-linecap: round; }
+.tv-art .tv-mark { stroke-width: 2; }
+.tv-foot { fill: #121110; stroke: #3d3a36; }
+
+/* The power light: green while the PS2 runs, like the console's. */
+.tv-led {
+  fill: #2a2825;
+  stroke: none;
+  transition: fill 160ms var(--ease-out);
+}
+
+body:is([data-state="starting"], [data-state="running"]) .tv-led {
+  fill: #6edc96;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tv-led {
+    transition: none;
+  }
+}
