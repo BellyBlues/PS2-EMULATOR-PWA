@@ -7,8 +7,9 @@
 <meta name="theme-color" content="#121110">
 <meta name="description" content="TabStationToo's disc library: your disc images on a shelf, and a PS2 to put them in.">
 <title>Disc library · TabStationToo</title>
-<!-- The disc library on its own, for working on it without the emulator: the same component as the
-     player's "Disc library" (library/disc-library.js), where the insert only rehearses the boot.
+<!-- The disc library on its own, for working on it without the emulator (?demo, ?tray=open, ?study;
+     anything else goes to index.html, where the library boots the games): the same component as the
+     player's home (library/disc-library.js), where the insert only rehearses the boot.
      library-3d.html is the first, 3D take. The page reads the start of each disc image in the chosen
      folder to name it; nothing is uploaded. It fetches disc art from one other origin
      (library/folder.js), which the owner allowed for the library. -->
@@ -20,6 +21,10 @@
 <script type="module">
 import { createDiscLibrary } from './library/disc-library.js';
 const params = new URLSearchParams(location.search);
+// The library that boots games is the player's home page; this one stays for working on the
+// library without the emulator (?demo, ?tray=open, or ?study with your own folder).
+if (!['demo', 'tray', 'study'].some((k) => params.has(k)))
+	location.replace('index.html');
 const lib = createDiscLibrary(document.getElementById('library'), { demo: params.has('demo') });
 // ?tray=open opens the tray, for checking the cut-out against the photo.
 if (params.get('tray') === 'open')

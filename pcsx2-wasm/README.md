@@ -349,14 +349,15 @@ compile a block once it has run 128 times, within 4 ms of compiling per vsync (`
 
 ### Disc library
 
-"Disc library…" (on the slate and in the disc menu) opens a dialog with a shelf of the discs in a
-folder and a PS2 to put them in (UI-SPEC.md §15). Putting one in chooses it and queues its boot at
+The page's home is a dialog with a shelf of the discs in a folder and a PS2 to put them in
+(UI-SPEC.md §15): it opens by itself once a BIOS is ready, and "Disc library…" (on the slate and in
+the disc menu) opens it again. Putting one in chooses it and queues its boot at
 once; the insert plays while the PS2 starts, and the dialog stays dark until the game shows a
 picture, so the boot is never seen. The component is `library/disc-library.js` (with
 `disc-library.css`); `library/player-library.js` wires it to `app.js` through
-`window.PCSX2WebLibrary`. `library.html` shows the same component on its own, without the emulator
-(the insert is only rehearsed; `?demo` shows made-up games, `?tray=open` opens the tray for checking
-it against the photo).
+`window.PCSX2WebLibrary`. `library.html` forwards to the player, except with `?demo` (made-up games),
+`?tray=open` (the tray open, for checking it against the photo) or `?study` (your folder): then it
+shows the same component without the emulator, and the insert is only rehearsed.
 
 - The console is a photo (`library/ps2.webp`, Evan-Amos, public domain; `library/ps2-photo.txt`).
   The tray is the photo's own front panel, cut out and slid along the console's depth; the plate

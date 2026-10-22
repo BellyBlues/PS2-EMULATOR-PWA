@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-// The player's disc library (UI-SPEC.md §15): "Disc library…" on the slate and in the disc menu opens
-// a dialog over the page with the shelf and the PS2. Putting a disc in chooses it and queues its boot
+// The player's disc library (UI-SPEC.md §15), the page's home: it opens by itself once a BIOS is ready
+// (on load, or when one is chosen), and "Disc library…" on the slate and in the disc menu opens it
+// again. It is a dialog over the page with the shelf and the PS2. Putting a disc in chooses it and queues its boot
 // in app.js (window.PCSX2WebLibrary) inside the same press; the insert then plays while the PS2 starts,
 // the room goes dark, and the dialog fades away once the game's first frame is up, so the boot itself
 // is never seen.
@@ -70,4 +71,24 @@ if (host && dialog && root) {
 	new MutationObserver(() => {
 		dialog.classList.toggle('is-dark', root.dataset.lights === 'down');
 	}).observe(root, { attributes: true, attributeFilter: ['data-lights'] });
+
+	// The library is the home: it opens by itself when the page becomes ready to boot a disc (a BIOS
+	// remembered or just chosen), once each time, never over a boot the address asked for (?bios=,
+	// ?disc=, ?elf=) and never over another dialog. Close (Esc) leaves the player's own slate.
+	const params = new URLSearchParams(location.search);
+	const addressBoots = ['bios', 'disc', 'elf'].some((k) => params.has(k));
+	let wasReady = false;
+	const watch = () => {
+		const ready = host.canOpen() && host.status().view === 'ready';
+		if (ready && !wasReady && !addressBoots && !dialog.open && !document.querySelector('dialog[open]') &&
+			document.visibilityState === 'visible')
+			open();
+		// Ready again only after the BIOS goes away (Forget) or a boot: not each time Close leaves it.
+		if (!host.canOpen() || ['nobios', 'starting', 'running'].includes(host.status().view))
+			wasReady = false;
+		else if (ready)
+			wasReady = true;
+	};
+	setInterval(watch, 400);
+	watch();
 }
