@@ -6,9 +6,8 @@
 
 /* ---------------------------------------------------------------- the plug in a port, and the cables */
 
-/* The plug covers the port's opening. Its cable comes out of the boot at its centre, towards you, and hangs
-   down in front of the plug to the console's lower edge, where the page's cable (.cables), as thick, takes
-   over. */
+/* The plug covers the port's opening. Its cable comes out of the boot at its centre, towards you: the cable
+   starts there and lies in front of the plug (.cables-front), the boot over its end. */
 .ps2bar .bar-port .plug {
   position: absolute;
   inset: -14% -3%;
@@ -20,36 +19,24 @@
   pointer-events: none;
 }
 
-/* The boot, over the cable's end. */
-.ps2bar .bar-port .plug::before {
-  content: "";
+/* The boot, over the cable's end: its own element, so that it sits above the cable while the plug lies below. */
+.ps2bar .bar-port .plug-boot {
   position: absolute;
   z-index: 1;
   left: 50%;
   top: 50%;
   width: 13px;
   height: 13px;
-  translate: -50% -50%;
+  margin: -6.5px 0 0 -6.5px;
   border: 1px solid #8a847b;
   border-radius: 50%;
   background: #2a2825;
+  opacity: 0;
+  translate: 0 40%;
+  pointer-events: none;
 }
 
-/* 5 px across with its walls, like .cable-wall and .cable-core: from the centre to the console's edge
-   (the port's centre is 25 of the plug's 23 units above it). */
-.ps2bar .bar-port .plug::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 5px;
-  height: calc(25 / 23 * 100% + 1px);
-  translate: -50% 0;
-  border-inline: 1px solid #6f6a63;
-  background: #2a2825;
-}
-
-.ps2bar .bar-port[data-plugged="true"] .plug {
+.ps2bar .bar-port[data-plugged="true"] :is(.plug, .plug-boot) {
   opacity: 1;
   translate: 0 0;
 }
@@ -57,11 +44,11 @@
 /* Plugging in: the cable comes up from the controller to the port (600 ms), then the plug goes in. Pulling out:
    the plug comes out, then the cable slides back down to the controller. Nothing moves at load (.live comes
    after the first drawing). */
-.ps2bar.live .bar-port .plug {
+.ps2bar.live .bar-port :is(.plug, .plug-boot) {
   transition: opacity 180ms var(--ease-in) 80ms, translate 260ms var(--ease-in);
 }
 
-.ps2bar.live .bar-port[data-plugged="true"] .plug {
+.ps2bar.live .bar-port[data-plugged="true"] :is(.plug, .plug-boot) {
   transition: opacity 120ms var(--ease-out) 540ms, translate 380ms cubic-bezier(0.3, 0, 0.15, 1) 540ms;
 }
 
@@ -77,6 +64,11 @@
   z-index: -1;
   pointer-events: none;
   transition: opacity var(--d-chrome-show) var(--ease-out);
+}
+
+/* The copy in front, clipped to the console's face: over the plug, under the boot and the remote. */
+.cables-front {
+  z-index: 0;
 }
 
 /* Each path is 1 long (pathLength): a dash as long as it, moved along it, draws it from the controller's end. */
@@ -433,8 +425,8 @@ body[data-chrome="hidden"] .cables {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ps2bar.live .bar-port .plug,
-  .ps2bar.live .bar-port[data-plugged="true"] .plug,
+  .ps2bar.live .bar-port :is(.plug, .plug-boot),
+  .ps2bar.live .bar-port[data-plugged="true"] :is(.plug, .plug-boot),
   .cables,
   .cables.live path,
   .cables.live path[data-on="true"],

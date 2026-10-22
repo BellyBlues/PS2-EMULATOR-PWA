@@ -14,6 +14,7 @@
 //         (page coordinates), or null;
 //   arts: per controller, its drawing's box {left, right, top, bottom};
 //   avoid: rects to keep out of as well (the controllers' heading);
+//   barBottom: the console's lower edge: only the first links (from the plug) may lie above it;
 //   box: {left, right}, the window's sides less a margin.
 //   params: optional, any of CABLE_DEFAULTS below (the page's cable tuner, ?tune-cables, sends them).
 // Answer: {id, paths}, an SVG path per cable ('' for none).
@@ -146,12 +147,12 @@ function settleRope(run, links, seed, box, keepOut) {
 	M.Composite.add(engine.world, [...bodies, ...constraints]);
 	// Back where it may lie: in the box, out of the keep-out rects (sideways, or up out of those marked up).
 	const hold = () => {
-		for (const b of bodies) {
+		bodies.forEach((b, i) => {
 			if (b.isStatic)
-				continue;
+				return;
 			let { x, y } = b.position;
 			x = Math.min(box.right, Math.max(box.left, x));
-			y = Math.min(box.bottom, Math.max(box.top, y));
+			y = Math.min(box.bottom, Math.max(i <= (box.near || 0) ? box.nearTop : box.top, y));
 			for (const r of keepOut) {
 				if (x > r.left && x < r.right && y > r.top && y < r.bottom) {
 					if (r.up)
@@ -162,7 +163,7 @@ function settleRope(run, links, seed, box, keepOut) {
 			}
 			if (x !== b.position.x || y !== b.position.y)
 				M.Body.setPosition(b, { x, y }, false);
-		}
+		});
 	};
 	for (let step = 0; step < P.steps; step++) {
 		M.Engine.update(engine, 1000 / 60);
@@ -212,7 +213,7 @@ function toLength(rope, run, length) {
 }
 
 self.onmessage = (e) => {
-	const { id, runs, arts, avoid, box, params } = e.data;
+	const { id, runs, arts, avoid, barBottom, box, params } = e.data;
 	P = { ...CABLE_DEFAULTS, ...(params || {}) };
 	const lengths = runs.map((run) => (run ? polyLength(runPoints(run)) : 0));
 	const links = Math.round((Math.max(...lengths) * P.slack + P.extra) / P.link) + 1;
@@ -224,7 +225,9 @@ self.onmessage = (e) => {
 		const lane = (own.right - own.left) * CABLE_LANE;
 		// From just under the console down to where it goes in; off its own controller (its shoulders and their
 		// labels) but for a lane down the middle, and out of the other controller's way.
-		const area = { left: box.left, right: box.right, top: run[0][0][1] + 1, bottom: end[1] };
+		// The first links may lie on the console's face (from the plug's centre); the rest only below it.
+		const near = Math.ceil(((barBottom || run[0][0][1]) - run[0][0][1]) / P.link) + 1;
+		const area = { left: box.left, right: box.right, top: (barBottom || run[0][0][1]) + 1, nearTop: run[0][0][1] + 1, near, bottom: end[1] };
 		const keepOut = [
 			{ ...own, top: own.top - CABLE_CLEAR, right: end[0] - lane, up: true },
 			{ ...own, top: own.top - CABLE_CLEAR, left: end[0] + lane, up: true },

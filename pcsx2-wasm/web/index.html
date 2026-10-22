@@ -132,8 +132,8 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <div class="bar-slot" id="bar-slot-2"></div>
       <!-- Controller ports: a plug in each port something plays on, its cable down to its controller. Pressing one
            pulls the plug out or pushes it back in. -->
-      <button type="button" class="bar-hot bar-port" id="port-1" data-port="1" aria-pressed="false" aria-label="Controller port 1"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
-      <button type="button" class="bar-hot bar-port" id="port-2" data-port="2" aria-pressed="false" aria-label="Controller port 2"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
+      <button type="button" class="bar-hot bar-port" id="port-1" data-port="1" aria-pressed="false" aria-label="Controller port 1"><span class="plug" aria-hidden="true"></span><span class="plug-boot" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
+      <button type="button" class="bar-hot bar-port" id="port-2" data-port="2" aria-pressed="false" aria-label="Controller port 2"><span class="plug" aria-hidden="true"></span><span class="plug-boot" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
       <button type="button" class="bar-hot bar-plate bios-btn" id="bios-btn" popovertarget="bios-menu" aria-controls="bios-menu" aria-expanded="false">
         <span class="vh">BIOS: </span><span class="bios-btn-name" id="bios-btn-name"></span>
       </button>
@@ -490,6 +490,14 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
 <svg class="cables" id="cables" aria-hidden="true" focusable="false">
   <path class="cable-wall" id="cable-1-wall" pathLength="1"/><path class="cable-core" id="cable-1" pathLength="1"/>
   <path class="cable-wall" id="cable-2-wall" pathLength="1"/><path class="cable-core" id="cable-2" pathLength="1"/>
+</svg>
+<!-- The same cables in front of the page, shown only over the console's face: where they come out of the plugs. -->
+<svg class="cables cables-front" id="cables-front" aria-hidden="true" focusable="false">
+  <clipPath id="cables-front-clip"><rect id="cables-front-rect"/></clipPath>
+  <g clip-path="url(#cables-front-clip)">
+    <path class="cable-wall" id="cable-1-front-wall" pathLength="1"/><path class="cable-core" id="cable-1-front" pathLength="1"/>
+    <path class="cable-wall" id="cable-2-front-wall" pathLength="1"/><path class="cable-core" id="cable-2-front" pathLength="1"/>
+  </g>
 </svg>
 
 <!-- A controller, drawn as a wireframe like the console (600 × 310 units) and without any maker's marks. app.js

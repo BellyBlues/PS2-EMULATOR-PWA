@@ -6761,7 +6761,7 @@
 				also: el.querySelector('.pad-also'),
 				map: el.querySelector('.pad-map'),
 				reset: el.querySelector('.pad-reset'),
-				cable: [$(`cable-${port}-wall`), $(`cable-${port}`)],
+				cable: [$(`cable-${port}-wall`), $(`cable-${port}`), $(`cable-${port}-front-wall`), $(`cable-${port}-front`)],
 				lit: false,
 			};
 			const box = el.querySelector('.pad-spots');
@@ -7125,14 +7125,14 @@
 		const bar = $('ps2bar').getBoundingClientRect();
 		const first = pads.units[0].art.getBoundingClientRect();
 		const sx = window.scrollX, sy = window.scrollY;
-		// Each cable's straight run, from the plug at the console's lower edge to the top of its controller.
+		// Each cable's straight run, from the plug's centre (where it comes out of the boot) to the top of its controller.
 		const runs = pads.units.map((u) => {
 			const pr = els.ports[u.port - 1].getBoundingClientRect();
 			const ar = u.art.getBoundingClientRect();
 			if (!pr.width || !ar.width)
 				return null;
 			const x0 = pr.left + pr.width / 2 + sx;
-			const y0 = bar.bottom - 1 + sy;
+			const y0 = pr.top + pr.height / 2 + sy;
 			const x1 = ar.left + ar.width / 2 + sx;
 			const y1 = ar.top + ar.height * PAD_CABLE_Y / PAD_FRAME_H + sy;
 			if (u.port === 2 && ar.top > first.bottom) {
@@ -7159,7 +7159,12 @@
 		tr.selectNodeContents($('pads-title'));
 		const t = tr.getBoundingClientRect(); // the heading's words, not its whole row
 		const avoid = t.width ? [{ left: t.left + sx - 8, right: t.right + sx + 8, top: t.top + sy - 8, bottom: t.bottom + sy + 8 }] : [];
-		const job = { runs, arts, avoid, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP }, params: pads.cableParams };
+		// The cables show in front of the page only over the console's face (cables-front).
+		const clip = $('cables-front-rect');
+		for (const [k, v] of [['x', bar.left + sx], ['y', bar.top + sy], ['width', bar.width], ['height', bar.height]])
+			clip.setAttribute(k, v.toFixed(1));
+		const job = { runs, arts, avoid, barBottom: bar.bottom + sy, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP },
+			params: pads.cableParams };
 		const key = JSON.stringify(job);
 		const worker = key !== pads.cableKey && cableWorker();
 		if (worker) {
@@ -7180,6 +7185,7 @@
 			pads.cablesLive = true;
 			requestAnimationFrame(() => requestAnimationFrame(() => {
 				$('cables').classList.add('live');
+				$('cables-front').classList.add('live');
 				$('ps2bar').classList.add('live');
 			}));
 		}
