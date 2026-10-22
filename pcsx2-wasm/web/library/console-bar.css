@@ -8,7 +8,15 @@
 #transport {
   display: block;
   min-height: 0;
+  /* The console grows with the screen, but no wider than this: its height follows its width, and an open
+     drawer widens the column under the screen. */
+  max-width: min(100%, 760px);
   padding: 4px 0 8px;
+}
+
+/* With the controls open (from a port), the remote steps aside so the picture keeps its room. */
+body[data-drawer="keys"] .remote {
+  display: none;
 }
 
 #transport > .ps2bar,
@@ -67,6 +75,8 @@
 
 #bar-slot-1 { left: 4%; top: 36.67%; width: 15%; height: 11.67%; }
 #bar-slot-2 { left: 24%; top: 36.67%; width: 15%; height: 11.67%; }
+.ps2bar .bar-port { left: 5%; top: 71.67%; width: 13%; height: 15%; }
+.ps2bar #port-2 { left: 25%; }
 .ps2bar .bar-plate { left: 41.2%; top: 36.67%; width: 9.2%; height: 11.67%; }
 .ps2bar .bar-tray { left: 52.4%; top: 33.33%; width: 38%; height: 36.67%; }
 .ps2bar .bar-reset { left: 92.8%; top: 28.33%; width: 4.4%; height: 28.33%; }
@@ -250,11 +260,13 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 
 /* ---------------------------------------------------------------- the TV remote, lying under the tray */
 
-/* The first mockup's remote turned on its side, its lettering kept upright. Fixed size: 336 × 84. */
+/* The first mockup's remote turned on its side, its lettering kept upright. Fixed size: 276 × 84.
+   Left to right: the IR window; the volume rocker over MUTE and WIDE (the two together as wide as the
+   rocker and its VOL); PICTURE over MENU; REC over INFO. */
 .remote {
   position: relative;
   z-index: 1;
-  width: 336px;
+  width: 276px;
   height: 84px;
   margin: -14px 9.6% 0 auto !important;
   border-radius: 30px;
@@ -316,8 +328,8 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   height: 16px;
 }
 
-.rm-mute { left: 36px; top: 14px; }
-.rm-wide { left: 94px; top: 14px; }
+.rm-mute { left: 32px; top: 46px; }
+.rm-wide { left: 86px; top: 46px; }
 
 .rm-cap {
   position: absolute;
@@ -329,15 +341,15 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   pointer-events: none;
 }
 
-.rm-cap-mute { left: 64px; top: 23px; }
-.rm-cap-wide { left: 122px; top: 23px; }
-.rm-cap-vol { left: 114px; top: 59px; }
+.rm-cap-mute { left: 58px; top: 55px; }
+.rm-cap-wide { left: 113px; top: 55px; }
+.rm-cap-vol { left: 116px; top: 23px; }
 
 /* The volume rocker: one body, two halves. */
 .rm-rocker {
   position: absolute;
   left: 32px;
-  top: 50px;
+  top: 14px;
   width: 76px;
   height: 24px;
   border-radius: 12px;
@@ -346,7 +358,7 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 }
 
 .rm-vol {
-  top: 50px;
+  top: 14px;
   width: 38px;
   height: 24px;
   border-color: transparent;
@@ -368,9 +380,8 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   border-radius: 6px;
 }
 
-.rm-picture { left: 150px; top: 14px; width: 66px; }
-.rm-menu { left: 150px; top: 46px; width: 66px; }
-.rm-keys { left: 266px; top: 30px; width: 58px; }
+.rm-picture { left: 146px; top: 14px; width: 66px; }
+.rm-menu { left: 146px; top: 46px; width: 66px; }
 
 .rm-small {
   width: 36px;
@@ -379,8 +390,13 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   font-size: 8px;
 }
 
-.rm-rec { left: 224px; top: 15px; }
-.rm-info { left: 224px; top: 47px; }
+.rm-rec { left: 222px; top: 15px; }
+.rm-info { left: 222px; top: 47px; }
+
+/* Without the recorder, INFO sits alone in the middle of its column. */
+.remote:not(:has(#btn-rec:not([hidden]))) .rm-info {
+  top: 31px;
+}
 
 .rm-dot {
   width: 5px;
@@ -403,6 +419,64 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   height: 6px;
   border-radius: 50%;
   background: var(--amber);
+}
+
+/* ---------------------------------------------------------------- the controls opened from a port */
+
+.port-pick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.port-pick > .lbl {
+  margin: 0;
+}
+
+.port-pick-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.port-opt {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink-2);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 560;
+  cursor: pointer;
+  transition: background-color var(--d-line) var(--ease-out), color var(--d-line) var(--ease-out);
+}
+
+.port-opt:hover {
+  background: var(--raise);
+  color: var(--ink);
+}
+
+/* What plays on this port: the house's amber, where the input goes. */
+.port-opt[aria-pressed="true"] {
+  border-color: var(--amber);
+  color: var(--ink);
+}
+
+.port-opt:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.port-pick-hint {
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--ink-3);
 }
 
 /* ---------------------------------------------------------------- fullscreen and phones */

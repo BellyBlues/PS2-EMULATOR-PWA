@@ -308,7 +308,10 @@
 		biosBtn: $('bios-btn'),
 		biosBtnName: $('bios-btn-name'),
 		btnCrisp: $('btn-crisp'),
-		btnKeys: $('btn-keys'),
+		ports: [$('port-1'), $('port-2')],
+		portPick: $('port-pick'),
+		portPickTitle: $('port-pick-title'),
+		portPickList: $('port-pick-list'),
 		btnLog: $('btn-log'),
 		btnRec: $('btn-rec'),
 		recDrawer: $('rec-drawer'),
@@ -425,6 +428,7 @@
 		env: null, // environmentProblem() when unsupported
 		drag: '', // '' | 'ok' | 'blocked'
 		drawer: '', // '' | 'keys' | 'log' | 'rec'
+		keysPort: 1, // the controller port the controls (the Keys drawer) were opened for
 		fsByPage: false, // the page itself is leaving fullscreen
 		keepChrome: false,
 		slowSince: 0,
@@ -5819,7 +5823,13 @@
 			['ready', 'stopped', 'failed'].includes(pageState())) {
 			action = boot;
 		} else if (e.key === '?' && !PAD_CODES.has(e.code) && inShortcutScope()) {
-			action = () => toggleDrawer('keys');
+			action = () => {
+				if (page.drawer !== 'keys') {
+					page.keysPort = players.keyboard;
+					showPortControls();
+				}
+				toggleDrawer('keys');
+			};
 		} else if (e.code === 'Backquote' && !e.shiftKey && inShortcutScope()) {
 			action = () => toggleDrawer('log');
 		} else if (isMuteKey(e) && (inShortcutScope() || soundEls.menu.contains(document.activeElement))) {
@@ -6370,6 +6380,79 @@
 		writePref(PREF_PAD_KEYBOARD, String(port));
 		syncPads();
 		announce(COPY.announce.keyboardPlayer(port));
+		renderPorts();
+	}
+
+	// ---- the console's controller ports (UI-SPEC §16)
+
+	// What plays on a port: the keyboard and the gamepads there.
+	function portDevices(port) {
+		const list = [];
+		if (players.keyboard === port)
+			list.push('Keyboard');
+		for (const g of [...gamepads.values()].sort((a, b) => a.rank - b.rank))
+			if (g.connected && g.port === port)
+				list.push(g.name);
+		return list;
+	}
+
+	function renderPorts() {
+		for (const btn of els.ports) {
+			const port = Number(btn.dataset.port);
+			const who = portDevices(port);
+			const text = who.length ? who.join(' and ') : 'nothing plugged in';
+			btn.setAttribute('aria-label', `Controller port ${port}, Player ${port}: ${text}`);
+			setText(btn.querySelector('.tip'), `Player ${port} · ${who.length ? who.join(' + ') : 'empty'}`);
+		}
+		if (page.drawer === 'keys')
+			renderPortPick();
+	}
+
+	// The drawer's "Player N plays with" row: the keyboard and each connected gamepad, the ones on this
+	// port pressed. Choosing one moves it to this port and shows its keys.
+	function renderPortPick() {
+		const port = page.keysPort;
+		setText(els.portPickTitle, `Player ${port} plays with`);
+		const options = [{ id: 'keyboard', name: 'Keyboard', on: players.keyboard === port }];
+		for (const g of [...gamepads.values()].sort((a, b) => a.rank - b.rank))
+			if (g.connected)
+				options.push({ id: g.index, name: g.name, on: g.port === port, g });
+		const key = options.map((o) => `${o.id}:${o.on}`).join('|') + port;
+		if (els.portPickList.dataset.key === key)
+			return;
+		els.portPickList.dataset.key = key;
+		els.portPickList.replaceChildren(...options.map((o) => {
+			const b = document.createElement('button');
+			b.type = 'button';
+			b.className = 'port-opt';
+			b.setAttribute('aria-pressed', String(o.on));
+			b.textContent = o.name;
+			b.addEventListener('click', () => {
+				if (o.g)
+					setGamepadPort(o.g, port);
+				else
+					setKeyboardPlayer(port);
+				for (const r of els.kbPlayers)
+					r.checked = Number(r.value) === players.keyboard;
+				selectControlsTab(o.g ? 'gamepad' : 'keyboard', false);
+				renderPorts();
+			});
+			return b;
+		}));
+		if (options.length === 1) {
+			const hint = document.createElement('span');
+			hint.className = 'port-pick-hint';
+			hint.textContent = 'or press a button on a gamepad to connect it.';
+			els.portPickList.append(hint);
+		}
+	}
+
+	// Opening the controls for page.keysPort: its row, and the tab of what plays there.
+	function showPortControls() {
+		renderPortPick();
+		const port = page.keysPort;
+		const gamepadThere = [...gamepads.values()].some((g) => g.connected && g.port === port);
+		selectControlsTab(players.keyboard !== port && gamepadThere ? 'gamepad' : 'keyboard', false);
 	}
 
 	// ---- gamepads the browser does not lay out in the standard way: the user maps them
@@ -6711,6 +6794,7 @@
 	// ---- Keys drawer: the Gamepad tab
 
 	function renderGamepads() {
+		renderPorts();
 		const connected = [...gamepads.values()].filter((g) => g.connected).sort((a, b) => a.rank - b.rank);
 		els.gpEmpty.hidden = connected.length > 0;
 		els.gpActions.hidden = connected.filter((g) => g.port).length < 2;
@@ -6850,6 +6934,7 @@
 			});
 		}
 		els.gpSwap.addEventListener('click', swapGamepads);
+		renderPorts();
 		window.addEventListener('gamepadconnected', startGamepadLoop);
 		if (GAMEPAD_EVENTS) {
 			window.addEventListener('gamepadbuttondown', onGamepadEvent);
@@ -7592,7 +7677,7 @@
 	}
 
 	function drawerToggle(name) {
-		return name === 'keys' ? els.btnKeys : name === 'rec' ? els.btnRec : els.btnLog;
+		return name === 'keys' ? els.ports[page.keysPort - 1] : name === 'rec' ? els.btnRec : els.btnLog;
 	}
 
 	// data-drawer (which widens the column under the screen) is cleared only here, once the
@@ -8335,10 +8420,26 @@
 			writePref(PREF_CRISP, on ? '1' : '0');
 			returnFocusAfterPointer(e);
 		});
-		els.btnKeys.addEventListener('click', (e) => {
-			toggleDrawer('keys');
-			returnFocusAfterPointer(e);
-		});
+		// The controller ports (UI-SPEC §16): the controls for that player. Another port while they are
+		// open switches to it; the same one closes them.
+		for (const btn of els.ports) {
+			btn.addEventListener('click', (e) => {
+				const port = Number(btn.dataset.port);
+				if (page.drawer === 'keys' && page.keysPort === port) {
+					closeDrawer(false);
+				} else {
+					if (page.drawer === 'keys')
+						els.ports[page.keysPort - 1].setAttribute('aria-expanded', 'false');
+					page.keysPort = port;
+					showPortControls();
+					if (page.drawer === 'keys')
+						btn.setAttribute('aria-expanded', 'true');
+					else
+						openDrawer('keys');
+				}
+				returnFocusAfterPointer(e);
+			});
+		}
 		els.btnLog.addEventListener('click', (e) => {
 			toggleDrawer('log');
 			returnFocusAfterPointer(e);

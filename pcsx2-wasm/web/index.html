@@ -127,6 +127,9 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       </svg>
       <div class="bar-slot" id="bar-slot-1"></div>
       <div class="bar-slot" id="bar-slot-2"></div>
+      <!-- Controller ports: each opens the controls for its player (who plays there, and the keys). -->
+      <button type="button" class="bar-hot bar-port" id="port-1" data-port="1" aria-controls="keys-drawer" aria-expanded="false" aria-label="Controller port 1"><span class="tip" aria-hidden="true"></span></button>
+      <button type="button" class="bar-hot bar-port" id="port-2" data-port="2" aria-controls="keys-drawer" aria-expanded="false" aria-label="Controller port 2"><span class="tip" aria-hidden="true"></span></button>
       <button type="button" class="bar-hot bar-plate bios-btn" id="bios-btn" popovertarget="bios-menu" aria-controls="bios-menu" aria-expanded="false">
         <span class="vh">BIOS: </span><span class="bios-btn-name" id="bios-btn-name"></span>
       </button>
@@ -144,11 +147,11 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
         <span class="tip" aria-hidden="true">Disc library</span>
       </button>
     </div>
-    <!-- The remote of the first mockup, turned on its side: IR window, MUTE and WIDE over the volume rocker,
-         then PICTURE and MENU, INFO and REC over KEYS. -->
+    <!-- The remote of the first mockup, turned on its side: IR window, the volume rocker over MUTE and WIDE,
+         PICTURE over MENU, REC over INFO. The controls (keys, players) open from the console's ports. -->
     <div class="remote t-right" id="remote" role="group" aria-label="Remote">
       <span class="rm-ir" aria-hidden="true"></span>
-      <button type="button" class="rm-btn rm-round rm-mute" id="remote-mute" aria-pressed="false" aria-keyshortcuts="M" aria-label="Mute"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 9 h4 l4 -4 v14 l-4 -4 h-4 z" fill="currentColor"/><path d="M16.5 9 l5 6 M21.5 9 l-5 6" fill="none" stroke="currentColor" stroke-width="1.4"/></svg></button>
+      <button type="button" class="rm-btn rm-round rm-mute" id="remote-mute" aria-pressed="false" aria-keyshortcuts="M" aria-label="Mute"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g transform="translate(-1.75 0)"><path d="M6 9 h4 l4 -4 v14 l-4 -4 h-4 z" fill="currentColor"/><path d="M16.5 9 l5 6 M21.5 9 l-5 6" fill="none" stroke="currentColor" stroke-width="1.4"/></g></svg></button>
       <span class="rm-cap rm-cap-mute" aria-hidden="true">MUTE</span>
       <button type="button" class="rm-btn rm-round rm-wide" id="btn-fs" aria-keyshortcuts="Alt+Enter"><span class="vh" id="btn-fs-label">Fullscreen</span><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="6" y="7" width="12" height="10" fill="none" stroke="currentColor" stroke-width="1.6"/></svg><svg class="vh" aria-hidden="true" focusable="false"><use id="btn-fs-icon" href="icons.svg#i-corners-out"/></svg><span class="vh" id="btn-fs-tip"></span></button>
       <span class="rm-cap rm-cap-wide" aria-hidden="true">WIDE</span>
@@ -160,7 +163,6 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <button type="button" class="rm-btn rm-pill rm-menu" id="btn-gfx" popovertarget="gfx-menu" aria-controls="gfx-menu" aria-expanded="false" aria-label="Graphics">MENU</button>
       <button type="button" class="rm-btn rm-small rm-info" id="btn-log" aria-expanded="false" aria-controls="log-drawer" aria-keyshortcuts="`" aria-label="Log">INFO</button>
       <button type="button" class="rm-btn rm-small rm-rec" id="btn-rec" aria-expanded="false" aria-controls="rec-drawer" aria-label="Recorder" hidden><span class="rm-dot" aria-hidden="true"></span>REC</button>
-      <button type="button" class="rm-btn rm-pill rm-keys" id="btn-keys" aria-expanded="false" aria-controls="keys-drawer" aria-keyshortcuts="Shift+?" aria-label="Keys">KEYS ?</button>
       <!-- The sound menu stays for the M shortcut's state and its fine print; the remote sets the volume. -->
       <button type="button" class="rm-btn" id="btn-sound" popovertarget="sound-menu" aria-controls="sound-menu" aria-expanded="false" aria-label="Sound, 100 percent" hidden><svg class="icon" aria-hidden="true" focusable="false"><use id="btn-sound-icon" href="icons.svg#i-speaker-high"/></svg></button>
     </div>
@@ -168,6 +170,11 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
 
   <section class="drawer keys" id="keys-drawer" aria-labelledby="keys-title" hidden>
     <h2 class="vh" id="keys-title">Keys</h2>
+    <!-- Opened from a controller port: who plays there. -->
+    <div class="port-pick" id="port-pick" role="group" aria-labelledby="port-pick-title">
+      <p class="lbl" id="port-pick-title">Player 1 plays with</p>
+      <div class="port-pick-list" id="port-pick-list"></div>
+    </div>
     <div class="tabs" role="tablist" aria-label="Controls">
       <button type="button" class="tab" role="tab" id="tab-keyboard" aria-controls="panel-keyboard" aria-selected="true">Keyboard</button>
       <button type="button" class="tab" role="tab" id="tab-gamepad" aria-controls="panel-gamepad" aria-selected="false" tabindex="-1">Gamepad</button>
