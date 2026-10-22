@@ -179,8 +179,11 @@ The EE JIT compiles game code once a block has run often enough, within 4 ms of 
 of compiling it, runs on a thread of its own: the EE thread copies the code it reads, goes on
 interpreting, and only compiles the finished module with the browser's engine (`pcsx2/wasm/EEJit.cpp`,
 `CompileJob`). The page also keeps, per game, the list of blocks the JIT compiled, so that the next
-time the game runs, they compile when the frame limiter has time left (loading screens, light
-scenes) before the game reaches them. The JIT logs each block it compiles, its PC and a hash of its
+time the game runs, they compile before the game reaches them: the build thread builds the list's
+modules whenever it has nothing else to build (at most 16 waiting), and each waits until the game
+reaches one of its blocks, which then switches it in at once, or until the frame limiter has time left
+to compile it with the engine (loading screens, light scenes). Without the build thread
+(`-eejit-bg 0`), listed blocks compile on the EE thread in the limiter's spare time only. The JIT logs each block it compiles, its PC and a hash of its
 first words (`pcsx2web_ee_code_log()`); every 2 s the page copies new ones and stores the list in the
 IndexedDB database `pcsx2-web-code` (store `ee`, keyed by the game's serial:
 `{version, entries, savedAt}`, `entries` two 32-bit words per block, at most 32768) every 15 s while it

@@ -4093,6 +4093,7 @@ namespace
 		s_compile_ns += ns;
 		s_max_module_ns = std::max(s_max_module_ns, ns);
 		PerfCounters::Add(PerfCounters::jit_compile_ns, ns);
+		PerfCounters::Add(PerfCounters::ee_modules, 1);
 		JitHeat::Spend(ns);
 		return true;
 	}
@@ -4123,6 +4124,7 @@ namespace
 		CodeSnapshot snap;
 		GroupBuild build;
 		bool built = false;
+		bool ahead = false; // from the code list (SubmitAhead()): kept in s_ready until needed or idle time
 	};
 
 	std::mutex s_job_mutex;
@@ -4144,7 +4146,9 @@ namespace
 				job = s_job_in;
 				s_job_in = nullptr;
 			}
+			Common::Timer timer;
 			job->built = BuildGroup(job->entry, &job->snap, &job->build);
+			PerfCounters::Add(PerfCounters::ee_build_ns, static_cast<u64>(timer.GetTimeNanoseconds()));
 			s_job_done.store(job, std::memory_order_release);
 		}
 	}
@@ -4180,7 +4184,7 @@ namespace
 	}
 
 	// Hands the build of entry's module to the code generation thread. False if a job is already in flight.
-	bool SubmitGroup(u32 entry)
+	bool SubmitGroup(u32 entry, bool ahead = false)
 	{
 		if (s_job_busy)
 			return false;
@@ -4193,6 +4197,7 @@ namespace
 		auto job = std::make_unique<CompileJob>();
 		job->entry = entry;
 		job->generation = s_generation;
+		job->ahead = ahead;
 		if (!SnapPage(job->snap, entry))
 			return false;
 		// The warm entries the build may take (a module holds kMaxModuleBlocks blocks at most).
@@ -4213,7 +4218,88 @@ namespace
 		return true;
 	}
 
-	// At the dispatcher: installs the job's module once it is built.
+	// Modules built ahead from the code list (SubmitAhead()), not installed yet: the engine's compile and the
+	// instantiation are the EE thread's, so they wait for the game to reach one of their blocks (TakeReady()) or for
+	// the frame limiter's spare time (EEJit::CompileAhead()). At most kMaxReady, oldest first.
+	constexpr size_t kMaxReady = 16;
+	std::vector<std::unique_ptr<CompileJob>> s_ready;
+
+	bool InReady(u32 pc)
+	{
+		for (const auto& job : s_ready)
+		{
+			if (std::find(job->build.pcs.begin(), job->build.pcs.end(), pc) != job->build.pcs.end())
+				return true;
+		}
+		return false;
+	}
+
+	// Installs a module built ahead. False if it is stale (a flush since) or its code changed.
+	bool InstallReady(std::unique_ptr<CompileJob> job, bool allow_flush)
+	{
+		if (job->generation != s_generation)
+		{
+			s_bg_stale++;
+			return false;
+		}
+		if (!InstallGroup(job->entry, job->build, allow_flush))
+			return false;
+		s_bg_installed++;
+		s_ahead_compiles++;
+		PerfCounters::Add(PerfCounters::ee_ahead_modules, 1);
+		return true;
+	}
+
+	// The dispatcher wants pc compiled: installs the module built ahead that holds it, if there is one.
+	bool TakeReady(u32 pc)
+	{
+		for (size_t i = 0; i < s_ready.size(); i++)
+		{
+			const std::vector<u32>& pcs = s_ready[i]->build.pcs;
+			if (std::find(pcs.begin(), pcs.end(), pc) == pcs.end())
+				continue;
+			std::unique_ptr<CompileJob> job = std::move(s_ready[i]);
+			s_ready.erase(s_ready.begin() + i);
+			return InstallReady(std::move(job), true) && SlotRef(pc) != 0;
+		}
+		return false;
+	}
+
+	bool ListedAndUncompiled(const struct ListEntry& e);
+
+	// Keeps the code generation thread busy with the code list while it has nothing else to build: the next listed
+	// blocks whose code is in memory, as in EEJit::CompileAhead(), built into a module that waits in s_ready.
+	void SubmitAhead()
+	{
+		// Modules built before a flush would be dropped when installed: free their places.
+		std::erase_if(s_ready, [](const std::unique_ptr<CompileJob>& job) { return job->generation != s_generation; });
+		if (!EEJit::g_ahead || s_list.empty() || s_job_busy || s_ahead_off || s_ready.size() >= kMaxReady)
+			return;
+		const size_t n = s_list.size();
+		for (size_t scanned = 0; scanned < std::min<size_t>(n, 256); scanned++)
+		{
+			const ListEntry& e = s_list[s_list_cursor];
+			s_list_cursor = (s_list_cursor + 1) % n;
+			if (!ListedAndUncompiled(e) || InReady(e.pc))
+				continue;
+			std::vector<u32> more;
+			for (size_t i = 1; i < std::min<size_t>(n, 512) && more.size() + 1 < kMaxModuleBlocks; i++)
+			{
+				const ListEntry& m = s_list[(s_list_cursor + i - 1) % n];
+				if (ListedAndUncompiled(m) && !InReady(m.pc))
+					more.push_back(m.pc);
+			}
+			for (u32 pc : more)
+				HeatRef(pc) = std::max(HeatRef(pc), static_cast<int>(JitHeat::ee.batch));
+			HeatRef(e.pc) = std::max(HeatRef(e.pc), static_cast<int>(JitHeat::ee.batch));
+			s_warm.insert(s_warm.begin(), more.begin(), more.end());
+			SubmitGroup(e.pc, true);
+			return;
+		}
+	}
+
+	// At the dispatcher: installs the job's module once it is built (a module built ahead waits in s_ready), then
+	// gives the thread its next job from the code list.
 	void PollGroup()
 	{
 		CompileJob* const job = s_job_done.load(std::memory_order_acquire);
@@ -4225,6 +4311,7 @@ namespace
 		if (job->generation != s_generation || !job->built)
 		{
 			s_bg_stale++;
+			SubmitAhead();
 			return;
 		}
 		// The warm entries it took leave the warm list, as CompileGroup() does.
@@ -4234,8 +4321,11 @@ namespace
 			if (it != s_warm.end())
 				s_warm.erase(it);
 		}
-		if (InstallGroup(job->entry, job->build, true))
+		if (job->ahead)
+			s_ready.push_back(std::move(owned));
+		else if (InstallGroup(job->entry, job->build, true))
 			s_bg_installed++;
+		SubmitAhead();
 	}
 
 	// A list entry whose code is in memory, as listed, and not compiled.
@@ -4263,6 +4353,8 @@ namespace
 			}
 			s_code_slot.word0.store(EEJit::CODE_SLOT_FREE, std::memory_order_release);
 		}
+		if (EEJit::g_background && !EEJit::g_stats)
+			SubmitAhead();
 	}
 
 	u64 s_trace_step = 0, s_trace_hash = 0xcbf29ce484222325ull;
@@ -4348,6 +4440,8 @@ void EEJit::Execute()
 		const bool compile = JitHeat::ee.threshold <= 1 ? aligned && JitHeat::CanCompile() : entry && aligned && Warm(pc);
 		// On the code generation thread unless counting statistics (which the build updates without locks).
 		const bool background = g_background && !g_stats;
+		if (compile && background && TakeReady(pc))
+			continue;
 		if (!compile || (background ? (SubmitGroup(pc), true) : !CompileGroup(pc)))
 		{
 			if (s_failed)
@@ -4553,6 +4647,21 @@ void EEJit::CompileAhead(u64 deadline)
 {
 	if (!g_ahead || !s_running || s_failed || s_ahead_off || s_list.empty() || !g_mode)
 		return;
+	if (g_background && !g_stats)
+	{
+		// The code generation thread builds the list's modules (SubmitAhead()); spare time installs them, about
+		// 0.5 ms each (the engine's compile). Under running code (the limiter runs in the event test): no flush.
+		const u64 install_margin = GetTickFrequency() / 1000;
+		Common::Timer timer;
+		while (!s_ready.empty() && GetCPUTicks() + install_margin < deadline && s_groups.size() + 1 < kMaxGroups)
+		{
+			std::unique_ptr<CompileJob> job = std::move(s_ready.front());
+			s_ready.erase(s_ready.begin());
+			InstallReady(std::move(job), false);
+		}
+		s_ahead_ns += static_cast<u64>(timer.GetTimeNanoseconds());
+		return;
+	}
 	// A module takes about 2 ms to build and compile (at most about 15): start one only with 3 ms left.
 	const u64 margin = GetTickFrequency() * 3 / 1000;
 	Common::Timer timer;
@@ -4580,7 +4689,10 @@ void EEJit::CompileAhead(u64 deadline)
 		s_warm.insert(s_warm.begin(), more.begin(), more.end());
 		// Under running code (the limiter runs in the event test): no flush, which would release it.
 		if (CompileGroup(e.pc, false))
+		{
 			s_ahead_compiles++;
+			PerfCounters::Add(PerfCounters::ee_ahead_modules, 1);
+		}
 	}
 	s_ahead_ns += static_cast<u64>(timer.GetTimeNanoseconds());
 }

@@ -15,6 +15,11 @@ namespace PerfCounters
 {
 	// The EE and IOP JITs (CPU thread) and the VU1 JIT (VU thread): building and compiling modules.
 	inline std::atomic<u64> jit_compile_ns{0};
+	// The EE JIT's code generation thread: building modules (EEJit::g_background), off the EE thread.
+	inline std::atomic<u64> ee_build_ns{0};
+	// EE JIT modules installed (EE thread), and those of them built or compiled ahead from a code list.
+	inline std::atomic<u64> ee_modules{0};
+	inline std::atomic<u64> ee_ahead_modules{0};
 	// The WebGPU device (GS thread): render pipelines it waited for.
 	inline std::atomic<u64> gpu_pipeline_ns{0};
 	inline std::atomic<u32> gpu_pipelines{0};
