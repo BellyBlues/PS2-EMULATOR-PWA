@@ -196,7 +196,8 @@ a:hover {
 
 /* ---------------------------------------------------------------- layout */
 
-body {
+/* The room is the first screen; the controllers (console-pads.css) lie below it. */
+.room {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100vh;
@@ -2437,7 +2438,7 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
     --gutter: 16px;
   }
 
-  body {
+  .room {
     display: block;
     height: auto;
     min-height: 100dvh;

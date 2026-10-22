@@ -238,7 +238,7 @@
 			runningReleased: 'Running. Click the screen to play.',
 			released: 'Keyboard released.',
 			gamepadConnected: (name, port) => `Gamepad connected: ${name}, Player ${port}.`,
-			gamepadNeedsMap: (name, port) => `Gamepad connected: ${name}, Player ${port}. Its layout is not standard: open Keys, then Gamepad, to map its controls.`,
+			gamepadNeedsMap: (name, port) => `Gamepad connected: ${name}, Player ${port}. Its layout is not standard: map its controls on Player ${port}’s controller, under the console.`,
 			gamepadMapped: (name) => `${name} is mapped. Press its controls to check them.`,
 			gamepadMapCancelled: 'Mapping cancelled.',
 			gamepadMapCleared: (name) => `The mapping of ${name} is cleared.`,
@@ -6020,17 +6020,48 @@
 	const PAD_INPUTS = ['Up', 'Right', 'Down', 'Left', 'Triangle', 'Circle', 'Cross', 'Square', 'Select', 'Start',
 		'L1', 'L2', 'R1', 'R2', 'L3', 'R3', 'Analog', 'LUp', 'LRight', 'LDown', 'LLeft', 'RUp', 'RRight', 'RDown', 'RLeft'];
 	const PAD_INDEX = Object.fromEntries(PAD_INPUTS.map((name, i) => [name, i]));
-	// Host key name (KEY_NAMES) -> the pad input it plays. The Keys drawer shows the same layout.
-	const KEY_PAD = {
+	// Host key name (KEY_NAMES) -> the pad input it plays, as it comes. The player changes it on the controllers
+	// under the console (keyBinds, saved); KEY_PAD is what plays now. The Keys drawer shows the same layout.
+	const DEFAULT_KEY_PAD = {
 		Up: 'Up', Down: 'Down', Left: 'Left', Right: 'Right', Return: 'Start', Backspace: 'Select',
 		Q: 'L1', E: 'R1', 1: 'L2', 3: 'R2', 2: 'L3', 4: 'R3',
 		W: 'LUp', A: 'LLeft', S: 'LDown', D: 'LRight', T: 'RUp', F: 'RLeft', G: 'RDown', H: 'RRight',
 		I: 'Triangle', J: 'Square', K: 'Cross', L: 'Circle',
 	};
+	const KEY_PAD = {};
+	const PREF_KEY_BINDS = 'pcsx2web.keyBinds';
+	const defaultKeyBinds = () => Object.fromEntries(Object.entries(DEFAULT_KEY_PAD).map(([key, input]) => [input, key]));
+	// Pad input -> host key name, one key each. Saved whole, null for an input with no key.
+	const keyBinds = (() => {
+		const binds = defaultKeyBinds();
+		try {
+			const saved = JSON.parse(readPref(PREF_KEY_BINDS) || 'null');
+			if (!saved || typeof saved !== 'object')
+				return binds;
+			const known = new Set(Object.values(KEY_NAMES));
+			const taken = new Set();
+			const out = {};
+			for (const input of PAD_INPUTS) {
+				const key = input in saved ? saved[input] : binds[input];
+				if (typeof key === 'string' && known.has(key) && !taken.has(key)) {
+					out[input] = key;
+					taken.add(key);
+				}
+			}
+			return out;
+		} catch {
+			return binds;
+		}
+	})();
 	// Gamepad API "standard" mapping, by position: the bottom face button is Cross.
 	const GAMEPAD_BUTTONS = { 0: 'Cross', 1: 'Circle', 2: 'Square', 3: 'Triangle', 4: 'L1', 5: 'R1', 8: 'Select',
 		9: 'Start', 10: 'L3', 11: 'R3', 12: 'Up', 13: 'Down', 14: 'Left', 15: 'Right', 16: 'Analog' };
 	const GAMEPAD_TRIGGERS = { 6: 'L2', 7: 'R2' };
+	// The same layout as a mapping (readCustom's form), where a change to one control on a standard gamepad starts.
+	const STANDARD_MAP = {
+		buttons: Object.fromEntries(Object.entries({ ...GAMEPAD_BUTTONS, ...GAMEPAD_TRIGGERS }).map(([i, name]) => [name, { k: 'b', i: Number(i) }])),
+		sticks: { L: { x: { i: 0, s: 1 }, y: { i: 1, s: 1 } }, R: { x: { i: 2, s: 1 }, y: { i: 3, s: 1 } } },
+	};
 	// Browsers pass sticks on as the hardware reports them, with the rest-position noise of worn
 	// sticks; the PS2 pad has no dead zone of its own here. A round dead zone, rescaled so that the
 	// full throw still reaches 1.
@@ -6164,7 +6195,7 @@
 	}
 
 	function readGamepad(gp, out, g) {
-		if (g && g.custom) {
+		if (g && (g.custom || g.map)) {
 			readCustom(gp, out, g);
 			return;
 		}
@@ -6215,10 +6246,11 @@
 			};
 			gamepads.set(gp.index, g);
 		}
-		// A gamepad that is not laid out in the standard way plays through the mapping its owner made.
+		// A gamepad that is not laid out in the standard way plays through the mapping its owner made; a standard
+		// one too once its owner changed a control on its controller.
 		g.custom = gp.mapping !== 'standard';
 		g.key = padMapKey(gp);
-		g.map = g.custom ? (padMaps[g.key] || null) : null;
+		g.map = padMaps[g.key] || null;
 		g.seen = [];
 		g.mapper = null;
 		padDevices.set('pad:' + g.index, g.state);
@@ -6226,7 +6258,7 @@
 		const needsMap = g.custom && !g.map;
 		announce(!g.port ? COPY.announce.gamepadUnused(g.name) :
 			needsMap ? COPY.announce.gamepadNeedsMap(g.name, g.port) : COPY.announce.gamepadConnected(g.name, g.port));
-		pageLog(`Gamepad connected: ${g.name}${g.port ? ` (Player ${g.port})` : ' (not used)'}${needsMap ? '; its layout is not standard: map its controls in Keys, Gamepad' : ''}.`);
+		pageLog(`Gamepad connected: ${g.name}${g.port ? ` (Player ${g.port})` : ' (not used)'}${needsMap ? '; its layout is not standard: map its controls on its controller, under the console' : ''}.`);
 		startGamepadLoop();
 	}
 
@@ -6298,9 +6330,11 @@
 		}
 		if (g.mapper)
 			mapperFrame(g, seen, now);
-		if (g.view && now - g.viewAt >= VIEW_REFRESH_MS) {
+		if ((g.view || pads.seen) && now - g.viewAt >= VIEW_REFRESH_MS) {
 			g.viewAt = now;
-			updateGamepadView(g);
+			if (g.view)
+				updateGamepadView(g);
+			updatePadLive(g);
 		}
 		const idle = !raw.some((v) => v > 0);
 		if (idle)
@@ -6418,6 +6452,7 @@
 		}
 		if (page.drawer === 'keys')
 			renderPortPick();
+		renderPads();
 	}
 
 	// The drawer's "Player N plays with" row: the keyboard and each connected gamepad, the ones on this
@@ -6465,6 +6500,590 @@
 		const port = page.keysPort;
 		const gamepadThere = [...gamepads.values()].some((g) => g.connected && g.port === port);
 		selectControlsTab(players.keyboard !== port && gamepadThere ? 'gamepad' : 'keyboard', false);
+	}
+
+	// ---- the controllers under the console (UI-SPEC §17)
+
+	// Where each control is on a controller's drawing (pad-template, 600 × 380 units): its centre and size, in
+	// tab order. The shoulder buttons sit behind one another, so theirs are at the ends of lines led out of them.
+	const PAD_SPOTS = [
+		{ id: 'L2', x: 70, y: 34, w: 40, h: 22, lead: true },
+		{ id: 'L1', x: 70, y: 84, w: 40, h: 22, lead: true },
+		{ id: 'Up', x: 176, y: 122, w: 24, h: 26 },
+		{ id: 'Left', x: 148, y: 150, w: 26, h: 24 },
+		{ id: 'Right', x: 204, y: 150, w: 26, h: 24 },
+		{ id: 'Down', x: 176, y: 178, w: 24, h: 26 },
+		{ id: 'Select', x: 262, y: 150, w: 34, h: 16 },
+		{ id: 'Start', x: 338, y: 150, w: 34, h: 16 },
+		{ id: 'Analog', x: 300, y: 192, w: 20, h: 20, round: true },
+		{ id: 'LUp', x: 240, y: 199, w: 22, h: 18 },
+		{ id: 'LLeft', x: 212, y: 226, w: 20, h: 22 },
+		{ id: 'L3', x: 240, y: 226, w: 22, h: 22, round: true },
+		{ id: 'LRight', x: 268, y: 226, w: 20, h: 22 },
+		{ id: 'LDown', x: 240, y: 253, w: 22, h: 18 },
+		{ id: 'RUp', x: 360, y: 199, w: 22, h: 18 },
+		{ id: 'RLeft', x: 332, y: 226, w: 20, h: 22 },
+		{ id: 'R3', x: 360, y: 226, w: 22, h: 22, round: true },
+		{ id: 'RRight', x: 388, y: 226, w: 20, h: 22 },
+		{ id: 'RDown', x: 360, y: 253, w: 22, h: 18 },
+		{ id: 'Triangle', x: 424, y: 120, w: 30, h: 30, round: true },
+		{ id: 'Square', x: 394, y: 150, w: 30, h: 30, round: true },
+		{ id: 'Circle', x: 454, y: 150, w: 30, h: 30, round: true },
+		{ id: 'Cross', x: 424, y: 180, w: 30, h: 30, round: true },
+		{ id: 'R1', x: 530, y: 84, w: 40, h: 22, lead: true },
+		{ id: 'R2', x: 530, y: 34, w: 40, h: 22, lead: true },
+	];
+	const PAD_CABLE_Y = 80; // where the cable comes out of the drawing, at its middle
+	const PAD_LABELS = {
+		Up: 'D-pad up', Down: 'D-pad down', Left: 'D-pad left', Right: 'D-pad right',
+		Triangle: 'Triangle', Circle: 'Circle', Cross: 'Cross', Square: 'Square', Select: 'Select', Start: 'Start',
+		L1: 'L1', L2: 'L2', R1: 'R1', R2: 'R2', L3: 'L3 (left stick pressed)', R3: 'R3 (right stick pressed)', Analog: 'Analog',
+		LUp: 'Left stick up', LRight: 'Left stick right', LDown: 'Left stick down', LLeft: 'Left stick left',
+		RUp: 'Right stick up', RRight: 'Right stick right', RDown: 'Right stick down', RLeft: 'Right stick left',
+	};
+	const STICK_INPUT = /^([LR])(Up|Down|Left|Right)$/;
+	const KEY_TEXT = { Return: 'Enter', Backspace: 'Bksp', Control: 'Ctrl', PageUp: 'PgUp', PageDown: 'PgDn', Delete: 'Del', Insert: 'Ins' };
+	const KEY_SPOKEN = { Up: 'Up arrow', Down: 'Down arrow', Left: 'Left arrow', Right: 'Right arrow', Return: 'Enter', Backspace: 'Backspace',
+		Control: 'Control', PageUp: 'Page Up', PageDown: 'Page Down', Delete: 'Delete', Insert: 'Insert' };
+	const KEY_ICONS = { Up: 'arrow-up', Down: 'arrow-down', Left: 'arrow-left', Right: 'arrow-right' };
+	// A standard gamepad's buttons by number, as printed on the maker's pads that use the numbering.
+	const SONY_BUTTONS = ['×', '○', '□', '△', 'L1', 'R1', 'L2', 'R2', 'Share', 'Options', 'L3', 'R3', '↑', '↓', '←', '→', 'Home'];
+	const XBOX_BUTTONS = ['A', 'B', 'X', 'Y', 'LB', 'RB', 'LT', 'RT', 'View', 'Menu', 'LS', 'RS', '↑', '↓', '←', '→', 'Home'];
+	const STICK_ARROWS = { Up: '↑', Down: '↓', Left: '←', Right: '→' };
+
+	const pads = {
+		units: [], // per port, built by buildPads
+		shown: [null, null], // per port: what its controller shows, 'keyboard' or a Gamepad.index, as chosen on it
+		listen: null, // { port, input, g }: a control waiting for its key (g null) or its gamepad control
+		note: ['', ''], // per port: the last change, until the next
+		swallowUp: '', // the code of the key just given to a control: its keyup must not press a button
+		seen: false, // the controllers are on screen
+		cableFrame: 0,
+	};
+
+	const letterCode = (name) => (/^[A-Z]$/.test(name) ? 'Key' + name : '');
+
+	function keyText(name) {
+		const code = letterCode(name);
+		return code ? keyLabel(code, name) : KEY_TEXT[name] || name;
+	}
+
+	function keySpoken(name) {
+		return KEY_SPOKEN[name] || keyText(name);
+	}
+
+	// A key's cap: an arrow's icon, or its name as the layout prints it ("Bksp", AZERTY's Q for A); a dash for none.
+	function fillKeyCap(el, name) {
+		el.replaceChildren();
+		el.dataset.key = name || '';
+		const code = name ? letterCode(name) : '';
+		if (code)
+			el.dataset.code = code;
+		else
+			delete el.dataset.code;
+		if (!name)
+			el.textContent = '—';
+		else if (KEY_ICONS[name])
+			el.append(svgIcon(KEY_ICONS[name], 'icon'), span('vh', KEY_SPOKEN[name]));
+		else
+			el.textContent = keyText(name);
+	}
+
+	function applyKeyBinds() {
+		for (const key of Object.keys(KEY_PAD))
+			delete KEY_PAD[key];
+		PAD_CODES.clear();
+		for (const [input, key] of Object.entries(keyBinds)) {
+			KEY_PAD[key] = input;
+			for (const [code, name] of Object.entries(KEY_NAMES)) {
+				if (name === key)
+					PAD_CODES.add(code);
+			}
+		}
+	}
+
+	function renderKeyCaps() {
+		for (const k of document.querySelectorAll('kbd[data-input]'))
+			fillKeyCap(k, keyBinds[k.dataset.input] || '');
+	}
+
+	function saveKeyBinds() {
+		applyKeyBinds();
+		writePref(PREF_KEY_BINDS, JSON.stringify(Object.fromEntries(PAD_INPUTS.map((i) => [i, keyBinds[i] || null]))));
+		renderKeyCaps();
+	}
+
+	// Gives a pad input a key. The input that had the key takes this one's old key, so that no key plays two
+	// inputs and none goes missing. Returns that other input, if any.
+	function setKeyBind(input, key) {
+		const prev = keyBinds[input] || '';
+		if (prev === key)
+			return null;
+		const other = PAD_INPUTS.find((i) => i !== input && keyBinds[i] === key) || null;
+		releaseAllKeys(true);
+		keyBinds[input] = key;
+		if (other && prev)
+			keyBinds[other] = prev;
+		else if (other)
+			delete keyBinds[other];
+		saveKeyBinds();
+		return other;
+	}
+
+	function keyBindsChanged() {
+		const def = defaultKeyBinds();
+		return PAD_INPUTS.some((i) => (keyBinds[i] || '') !== (def[i] || ''));
+	}
+
+	function resetKeyBinds() {
+		releaseAllKeys(true);
+		for (const input of Object.keys(keyBinds))
+			delete keyBinds[input];
+		Object.assign(keyBinds, defaultKeyBinds());
+		saveKeyBinds();
+	}
+
+	const isSonyPad = (g) => /054c|dualshock|dualsense|wireless controller/i.test(g.key || '');
+	const padMapOf = (g) => g.map || (g.custom ? null : STANDARD_MAP);
+
+	// What plays a pad input on a gamepad, short enough for its button on the controller ("A", "B3", "A1−").
+	function padControlText(g, input) {
+		const map = padMapOf(g);
+		if (!map)
+			return '';
+		const m = STICK_INPUT.exec(input);
+		if (m) {
+			const st = map.sticks && map.sticks[m[1]];
+			const ax = st && (m[2] === 'Left' || m[2] === 'Right' ? st.x : st.y);
+			if (!ax)
+				return '';
+			const std = STANDARD_MAP.sticks[m[1]];
+			const stdAx = m[2] === 'Left' || m[2] === 'Right' ? std.x : std.y;
+			if (!g.custom && ax.i === stdAx.i && ax.s === stdAx.s)
+				return STICK_ARROWS[m[2]]; // the gamepad's own stick, as it comes
+			// Right and down are the axis times its sign (readCustom).
+			const plus = (m[2] === 'Right' || m[2] === 'Down') === (ax.s > 0);
+			return `A${ax.i}${plus ? '+' : '−'}`;
+		}
+		const b = map.buttons && map.buttons[input];
+		if (!b)
+			return '';
+		if (b.k === 'b') {
+			const names = g.custom ? null : isSonyPad(g) ? SONY_BUTTONS : XBOX_BUTTONS;
+			return (names && names[b.i]) || `B${b.i}`;
+		}
+		if (b.k === 'h')
+			return `H${b.i}`;
+		return `A${b.i}${b.act > b.rest ? '+' : '−'}`;
+	}
+
+	function padControlSpoken(g, input) {
+		const map = padMapOf(g);
+		const m = STICK_INPUT.exec(input);
+		if (m) {
+			const st = map && map.sticks && map.sticks[m[1]];
+			const ax = st && (m[2] === 'Left' || m[2] === 'Right' ? st.x : st.y);
+			return ax ? `axis ${ax.i}` : 'nothing';
+		}
+		const b = map && map.buttons && map.buttons[input];
+		if (!b)
+			return 'nothing';
+		const text = padControlText(g, input);
+		return b.k === 'b' && text !== `B${b.i}` ? `${text}, button ${b.i}` : describeBinding(b);
+	}
+
+	function connectedGamepads() {
+		return [...gamepads.values()].filter((g) => g.connected).sort((a, b) => a.rank - b.rank);
+	}
+
+	function playsOn(id, port) {
+		if (id === 'keyboard')
+			return players.keyboard === port;
+		const g = gamepads.get(id);
+		return !!g && g.connected && g.port === port;
+	}
+
+	// What a port's controller shows: the device chosen on it while it plays there, else a gamepad there, else
+	// the keyboard there; null when nothing plays as that player.
+	function padShown(port) {
+		const want = pads.shown[port - 1];
+		if (want !== null && playsOn(want, port))
+			return want;
+		const g = connectedGamepads().find((o) => o.port === port);
+		if (g)
+			return g.index;
+		return players.keyboard === port ? 'keyboard' : null;
+	}
+
+	function choosePadDevice(port, id) {
+		stopListening(false);
+		pads.shown[port - 1] = id;
+		pads.note[port - 1] = '';
+		if (id === 'keyboard') {
+			setKeyboardPlayer(port);
+			for (const r of els.kbPlayers)
+				r.checked = Number(r.value) === players.keyboard;
+		} else {
+			const g = gamepads.get(id);
+			if (g)
+				setGamepadPort(g, port);
+		}
+		renderPads();
+	}
+
+	function buildPads() {
+		for (const port of [1, 2]) {
+			const el = $('pad-template').content.firstElementChild.cloneNode(true);
+			el.id = `pad-${port}`;
+			el.setAttribute('aria-labelledby', `pad-${port}-title`);
+			const title = el.querySelector('.pad-title');
+			title.id = `pad-${port}-title`;
+			title.textContent = `Player ${port}`;
+			el.querySelector('.pad-dev legend').textContent = `Player ${port} plays with`;
+			const u = {
+				port,
+				el,
+				art: el.querySelector('.pad-art'),
+				spots: new Map(),
+				sticks: {},
+				devList: el.querySelector('.pad-dev-list'),
+				devKey: '',
+				status: el.querySelector('.pad-status'),
+				also: el.querySelector('.pad-also'),
+				map: el.querySelector('.pad-map'),
+				reset: el.querySelector('.pad-reset'),
+				cable: [$(`cable-${port}-wall`), $(`cable-${port}`)],
+				lit: false,
+			};
+			const box = el.querySelector('.pad-spots');
+			for (const s of PAD_SPOTS) {
+				const btn = document.createElement('button');
+				btn.type = 'button';
+				btn.className = `pad-spot${s.round ? ' round' : ''}${s.lead ? ' lead' : ''}`;
+				btn.style.cssText = `--x: ${s.x}; --y: ${s.y}; --w: ${s.w}; --h: ${s.h}`;
+				const cap = document.createElement('kbd');
+				btn.append(cap);
+				btn.addEventListener('click', () => listenFor(port, s.id));
+				box.append(btn);
+				u.spots.set(s.id, { btn, cap });
+			}
+			for (const c of el.querySelectorAll('.p-stick'))
+				u.sticks[c.dataset.stick] = c;
+			u.map.addEventListener('click', () => {
+				const g = gamepads.get(padShown(port));
+				if (!g || g.mapper)
+					return;
+				stopListening(false);
+				pads.note[port - 1] = '';
+				pads.listen = { port, input: null, g };
+				startMapping(g);
+			});
+			u.reset.addEventListener('click', () => {
+				stopListening(false);
+				const id = padShown(port);
+				if (id === 'keyboard') {
+					resetKeyBinds();
+					pads.note[port - 1] = 'The keys are back as they came.';
+				} else if (gamepads.has(id)) {
+					const g = gamepads.get(id);
+					clearMapping(g);
+					pads.note[port - 1] = g.custom ? 'Mapping cleared.' : 'The gamepad’s controls are back as they came.';
+				}
+				renderPads();
+			});
+			$('pads-row').append(el);
+			pads.units.push(u);
+		}
+		// The keys drawer's caps follow the keys too.
+		for (const k of els.panelKeyboard.querySelectorAll('kbd[data-key]')) {
+			const input = DEFAULT_KEY_PAD[k.dataset.key];
+			if (input)
+				k.dataset.input = input;
+		}
+		applyKeyBinds();
+		renderKeyCaps();
+		// Before the page's own keys: while a control listens, the next key is its key.
+		window.addEventListener('keydown', onPadsKeyDown, true);
+		window.addEventListener('keyup', (e) => {
+			if (pads.swallowUp && e.code === pads.swallowUp) {
+				pads.swallowUp = '';
+				e.preventDefault();
+				e.stopImmediatePropagation();
+			}
+		}, true);
+		document.addEventListener('pointerdown', (e) => {
+			const l = pads.listen;
+			if (l && !(l.input && pads.units[l.port - 1].spots.get(l.input).btn.contains(e.target)))
+				stopListening(true);
+		}, true);
+		if (typeof IntersectionObserver === 'function') {
+			new IntersectionObserver((entries) => {
+				pads.seen = entries.some((en) => en.isIntersecting);
+			}).observe($('pads'));
+		}
+		if (typeof ResizeObserver === 'function') {
+			const ro = new ResizeObserver(scheduleCables);
+			for (const el of [document.body, els.transport, $('pads')])
+				ro.observe(el);
+		}
+		window.addEventListener('resize', scheduleCables);
+		renderPads();
+	}
+
+	function listenFor(port, input) {
+		const was = pads.listen;
+		stopListening(false);
+		if (was && was.port === port && was.input === input)
+			return; // a second click puts it down
+		const id = padShown(port);
+		if (id === null)
+			return;
+		pads.note[port - 1] = '';
+		if (id === 'keyboard') {
+			pads.listen = { port, input, g: null };
+			renderPads();
+			return;
+		}
+		const g = gamepads.get(id);
+		if (!g || g.mapper)
+			return;
+		const stick = STICK_INPUT.exec(input);
+		pads.listen = { port, input, g };
+		startMapping(g, stick ? [stick[1] + 'X', stick[1] + 'Y'] : [input]); // a stick is mapped whole
+		if (g.mapper)
+			g.mapper.swap = true;
+	}
+
+	function stopListening(cancelled) {
+		const l = pads.listen;
+		if (!l)
+			return;
+		pads.listen = null;
+		if (cancelled)
+			pads.note[l.port - 1] = 'Unchanged.';
+		if (l.g && l.g.mapper)
+			mapperCancel(l.g);
+		renderPads();
+	}
+
+	function onPadsKeyDown(e) {
+		const l = pads.listen;
+		if (!l)
+			return;
+		if (e.key === 'Tab') {
+			stopListening(true); // and focus moves on
+			return;
+		}
+		e.preventDefault();
+		e.stopImmediatePropagation();
+		if (e.repeat)
+			return;
+		if (e.key === 'Escape') {
+			stopListening(true);
+			return;
+		}
+		if (l.g)
+			return; // the gamepad answers
+		const key = KEY_NAMES[e.code];
+		const label = PAD_LABELS[l.input];
+		if (!key || KEEP_DEFAULT.has(key)) {
+			pads.note[l.port - 1] = `That key stays with the browser. Press another for ${label}, or Esc.`;
+			renderPads();
+			return;
+		}
+		pads.swallowUp = e.code;
+		const other = setKeyBind(l.input, key);
+		pads.listen = null;
+		const otherKey = other && keyBinds[other];
+		pads.note[l.port - 1] = !other ? `${keySpoken(key)} plays ${label} now.` :
+			otherKey ? `${keySpoken(key)} plays ${label} now, and ${keySpoken(otherKey)} ${PAD_LABELS[other]}.` :
+				`${keySpoken(key)} plays ${label} now; ${PAD_LABELS[other]} has no key.`;
+		renderPads();
+	}
+
+	function renderPads() {
+		if (!pads.units.length)
+			return;
+		const l = pads.listen;
+		if (l && l.g && !l.g.mapper) { // the gamepad answered
+			pads.listen = null;
+			const stick = l.input && STICK_INPUT.exec(l.input);
+			pads.note[l.port - 1] = !l.input ? 'Mapped.' : stick ? `${stick[1] === 'L' ? 'Left' : 'Right'} stick mapped.` :
+				`${PAD_LABELS[l.input]}: ${padControlText(l.g, l.input) || 'nothing'}.`;
+		}
+		for (const u of pads.units)
+			renderPad(u);
+		scheduleCables();
+	}
+
+	function renderPad(u) {
+		const port = u.port;
+		const id = padShown(port);
+		const g = id !== null && id !== 'keyboard' ? gamepads.get(id) : null;
+		u.el.dataset.plugged = String(id !== null);
+		els.ports[port - 1].dataset.plugged = String(id !== null);
+		renderPadDevices(u, id);
+		const l = pads.listen && pads.listen.port === port ? pads.listen : null;
+		const step = g && g.mapper ? g.mapper.steps[g.mapper.i] : null;
+		for (const [input, { btn, cap }] of u.spots) {
+			let spoken;
+			if (id === 'keyboard') {
+				cap.dataset.input = input;
+				fillKeyCap(cap, keyBinds[input] || '');
+				spoken = keyBinds[input] ? keySpoken(keyBinds[input]) : 'no key';
+				btn.classList.toggle('unbound', !keyBinds[input]);
+				btn.classList.toggle('listening', !!l && l.input === input);
+			} else {
+				delete cap.dataset.input;
+				delete cap.dataset.key;
+				delete cap.dataset.code;
+				const text = g ? padControlText(g, input) : '';
+				setText(cap, text || '—');
+				spoken = g ? padControlSpoken(g, input) : 'nothing';
+				btn.classList.toggle('unbound', !text);
+				const stick = STICK_INPUT.exec(input);
+				btn.classList.toggle('listening', !!step && (step.id === input || (!!stick && step.side === stick[1])));
+			}
+			btn.setAttribute('aria-label', `${PAD_LABELS[input]}: ${spoken}`);
+		}
+		if (id === 'keyboard' || !g)
+			resetPadLive(u);
+		let status;
+		if (id === null)
+			status = `Nothing plays as Player ${port}. Choose the keyboard or a gamepad.`;
+		else if (l && !l.g)
+			status = `Press the key for ${PAD_LABELS[l.input]}. Esc cancels.`;
+		else if (step)
+			status = `${step.text} Esc cancels.`;
+		else if (pads.note[port - 1])
+			status = pads.note[port - 1];
+		else if (g && g.custom && !g.map)
+			status = 'This gamepad does not say how its controls are laid out: map them once, or click a control to map just that one.';
+		else
+			status = id === 'keyboard' ? 'Click a control, then press the key you want for it.' :
+				'Click a control, then press the one you want for it on the gamepad.';
+		setText(u.status, status);
+		// Other devices playing as this player.
+		const others = [];
+		if (id !== 'keyboard' && players.keyboard === port)
+			others.push('The keyboard');
+		for (const o of connectedGamepads())
+			if (o.port === port && o.index !== id)
+				others.push(o.name);
+		setText(u.also, others.length ? `${others.join(' and ')} also ${others.length > 1 ? 'play' : 'plays'} as Player ${port}.` : '');
+		u.map.hidden = !g || !g.custom;
+		setText(u.map, g && g.map ? 'Map again' : 'Map all controls');
+		u.reset.hidden = id === null || (id === 'keyboard' ? !keyBindsChanged() : !g || !g.map);
+		setText(u.reset, id === 'keyboard' ? 'Reset the keys' : g && g.custom ? 'Clear the mapping' : 'Reset the controls');
+	}
+
+	// The device choice: the keyboard and each connected gamepad. Rebuilt only when the list changes, so that
+	// focus stays on the choice just made.
+	function renderPadDevices(u, id) {
+		const options = [{ id: 'keyboard', name: 'Keyboard' }, ...connectedGamepads().map((g) => ({ id: g.index, name: g.name }))];
+		const key = options.map((o) => `${o.id}:${o.name}`).join('|');
+		if (u.devKey !== key) {
+			u.devKey = key;
+			u.devList.replaceChildren(...options.map((o) => {
+				const label = document.createElement('label');
+				label.className = 'check';
+				const input = document.createElement('input');
+				input.type = 'radio';
+				input.name = `pad-dev-${u.port}`;
+				input.value = String(o.id);
+				input.addEventListener('change', () => {
+					if (input.checked)
+						choosePadDevice(u.port, o.id);
+				});
+				label.append(input, span('', o.name));
+				return label;
+			}));
+			if (options.length === 1)
+				u.devList.append(span('pad-dev-hint', 'Press a button on a gamepad to add it.'));
+		}
+		for (const r of u.devList.querySelectorAll('input'))
+			r.checked = r.value === String(id);
+	}
+
+	// A gamepad's presses, and its sticks, on the controller that shows it.
+	function updatePadLive(g) {
+		for (const u of pads.units) {
+			if (padShown(u.port) !== g.index)
+				continue;
+			const raw = g.shown;
+			for (const [input, { btn }] of u.spots)
+				btn.classList.toggle('down', raw[PAD_INDEX[input]] > 0);
+			for (const side of ['L', 'R']) {
+				const x = raw[PAD_INDEX[side + 'Right']] - raw[PAD_INDEX[side + 'Left']];
+				const y = raw[PAD_INDEX[side + 'Down']] - raw[PAD_INDEX[side + 'Up']];
+				u.sticks[side].style.translate = x || y ? `${(x * 8).toFixed(1)}px ${(y * 8).toFixed(1)}px` : '';
+			}
+			u.lit = true;
+		}
+	}
+
+	function resetPadLive(u) {
+		if (!u.lit)
+			return;
+		u.lit = false;
+		for (const { btn } of u.spots.values())
+			btn.classList.remove('down');
+		for (const c of Object.values(u.sticks))
+			c.style.translate = '';
+	}
+
+	// Port buttons lead down to their controller.
+	function showPad(port) {
+		const u = pads.units[port - 1];
+		if (!u)
+			return;
+		u.el.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'center' });
+		const r = u.devList.querySelector('input:checked') || u.devList.querySelector('input');
+		if (r)
+			r.focus({ preventScroll: true });
+	}
+
+	function scheduleCables() {
+		if (!pads.cableFrame && pads.units.length)
+			pads.cableFrame = requestAnimationFrame(drawCables);
+	}
+
+	// Each cable from its port's plug, at the console's lower edge, down to the top of its controller, in page
+	// coordinates (the cables lie behind the page).
+	function drawCables() {
+		pads.cableFrame = 0;
+		const bar = $('ps2bar').getBoundingClientRect();
+		const first = pads.units[0].art.getBoundingClientRect();
+		const f = (n) => n.toFixed(1);
+		for (const u of pads.units) {
+			const pr = els.ports[u.port - 1].getBoundingClientRect();
+			const ar = u.art.getBoundingClientRect();
+			let d = '';
+			if (u.el.dataset.plugged === 'true' && pr.width && ar.width) {
+				const x0 = pr.left + pr.width / 2 + window.scrollX;
+				const y0 = bar.bottom - 1 + window.scrollY;
+				const x1 = ar.left + ar.width / 2 + window.scrollX;
+				const y1 = ar.top + ar.height * PAD_CABLE_Y / 380 + window.scrollY;
+				if (u.port === 2 && ar.top > first.bottom) {
+					// One controller under the other (narrow windows): the second cable goes down the margin
+					// beside the first, not across it.
+					const xs = Math.min(document.documentElement.clientWidth - 6, first.right + 10) + window.scrollX;
+					const ya = first.top - 24 + window.scrollY;
+					const yb = ar.top - 24 + window.scrollY;
+					const k1 = Math.max(24, (ya - y0) * 0.5);
+					const k2 = Math.max(16, (y1 - yb) * 0.6);
+					d = `M${f(x0)} ${f(y0)} C${f(x0)} ${f(y0 + k1)} ${f(xs)} ${f(ya - k1)} ${f(xs)} ${f(ya)} ` +
+						`L${f(xs)} ${f(yb)} C${f(xs)} ${f(yb + k2)} ${f(x1)} ${f(y1 - k2)} ${f(x1)} ${f(y1)}`;
+				} else {
+					const k = Math.max(24, (y1 - y0) * 0.55);
+					d = `M${f(x0)} ${f(y0)} C${f(x0)} ${f(y0 + k)} ${f(x1)} ${f(y1 - k)} ${f(x1)} ${f(y1)}`;
+				}
+			}
+			for (const p of u.cable) {
+				if (p.getAttribute('d') !== d)
+					p.setAttribute('d', d);
+			}
+		}
 	}
 
 	// ---- gamepads the browser does not lay out in the standard way: the user maps them
@@ -6635,7 +7254,7 @@
 		const steps = MAP_PROMPTS.filter((p) => !ids || ids.includes(p.id));
 		if (!steps.length || g.mapper)
 			return;
-		const draft = g.map ? JSON.parse(JSON.stringify(g.map)) : { buttons: {}, sticks: {} };
+		const draft = JSON.parse(JSON.stringify(g.map || (g.custom ? { buttons: {}, sticks: {} } : STANDARD_MAP)));
 		draft.buttons = draft.buttons || {};
 		draft.sticks = draft.sticks || {};
 		g.mapper = { steps, i: 0, draft, phase: 'start', until: 0, snap: null, cap: null, skip: new Set(), last: '' };
@@ -6673,6 +7292,19 @@
 			else
 				delete d.sticks[step.side][step.kind === 'stickx' ? 'x' : 'y'];
 		} else if (binding) {
+			// Changing one control on its controller: the control that had this binding takes this one's old one.
+			const prev = d.buttons[step.id];
+			const same = (b) => b.k === binding.k && b.i === binding.i && (b.k !== 'a' || (b.act > b.rest) === (binding.act > binding.rest));
+			if (g.mapper.swap && binding.k !== 'h') {
+				for (const [name, b] of Object.entries(d.buttons)) {
+					if (name !== step.id && same(b)) {
+						if (prev && prev.k !== 'h')
+							d.buttons[name] = prev;
+						else
+							delete d.buttons[name];
+					}
+				}
+			}
 			d.buttons[step.id] = binding;
 			if (binding.k === 'h') { // a hat is all four directions
 				for (const dir of ['Up', 'Right', 'Down', 'Left']) {
@@ -6773,6 +7405,7 @@
 	}
 
 	function renderMapUi(g) {
+		renderPads();
 		const v = g.view;
 		if (!v)
 			return;
@@ -6946,6 +7579,7 @@
 			});
 		}
 		els.gpSwap.addEventListener('click', swapGamepads);
+		buildPads();
 		renderPorts();
 		window.addEventListener('gamepadconnected', startGamepadLoop);
 		if (GAMEPAD_EVENTS) {
@@ -8435,21 +9069,10 @@
 		// The controller ports (UI-SPEC §16): the controls for that player. Another port while they are
 		// open switches to it; the same one closes them.
 		for (const btn of els.ports) {
-			btn.addEventListener('click', (e) => {
-				const port = Number(btn.dataset.port);
-				if (page.drawer === 'keys' && page.keysPort === port) {
+			btn.addEventListener('click', () => {
+				if (page.drawer === 'keys')
 					closeDrawer(false);
-				} else {
-					if (page.drawer === 'keys')
-						els.ports[page.keysPort - 1].setAttribute('aria-expanded', 'false');
-					page.keysPort = port;
-					showPortControls();
-					if (page.drawer === 'keys')
-						btn.setAttribute('aria-expanded', 'true');
-					else
-						openDrawer('keys');
-				}
-				returnFocusAfterPointer(e);
+				showPad(Number(btn.dataset.port));
 			});
 		}
 		els.btnLog.addEventListener('click', (e) => {

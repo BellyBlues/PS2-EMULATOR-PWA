@@ -20,6 +20,7 @@
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="library/disc-library.css">
 <link rel="stylesheet" href="library/console-bar.css">
+<link rel="stylesheet" href="library/console-pads.css">
 <script src="app.js" defer></script>
 <!-- The disc library (UI-SPEC.md §15): a module, after app.js, which it talks to through
      window.PCSX2WebLibrary. It is the one part of the page that reaches another origin (disc art). -->
@@ -27,6 +28,8 @@
 </head>
 <body data-state="nobios" data-bios="none" data-disc="none" data-runtime="loading" data-lights="up" data-chrome="shown" data-capture="na" data-drag="" data-picture="none" data-subtitle="off" data-cards="loading">
 
+<!-- The room: the first screen, as tall as the window. The controllers lie on the floor below it. -->
+<div class="room" id="room">
 <header class="marquee">
   <h1 class="wordmark"><svg class="mark" aria-hidden="true" focusable="false"><use href="icons.svg#i-mark"/></svg><span class="wm">TabStation<span class="wm-too">Too</span></span></h1>
   <button type="button" class="btn-quiet" id="about-btn" aria-haspopup="dialog">About</button>
@@ -127,9 +130,9 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       </svg>
       <div class="bar-slot" id="bar-slot-1"></div>
       <div class="bar-slot" id="bar-slot-2"></div>
-      <!-- Controller ports: each opens the controls for its player (who plays there, and the keys). -->
-      <button type="button" class="bar-hot bar-port" id="port-1" data-port="1" aria-controls="keys-drawer" aria-expanded="false" aria-label="Controller port 1"><span class="tip" aria-hidden="true"></span></button>
-      <button type="button" class="bar-hot bar-port" id="port-2" data-port="2" aria-controls="keys-drawer" aria-expanded="false" aria-label="Controller port 2"><span class="tip" aria-hidden="true"></span></button>
+      <!-- Controller ports: a plug in each port something plays on; each leads down to its controller. -->
+      <button type="button" class="bar-hot bar-port" id="port-1" data-port="1" aria-controls="pad-1" aria-label="Controller port 1"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
+      <button type="button" class="bar-hot bar-port" id="port-2" data-port="2" aria-controls="pad-2" aria-label="Controller port 2"><span class="plug" aria-hidden="true"></span><span class="tip" aria-hidden="true"></span></button>
       <button type="button" class="bar-hot bar-plate bios-btn" id="bios-btn" popovertarget="bios-menu" aria-controls="bios-menu" aria-expanded="false">
         <span class="vh">BIOS: </span><span class="bios-btn-name" id="bios-btn-name"></span>
       </button>
@@ -475,6 +478,84 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
 <footer class="credits">
   <p><span class="seg">Use a BIOS and discs from your own console; they never leave this browser&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Built on <a href="https://github.com/PCSX2/pcsx2" target="_blank" rel="noopener noreferrer">PCSX2<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a> (GPL-3.0)&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg"><a class="source-link" href="https://github.com/TabStationToo/TabStationToo" target="_blank" rel="noopener noreferrer">Source<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a>&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Not affiliated with Sony or the PCSX2 project</span></p>
 </footer>
+</div>
+
+<!-- The controllers on the floor under the console (UI-SPEC.md §17), one per port, each plugged in by a cable
+     while something plays as its player. app.js builds them from pad-template. -->
+<section class="pads" id="pads" aria-labelledby="pads-title">
+  <h2 class="lbl pads-title" id="pads-title">Controllers</h2>
+  <div class="pads-row" id="pads-row"></div>
+</section>
+<svg class="cables" id="cables" aria-hidden="true" focusable="false">
+  <path class="cable-wall" id="cable-1-wall"/><path class="cable-core" id="cable-1"/>
+  <path class="cable-wall" id="cable-2-wall"/><path class="cable-core" id="cable-2"/>
+</svg>
+
+<!-- A controller, drawn as a wireframe like the console (600 × 380 units) and without any maker's marks. app.js
+     lays a button over each control, showing the key or gamepad control that plays it. -->
+<template id="pad-template">
+  <section class="pad-unit">
+    <div class="pad-art">
+      <svg class="pad-svg" viewBox="0 0 600 380" aria-hidden="true" focusable="false">
+        <!-- the shoulder buttons: L2 and R2 behind L1 and R1, each led out to its label -->
+        <path class="p-lead" d="M156 70 L124 34 H92 M146 84 H92 M444 70 L476 34 H508 M454 84 H508"/>
+        <path class="p-sh p-sh2" d="M154 80 C156 68 164 61 176 61 H212 C220 61 225 68 225 80 Z"/>
+        <path class="p-sh p-sh2" d="M446 80 C444 68 436 61 424 61 H388 C380 61 375 68 375 80 Z"/>
+        <path class="p-sh" d="M143 94 C145 83 154 76 168 76 H220 C228 76 233 82 233 92 Z"/>
+        <path class="p-sh" d="M457 94 C455 83 446 76 432 76 H380 C372 76 367 82 367 92 Z"/>
+        <text class="p-name p-name-l" x="44" y="38">L2</text>
+        <text class="p-name p-name-l" x="44" y="88">L1</text>
+        <text class="p-name" x="556" y="88">R1</text>
+        <text class="p-name" x="556" y="38">R2</text>
+        <!-- the body and its grips -->
+        <path class="p-body" d="M300 98 C262 98 240 92 222 88 C196 82 160 82 142 94 C122 108 114 140 112 172 C108 218 102 268 106 310 C110 346 130 364 156 364 C182 364 196 346 206 326 C220 298 240 284 264 282 C278 281 290 281 300 281 C310 281 322 281 336 282 C360 284 380 298 394 326 C404 346 418 364 444 364 C470 364 490 346 494 310 C498 268 492 218 488 172 C486 140 478 108 458 94 C440 82 404 82 378 88 C360 92 338 98 300 98 Z"/>
+        <!-- where the cable comes out -->
+        <rect class="p-relief" x="292" y="80" width="16" height="20" rx="3"/>
+        <!-- the wells around the D-pad, the face buttons and the sticks -->
+        <circle class="p-well" cx="176" cy="150" r="42"/>
+        <circle class="p-well" cx="424" cy="150" r="47"/>
+        <circle class="p-well" cx="240" cy="226" r="37"/>
+        <circle class="p-well" cx="360" cy="226" r="37"/>
+        <!-- the D-pad -->
+        <path class="p-key" d="M164 108 H188 V136 L176 148 L164 136 Z M164 192 H188 V164 L176 152 L164 164 Z M134 138 V162 H162 L174 150 L162 138 Z M218 138 V162 H190 L178 150 L190 138 Z"/>
+        <!-- the face buttons, each with its symbol outside it -->
+        <circle class="p-key" cx="424" cy="120" r="15"/>
+        <circle class="p-key" cx="394" cy="150" r="15"/>
+        <circle class="p-key" cx="454" cy="150" r="15"/>
+        <circle class="p-key" cx="424" cy="180" r="15"/>
+        <path class="p-glyph" d="M424 92 l5 8.5 h-10 z M363 145 h9 v9 h-9 z M419 202 l9 9 M428 202 l-9 9"/>
+        <circle class="p-glyph" cx="485" cy="150" r="4.5"/>
+        <!-- Select, Start and Analog -->
+        <rect class="p-key" x="247" y="144" width="30" height="12" rx="6"/>
+        <rect class="p-key" x="323" y="144" width="30" height="12" rx="6"/>
+        <text class="p-print" x="262" y="170">SELECT</text>
+        <text class="p-print" x="338" y="170">START</text>
+        <circle class="p-key" cx="300" cy="192" r="9"/>
+        <circle class="p-led" cx="300" cy="175" r="2.5"/>
+        <text class="p-print" x="300" y="214">ANALOG</text>
+        <!-- the sticks: the ring and the cap, which follows a gamepad's stick -->
+        <circle class="p-ring" cx="240" cy="226" r="30"/>
+        <circle class="p-ring" cx="360" cy="226" r="30"/>
+        <circle class="p-stick" data-stick="L" cx="240" cy="226" r="20"/>
+        <circle class="p-stick" data-stick="R" cx="360" cy="226" r="20"/>
+      </svg>
+      <div class="pad-spots"></div>
+    </div>
+    <div class="pad-foot">
+      <h3 class="pad-title"></h3>
+      <fieldset class="pad-dev">
+        <legend class="vh"></legend>
+        <div class="pad-dev-list"></div>
+      </fieldset>
+    </div>
+    <p class="pad-status" role="status"></p>
+    <p class="pad-also"></p>
+    <div class="pad-actions">
+      <button type="button" class="btn-quiet pad-map" hidden>Map all controls</button>
+      <button type="button" class="btn-quiet pad-reset" hidden></button>
+    </div>
+  </section>
+</template>
 
 <dialog class="lib-dialog" id="library" aria-labelledby="library-title">
   <header class="lib-head">
