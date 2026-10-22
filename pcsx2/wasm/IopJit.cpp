@@ -41,6 +41,8 @@
 #include "wasm/WasmEmitter.h"
 #include "wasm/WasmJitRuntime.h"
 
+#include "DebugTools/Debug.h"
+
 #include "common/Console.h"
 #include "common/Timer.h"
 
@@ -48,12 +50,14 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace IopJit
 {
 	int g_mode = 1;
+	bool g_stats = false;
 } // namespace IopJit
 
 namespace
@@ -93,6 +97,11 @@ namespace
 
 	u64 s_blocks_compiled = 0, s_groups_compiled = 0, s_invalidations = 0, s_flushes = 0, s_interp_steps = 0;
 	u64 s_compile_ns = 0, s_max_module_ns = 0, s_wasm_bytes = 0, s_guest_instrs = 0, s_native_instrs = 0;
+	// -eejit-stats: entries of each compiled block (IopJit::g_stats), for PrintStats().
+	constexpr u32 kMaxBlockStats = 1u << 16;
+	u64 s_block_stat_count[kMaxBlockStats];
+	u32 s_block_stat_pc[kMaxBlockStats];
+	u32 s_block_stats = 0;
 
 	template <typename T>
 	u32 Addr(const T* p)
@@ -249,6 +258,17 @@ namespace
 			Function& f = m_fn;
 			const u32 end = Scan(start);
 			EmitEntryChecks(start, end);
+			if (IopJit::g_stats && s_block_stats < kMaxBlockStats)
+			{
+				const u32 a = Addr(&s_block_stat_count[s_block_stats]);
+				s_block_stat_pc[s_block_stats++] = start;
+				f.i32_const(0);
+				f.i32_const(0);
+				f.i64_load(a);
+				f.i64_const(1);
+				f.i64_add();
+				f.i64_store(a);
+			}
 			f.i32_const(0);
 			f.i64_load(Addr(&psxRegs.cycle));
 			f.local_set(m_c0);
@@ -1145,4 +1165,37 @@ void IopJit::PrintStats()
 		s_compile_ns / 1e6, s_max_module_ns / 1e6, static_cast<unsigned long long>(s_invalidations), static_cast<unsigned long long>(s_flushes),
 		static_cast<unsigned long long>(s_interp_steps), static_cast<unsigned long long>(s_native_instrs),
 		static_cast<unsigned long long>(s_guest_instrs));
+	if (!g_stats)
+		return;
+	// The blocks run most, by entries, with their instructions as they are in memory now.
+	std::vector<std::pair<u64, u32>> b;
+	u64 total = 0;
+	for (u32 i = 0; i < s_block_stats; i++)
+	{
+		b.emplace_back(s_block_stat_count[i], s_block_stat_pc[i]);
+		total += s_block_stat_count[i];
+	}
+	std::sort(b.rbegin(), b.rend());
+	Console.WriteLn("IOP JIT: %llu block entries", static_cast<unsigned long long>(total));
+	for (size_t i = 0; i < std::min<size_t>(b.size(), 20); i++)
+	{
+		const u32 pc = b[i].second;
+		std::string ops;
+		for (u32 k = 0; k < 12; k++)
+		{
+			const u32 code = iopMemRead32(pc + k * 4);
+			ops += " | ";
+			ops += R3000A::disR3000AF(code, pc + k * 4);
+			const u32 op = code >> 26;
+			const bool branch = (op >= 2 && op <= 7) || op == 1 || (op == 0 && ((code & 0x3f) == 8 || (code & 0x3f) == 9));
+			if (k > 0 && branch)
+			{
+				ops += " | ";
+				ops += R3000A::disR3000AF(iopMemRead32(pc + k * 4 + 4), pc + k * 4 + 4);
+				break;
+			}
+		}
+		Console.WriteLn("  block %08x %12llu (%4.1f%%):%s", pc, static_cast<unsigned long long>(b[i].first),
+			100.0 * b[i].first / std::max<u64>(total, 1), ops.c_str());
+	}
 }

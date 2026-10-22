@@ -15,6 +15,7 @@ namespace IopJit
 {
 	// 0: interpreter only; 1: JIT (default). -iopjit 0 (headless) or the page's ?iopjit=0 turn it off.
 	extern int g_mode;
+	extern bool g_stats; // per-block entry counts for PrintStats() (headless -eejit-stats)
 
 	// Runs IOP instructions from psxRegs.pc the way intExecuteBlock()'s inner loop does: until a taken branch has
 	// ended (branch2) or, with no branch, 0x10000 cycles after last_cycle.

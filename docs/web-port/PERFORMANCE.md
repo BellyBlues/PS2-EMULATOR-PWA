@@ -173,6 +173,13 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   interpreter), interpreter calls 13.5 M → 1.5 M per 1,200 GTA vsyncs, but 1,043.4 G → 1,042.4 G
   instructions retired per 2,400 vsyncs (within noise): their interpreter bodies were 0.5 % of the EE
   thread. Branch `native-fallbacks` (`950539bc7`), not merged.
+- **IOP idle loops** (2026-10-22): in GTA San Andreas gameplay the IOP's hottest block (43 % of its block
+  entries, `-eejit-stats` now lists the IOP's blocks too) is the kernel's idle loop, `J self; NOP` at
+  0xbe9c, entered once per EE event test (about 6,300 times a vsync). The interpreter's wait loop skip
+  (`doBranchEnd()`) already skips its waiting to the next IOP event; what each entry costs is the IOP run
+  around it and the event test, which run anyway. The generated IOP and VU0 code together are 3.9 % of the
+  EE thread. Stepping the idle loop on the interpreter instead of calling its block (exact by
+  construction) gave the same instructions retired (996-1,000 G per 2,400 vsyncs, on and off): not kept.
 - **Main RAM without the vtlb** (2026-10-22): accesses below 32 MB taken straight to main RAM, a range
   check instead of the table read. Exact on GTA (state hashes identical over 600 vsyncs), but 0.5 % more
   instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
