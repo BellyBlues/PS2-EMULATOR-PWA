@@ -1892,6 +1892,7 @@ static void RunVM(const std::string& bios_name)
 
 	MakeBootParameters(bios_name, disc, &params);
 	Error error;
+	EEJit::NewCodeLogSession();
 	const VMBootResult result = VMManager::Initialize(params, &error);
 	if (result != VMBootResult::StartupSuccess)
 	{
@@ -2193,6 +2194,21 @@ EMSCRIPTEN_KEEPALIVE const void* pcsx2web_tfx_log(void)
 EMSCRIPTEN_KEEPALIVE void* pcsx2web_tfx_prewarm(void)
 {
 	return WebGPUHost::TFXPrewarmSlot();
+}
+
+/// Address of the EE JIT's code log: the blocks it compiled since the VM started (EEJit::CodeListBlock: session,
+/// count, version lo/hi, then count entries of PC and code hash). The page keeps them per game to hand them back
+/// at the game's next boot (README "Code lists").
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_ee_code_log(void)
+{
+	return EEJit::CodeLog();
+}
+
+/// Address of the slot the page writes a game's stored code list into (the same layout; its first word is the
+/// slot's state, EEJit::CODE_SLOT_*). The EE thread takes it at its next vsync.
+EMSCRIPTEN_KEEPALIVE void* pcsx2web_ee_code_list(void)
+{
+	return EEJit::CodeListSlot();
 }
 
 /// Test hook: the WebGPU device destroys itself at its next present, as on a device loss.

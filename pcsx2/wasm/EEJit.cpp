@@ -51,6 +51,7 @@
 #include "wasm/WasmJitRuntime.h"
 
 #include "common/Console.h"
+#include "common/Threading.h"
 #include "common/Timer.h"
 
 #include <algorithm>
@@ -60,6 +61,10 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 using namespace R5900;
@@ -78,6 +83,9 @@ namespace EEJit
 	bool g_stats = false;
 	u32 g_dbgmask = 0;
 	bool g_spin = true;
+	bool g_ahead = true;
+	bool g_ahead_test = false;
+	bool g_background = true;
 } // namespace EEJit
 
 namespace CodeWrites
@@ -162,7 +170,12 @@ namespace
 	// Statistics.
 	u64 s_dispatches = 0; // blocks called by the C++ dispatcher
 	u64 s_blocks_compiled = 0, s_groups_compiled = 0, s_invalidations = 0, s_flushes = 0, s_interp_steps = 0;
-	u64 s_compile_ns = 0, s_max_module_ns = 0, s_wasm_bytes = 0, s_guest_instrs = 0, s_native_instrs = 0;
+	u64 s_compile_ns = 0, s_max_module_ns = 0, s_wasm_bytes = 0;
+	std::atomic<u64> s_guest_instrs{0}, s_native_instrs{0}; // also counted by the code generation thread
+	u64 s_gen_ns = 0, s_engine_ns = 0, s_interp_ns = 0, s_max_frame_compile_ns = 0, s_frame_compile_ns = 0;
+	u64 s_ahead_compiles = 0, s_ahead_ns = 0;
+	u64 s_bg_jobs = 0, s_bg_installed = 0, s_bg_dropped = 0, s_bg_stale = 0, s_bg_snapshot_ns = 0;
+	u32 s_frame_compile_frame = 0;
 	std::vector<std::string> s_stat_names;
 	std::unordered_map<std::string, u32> s_stat_index;
 	u64 s_stat_counts[512];
@@ -451,7 +464,13 @@ namespace
 		u64 calls = 0, tries = 0, skips = 0, iters = 0; // -eejit-stats
 	};
 
-	std::vector<std::unique_ptr<SpinSite>> s_spin_sites;
+	constexpr size_t kMaxSpinSites = 1u << 16;
+	std::vector<std::unique_ptr<SpinSite>> s_spin_sites = [] {
+		std::vector<std::unique_ptr<SpinSite>> v;
+		v.reserve(kMaxSpinSites);
+		return v;
+	}();
+	std::mutex s_spin_mutex; // AddSpinSite() on the EE and code generation threads
 	std::unordered_map<u32, u32> s_spin_index; // branch PC -> s_spin_sites index
 	bool s_spin_off = false;
 	u64 s_spin_tries = 0, s_spin_hits = 0, s_spin_skips = 0, s_spin_iters = 0, s_spin_cycles = 0, s_spin_why[7] = {};
@@ -861,16 +880,26 @@ namespace
 	// ------------------------------------------------------------------------------------------------------------
 	// Code generation
 
+	struct CodeSnapshot;
+	// The word at pc in a snapshot (CodeSnapshot), if its page is in it.
+	const u32* SnapWord(const CodeSnapshot* snap, u32 pc);
+
 	class BlockCompiler
 	{
 	public:
-		BlockCompiler(u32 type_v_v, u32 type_i_v, u32 page_vaddr, const u32* host_page, u64 vmap_raw, u32* checked)
-			: m_checked(checked)
-			, m_tvv(type_v_v)
+		// host_page: the page's words to compile; host_addr: where the page is in memory (the same unless the words are
+		// a copy, taken for code generated on another thread: `deferred`, see CompileJob).
+		BlockCompiler(u32 type_v_v, u32 type_i_v, u32 page_vaddr, const u32* host_page, const u32* host_addr,
+			u64 vmap_raw, u32* checked, const CodeSnapshot* snap)
+			: m_tvv(type_v_v)
 			, m_tiv(type_i_v)
 			, m_page(page_vaddr)
 			, m_host(host_page)
+			, m_host_addr(host_addr)
 			, m_vmap_raw(vmap_raw)
+			, m_deferred(snap != nullptr)
+			, m_snap(snap)
+			, m_checked(checked)
 			, m_fn(0)
 			, m_regs(m_fn, ValType::I64, kNumRegs, &RegAddr)
 		{
@@ -944,10 +973,13 @@ namespace
 			f.i64_const(static_cast<s64>(m_vmap_raw));
 			f.i64_ne();
 			f.br_if(0);
-			const u32 host = Addr(m_host) + (start - m_page);
+			const u32 host = Addr(m_host_addr) + (start - m_page);
 			const u32 nwords = (end - start) >> 2;
+			m_region_start = start;
+			m_region_words = nwords;
 			// No write to the page since the last compare (CodeWrites.h).
-			const bool tracked = CodeWrites::EmitSkipCompare(f, host, nwords * 4, m_checked, m_a);
+			const bool tracked = CodeWrites::EmitSkipCompare(f, host, nwords * 4, m_checked, m_a, !m_deferred);
+			m_tracked = tracked;
 			// Same code.
 			u32 i = 0;
 			for (; i + 2 <= nwords; i += 2)
@@ -3125,7 +3157,8 @@ namespace
 			std::vector<SpinWord> words;
 			for (u32 a = target; a <= pc + 4; a += 4)
 			{
-				const u32* word = SpinWordPtr(a);
+				// From the snapshot when the block is built on another thread (with the page before its own).
+				const u32* word = m_snap ? SnapWord(m_snap, a) : SpinWordPtr(a);
 				if (!word)
 					return -1;
 				const u32 code = *word;
@@ -3134,24 +3167,30 @@ namespace
 					return -1;
 				words.push_back({code, d.kind, d.op->cycles});
 			}
-			auto [it, added] = s_spin_index.try_emplace(pc, static_cast<u32>(s_spin_sites.size()));
-			if (added)
-				s_spin_sites.push_back(std::make_unique<SpinSite>());
-			SpinSite& site = *s_spin_sites[it->second];
-			if (site.target != target || site.words.size() != words.size() ||
-				!std::equal(words.begin(), words.end(), site.words.begin(),
-					[](const SpinWord& a, const SpinWord& b) { return a.code == b.code; }))
+			// The code generation thread adds sites too (CompileJob): under a lock, into room reserved so that
+			// SpinTry() on the EE thread never sees the vector move, and a site is never changed once made: other
+			// code for the same loop gets a site of its own.
+			std::lock_guard lock(s_spin_mutex);
+			const auto it = s_spin_index.find(pc);
+			if (it != s_spin_index.end())
 			{
-				site.target = target;
-				site.codes.clear();
-				for (const SpinWord& w : words)
-					site.codes.push_back(w.code);
-				site.words = std::move(words);
-				site.memo = false;
-				site.fails = 0;
-				site.wait = 0;
+				const SpinSite& site = *s_spin_sites[it->second];
+				if (site.target == target && site.words.size() == words.size() &&
+					std::equal(words.begin(), words.end(), site.words.begin(),
+						[](const SpinWord& a, const SpinWord& b) { return a.code == b.code; }))
+					return static_cast<s32>(it->second);
 			}
-			return static_cast<s32>(it->second);
+			if (s_spin_sites.size() >= kMaxSpinSites)
+				return -1;
+			auto site = std::make_unique<SpinSite>();
+			site->target = target;
+			for (const SpinWord& w : words)
+				site->codes.push_back(w.code);
+			site->words = std::move(words);
+			const u32 index = static_cast<u32>(s_spin_sites.size());
+			s_spin_sites.push_back(std::move(site));
+			s_spin_index[pc] = index;
+			return static_cast<s32>(index);
 		}
 
 		// Emits the branch at pc. Returns true if the block goes on (at m_next_pc) after the branch not taken.
@@ -3372,11 +3411,19 @@ namespace
 			return f;
 		}
 
+	public:
 		u32 m_tvv, m_tiv;
 		u32 m_page;
 		const u32* m_host;
+		const u32* m_host_addr;
 		u64 m_vmap_raw;
+		bool m_deferred;
+		const CodeSnapshot* m_snap; // what a block built on another thread reads (CompileJob), else null
 		u32* m_checked; // the page generation this block's code was last compared at
+		u32 m_region_start = 0, m_region_words = 0; // the words its entry checks compare
+		bool m_tracked = false; // ... skipping the compare when the page was not written (CodeWrites.h)
+
+	private:
 		Function m_fn;
 		WasmJit::RegCache m_regs;
 		u32 m_a, m_j, m_cyc, m_f;
@@ -3392,6 +3439,38 @@ namespace
 		u32 m_pending = 0; // cycles not yet written, before the Config factor
 		bool m_cyc_dirty = false; // m_cyc may be non-zero
 	};
+
+	// ------------------------------------------------------------------------------------------------------------
+	// Code lists (EEJit.h): the log of compiled blocks, and a list from an earlier run to compile early.
+
+	EEJit::CodeListBlock s_code_log;
+	EEJit::CodeListBlock s_code_slot;
+	std::unordered_set<u32> s_logged; // PCs in this session's log
+	struct ListEntry
+	{
+		u32 pc, hash;
+	};
+	std::vector<ListEntry> s_list; // the list in use
+	size_t s_list_cursor = 0; // CompileAhead()'s next entry
+	bool s_running = false; // Execute() runs: CompileAhead() may compile
+	bool s_ahead_off = false; // out of executable memory while compiling ahead: stop
+	u32 s_ahead_frame = ~0u;
+	u64 s_generation = 0; // FlushAll() count: a module built on another thread before a flush is dropped
+
+	// FNV-1a of the guest code at pc: up to 8 words, not past its page. False if pc is not in memory.
+	bool CodeHash(u32 pc, u32* hash)
+	{
+		const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
+		if ((pc & 3) || vmv.isHandler(pc))
+			return false;
+		const u32* host = reinterpret_cast<const u32*>(vmv.assumePtr(pc));
+		const u32 n = std::min<u32>(8, (4096 - (pc & 4095)) / 4);
+		u32 h = 2166136261u;
+		for (u32 i = 0; i < n; i++)
+			h = (h ^ host[i]) * 16777619u;
+		*hash = h;
+		return true;
+	}
 
 	// ------------------------------------------------------------------------------------------------------------
 	// Cache
@@ -3466,7 +3545,9 @@ namespace
 			page = nullptr;
 		}
 		if (!keep_heat)
+		{
 			s_warm.clear();
+		}
 		for (auto& [slot, g] : s_slot_group)
 			wasmjit_remove_function(slot);
 		s_slot_group.clear();
@@ -3479,6 +3560,7 @@ namespace
 		}
 		s_groups.clear();
 		s_flushes++;
+		s_generation++;
 	}
 
 	// intUpdateCPUCycles() with an EE cycle rate of 0: cpuRegs.cycle += max(cpuBlockCycles >> 3, 1), and
@@ -3702,12 +3784,64 @@ namespace
 
 	// Compiles the block at entry, its neighbours in the same page and the warm entries of any page (JitHeat.h) into
 	// one module. False if entry cannot be compiled.
-	bool CompileGroup(u32 entry)
+	// What a module is compiled from when its code is generated on another thread (CompileJob): copies taken on the
+	// EE thread of the pages it may read (their words, mapping, and which of their blocks may join the module as
+	// neighbours) and of the warm entries it may take.
+	struct CodeSnapshot
 	{
-		if (vtlbdata.vmap[entry >> VTLB_PAGE_BITS].isHandler(entry))
-			return false;
+		struct Page
+		{
+			u32 vpage;
+			u64 raw;
+			const u32* host;
+			std::unique_ptr<u32[]> words;
+			u64 eligible[kPageWords / 64]; // not compiled and ran JitHeat::ee.neighbour times
+		};
+		std::vector<Page> pages;
+		std::vector<u32> warm; // warm entries that may join, in s_warm's order
 
+		const Page* Find(u32 pc) const
+		{
+			for (const Page& p : pages)
+			{
+				if (p.vpage == (pc & ~4095u))
+					return &p;
+			}
+			return nullptr;
+		}
+	};
+
+	const u32* SnapWord(const CodeSnapshot* snap, u32 pc)
+	{
+		const CodeSnapshot::Page* p = snap->Find(pc);
+		return p ? &p->words[(pc & 4095) >> 2] : nullptr;
+	}
+
+	// A module built and not yet compiled by the engine.
+	struct GroupBuild
+	{
+		std::vector<u8> bytes;
+		std::vector<u32> pcs;
+		std::unique_ptr<u32[]> checked;
+		struct Region
+		{
+			u32 pc, words;
+			const u32* host; // in memory
+			std::vector<u32> code; // the words compiled from
+			bool tracked;
+		};
+		std::vector<Region> regions; // deferred builds: what InstallGroup() checks
+		size_t warm_taken = 0;
+		u64 gen_ns = 0;
+		bool deferred = false;
+	};
+
+	// Builds the module of entry, its neighbours in the same page and the warm entries of any page (JitHeat.h). From
+	// memory and the JIT's state (snap null, on the EE thread), or from a snapshot (on the code generation thread).
+	bool BuildGroup(u32 entry, const CodeSnapshot* snap, GroupBuild* out)
+	{
 		Common::Timer timer;
+		const bool deferred = snap != nullptr;
 		WasmJit::Module m;
 		const u32 t_v_v = m.type({}, {});
 		const u32 t_i_v = m.type({ValType::I32}, {});
@@ -3716,23 +3850,34 @@ namespace
 		m.import_table("env", "table", 0);
 
 		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxModuleBlocks);
-		std::vector<u32> pcs;
+		std::vector<u32>& pcs = out->pcs;
 		std::vector<std::unique_ptr<BlockCompiler>> blocks;
 		std::vector<u32> work{entry};
 		u32 first = entry; // the entry whose neighbours `work` holds
 		size_t warm_taken = 0;
+		const std::vector<u32>& warm = deferred ? snap->warm : s_warm;
+		auto eligible = [&](u32 pc) {
+			if (!deferred)
+				return SlotRef(pc) == 0 && static_cast<u32>(HeatRef(pc)) >= JitHeat::ee.neighbour;
+			const CodeSnapshot::Page* p = snap->Find(pc);
+			const u32 w = (pc >> 2) & (kPageWords - 1);
+			return p && (p->eligible[w / 64] >> (w % 64)) & 1;
+		};
 		for (;;)
 		{
 			// The entry's page first, then each warm entry with its own warm neighbours.
 			if (work.empty() || pcs.size() >= kMaxGroupBlocks)
 			{
 				work.clear();
-				while (warm_taken < s_warm.size() && work.empty())
+				while (warm_taken < warm.size() && work.empty())
 				{
-					const u32 pc = s_warm[warm_taken++];
-					if (SlotRef(pc) == 0 && static_cast<u32>(HeatRef(pc)) >= JitHeat::ee.batch &&
-						std::find(pcs.begin(), pcs.end(), pc) == pcs.end() &&
-						!vtlbdata.vmap[pc >> VTLB_PAGE_BITS].isHandler(pc))
+					const u32 pc = warm[warm_taken++];
+					// A snapshot's warm entries were picked under the same rules (SubmitGroup()).
+					bool ok = deferred && snap->Find(pc);
+					if (!deferred)
+						ok = SlotRef(pc) == 0 && static_cast<u32>(HeatRef(pc)) >= JitHeat::ee.batch &&
+						     !vtlbdata.vmap[pc >> VTLB_PAGE_BITS].isHandler(pc);
+					if (ok && std::find(pcs.begin(), pcs.end(), pc) == pcs.end())
 					{
 						work.push_back(pc);
 						first = pc;
@@ -3745,19 +3890,51 @@ namespace
 			work.erase(work.begin());
 			if (std::find(pcs.begin(), pcs.end(), pc) != pcs.end())
 				continue;
-			if (pc != first && (SlotRef(pc) != 0 || static_cast<u32>(HeatRef(pc)) < JitHeat::ee.neighbour))
+			if (pc != first && !eligible(pc))
 				continue;
 			const u32 page = pc & ~4095u;
-			const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
-			const u32* host = reinterpret_cast<const u32*>(vmv.assumePtr(page));
+			const u32* host;
+			const u32* host_addr;
+			u64 raw;
+			if (deferred)
+			{
+				const CodeSnapshot::Page* p = snap->Find(pc);
+				if (!p)
+					continue;
+				host = p->words.get();
+				host_addr = p->host;
+				raw = p->raw;
+			}
+			else
+			{
+				const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
+				host = host_addr = reinterpret_cast<const u32*>(vmv.assumePtr(page));
+				raw = vmv.raw();
+			}
 			std::vector<u32> next;
-			blocks.push_back(std::make_unique<BlockCompiler>(t_v_v, t_i_v, page, host, vmv.raw(), &checked[pcs.size()]));
+			blocks.push_back(std::make_unique<BlockCompiler>(t_v_v, t_i_v, page, host, host_addr, raw, &checked[pcs.size()], snap));
 			blocks.back()->Run(pc, &next);
 			pcs.push_back(pc);
 			for (u32 n : next)
 				work.push_back(n);
 		}
-		s_warm.erase(s_warm.begin(), s_warm.begin() + warm_taken);
+		out->warm_taken = warm_taken;
+		out->deferred = deferred;
+		if (pcs.empty())
+			return false;
+		for (const auto& bc : blocks)
+		{
+			if (!deferred)
+				continue;
+			GroupBuild::Region r;
+			r.pc = bc->m_region_start;
+			r.words = bc->m_region_words;
+			r.host = bc->m_host_addr + ((r.pc - bc->m_page) >> 2);
+			const u32* from = bc->m_host + ((r.pc - bc->m_page) >> 2);
+			r.code.assign(from, from + r.words);
+			r.tracked = bc->m_tracked;
+			out->regions.push_back(std::move(r));
+		}
 		// Block i is function kFnFirstBlock + i; the next one returns 0 (links to blocks outside the module).
 		const u32 nblocks = static_cast<u32>(pcs.size());
 		m.add_function(t_i_v, EmitBranchEndFunction(t_v_v, t_i_v));
@@ -3790,11 +3967,41 @@ namespace
 		if (EEJit::g_stats)
 			m.name_function(lookup, "ee_lookup");
 		blocks.clear();
+		out->bytes = m.finish();
+		out->checked = std::move(checked);
+		out->gen_ns = static_cast<u64>(timer.GetTimeNanoseconds());
+		return true;
+	}
 
-		const std::vector<u8> bytes = m.finish();
+	// Compiles a built module with the engine and puts its blocks in the cache (EE thread). A module built on
+	// another thread is first checked against memory: its blocks' words must still be those it was compiled from,
+	// which they then compare with as a compile here would have (CodeWrites.h); otherwise it is dropped.
+	bool InstallGroup(u32 entry, GroupBuild& build, bool allow_flush)
+	{
+		Common::Timer timer;
+		for (const GroupBuild::Region& r : build.regions)
+		{
+			if (std::memcmp(r.host, r.code.data(), r.words * 4) != 0)
+			{
+				s_bg_dropped++;
+				return false;
+			}
+		}
+		for (size_t i = 0; i < build.regions.size(); i++)
+		{
+			const GroupBuild::Region& r = build.regions[i];
+			if (!r.tracked)
+				continue;
+			const u32 page = static_cast<u32>(reinterpret_cast<uptr>(r.host)) >> 12;
+			CodeWrites::AddCodePage(page);
+			build.checked[i] = CodeWrites::Current(page);
+		}
+		const std::vector<u8>& bytes = build.bytes;
+		const std::vector<u32>& pcs = build.pcs;
 		s_wasm_bytes += bytes.size();
+		s_gen_ns += build.gen_ns;
 		auto g = std::make_unique<Group>();
-		g->checked = std::move(checked);
+		g->checked = std::move(build.checked);
 		const int module = wasmjit_compile(bytes.data(), bytes.size());
 		const int instance = module > 0 ? wasmjit_instantiate(module) : 0;
 		if (module <= 0 || instance <= 0)
@@ -3803,8 +4010,11 @@ namespace
 				wasmjit_release(module);
 			if (module < 0 || instance < 0)
 			{
-				// Out of executable memory: start again with an empty cache.
-				FlushAll(true);
+				// Out of executable memory: start again with an empty cache (not under running code: CompileAhead()).
+				if (allow_flush)
+					FlushAll(true);
+				else
+					s_ahead_off = true;
 				return false;
 			}
 			Console.Error("EE JIT: generated code for %08x did not compile; using the interpreter.", entry);
@@ -3832,6 +4042,15 @@ namespace
 			g->slots.push_back(slot);
 			g->live++;
 			s_slot_group.emplace(slot, g.get());
+			// The log, in the order blocks are compiled (the page reads count, then the entries before it).
+			const u32 n = s_code_log.count.load(std::memory_order_relaxed);
+			u32 hash;
+			if (n < EEJit::kCodeListCapacity && CodeHash(pcs[i], &hash) && s_logged.insert(pcs[i]).second)
+			{
+				s_code_log.entries[2 * n] = pcs[i];
+				s_code_log.entries[2 * n + 1] = hash;
+				s_code_log.count.store(n + 1, std::memory_order_release);
+			}
 		}
 		if (g->live == 0)
 		{
@@ -3842,12 +4061,190 @@ namespace
 		s_blocks_compiled += pcs.size();
 		s_groups_compiled++;
 		s_groups.push_back(std::move(g));
-		const u64 ns = static_cast<u64>(timer.GetTimeNanoseconds());
+		// The EE thread's own time: the engine's compile, and the build when it was not done on another thread.
+		const u64 engine_ns = static_cast<u64>(timer.GetTimeNanoseconds());
+		s_engine_ns += engine_ns;
+		const u64 ns = engine_ns + (build.regions.empty() && !build.deferred ? build.gen_ns : 0);
+		if (s_frame_compile_frame != g_FrameCount)
+		{
+			s_frame_compile_frame = g_FrameCount;
+			s_frame_compile_ns = 0;
+		}
+		s_frame_compile_ns += ns;
+		s_max_frame_compile_ns = std::max(s_max_frame_compile_ns, s_frame_compile_ns);
 		s_compile_ns += ns;
 		s_max_module_ns = std::max(s_max_module_ns, ns);
 		PerfCounters::Add(PerfCounters::jit_compile_ns, ns);
 		JitHeat::Spend(ns);
 		return true;
+	}
+
+
+	// Builds and installs on the EE thread.
+	bool CompileGroup(u32 entry, bool allow_flush = true)
+	{
+		if (vtlbdata.vmap[entry >> VTLB_PAGE_BITS].isHandler(entry))
+			return false;
+		GroupBuild build;
+		const bool built = BuildGroup(entry, nullptr, &build);
+		s_warm.erase(s_warm.begin(), s_warm.begin() + build.warm_taken);
+		return built && InstallGroup(entry, build, allow_flush);
+	}
+
+	// ------------------------------------------------------------------------------------------------------------
+	// Code generation on another thread (EEJit::g_background). Building a module (BlockCompiler, the module's
+	// bytes) is about three quarters of compiling it; the engine's compile and instantiation must stay on the EE
+	// thread, which runs the code (WasmJitRuntime.h). When a block is hot, the EE thread copies what the build reads
+	// (CodeSnapshot) and goes on interpreting; a thread builds the module, and the dispatcher installs it once it
+	// is ready (InstallGroup(), which checks the code is still the same). One job at a time.
+
+	struct CompileJob
+	{
+		u32 entry;
+		u64 generation;
+		CodeSnapshot snap;
+		GroupBuild build;
+		bool built = false;
+	};
+
+	std::mutex s_job_mutex;
+	std::condition_variable s_job_cv;
+	CompileJob* s_job_in = nullptr; // handed to the thread (under s_job_mutex)
+	std::atomic<CompileJob*> s_job_done{nullptr}; // built, for the dispatcher
+	CompileJob* s_job_busy = nullptr; // EE thread: the job in flight
+	bool s_worker_started = false;
+
+	void CompileThread()
+	{
+		Threading::SetNameOfCurrentThread("EE JIT build");
+		for (;;)
+		{
+			CompileJob* job;
+			{
+				std::unique_lock lock(s_job_mutex);
+				s_job_cv.wait(lock, [] { return s_job_in != nullptr; });
+				job = s_job_in;
+				s_job_in = nullptr;
+			}
+			job->built = BuildGroup(job->entry, &job->snap, &job->build);
+			s_job_done.store(job, std::memory_order_release);
+		}
+	}
+
+	// Copies the page of pc (once) into the snapshot, and the page before it (an idle loop that ends in this page may
+	// start there, AddSpinSite()). False if pc is not in memory.
+	bool SnapPage(CodeSnapshot& snap, u32 pc, bool with_previous = true)
+	{
+		if (snap.Find(pc))
+			return true;
+		if (with_previous && pc >= 4096)
+			SnapPage(snap, pc - 4096, false);
+		const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
+		if (vmv.isHandler(pc))
+			return false;
+		CodeSnapshot::Page p;
+		p.vpage = pc & ~4095u;
+		p.raw = vmv.raw();
+		p.host = reinterpret_cast<const u32*>(vmv.assumePtr(p.vpage));
+		p.words = std::make_unique<u32[]>(kPageWords);
+		std::memcpy(p.words.get(), p.host, 4096);
+		std::fill(std::begin(p.eligible), std::end(p.eligible), 0);
+		if (const int* page = s_pages[pc >> 12])
+		{
+			for (u32 w = 0; w < kPageWords; w++)
+			{
+				if (page[w] == 0 && static_cast<u32>(page[kPageWords + w]) >= JitHeat::ee.neighbour)
+					p.eligible[w / 64] |= 1ull << (w % 64);
+			}
+		}
+		snap.pages.push_back(std::move(p));
+		return true;
+	}
+
+	// Hands the build of entry's module to the code generation thread. False if a job is already in flight.
+	bool SubmitGroup(u32 entry)
+	{
+		if (s_job_busy)
+			return false;
+		if (!s_worker_started)
+		{
+			std::thread(CompileThread).detach();
+			s_worker_started = true;
+		}
+		Common::Timer timer;
+		auto job = std::make_unique<CompileJob>();
+		job->entry = entry;
+		job->generation = s_generation;
+		if (!SnapPage(job->snap, entry))
+			return false;
+		// The warm entries the build may take (a module holds kMaxModuleBlocks blocks at most).
+		for (size_t i = 0; i < s_warm.size() && job->snap.warm.size() < 2 * kMaxModuleBlocks; i++)
+		{
+			const u32 pc = s_warm[i];
+			if (SlotRef(pc) == 0 && static_cast<u32>(HeatRef(pc)) >= JitHeat::ee.batch && SnapPage(job->snap, pc))
+				job->snap.warm.push_back(pc);
+		}
+		s_bg_snapshot_ns += static_cast<u64>(timer.GetTimeNanoseconds());
+		s_bg_jobs++;
+		s_job_busy = job.release();
+		{
+			std::lock_guard lock(s_job_mutex);
+			s_job_in = s_job_busy;
+		}
+		s_job_cv.notify_one();
+		return true;
+	}
+
+	// At the dispatcher: installs the job's module once it is built.
+	void PollGroup()
+	{
+		CompileJob* const job = s_job_done.load(std::memory_order_acquire);
+		if (!job)
+			return;
+		s_job_done.store(nullptr, std::memory_order_relaxed);
+		s_job_busy = nullptr;
+		std::unique_ptr<CompileJob> owned(job);
+		if (job->generation != s_generation || !job->built)
+		{
+			s_bg_stale++;
+			return;
+		}
+		// The warm entries it took leave the warm list, as CompileGroup() does.
+		for (u32 pc : job->build.pcs)
+		{
+			const auto it = std::find(s_warm.begin(), s_warm.end(), pc);
+			if (it != s_warm.end())
+				s_warm.erase(it);
+		}
+		if (InstallGroup(job->entry, job->build, true))
+			s_bg_installed++;
+	}
+
+	// A list entry whose code is in memory, as listed, and not compiled.
+	bool ListedAndUncompiled(const ListEntry& e)
+	{
+		const int* page = s_pages[e.pc >> 12];
+		u32 hash;
+		return !(page && page[(e.pc >> 2) & (kPageWords - 1)]) && CodeHash(e.pc, &hash) && hash == e.hash;
+	}
+
+	// Once a vsync, at the dispatcher: takes a list the page handed over.
+	void CodeListVsync()
+	{
+		s_ahead_frame = g_FrameCount;
+		if (s_code_slot.word0.load(std::memory_order_acquire) == EEJit::CODE_SLOT_READY)
+		{
+			const u32 n = std::min(s_code_slot.count.load(std::memory_order_relaxed), EEJit::kCodeListCapacity);
+			if (EEJit::g_ahead && s_code_slot.version[0] == EEJit::kCodeListVersion)
+			{
+				s_list.clear();
+				for (u32 i = 0; i < n; i++)
+					s_list.push_back({s_code_slot.entries[2 * i], s_code_slot.entries[2 * i + 1]});
+				s_list_cursor = 0;
+				Console.WriteLn("EE JIT: a code list of %u blocks from an earlier run.", n);
+			}
+			s_code_slot.word0.store(EEJit::CODE_SLOT_FREE, std::memory_order_release);
+		}
 	}
 
 	u64 s_trace_step = 0, s_trace_hash = 0xcbf29ce484222325ull;
@@ -3893,12 +4290,17 @@ void EEJit::Execute()
 	}();
 	s_link = can_link && g_link;
 
+	s_running = true;
 	u32* const block_cycles = intJitBlockCycles();
 	// Whether the PC was reached by a jump, a taken branch or an exception, or by leaving compiled code: the
 	// places blocks start, whose runs count towards compiling them (JitHeat.h).
 	bool entry = true;
 	for (;;)
 	{
+		if (g_FrameCount != s_ahead_frame) [[unlikely]]
+			CodeListVsync();
+		if (s_job_busy) [[unlikely]]
+			PollGroup();
 		const u32 pc = cpuRegs.pc;
 		int* const page = s_pages[pc >> 12];
 		int slot = page ? page[(pc >> 2) & (kPageWords - 1)] : 0;
@@ -3926,14 +4328,26 @@ void EEJit::Execute()
 			FlushAll(true);
 		const bool aligned = (pc & 3) == 0;
 		const bool compile = JitHeat::ee.threshold <= 1 ? aligned && JitHeat::CanCompile() : entry && aligned && Warm(pc);
-		if (!compile || !CompileGroup(pc))
+		// On the code generation thread unless counting statistics (which the build updates without locks).
+		const bool background = g_background && !g_stats;
+		if (!compile || (background ? (SubmitGroup(pc), true) : !CompileGroup(pc)))
 		{
 			if (s_failed)
 				return;
 			s_interp_steps++;
 			if (g_stats)
 				s_interp_pcs[pc]++;
-			intJitExecOne();
+			if (g_stats && (s_interp_steps & 63) == 0) // one step in 64 timed, less the timer's own cost
+			{
+				const u64 t0 = Common::Timer::GetCurrentValue();
+				const u64 t1 = Common::Timer::GetCurrentValue();
+				intJitExecOne();
+				const u64 t2 = Common::Timer::GetCurrentValue();
+				const s64 d = static_cast<s64>(t2 - t1) - static_cast<s64>(t1 - t0);
+				s_interp_ns += 64 * static_cast<u64>(std::max<double>(0, Common::Timer::ConvertValueToNanoseconds(static_cast<u64>(std::max<s64>(d, 0)))));
+			}
+			else
+				intJitExecOne();
 			entry = cpuRegs.pc != pc + 4;
 		}
 	}
@@ -4013,8 +4427,17 @@ void EEJit::PrintStats()
 		g_mode ? "on" : "off", static_cast<unsigned long long>(s_blocks_compiled),
 		static_cast<unsigned long long>(s_groups_compiled), static_cast<unsigned long long>(s_wasm_bytes / 1024),
 		s_compile_ns / 1e6, s_max_module_ns / 1e6, static_cast<unsigned long long>(s_invalidations), static_cast<unsigned long long>(s_flushes),
-		static_cast<unsigned long long>(s_interp_steps), static_cast<unsigned long long>(s_native_instrs),
-		static_cast<unsigned long long>(s_guest_instrs));
+		static_cast<unsigned long long>(s_interp_steps), static_cast<unsigned long long>(s_native_instrs.load()),
+		static_cast<unsigned long long>(s_guest_instrs.load()));
+	if (s_bg_jobs)
+		Console.WriteLn("EE JIT: built on another thread: %llu modules, %llu installed, %llu dropped (code changed), %llu stale; "
+						"%.1f ms copying for them",
+			static_cast<unsigned long long>(s_bg_jobs), static_cast<unsigned long long>(s_bg_installed),
+			static_cast<unsigned long long>(s_bg_dropped), static_cast<unsigned long long>(s_bg_stale), s_bg_snapshot_ns / 1e6);
+	if (!s_list.empty() || s_ahead_compiles)
+		Console.WriteLn("EE JIT: code list of %zu blocks: %llu modules compiled ahead in %.1f ms; log of %u blocks",
+			s_list.size(), static_cast<unsigned long long>(s_ahead_compiles),
+			s_ahead_ns / 1e6, s_code_log.count.load(std::memory_order_relaxed));
 	Console.WriteLn("EE JIT: idle loops: %zu sites, %llu tries, %llu remembered, %llu skips of %llu iterations (%llu cycles)%s",
 		s_spin_sites.size(), static_cast<unsigned long long>(s_spin_tries), static_cast<unsigned long long>(s_spin_hits),
 		static_cast<unsigned long long>(s_spin_skips),
@@ -4023,6 +4446,8 @@ void EEJit::PrintStats()
 	if (!g_stats)
 		return;
 	Console.WriteLn("EE JIT: %llu blocks called by the dispatcher", static_cast<unsigned long long>(s_dispatches));
+	Console.WriteLn("EE JIT: compile split: %.1f ms generating, %.1f ms engine compile+instantiate; worst vsync %.1f ms; %.1f ms interpreting (timed per step)",
+		s_gen_ns / 1e6, s_engine_ns / 1e6, s_max_frame_compile_ns / 1e6, s_interp_ns / 1e6);
 	Console.WriteLn("EE JIT: idle loop fails: %llu left, %llu load, %llu op, %llu delay slot, %llu changed, %llu wait loops; %llu events due",
 		static_cast<unsigned long long>(s_spin_why[0]), static_cast<unsigned long long>(s_spin_why[1]),
 		static_cast<unsigned long long>(s_spin_why[2]), static_cast<unsigned long long>(s_spin_why[3]),
@@ -4083,4 +4508,88 @@ void EEJit::PrintStats()
 		}
 		Console.WriteLn("  block %08x %12llu:%s", pc, static_cast<unsigned long long>(b[i].first), ops.c_str());
 	}
+}
+
+EEJit::CodeListBlock* EEJit::CodeLog()
+{
+	return &s_code_log;
+}
+
+EEJit::CodeListBlock* EEJit::CodeListSlot()
+{
+	return &s_code_slot;
+}
+
+void EEJit::NewCodeLogSession()
+{
+	s_list.clear(); // a list is for one game: the page hands it over again once it knows the game
+	s_list_cursor = 0;
+	s_logged.clear();
+	s_code_log.version[0] = kCodeListVersion;
+	s_code_log.version[1] = 0;
+	s_code_log.count.store(0, std::memory_order_release);
+	s_code_log.word0.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void EEJit::CompileAhead(u64 deadline)
+{
+	if (!g_ahead || !s_running || s_failed || s_ahead_off || s_list.empty() || !g_mode)
+		return;
+	// A module takes about 2 ms to build and compile (at most about 15): start one only with 3 ms left.
+	const u64 margin = GetTickFrequency() * 3 / 1000;
+	Common::Timer timer;
+	const size_t n = s_list.size();
+	for (size_t scanned = 0; scanned < n; scanned++)
+	{
+		if (GetCPUTicks() + margin >= deadline || s_groups.size() + 1 >= kMaxGroups)
+			break;
+		const ListEntry& e = s_list[s_list_cursor];
+		s_list_cursor = (s_list_cursor + 1) % n;
+		if (!ListedAndUncompiled(e))
+			continue; // compiled, or its code is not in memory (yet)
+		// The next listed blocks in memory go into the same module, as warm entries (CompileGroup() takes them
+		// after the entry's page). Counted as warm, they are also taken as neighbours.
+		std::vector<u32> more;
+		for (size_t i = 1; i < n && more.size() + 1 < kMaxModuleBlocks; i++)
+		{
+			const ListEntry& m = s_list[(s_list_cursor + i - 1) % n];
+			if (ListedAndUncompiled(m))
+				more.push_back(m.pc);
+		}
+		for (u32 pc : more)
+			HeatRef(pc) = std::max(HeatRef(pc), static_cast<int>(JitHeat::ee.batch));
+		HeatRef(e.pc) = std::max(HeatRef(e.pc), static_cast<int>(JitHeat::ee.batch));
+		s_warm.insert(s_warm.begin(), more.begin(), more.end());
+		// Under running code (the limiter runs in the event test): no flush, which would release it.
+		if (CompileGroup(e.pc, false))
+			s_ahead_compiles++;
+	}
+	s_ahead_ns += static_cast<u64>(timer.GetTimeNanoseconds());
+}
+
+bool EEJit::LoadCodeList(const char* path)
+{
+	FILE* fp = std::fopen(path, "rb");
+	if (!fp)
+		return false;
+	s_list.clear();
+	u32 w[2];
+	while (s_list.size() < kCodeListCapacity && std::fread(w, 4, 2, fp) == 2)
+		s_list.push_back({w[0], w[1]});
+	std::fclose(fp);
+	s_list_cursor = 0;
+	Console.WriteLn("EE JIT: a code list of %zu blocks from %s.", s_list.size(), path);
+	return true;
+}
+
+bool EEJit::SaveCodeLog(const char* path)
+{
+	FILE* fp = std::fopen(path, "wb");
+	if (!fp)
+		return false;
+	const u32 n = s_code_log.count.load(std::memory_order_acquire);
+	const bool ok = std::fwrite(s_code_log.entries, 8, n, fp) == n;
+	std::fclose(fp);
+	Console.WriteLn("EE JIT: the code log of %u blocks written to %s.", n, path);
+	return ok;
 }

@@ -81,6 +81,7 @@ static bool s_unlimited = false;
 static std::vector<s64> s_disc_check_lsns;
 static std::string s_load_state_path;
 static std::string s_save_state_path;
+static std::string s_code_list_path, s_code_log_path; // -eejit-list, -eejit-list-out
 static bool s_disc_check = false;
 static std::string s_wav_path;
 static WavOutput::Clock s_wav_clock = WavOutput::Clock::Emulated;
@@ -416,6 +417,18 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 			EEJit::g_stats = true;
 		else if (arg == "-eejit-spin" && has_value)
 			EEJit::g_spin = StringUtil::FromChars<int>(argv[++i]).value_or(1) != 0;
+		else if (arg == "-eejit-bg" && has_value)
+			EEJit::g_background = StringUtil::FromChars<int>(argv[++i]).value_or(1) != 0;
+		else if (arg == "-eejit-ahead" && has_value)
+		{
+			const int ahead = StringUtil::FromChars<int>(argv[++i]).value_or(1);
+			EEJit::g_ahead = ahead != 0;
+			EEJit::g_ahead_test = ahead == 2;
+		}
+		else if (arg == "-eejit-list" && has_value)
+			s_code_list_path = argv[++i];
+		else if (arg == "-eejit-list-out" && has_value)
+			s_code_log_path = argv[++i];
 		else if ((arg == "-eejit-hot" || arg == "-iopjit-hot") && has_value)
 		{
 			// N[,M[,B]]: compile block entries on their Nth run, with the neighbours that ran M times and the entries that ran B times (JitHeat.h).
@@ -466,12 +479,16 @@ static bool ParseCommandLineArgs(int argc, char* argv[])
 								 "         [-wav FILE.wav [-wav-realtime [-wav-period FRAMES]]]\n"
 								 "         [-set Section/Key=Value]... [-disc-check [LSN,LSN,...]] [disc image]\n"
 								 "         [-eejit 0|1] [-eejit-link 0|1] [-iopjit 0|1] [-eejit-stats] [-eejit-trace SHIFT[,FROM,TO]] [-eejit-mask BITS]\n"
-								 "         [-eejit-spin 0|1]\n"
+								 "         [-eejit-spin 0|1] [-eejit-bg 0|1] [-eejit-ahead 0|1] [-eejit-list FILE] [-eejit-list-out FILE]\n"
 								 "         [-eejit-hot N[,M[,B]]] [-iopjit-hot N[,M[,B]]] [-jit-budget US] [-jit-compile-stats VSYNCS]\n",
 				argv[0]);
 			std::fprintf(stderr, "  -eejit 0 runs the EE interpreter instead of the EE JIT, -iopjit 0 the IOP interpreter instead of the IOP JIT;\n"
 								 "  -eejit-trace prints EE and IOP state hashes to compare runs.\n"
 								 "  -eejit-spin 0 runs idle loops iteration by iteration instead of skipping to the next event.\n"
+								 "  -eejit-list-out writes the EE JIT's code log (the blocks it compiled) to FILE at the end; -eejit-list\n"
+								 "         uses such a file as the code list: those blocks compile on their first run, and ahead when the\n"
+								 "         frame limiter has time left. -eejit-ahead 0 ignores code lists (2: compiles ahead every vsync, a test mode). -eejit-bg 0 builds EE JIT\n"
+								 "         modules on the EE thread instead of a thread of their own.\n"
 								 "  -eejit-hot and -iopjit-hot compile a block entry on its Nth run, with the neighbours in its page that\n"
 								 "         ran M times (0: all) and the entries of any page that ran B times (default 128,1,64; 1\n"
 								 "         compiles everything on its first run). -jit-budget caps the EE and IOP JITs' compile time per\n"
@@ -839,6 +856,9 @@ static void CPUThreadMain(std::atomic<int>* ret)
 		params.elf_override = s_elf_path.empty() ? std::string() : Path::RealPath(s_elf_path);
 		params.save_state = s_load_state_path;
 		params.start_unlimited = s_unlimited;
+		EEJit::NewCodeLogSession();
+		if (!s_code_list_path.empty() && !EEJit::LoadCodeList(s_code_list_path.c_str()))
+			Console.ErrorFmt("Headless: could not read the code list '{}'", s_code_list_path);
 
 		const VMBootResult result = VMManager::Initialize(params);
 		if (result == VMBootResult::StartupSuccess)
@@ -883,6 +903,8 @@ static void CPUThreadMain(std::atomic<int>* ret)
 				if (!save_failed)
 					INFO_LOG("Headless: saved state to '{}'", s_save_state_path);
 			}
+			if (!s_code_log_path.empty() && !EEJit::SaveCodeLog(s_code_log_path.c_str()))
+				Console.ErrorFmt("Headless: could not write the code log '{}'", s_code_log_path);
 			GSJoinSnapshotThreads();
 			VMManager::Shutdown(false);
 			ret->store(save_failed ? EXIT_FAILURE : EXIT_SUCCESS);

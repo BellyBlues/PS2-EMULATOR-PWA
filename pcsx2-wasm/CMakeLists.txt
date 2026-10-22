@@ -92,6 +92,11 @@ list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_tfx_log
 	_pcsx2web_tfx_prewarm
 )
+# Per-game EE JIT code lists (Main.cpp, EEJit.h).
+list(APPEND PCSX2_WASM_EXPORTS
+	_pcsx2web_ee_code_log
+	_pcsx2web_ee_code_list
+)
 # Audio (Main.cpp, "Audio").
 list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_audio_start

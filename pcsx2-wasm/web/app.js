@@ -3149,8 +3149,10 @@
 		disc.runTitle = title;
 		disc.runSerial = serial;
 		pageLog(`Game: ${title || 'not in the game database'}${serial ? ` (${serial})` : ''}`);
-		if (newSerial)
+		if (newSerial) {
 			pipeGameKnown(serial);
+			codeGameKnown(serial);
+		}
 		const d = disc.current;
 		if (title && d && d.title !== title) {
 			d.title = title;
@@ -3168,9 +3170,11 @@
 				if (page.vmState === STATE.STOPPED || page.vmState === STATE.FAILED) {
 					checkMemoryCards(true); // a normal Stop closed the card: keep it now
 					pipeVmStopped();
+					codeVmStopped();
 				}
 			}
 			pipeTick();
+			codeTick();
 		}
 		checkMemoryCards(false);
 		const running = disc.runIsDisc && disc.current && pageState() === 'running';
@@ -3370,6 +3374,185 @@
 		if (buf && M && typeof M._pcsx2web_tfx_log === 'function')
 			pipes.staleSession = Atomics.load(new Uint32Array(buf, M._pcsx2web_tfx_log() >>> 0, 1), 0);
 		pipes.serial = '';
+	}
+
+	// ------------------------------------------------------------------ code lists
+	// The EE JIT logs the blocks it compiles (pcsx2web_ee_code_log(): a PC and a hash of its code each). The page
+	// keeps them per game serial in IndexedDB (CODE_IDB_NAME) and, when the same game boots again, hands the list
+	// to the EE thread (pcsx2web_ee_code_list()), which compiles those blocks ahead when the frame limiter has time
+	// left, before the game runs them (README "Code lists"). ?codelist=0 keeps the lists but does not hand them over.
+	const CODE_IDB_NAME = 'pcsx2-web-code';
+	const CODE_IDB_STORE = 'ee';
+	const CODE_ENTRY_BYTES = 8; // PC, hash
+	const CODE_CAPACITY = 32768; // EEJit::kCodeListCapacity
+	const CODE_HEADER_BYTES = 16; // session or state, count, version lo, version hi
+	const CODE_SLOT_FREE = 0;
+	const CODE_SLOT_WRITING = 1;
+	const CODE_SLOT_READY = 2;
+	const CODE_READ_MS = 2000;
+	const CODE_SAVE_MS = 15000;
+	const codes = {
+		serial: '', session: -1, staleSession: -1, read: 0, version: null, used: [], usedSet: new Set(),
+		stored: null, handOver: null, dirty: false, lastRead: 0, lastSave: 0, writes: Promise.resolve(), warned: false,
+	};
+
+	function codeIdb(mode, fn) {
+		return new Promise((resolve, reject) => {
+			if (typeof indexedDB === 'undefined') {
+				reject(new Error('IndexedDB is not available'));
+				return;
+			}
+			const open = indexedDB.open(CODE_IDB_NAME, 1);
+			open.onupgradeneeded = () => open.result.createObjectStore(CODE_IDB_STORE);
+			open.onblocked = () => reject(new Error('IndexedDB open blocked'));
+			open.onerror = () => reject(open.error);
+			open.onsuccess = () => {
+				const db = open.result;
+				const tx = db.transaction(CODE_IDB_STORE, mode);
+				const req = fn(tx.objectStore(CODE_IDB_STORE));
+				let result;
+				req.onsuccess = () => { result = req.result; };
+				tx.oncomplete = () => { db.close(); resolve(result); };
+				tx.onerror = () => { db.close(); reject(tx.error || req.error); };
+				tx.onabort = () => { db.close(); reject(tx.error || new Error('IndexedDB transaction aborted')); };
+			};
+		});
+	}
+
+	function codeWarn(what, err) {
+		if (codes.warned)
+			return;
+		codes.warned = true;
+		pageLog(`Code list: could not ${what} (${err && err.message}); the game compiles its code as it runs it.`, 'warn');
+	}
+
+	// The game's serial is known (readGameDetails()): start its list, and hand the stored one over.
+	function codeGameKnown(serial) {
+		const M = window.Module;
+		codes.serial = serial;
+		codes.read = 0;
+		codes.used = [];
+		codes.usedSet = new Set();
+		codes.stored = null;
+		codes.handOver = null;
+		codes.dirty = false;
+		if (!serial || !M || typeof M._pcsx2web_ee_code_log !== 'function')
+			return;
+		codeIdb('readonly', (s) => s.get(serial)).then((rec) => {
+			if (codes.serial !== serial || !rec || !(rec.entries instanceof ArrayBuffer) || !Array.isArray(rec.version))
+				return;
+			codes.stored = rec;
+			if (params.get('codelist') === '0')
+				return;
+			codes.handOver = rec;
+			codeHandOver();
+		}).catch((err) => codeWarn('read the stored list', err));
+	}
+
+	// Writes the list into the EE thread's slot, unless it is taking an earlier one (then the next tick tries again).
+	function codeHandOver() {
+		const rec = codes.handOver;
+		const buf = heapBuffer();
+		if (!rec || !buf)
+			return;
+		const ptr = window.Module._pcsx2web_ee_code_list() >>> 0;
+		const words = new Int32Array(buf, ptr, CODE_HEADER_BYTES / 4);
+		if (Atomics.compareExchange(words, 0, CODE_SLOT_FREE, CODE_SLOT_WRITING) !== CODE_SLOT_FREE &&
+			Atomics.compareExchange(words, 0, CODE_SLOT_READY, CODE_SLOT_WRITING) !== CODE_SLOT_READY)
+			return;
+		codes.handOver = null;
+		const n = Math.min(Math.floor(rec.entries.byteLength / CODE_ENTRY_BYTES), CODE_CAPACITY);
+		new Uint8Array(buf, ptr + CODE_HEADER_BYTES, n * CODE_ENTRY_BYTES).set(new Uint8Array(rec.entries, 0, n * CODE_ENTRY_BYTES));
+		words[2] = rec.version[0] | 0;
+		words[3] = rec.version[1] | 0;
+		Atomics.store(words, 1, n);
+		Atomics.store(words, 0, CODE_SLOT_READY);
+		pageLog(`Code list: ${n} blocks of code this game ran before, to compile ahead.`);
+	}
+
+	// Copies the entries logged since the last read (a session is one VM's log).
+	function codeRead() {
+		const M = window.Module;
+		const buf = heapBuffer();
+		if (!codes.serial || !buf || !M || typeof M._pcsx2web_ee_code_log !== 'function')
+			return;
+		const ptr = M._pcsx2web_ee_code_log() >>> 0;
+		const words = new Uint32Array(buf, ptr, CODE_HEADER_BYTES / 4);
+		const session = Atomics.load(words, 0);
+		if (session === codes.staleSession)
+			return; // the log of the VM that ran before this game's
+		if (session !== codes.session) {
+			codes.session = session;
+			codes.read = 0;
+		}
+		const count = Math.min(Atomics.load(words, 1), CODE_CAPACITY);
+		const version = [Atomics.load(words, 2) >>> 0, Atomics.load(words, 3) >>> 0];
+		if (count <= codes.read)
+			return;
+		const entries = new Uint32Array(buf, ptr + CODE_HEADER_BYTES + codes.read * CODE_ENTRY_BYTES, (count - codes.read) * 2).slice();
+		if (Atomics.load(words, 0) !== session)
+			return; // a new log started meanwhile: the next read starts it over
+		codes.version = version;
+		for (let i = 0; i < entries.length; i += 2) {
+			const id = `${entries[i]}:${entries[i + 1]}`;
+			if (!codes.usedSet.has(id)) {
+				codes.usedSet.add(id);
+				codes.used.push([entries[i], entries[i + 1]]);
+				codes.dirty = true;
+			}
+		}
+		codes.read = count;
+	}
+
+	// Stores this session's blocks, in the order they were compiled, then the stored ones of the same version it
+	// did not compile, up to CODE_CAPACITY.
+	function codeSave() {
+		codeRead();
+		if (!codes.dirty || !codes.serial || !codes.version)
+			return;
+		const serial = codes.serial;
+		const version = codes.version;
+		const list = codes.used.slice(0, CODE_CAPACITY);
+		const old = codes.stored;
+		if (old && old.version[0] === version[0] && old.version[1] === version[1]) {
+			const ob = new Uint32Array(old.entries);
+			for (let i = 0; i + 1 < ob.length && list.length < CODE_CAPACITY; i += 2) {
+				if (!codes.usedSet.has(`${ob[i]}:${ob[i + 1]}`))
+					list.push([ob[i], ob[i + 1]]);
+			}
+		}
+		const out = new Uint32Array(list.length * 2);
+		list.forEach(([pc, hash], i) => { out[2 * i] = pc; out[2 * i + 1] = hash; });
+		const rec = { version, entries: out.buffer, savedAt: Date.now() };
+		codes.dirty = false;
+		codes.stored = rec;
+		codes.lastSave = performance.now();
+		// One write after another, so that an older list never lands after a newer one.
+		codes.writes = codes.writes.then(() => codeIdb('readwrite', (s) => s.put(rec, serial)))
+			.catch((err) => codeWarn('store the list', err));
+	}
+
+	function codeTick() {
+		if (codes.handOver)
+			codeHandOver();
+		const now = performance.now();
+		if (!codes.serial || now - codes.lastRead < CODE_READ_MS)
+			return;
+		codes.lastRead = now;
+		codeRead();
+		if (codes.dirty && now - codes.lastSave >= CODE_SAVE_MS)
+			codeSave();
+	}
+
+	// The VM stopped: keep what it compiled, and ignore its log from now on (the next VM starts a new session).
+	function codeVmStopped() {
+		const M = window.Module;
+		const buf = heapBuffer();
+		if (codes.serial)
+			codeSave();
+		if (buf && M && typeof M._pcsx2web_ee_code_log === 'function')
+			codes.staleSession = Atomics.load(new Uint32Array(buf, M._pcsx2web_ee_code_log() >>> 0, 1), 0);
+		codes.serial = '';
 	}
 
 	// ---- the slate, the disc menu

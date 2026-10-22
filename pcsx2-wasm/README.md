@@ -172,6 +172,23 @@ key means (the key's layout, `tfx.wgsl`, the shader macros each selector bit set
 formats); the GS thread ignores a list made by a build whose keys meant something else, and the next
 save replaces it. Only disc boots with a serial keep a list.
 
+### Code lists
+
+The EE JIT compiles game code once a block has run often enough, within 4 ms of compiling per vsync
+(`pcsx2/wasm/JitHeat.h`); until then the interpreter runs it. Building a module, about three quarters
+of compiling it, runs on a thread of its own: the EE thread copies the code it reads, goes on
+interpreting, and only compiles the finished module with the browser's engine (`pcsx2/wasm/EEJit.cpp`,
+`CompileJob`). The page also keeps, per game, the list of blocks the JIT compiled, so that the next
+time the game runs, they compile when the frame limiter has time left (loading screens, light
+scenes) before the game reaches them. The JIT logs each block it compiles, its PC and a hash of its
+first words (`pcsx2web_ee_code_log()`); every 2 s the page copies new ones and stores the list in the
+IndexedDB database `pcsx2-web-code` (store `ee`, keyed by the game's serial:
+`{version, entries, savedAt}`, `entries` two 32-bit words per block, at most 32768) every 15 s while it
+grows and when the VM stops. When the game's serial is known, the page writes the stored list into the
+EE thread's slot (`pcsx2web_ee_code_list()`), which takes it at its next vsync. A listed block is
+compiled ahead only when its code is in memory with the same hash; compiling earlier changes when
+code is compiled, never what it does. `?codelist=0` keeps the lists without handing them over.
+
 A linked card is read from its file when it is plugged in (the file wins over the browser's copy).
 After a reload it stays plugged in only if the browser still allows the page to write the file;
 otherwise it comes back unplugged, and choosing it in the slot's menu asks for permission. A file that
@@ -535,6 +552,8 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_audio_start()` | start the sound worklet in `Module.pcsx2webAudioContext` (an AudioContext the page made); it calls `Module.pcsx2webAudioReady(node)` when the node exists, or with `null` if it failed; 0 if started, -1 if a start already ran or there is no context |
 | `pcsx2web_audio()` | address of the audio block: 16 u32 words (see Sound) |
 | `pcsx2web_tfx_log()` | address of the log of TFX pipeline keys the WebGPU HW renderer's draws asked for since its device started: `session, count, version lo, version hi` (u32), then `count` keys of 36 bytes; `session` changes when a new device starts a new log (see Pipeline lists) |
+| `pcsx2web_ee_code_log()` | address of the EE JIT's code log since the VM started: session, count, version (two words), then count entries of PC and code hash |
+| `pcsx2web_ee_code_list()` | address of the slot a stored code list is written into, the same layout with a state for its first word: 0 free, 1 the page is writing, 2 ready. The page claims it by compare-exchange (0 or 2 to 1), writes the entries, version and count, then stores 2; the EE thread takes it at its next vsync |
 | `pcsx2web_tfx_prewarm()` | address of the prewarm slot, the same layout with a state for its first word: 0 free, 1 the page is writing, 2 ready, 3 the GS thread is taking it. The page claims it by compare-exchange (0 or 2 to 1), writes the keys, count and version, then stores 2 |
 
 On the 2D path, each animation frame the page reads `seq` with `Atomics.load`; when it changed, it copies
