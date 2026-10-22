@@ -180,6 +180,8 @@
 		otherOrigin: '?bios= only accepts addresses on this server.',
 		elfFetchFailed: (path, why) => `Couldn’t fetch the ELF from ${path} (${why}).`,
 		elfOtherOrigin: '?elf= only accepts addresses on this server.',
+		stateFetchFailed: (path, why) => `Couldn’t fetch the save state from ${path} (${why}).`,
+		stateOtherOrigin: '?state= only accepts addresses on this server.',
 		stored: { idb: 'Remembered in this browser', visit: 'This visit only', url: 'Loaded from ?bios=, not saved' },
 		boot: 'Boot',
 		another: 'Use another BIOS…',
@@ -317,6 +319,10 @@
 		recCopyLabel: $('rec-copy-label'),
 		recDownload: $('rec-download'),
 		recClose: $('rec-close'),
+		stateSave: $('state-save'),
+		stateSaveLabel: $('state-save-label'),
+		stateLoad: $('state-load'),
+		stateLoadLabel: $('state-load-label'),
 		recEmpty: $('rec-empty'),
 		recChart: $('rec-chart'),
 		recCrop: $('rec-crop'),
@@ -1451,6 +1457,7 @@
 
 	function onVmStateChange(prev, state) {
 		page.vmState = state;
+		stateRender();
 		pageLog(`VM state: ${STATE_NAMES[prev] || prev} -> ${STATE_NAMES[state] || state}`);
 		if (state !== STATE.RUNNING)
 			releaseAllKeys(true);
@@ -1471,7 +1478,7 @@
 	}
 
 	function canBoot() {
-		return page.phase === 'ready' && !!page.bios && !!page.writtenBiosName && !page.biosReading && discBootable() && !devElf.pending &&
+		return page.phase === 'ready' && !!page.bios && !!page.writtenBiosName && !page.biosReading && discBootable() && !devElf.pending && !devState.pending &&
 			(page.vmState === STATE.WAITING || page.vmState === STATE.STOPPED || page.vmState === STATE.FAILED);
 	}
 
@@ -2925,8 +2932,148 @@
 		return window.Module.ccall('pcsx2web_boot_elf', 'number', ['string', 'string'], [page.bios.name, path]);
 	}
 
+	// Developer save states (?threads=1, ?state=): snapshots of the whole emulated machine, not memory card saves.
+	// Save state writes one at the CPU thread's next pause and downloads it; Load state puts the last one saved
+	// (or given with ?state=) back into the running game. ?state=<url>, a file on this server (dev-bios/<name> with
+	// serve.py --bios-dir), is also loaded by the next boot once the game has started.
+	const STATE_DIR = '/states';
+	const STATE_TIMEOUT_MS = 60000;
+	const devState = { pending: false, bootName: null, bootBytes: null, bytes: null, busy: null };
+
+	async function loadStateFromUrl(param) {
+		const fail = (text, detail) => {
+			devState.pending = false;
+			page.autoBoot = false;
+			showError(text);
+			if (detail)
+				pageLog(detail, 'warn');
+			render();
+		};
+		let url;
+		try {
+			url = new URL(param, location.href);
+		} catch {
+			fail(COPY.stateFetchFailed(param, 'not a valid address'));
+			return;
+		}
+		if (url.origin !== location.origin) {
+			fail(COPY.stateOtherOrigin, `Refusing to fetch a save state from another origin: ${url.href}`);
+			return;
+		}
+		let base = url.pathname.split('/').pop() || '';
+		try {
+			base = decodeURIComponent(base);
+		} catch {
+			// keep it encoded
+		}
+		pageLog(`Fetching the save state from ${url.pathname}`);
+		try {
+			const response = await fetch(url.href, { credentials: 'same-origin', cache: 'no-store' });
+			if (!response.ok)
+				throw httpError(response.status, response.statusText, url.pathname);
+			devState.bootBytes = new Uint8Array(await response.arrayBuffer());
+		} catch (err) {
+			fail(COPY.stateFetchFailed(url.pathname, downloadReason(err)), `Could not fetch the save state from ${url.pathname}: ${errorText(err)}`);
+			return;
+		}
+		devState.bootName = sanitizeBiosName(base || 'boot.p2s');
+		devState.bytes = devState.bootBytes;
+		devState.pending = false;
+		pageLog(`Save state fetched: ${devState.bootName} (${devState.bootBytes.length.toLocaleString('en-US')} bytes); the next boot loads it.`);
+		stateRender();
+		maybeAutoBoot();
+	}
+
+	function writeStateFile(name, bytes) {
+		const FS = window.Module.FS;
+		if (!FS.analyzePath(STATE_DIR).exists)
+			FS.mkdir(STATE_DIR);
+		const path = `${STATE_DIR}/${name}`;
+		FS.writeFile(path, bytes);
+		return path;
+	}
+
+	// bootRequest(): the ?state= state for this boot, or none.
+	function setBootState() {
+		if (typeof window.Module._pcsx2web_set_boot_state !== 'function')
+			return;
+		const path = devState.bootBytes ? writeStateFile(devState.bootName, devState.bootBytes) : '';
+		if (path)
+			pageLog(`The boot loads the save state ${path}.`);
+		window.Module.ccall('pcsx2web_set_boot_state', 'number', ['string'], [path]);
+	}
+
+	function stateOperation(kind) {
+		const M = window.Module;
+		if (devState.busy || page.vmState !== STATE.RUNNING || !M || typeof M._pcsx2web_state_result !== 'function')
+			return;
+		if (kind === 'load' && !devState.bytes)
+			return;
+		const save = kind === 'save';
+		const path = save ? `${STATE_DIR}/snapshot.p2s` : writeStateFile('restore.p2s', devState.bytes);
+		if (save && !M.FS.analyzePath(STATE_DIR).exists)
+			M.FS.mkdir(STATE_DIR);
+		const before = M._pcsx2web_state_result() >>> 0;
+		if (M.ccall(save ? 'pcsx2web_save_state' : 'pcsx2web_load_state', 'number', ['string'], [path]) !== 0) {
+			pageLog(`${save ? 'Saving' : 'Loading'} the state was refused.`, 'warn');
+			return;
+		}
+		devState.busy = kind;
+		stateRender();
+		const started = performance.now();
+		const finish = (ok, why) => {
+			devState.busy = null;
+			if (ok && save) {
+				const bytes = M.FS.readFile(path);
+				devState.bytes = bytes;
+				const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+				const a = document.createElement('a');
+				const name = (disc.runSerial || disc.runTitle || 'bios').replace(/[^A-Za-z0-9._-]+/g, '-');
+				a.href = url;
+				a.download = `tabstationtoo-state-${name}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.p2s`;
+				document.body.append(a);
+				a.click();
+				a.remove();
+				setTimeout(() => URL.revokeObjectURL(url), 1000);
+				pageLog(`State saved (${bytes.length.toLocaleString('en-US')} bytes) and downloaded as ${a.download}.`);
+				announce('State saved');
+			} else if (ok) {
+				pageLog('State loaded.');
+				announce('State loaded');
+			} else {
+				pageLog(`${save ? 'Saving' : 'Loading'} the state failed${why ? `: ${why}` : ' (see the log)'}.`, 'warn');
+				announce(save ? 'Saving the state failed' : 'Loading the state failed');
+			}
+			stateRender();
+		};
+		const check = () => {
+			const result = M._pcsx2web_state_result() >>> 0;
+			if (result !== before) {
+				finish((result & 1) === 1);
+				return;
+			}
+			if (performance.now() - started > STATE_TIMEOUT_MS) {
+				finish(false, 'no answer from the emulator');
+				return;
+			}
+			setTimeout(check, 100);
+		};
+		setTimeout(check, 100);
+	}
+
+	function stateRender() {
+		if (!els.stateSave)
+			return;
+		const running = page.vmState === STATE.RUNNING;
+		els.stateSave.disabled = !running || !!devState.busy;
+		els.stateLoad.disabled = !running || !!devState.busy || !devState.bytes;
+		setText(els.stateSaveLabel, devState.busy === 'save' ? 'Saving…' : 'Save state');
+		setText(els.stateLoadLabel, devState.busy === 'load' ? 'Loading…' : 'Load state');
+	}
+
 	// startVm(): an ELF boot with ?elf=, a disc boot when a disc is open, otherwise the BIOS alone.
 	function bootRequest() {
+		setBootState();
 		if (devElf.bytes) {
 			disc.runIsDisc = false;
 			return bootElfRequest();
@@ -8421,6 +8568,8 @@
 		els.recToggle.addEventListener('click', () => (rec.recording ? recStop() : recStart()));
 		els.recCopy.addEventListener('click', () => copyText(recText(), els.recCopyLabel));
 		els.recDownload.addEventListener('click', recDownload);
+		els.stateSave.addEventListener('click', () => stateOperation('save'));
+		els.stateLoad.addEventListener('click', () => stateOperation('load'));
 		for (const input of [els.recFrom, els.recTo]) {
 			input.addEventListener('input', () => {
 				const a = Number(els.recFrom.value), b = Number(els.recTo.value);
@@ -8561,8 +8710,10 @@
 		const biosParam = params.get('bios');
 		const discParam = params.get('disc');
 		const elfParam = params.get('elf');
+		const stateParam = params.get('state');
 		disc.urlPending = !!discParam; // a queued ?bios= boot waits for the ?disc= check
 		devElf.pending = !!elfParam; // and for the ?elf= download
+		devState.pending = !!stateParam; // and for the ?state= download
 		// Touch-only devices: the download waits for a BIOS.
 		if (!touchOnlyQuery.matches || biosParam)
 			ensureRuntime();
@@ -8578,6 +8729,8 @@
 			loadRememberedDisc();
 		if (elfParam)
 			loadElfFromUrl(elfParam);
+		if (stateParam)
+			loadStateFromUrl(stateParam);
 	}
 
 	main();

@@ -295,6 +295,8 @@ static std::atomic<u32> s_pad_snapshot[NUM_PAD_PORTS][PAD_SNAPSHOT_WORDS];
 static constexpr const char* DISC_DIRECTORY = "/disc";
 static constexpr const char* ELF_DIRECTORY = "/elf";
 static constexpr const char* MEMCARD_DIRECTORY = "/memcards";
+// Developer save states (?threads=1, ?state=): files the page writes or reads directly inside /states.
+static constexpr const char* STATE_DIRECTORY = "/states";
 
 // pcsx2web_boot_disc() flags.
 static constexpr int BOOT_FLAG_FULL_BOOT = 1; // run the BIOS intro instead of fast boot
@@ -304,6 +306,11 @@ static constexpr int BOOT_FLAG_ELF = 2; // internal: s_boot_disc_path is an ELF 
 // pcsx2web_boot_elf() between its claim of the STARTING state and the request, taken by RunVM() on
 // the CPU thread.
 static char s_boot_disc_path[512];
+// The state the next boot loads (pcsx2web_set_boot_state()); empty for none. Written by the page while no VM starts
+// or runs, read by the CPU thread at the start of RunVM().
+static char s_boot_state_path[512];
+// Save state results for the page: (sequence << 1) | ok, the sequence counting finished saves and loads.
+static std::atomic<unsigned int> s_state_result{0};
 static std::atomic<int> s_boot_disc_flags{0};
 static std::atomic<bool> s_boot_disc_requested{false};
 
@@ -433,6 +440,11 @@ static BootDisc TakeBootDisc()
 // RunVM() has set up a BIOS boot (no disc, no fast boot); a disc or ELF boot changes that.
 static void MakeBootParameters(const std::string& bios_name, const BootDisc& disc, VMBootParameters* params)
 {
+	if (s_boot_state_path[0])
+	{
+		params->save_state = s_boot_state_path;
+		Console.WriteLnFmt("pcsx2-wasm: the boot loads the state '{}'", s_boot_state_path);
+	}
 	if (!disc.elf.empty())
 	{
 		// PCSX2 always fast boots an ELF: the BIOS starts it instead of its menu.
@@ -546,6 +558,81 @@ EMSCRIPTEN_KEEPALIVE int pcsx2web_boot_elf(const char* bios_filename, const char
 	s_boot_request.store(1, std::memory_order_release);
 	emscripten_futex_wake(&s_boot_request, 1);
 	return 0;
+}
+
+// A save state path the page may use: a plain file name directly inside /states.
+static bool IsStatePath(const char* path)
+{
+	const size_t length = std::strlen(path);
+	const size_t dir_length = std::strlen(STATE_DIRECTORY);
+	if (length >= sizeof(s_boot_state_path) || length <= dir_length + 1 ||
+		std::strncmp(path, STATE_DIRECTORY, dir_length) != 0 || path[dir_length] != '/')
+		return false;
+	const char* name = path + dir_length + 1;
+	return !std::strchr(name, '/') && std::strcmp(name, ".") != 0 && std::strcmp(name, "..") != 0;
+}
+
+/// Developer runs (?state=): the save state the next boot loads once the game started (a path the page wrote
+/// directly inside /states), or "" for none. Only while no VM starts or runs. 0 if accepted, -1 otherwise.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_set_boot_state(const char* path)
+{
+	if (!path || (path[0] && !IsStatePath(path)))
+		return -1;
+	const int state = s_state.load(std::memory_order_acquire);
+	if (state == WEB_STATE_STARTING || state == WEB_STATE_RUNNING)
+		return -1;
+	StringUtil::Strlcpy(s_boot_state_path, path, sizeof(s_boot_state_path));
+	return 0;
+}
+
+// Queues a save or load of the state at path on the CPU thread, which publishes the result in s_state_result.
+static int QueueStateOperation(const char* path, bool save)
+{
+	if (!path || !IsStatePath(path) || s_state.load(std::memory_order_acquire) != WEB_STATE_RUNNING)
+		return -1;
+	Host::RunOnCPUThread([path = std::string(path), save]() {
+		bool ok = VMManager::HasValidVM();
+		if (ok && save)
+		{
+			Error error;
+			FileSystem::EnsureDirectoryExists(STATE_DIRECTORY, false, &error);
+			// On this thread, not a compression thread of its own: the page reads the file once this returns.
+			VMManager::SaveState(path.c_str(), false, false, [&ok](const std::string& message) {
+				Console.ErrorFmt("pcsx2-wasm: saving the state failed: {}", message);
+				ok = false;
+			});
+		}
+		else if (ok)
+		{
+			Error error;
+			ok = VMManager::LoadState(path.c_str(), &error);
+			if (!ok)
+				Console.ErrorFmt("pcsx2-wasm: loading the state failed: {}", error.GetDescription());
+		}
+		const unsigned int seq = (s_state_result.load(std::memory_order_relaxed) >> 1) + 1;
+		s_state_result.store((seq << 1) | (ok ? 1u : 0u), std::memory_order_release);
+	});
+	return 0;
+}
+
+/// Developer runs (?threads=1): saves the running VM's state to path (directly inside /states) at the CPU
+/// thread's next pause point. 0 if queued, -1 otherwise; pcsx2web_state_result() changes when it is done.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_save_state(const char* path)
+{
+	return QueueStateOperation(path, true);
+}
+
+/// Developer runs: loads the state at path (directly inside /states) into the running VM. As
+/// pcsx2web_save_state().
+EMSCRIPTEN_KEEPALIVE int pcsx2web_load_state(const char* path)
+{
+	return QueueStateOperation(path, false);
+}
+
+/// (sequence << 1) | ok of the last finished pcsx2web_save_state() or pcsx2web_load_state().
+EMSCRIPTEN_KEEPALIVE unsigned int pcsx2web_state_result(void)
+{
+	return s_state_result.load(std::memory_order_acquire);
 }
 
 /// The disc request block the page's disc worker serves (docs/web-port/DISC-DESIGN.md, 4.1).

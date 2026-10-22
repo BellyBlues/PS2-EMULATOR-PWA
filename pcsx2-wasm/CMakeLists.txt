@@ -82,6 +82,10 @@ list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_game
 	_pcsx2web_memcard
 	_pcsx2web_memcard_status
+	_pcsx2web_set_boot_state
+	_pcsx2web_save_state
+	_pcsx2web_load_state
+	_pcsx2web_state_result
 )
 # Per-game TFX pipeline lists (Main.cpp, WebGPUHost.h).
 list(APPEND PCSX2_WASM_EXPORTS

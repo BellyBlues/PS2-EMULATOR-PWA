@@ -213,7 +213,7 @@ Switches for comparisons and tests (all optional):
 | `?renderer=sw` | Draws with PCSX2's software renderer instead of the hardware renderer on the WebGPU device (the default, `?renderer=hw`). Without a WebGPU device the GS uses the software renderer |
 | `?set=Section/Key=Value` | Overrides one setting after the defaults (repeatable), e.g. `?set=EmuCore/GS/deinterlace_mode=2` |
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
-| `?threads=1` | Adds how busy the EE, GS and VU1 threads are to the speed readout (`pcsx2web_thread_usage()`), to see which one limits a game without the developer tools, which slow WebAssembly down a lot while open; and a Recorder button: it records every vsync (its speed, each thread's load, JIT and GPU pipeline compiling, from `pcsx2web_perf_ring()`) until stopped, then charts it, crops it to an interval and copies it as text or downloads it as CSV |
+| `?threads=1` | Adds how busy the EE, GS and VU1 threads are to the speed readout (`pcsx2web_thread_usage()`), to see which one limits a game without the developer tools, which slow WebAssembly down a lot while open; and a Recorder button: it records every vsync (its speed, each thread's load, JIT and GPU pipeline compiling, from `pcsx2web_perf_ring()`) until stopped, then charts it, crops it to an interval and copies it as text or downloads it as CSV. The Recorder also has Save state, which snapshots the whole emulated machine and downloads it as a `.p2s` file, and Load state, which puts the last state saved (or given with `?state=`) back into the running game, to replay the same moment while measuring |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |
 | `?eejit=0` | Runs the EE (main CPU) interpreter instead of the EE JIT, which compiles EE code to WebAssembly at run time |
 | `?iopjit=0` | Runs the IOP (I/O processor) interpreter instead of the IOP JIT, which compiles IOP code to WebAssembly at run time |
@@ -222,6 +222,7 @@ Switches for comparisons and tests (all optional):
 | `?pipelines=wait` | The hardware renderer waits for every new TFX pipeline to the end, as before pipelines were created in the background, so no draw is skipped (for pixel-exact comparisons; see Pipeline lists) |
 | `?unlimited=1` | Boots with the frame limiter off (as `pcsx2-headless -unlimited`), to measure speed above 100 % |
 | `?elf=<url>` | Fetches a PS2 program (same origin only) and boots it instead of a disc or the BIOS menu, with the `?bios=` BIOS and fast boot (see below) |
+| `?state=<url>` | Fetches a save state (same origin only; for example `dev-bios/<file>.p2s` with a state file in `serve.py --bios-dir`'s folder), which the next disc boot loads once the game started, and Load state too. The state must come from the same game |
 
 `tools/wasm/pad-test.mjs` tests the players (the keyboard and gamepads going to port 1 or 2): it
 plays a mocked `navigator.getGamepads()` and the keyboard in headless Chrome and reads each port's
@@ -519,6 +520,8 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_boot(name)` | boot `/bios/<name>` with no disc; 0 if accepted, -1 otherwise |
 | `pcsx2web_boot_disc(name, path, flags)` | boot the disc at `path` (`/disc/<file>`, see below) with `/bios/<name>`; `flags` 1 = full boot (BIOS intro), 0 = fast boot; 0 if accepted, -1 otherwise |
 | `pcsx2web_boot_elf(name, path)` | developer runs (`?elf=`): boot the PS2 program at `path` (`/elf/<file>`) with `/bios/<name>`, no disc, fast boot; 0 if accepted, -1 otherwise |
+| `pcsx2web_set_boot_state(path)` | developer runs (`?state=`): the save state (`/states/<file>`) the next boot loads, or `""` for none; only while no VM starts or runs |
+| `pcsx2web_save_state(path)`, `pcsx2web_load_state(path)`, `pcsx2web_state_result()` | developer runs (Recorder): save the running VM's state to, or load it from, `/states/<file>` on the CPU thread; 0 if queued. The result's value, `(sequence << 1) \| ok`, changes when one finishes |
 | `pcsx2web_disc_block()` | address of the disc request block the disc worker serves (`DISC-DESIGN.md` §4.1) |
 | `pcsx2web_game()` | address of the running game's details: `seq, disc CRC, ELF CRC` (u32), `serial[32]`, `title[256]` (UTF-8); `seq` is odd while they change |
 | `pcsx2web_stop()` | request shutdown |
