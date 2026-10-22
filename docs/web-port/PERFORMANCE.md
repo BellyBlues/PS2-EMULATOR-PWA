@@ -107,6 +107,8 @@ Together: Naruto's intro video, headless, 95.3 → 96.9 %.
   `a1dbda87e`, `280678e8b`, `03b02602a`, `091fced07`.
 - **Thread usage on wasm** (wall time minus waits) and `?threads=1`: `511b26cc9`, `1e2bb736d`.
 - **The Recorder**: `556d474ad`.
+- **Save states in the Recorder** (Save state, Load state, `?state=`), to measure from the same frame
+  every time: `5b006b75c`.
 - **A Node runner crash fix**: `b16508154`.
 - **Use Node 24 for headless runs**: Node 22's V8 runs out of heap on games. `36c826032`.
 
