@@ -6507,33 +6507,33 @@
 	// Where each control is on a controller's drawing (pad-template, 600 × 380 units): its centre and size, in
 	// tab order. The shoulder buttons sit behind one another, so theirs are at the ends of lines led out of them.
 	const PAD_SPOTS = [
-		{ id: 'L2', x: 70, y: 34, w: 40, h: 22, lead: true },
-		{ id: 'L1', x: 70, y: 84, w: 40, h: 22, lead: true },
-		{ id: 'Up', x: 176, y: 122, w: 24, h: 26 },
-		{ id: 'Left', x: 148, y: 150, w: 26, h: 24 },
-		{ id: 'Right', x: 204, y: 150, w: 26, h: 24 },
-		{ id: 'Down', x: 176, y: 178, w: 24, h: 26 },
-		{ id: 'Select', x: 262, y: 150, w: 34, h: 16 },
-		{ id: 'Start', x: 338, y: 150, w: 34, h: 16 },
-		{ id: 'Analog', x: 300, y: 192, w: 20, h: 20, round: true },
-		{ id: 'LUp', x: 240, y: 199, w: 22, h: 18 },
-		{ id: 'LLeft', x: 212, y: 226, w: 20, h: 22 },
-		{ id: 'L3', x: 240, y: 226, w: 22, h: 22, round: true },
-		{ id: 'LRight', x: 268, y: 226, w: 20, h: 22 },
-		{ id: 'LDown', x: 240, y: 253, w: 22, h: 18 },
-		{ id: 'RUp', x: 360, y: 199, w: 22, h: 18 },
-		{ id: 'RLeft', x: 332, y: 226, w: 20, h: 22 },
-		{ id: 'R3', x: 360, y: 226, w: 22, h: 22, round: true },
-		{ id: 'RRight', x: 388, y: 226, w: 20, h: 22 },
-		{ id: 'RDown', x: 360, y: 253, w: 22, h: 18 },
-		{ id: 'Triangle', x: 424, y: 120, w: 30, h: 30, round: true },
-		{ id: 'Square', x: 394, y: 150, w: 30, h: 30, round: true },
-		{ id: 'Circle', x: 454, y: 150, w: 30, h: 30, round: true },
-		{ id: 'Cross', x: 424, y: 180, w: 30, h: 30, round: true },
-		{ id: 'R1', x: 530, y: 84, w: 40, h: 22, lead: true },
-		{ id: 'R2', x: 530, y: 34, w: 40, h: 22, lead: true },
+		{ id: 'L2', x: 70, y: 44, w: 40, h: 22, lead: true },
+		{ id: 'L1', x: 70, y: 94, w: 40, h: 22, lead: true },
+		{ id: 'Up', x: 177, y: 142, w: 24, h: 26 },
+		{ id: 'Left', x: 149, y: 170, w: 26, h: 24 },
+		{ id: 'Right', x: 205, y: 170, w: 26, h: 24 },
+		{ id: 'Down', x: 177, y: 198, w: 24, h: 26 },
+		{ id: 'Select', x: 265, y: 182, w: 30, h: 16 },
+		{ id: 'Start', x: 335, y: 182, w: 30, h: 16 },
+		{ id: 'Analog', x: 300, y: 214, w: 24, h: 16 },
+		{ id: 'LUp', x: 250, y: 236, w: 22, h: 18 },
+		{ id: 'LLeft', x: 224, y: 262, w: 20, h: 22 },
+		{ id: 'L3', x: 250, y: 262, w: 22, h: 22, round: true },
+		{ id: 'LRight', x: 276, y: 262, w: 20, h: 22 },
+		{ id: 'LDown', x: 250, y: 288, w: 22, h: 18 },
+		{ id: 'RUp', x: 350, y: 236, w: 22, h: 18 },
+		{ id: 'RLeft', x: 324, y: 262, w: 20, h: 22 },
+		{ id: 'R3', x: 350, y: 262, w: 22, h: 22, round: true },
+		{ id: 'RRight', x: 376, y: 262, w: 20, h: 22 },
+		{ id: 'RDown', x: 350, y: 288, w: 22, h: 18 },
+		{ id: 'Triangle', x: 423, y: 140, w: 30, h: 30, round: true },
+		{ id: 'Square', x: 393, y: 170, w: 30, h: 30, round: true },
+		{ id: 'Circle', x: 453, y: 170, w: 30, h: 30, round: true },
+		{ id: 'Cross', x: 423, y: 200, w: 30, h: 30, round: true },
+		{ id: 'R1', x: 530, y: 94, w: 40, h: 22, lead: true },
+		{ id: 'R2', x: 530, y: 44, w: 40, h: 22, lead: true },
 	];
-	const PAD_CABLE_Y = 80; // where the cable comes out of the drawing, at its middle
+	const PAD_CABLE_Y = 100; // where the cable comes out of the drawing, at its middle
 	const PAD_LABELS = {
 		Up: 'D-pad up', Down: 'D-pad down', Left: 'D-pad left', Right: 'D-pad right',
 		Triangle: 'Triangle', Circle: 'Circle', Cross: 'Cross', Square: 'Square', Select: 'Select', Start: 'Start',
@@ -6572,7 +6572,7 @@
 		return KEY_SPOKEN[name] || keyText(name);
 	}
 
-	// A key's cap: an arrow's icon, or its name as the layout prints it ("Bksp", AZERTY's Q for A); a dash for none.
+	// A key's cap: an arrow's icon, or its name as the layout prints it ("Bksp", AZERTY's Q for A); empty for none.
 	function fillKeyCap(el, name) {
 		el.replaceChildren();
 		el.dataset.key = name || '';
@@ -6582,8 +6582,8 @@
 		else
 			delete el.dataset.code;
 		if (!name)
-			el.textContent = '—';
-		else if (KEY_ICONS[name])
+			return;
+		if (KEY_ICONS[name])
 			el.append(svgIcon(KEY_ICONS[name], 'icon'), span('vh', KEY_SPOKEN[name]));
 		else
 			el.textContent = keyText(name);
@@ -6938,7 +6938,7 @@
 				delete cap.dataset.key;
 				delete cap.dataset.code;
 				const text = g ? padControlText(g, input) : '';
-				setText(cap, text || '—');
+				setText(cap, text);
 				spoken = g ? padControlSpoken(g, input) : 'nothing';
 				btn.classList.toggle('unbound', !text);
 				const stick = STICK_INPUT.exec(input);

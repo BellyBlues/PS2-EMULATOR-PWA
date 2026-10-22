@@ -6,8 +6,9 @@
 
 /* ---------------------------------------------------------------- the plug in a port, and the cables */
 
-/* The plug covers the port's opening; its cable leaves from the bottom, down to the console's lower edge,
-   where the page's cable (.cables) takes over. */
+/* The plug covers the port's opening. Its cable comes out of the boot at its centre, towards you, and hangs
+   down in front of the plug to the console's lower edge, where the page's cable (.cables), as thick, takes
+   over. */
 .ps2bar .bar-port .plug {
   position: absolute;
   inset: -14% -3%;
@@ -20,24 +21,30 @@
   transition: opacity 200ms var(--ease-in), translate 320ms var(--ease-in);
 }
 
-/* Its grip. */
+/* The boot, over the cable's end. */
 .ps2bar .bar-port .plug::before {
   content: "";
   position: absolute;
-  left: 32%;
-  right: 32%;
-  top: 34%;
-  height: 32%;
-  border-block: 1px solid #5d5953;
+  z-index: 1;
+  left: 50%;
+  top: 50%;
+  width: 13px;
+  height: 13px;
+  translate: -50% -50%;
+  border: 1px solid #8a847b;
+  border-radius: 50%;
+  background: #2a2825;
 }
 
+/* 5 px across with its walls, like .cable-wall and .cable-core: from the centre to the console's edge
+   (the port's centre is 25 of the plug's 23 units above it). */
 .ps2bar .bar-port .plug::after {
   content: "";
   position: absolute;
   left: 50%;
-  top: 100%;
-  width: 3px;
-  height: 64%;
+  top: 50%;
+  width: 5px;
+  height: calc(25 / 23 * 100% + 1px);
   translate: -50% 0;
   border-inline: 1px solid #6f6a63;
   background: #2a2825;
@@ -137,14 +144,15 @@ body[data-chrome="hidden"] .cables {
   stroke-width: 1;
 }
 
-.p-body { fill: #151413; stroke: #6f6a63; }
+/* The body's outline: the shapes drawn 2 px wide, then filled over (.p-body), so half of it shows, outside. */
+.pad-svg .p-shell { fill: #6f6a63; stroke: #6f6a63; stroke-width: 2; }
+.p-body { fill: #151413; stroke: none; }
 .p-sh { fill: #1a1917; stroke: #6f6a63; }
 .p-sh2 { fill: #121110; }
 .p-lead { fill: none; stroke: #4a4743; stroke-dasharray: 2 3; }
 .p-relief { fill: #1a1917; stroke: #6f6a63; }
 .p-well { fill: none; stroke: #2a2825; }
 .p-key { fill: #1a1917; stroke: #6f6a63; }
-.p-glyph { fill: none; stroke: #77726b; }
 .p-ring { fill: #0b0a0a; stroke: #3d3a36; }
 .p-stick { fill: #1f1e1c; stroke: #8a847b; }
 .p-led { fill: #2a2825; stroke: none; }
