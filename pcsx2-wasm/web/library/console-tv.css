@@ -1,5 +1,5 @@
 /* The old CRT television around the screen (UI-SPEC.md §18): a wireframe like the console's (the SVG in
-   index.html, 1120 × 1024 units, the screen 1000 × 750 at 60, 84). The screen and the slate shrink to leave it
+   index.html, 1080 × 952 units, the screen 1000 × 750 at 40, 64). The screen and the slate shrink to leave it
    room: --tv-s is the screen's width, as large as lets the whole set fit the stage; they move up by the set's
    lower panel, so that the set is centred. Their corners round like a tube's glass. Not in fullscreen, where the
    picture fills the screen, nor under 640 px, where the screen takes the width. Loaded after style.css. */
@@ -10,26 +10,33 @@
 
 @media (min-width: 640px) {
   .theatre:not(:fullscreen) :is(.tv, .screen, .slate) {
-    --tv-s: min(calc(100cqw / 1.12), calc(100cqh / 1.024));
+    --tv-s: min(calc(100cqw / 1.08), calc(100cqh / 0.952));
   }
 
   .theatre:not(:fullscreen) .tv {
     display: block;
     grid-area: 1 / 1;
-    width: calc(var(--tv-s) * 1.12);
-    aspect-ratio: 1120 / 1024;
+    width: calc(var(--tv-s) * 1.08);
+    aspect-ratio: 1080 / 952;
     pointer-events: none;
   }
 
   .theatre:not(:fullscreen) :is(.screen, .slate) {
     width: var(--tv-s);
-    /* the screen's centre is 53 units above the set's */
-    translate: 0 calc(var(--tv-s) * -0.053);
+    /* the screen's centre is 37 units above the set's */
+    translate: 0 calc(var(--tv-s) * -0.037);
     border-radius: calc(var(--tv-s) * 0.034);
   }
 
+  /* No frame line round the picture in the set: the tally and "Keys go to the PS2" under it say where keys go.
+     Keyboard focus on the screen lights the tube's surround instead. */
   .theatre:not(:fullscreen) .screen {
     overflow: hidden;
+    outline: none !important;
+  }
+
+  .stage-box:has(.screen:focus-visible) .tv-tube {
+    stroke: var(--ink-2);
   }
 }
 

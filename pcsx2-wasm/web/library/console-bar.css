@@ -304,6 +304,22 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 
 /* ---------------------------------------------------------------- the TV remote, lying under the tray */
 
+/* Wide windows (1440 px and up, where the console is at most 760 px and leaves room on both sides): the remote
+   lies beside the console instead of under it, so the room's height goes to the television. */
+@media (min-width: 1440px) {
+  .theatre:not(:fullscreen) #transport {
+    position: relative;
+  }
+
+  .theatre:not(:fullscreen) #transport > .remote {
+    position: absolute;
+    left: calc(100% + 28px);
+    top: 50%;
+    translate: 0 -50%;
+    margin: 0 !important;
+  }
+}
+
 /* The first mockup's remote turned on its side, its lettering kept upright. Fixed size: 276 × 84.
    Left to right: the IR window; the volume rocker over MUTE and WIDE (the two together as wide as the
    rocker and its VOL); PICTURE over MENU; REC over INFO. */
