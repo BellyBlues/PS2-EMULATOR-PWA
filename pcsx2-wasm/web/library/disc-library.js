@@ -77,9 +77,7 @@ const matrix = (m) => `matrix(${m.map(f).join(', ')})`;
 const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
 const easeIn = (t) => t * t;
 const lerp = (a, b, t) => a + (b - a) * t;
-const sleep = (t) => new Promise((r) => setTimeout(r, t));
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-const ms = (t) => (reducedMotion.matches ? 0 : t);
 
 // Pixels per millimetre along the tray's width (U) and its travel (V), on the photo.
 function trayAxes() {
@@ -183,6 +181,48 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 	let k = 1;
 
 	const onStage = (p) => add(p, G.photo);
+
+	// Three quick clicks (or Enter, Space, Esc) skip whatever is moving: the insert, the cleaning, the
+	// eject, and the wait in the dark on the player, whose boot then shows at once. Every pause and
+	// animation of the scene goes through dur() and wait(), so a skip finishes them all.
+	let skipping = false;
+	const timers = new Set();
+	const dur = (t) => (skipping || reducedMotion.matches ? 0 : t);
+	const wait = (t) => new Promise((resolve) => {
+		if (skipping || t <= 0) {
+			resolve();
+			return;
+		}
+		const entry = { resolve };
+		entry.id = setTimeout(() => {
+			timers.delete(entry);
+			resolve();
+		}, t);
+		timers.add(entry);
+	});
+	function skip() {
+		if (skipping || !['inserting', 'inserted', 'ejecting'].includes(mode))
+			return;
+		skipping = true;
+		for (const e of timers) {
+			clearTimeout(e.id);
+			e.resolve();
+		}
+		timers.clear();
+		for (const a of root.getAnimations({ subtree: true }))
+			a.finish();
+	}
+	const presses = [];
+	function pressToSkip() {
+		const now = performance.now();
+		presses.push(now);
+		while (presses.length && now - presses[0] > 900)
+			presses.shift();
+		if (presses.length >= 3) {
+			presses.length = 0;
+			skip();
+		}
+	}
 
 	// ------------------------------------------------------------------ layout
 
@@ -535,7 +575,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		return new Promise((resolve) => {
 			const check = () => {
 				const s = host.status();
-				if ((s.view === 'running' && s.lit) || ['failed', 'stopped', 'dead', 'unsupported'].includes(s.view) ||
+				if (skipping || (s.view === 'running' && s.lit) || ['failed', 'stopped', 'dead', 'unsupported'].includes(s.view) ||
 					(s.error && !s.busy) || performance.now() > until) {
 					resolve(s);
 					return;
@@ -550,6 +590,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		if (mode !== 'shelf' || !discs.length)
 			return;
 		const d = discs[target];
+		skipping = false;
 		if (host) {
 			const why = host.blocked();
 			if (why) {
@@ -571,28 +612,28 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 				o.el.classList.add('is-away');
 
 		d.el.style.transform = matrix(shelfPose(0, d.angle));
-		const opening = moveTray(true, ms(700), 'cubic-bezier(.3,0,.15,1)');
-		await sleep(ms(180));
+		const opening = moveTray(true, dur(700), 'cubic-bezier(.3,0,.15,1)');
+		await wait(dur(180));
 		d.el.classList.add('is-flying');
 		const frames = flightFrames(d);
-		await animate(d.el, frames, { duration: ms(1050) });
+		await animate(d.el, frames, { duration: dur(1050) });
 		await opening;
 		// It lies in the tray now: from here it moves with the tray, behind the console's face.
 		d.el.classList.remove('is-flying');
 		d.el.style.transform = frames[frames.length - 1].transform;
 		els.trayMove.append(d.el);
-		await sleep(ms(160));
-		await moveTray(false, ms(760), 'cubic-bezier(.5,0,.25,1)');
+		await wait(dur(160));
+		await moveTray(false, dur(760), 'cubic-bezier(.5,0,.25,1)');
 		if (!reducedMotion.matches && (clean || Math.random() < cleanChance))
 			await cleanDisc(d);
 		data.disc = 'in';
-		await sleep(ms(520));
+		await wait(dur(520));
 		data.lights = 'down';
 		els.startedTitle.textContent = COPY.starting(d.title);
 		els.startedBody.textContent = host ? '' : COPY.rehearsal;
 		els.startedBody.hidden = !!host;
 		els.startedActions.hidden = !!host;
-		await sleep(ms(900));
+		await wait(dur(900));
 		if (mode !== 'inserting')
 			return;
 		setMode('inserted');
@@ -608,16 +649,17 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		if (mode !== 'inserted' || !current || host)
 			return;
 		const d = current;
+		skipping = false;
 		setMode('ejecting');
 		data.lights = 'up';
 		data.disc = '';
-		await sleep(ms(300));
-		await moveTray(true, ms(700), 'cubic-bezier(.3,0,.15,1)');
-		await sleep(ms(120));
+		await wait(dur(300));
+		await moveTray(true, dur(700), 'cubic-bezier(.3,0,.15,1)');
+		await wait(dur(120));
 		els.shelf.append(d.el);
 		d.el.classList.add('is-flying');
 		const frames = flightFrames(d).reverse().map((fr) => ({ ...fr, offset: 1 - fr.offset }));
-		await animate(d.el, frames, { duration: ms(950) });
+		await animate(d.el, frames, { duration: dur(950) });
 		d.el.classList.remove('is-flying');
 		for (const o of discs)
 			o.el.classList.remove('is-away');
@@ -627,7 +669,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		renderInfo(d);
 		els.shelf.focus({ preventScroll: true });
 		announce(`${d.title} is back on the shelf.`);
-		await moveTray(false, ms(620), 'cubic-bezier(.5,0,.25,1)');
+		await moveTray(false, dur(620), 'cubic-bezier(.5,0,.25,1)');
 	}
 
 	// Back to the shelf at once, with the disc that went in back in its place (the player's dialog,
@@ -689,11 +731,11 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 
 	// Turns the disc over: one face narrows to nothing, the other opens out.
 	async function flip(from, to) {
-		await from.animate([{ transform: 'scaleX(1)' }, { transform: 'scaleX(0)' }], { duration: 190, easing: 'cubic-bezier(.5,0,1,1)', fill: 'forwards' }).finished;
+		await from.animate([{ transform: 'scaleX(1)' }, { transform: 'scaleX(0)' }], { duration: dur(190), easing: 'cubic-bezier(.5,0,1,1)', fill: 'forwards' }).finished;
 		from.style.visibility = 'hidden';
 		to.getAnimations().forEach((a) => a.cancel());
 		to.style.visibility = '';
-		await to.animate([{ transform: 'scaleX(0)' }, { transform: 'scaleX(1)' }], { duration: 210, easing: 'cubic-bezier(0,0,.5,1)' }).finished;
+		await to.animate([{ transform: 'scaleX(0)' }, { transform: 'scaleX(1)' }], { duration: dur(210), easing: 'cubic-bezier(0,0,.5,1)' }).finished;
 	}
 
 	function place(el, x, y, rotate = 0) {
@@ -713,11 +755,11 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		const left = nozzle[0] - NOZZLE[0] * K, top = nozzle[1] - NOZZLE[1] * K;
 		const at = (dx) => `translate(${f(left + dx)}px, ${f(top)}px) rotate(-8deg)`;
 		bottle.style.transformOrigin = `${(NOZZLE[0] + 54) * K}px ${(NOZZLE[1] + 70) * K}px`;
-		await bottle.animate([{ transform: at(520), opacity: 0 }, { transform: at(0), opacity: 1 }], { duration: 520, easing: 'cubic-bezier(.2,0,0,1)', fill: 'forwards' }).finished;
+		await bottle.animate([{ transform: at(520), opacity: 0 }, { transform: at(0), opacity: 1 }], { duration: dur(520), easing: 'cubic-bezier(.2,0,0,1)', fill: 'forwards' }).finished;
 		const shuffled = side.drops.slice().sort(() => Math.random() - 0.5);
 		for (let pass = 0; pass < 2; pass++) {
 			// The trigger, then the mist.
-			bottle.animate([{ transform: at(0) }, { transform: `${at(0)} rotate(-5deg)` }, { transform: at(0) }], { duration: 220, easing: 'ease-out' });
+			bottle.animate([{ transform: at(0) }, { transform: `${at(0)} rotate(-5deg)` }, { transform: at(0) }], { duration: dur(220), easing: 'ease-out' });
 			const mist = [];
 			for (let i = 0; i < 30; i++) {
 				const p = document.createElement('div');
@@ -730,15 +772,15 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 				mist.push(p.animate([
 					{ transform: `translate(${f(nozzle[0])}px, ${f(nozzle[1])}px) scale(0.6)`, opacity: 0.95 },
 					{ transform: `translate(${f(nozzle[0] + Math.cos(ang) * dist)}px, ${f(nozzle[1] + Math.sin(ang) * dist)}px) scale(2.6)`, opacity: 0 },
-				], { duration: 520 + Math.random() * 260, delay: Math.random() * 120, easing: 'cubic-bezier(.1,.6,.3,1)' }).finished.then(() => p.remove()));
+				], { duration: dur(520) + Math.random() * 260, delay: Math.random() * 120, easing: 'cubic-bezier(.1,.6,.3,1)' }).finished.then(() => p.remove()));
 			}
 			const half = shuffled.slice(pass * 13, pass * 13 + 13);
 			for (const [drop] of half)
-				drop.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, delay: 200 + Math.random() * 260, fill: 'forwards' });
+				drop.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur(260), delay: dur(200 + Math.random() * 260), fill: 'forwards' });
 			await Promise.all(mist);
-			await sleep(120);
+			await wait(120);
 		}
-		await bottle.animate([{ transform: at(0), opacity: 1 }, { transform: at(520), opacity: 0 }], { duration: 420, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' }).finished;
+		await bottle.animate([{ transform: at(0), opacity: 1 }, { transform: at(520), opacity: 0 }], { duration: dur(420), easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' }).finished;
 		bottle.remove();
 	}
 
@@ -772,7 +814,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		await cloth.animate([
 			{ transform: `translate(${f(enter[0] - 300)}px, ${f(enter[1] + 380)}px) translate(-50%, -50%) rotate(-30deg)`, opacity: 0 },
 			{ transform: `translate(${f(enter[0])}px, ${f(enter[1])}px) translate(-50%, -50%) rotate(${f(angles[0] + 90)}deg)`, opacity: 1 },
-		], { duration: 480, easing: 'cubic-bezier(.2,0,0,1)', fill: 'forwards' }).finished;
+		], { duration: dur(480), easing: 'cubic-bezier(.2,0,0,1)', fill: 'forwards' }).finished;
 		for (let k = 0; k < strokes; k++) {
 			const a = angles[k];
 			const from = pos(a, 0.3), to = pos(a, 1.05);
@@ -780,74 +822,74 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 			const going = cloth.animate([
 				{ transform: `translate(${f(from[0])}px, ${f(from[1])}px) translate(-50%, -50%) rotate(${f(rot)}deg)` },
 				{ transform: `translate(${f(to[0])}px, ${f(to[1])}px) translate(-50%, -50%) rotate(${f(rot)}deg)` },
-			], { duration: 300, easing: 'cubic-bezier(.4,0,.2,1)', fill: 'forwards' });
+			], { duration: dur(300), easing: 'cubic-bezier(.4,0,.2,1)', fill: 'forwards' });
 			for (const node of groups[k])
-				node.animate([{ opacity: getComputedStyle(node).opacity }, { opacity: 0 }], { duration: 240, delay: 60, fill: 'forwards' });
+				node.animate([{ opacity: getComputedStyle(node).opacity }, { opacity: 0 }], { duration: dur(240), delay: dur(60), fill: 'forwards' });
 			await going.finished;
 			if (k + 1 < strokes) {
 				const next = pos(angles[k + 1], 0.3);
 				await cloth.animate([
 					{ transform: `translate(${f(to[0])}px, ${f(to[1])}px) translate(-50%, -50%) rotate(${f(rot)}deg)` },
 					{ transform: `translate(${f(next[0])}px, ${f(next[1])}px) translate(-50%, -50%) rotate(${f(angles[k + 1] + 90)}deg)` },
-				], { duration: 150, easing: 'ease-in-out', fill: 'forwards' }).finished;
+				], { duration: dur(150), easing: 'ease-in-out', fill: 'forwards' }).finished;
 			}
 		}
 		const last = pos(angles[strokes - 1], 1.05);
 		await cloth.animate([
 			{ transform: `translate(${f(last[0])}px, ${f(last[1])}px) translate(-50%, -50%) rotate(${f(angles[strokes - 1] + 90)}deg)`, opacity: 1 },
 			{ transform: `translate(${f(last[0] - 260)}px, ${f(last[1] + 360)}px) translate(-50%, -50%) rotate(-30deg)`, opacity: 0 },
-		], { duration: 420, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' }).finished;
+		], { duration: dur(420), easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' }).finished;
 		cloth.remove();
 	}
 
 	async function cleanDisc(d) {
 		announce('The disc won’t read. It needs a clean.');
-		await sleep(300);
+		await wait(300);
 		// The power light comes on and blinks: nothing reads.
 		data.disc = 'in';
 		await els.ledPower.animate([{ opacity: 1 }, { opacity: 0.1 }, { opacity: 1 }, { opacity: 0.1 }, { opacity: 1 }, { opacity: 0.1 }, { opacity: 1 }],
-			{ duration: 1100 }).finished;
+			{ duration: dur(1100) }).finished;
 		data.disc = '';
-		await sleep(150);
-		await moveTray(true, 700, 'cubic-bezier(.3,0,.15,1)');
-		await sleep(120);
+		await wait(150);
+		await moveTray(true, dur(700), 'cubic-bezier(.3,0,.15,1)');
+		await wait(120);
 
 		// Out of the tray and up to the front.
 		els.shelf.append(d.el);
 		d.el.classList.add('is-flying');
 		const up = benchFrames(d);
-		await animate(d.el, up, { duration: 950 });
+		await animate(d.el, up, { duration: dur(950) });
 
 		// Turned over: the data side, with what years on a shelf leave on it.
 		const label = d.el.querySelector('.disc-svg');
 		const side = makeDataSide(hash(d.fileName));
 		side.el.style.visibility = 'hidden';
 		d.el.append(side.el);
-		await sleep(150);
+		await wait(150);
 		await flip(label, side.el);
-		await sleep(350);
+		await wait(350);
 
 		const [bx, by, bs] = G.bench;
 		const radius = (DISC_PX / 2) * G.scale * bs;
 		await spray(side, [bx, by], radius);
-		await sleep(150);
+		await wait(150);
 		await wipe(side, [bx, by], radius);
 		// Clean: it catches the light.
 		await side.glint.animate([{ transform: 'translateX(-120%) rotate(20deg)' }, { transform: 'translateX(120%) rotate(20deg)' }],
-			{ duration: 650, easing: 'ease-in-out' }).finished;
-		await sleep(200);
+			{ duration: dur(650), easing: 'ease-in-out' }).finished;
+		await wait(200);
 
 		// Back over, and back in.
 		await flip(side.el, label);
 		label.getAnimations().forEach((a) => a.cancel());
 		label.style.visibility = '';
 		side.el.remove();
-		await sleep(200);
-		await animate(d.el, up.slice().reverse().map((fr) => ({ ...fr, offset: 1 - fr.offset })), { duration: 900 });
+		await wait(200);
+		await animate(d.el, up.slice().reverse().map((fr) => ({ ...fr, offset: 1 - fr.offset })), { duration: dur(900) });
 		d.el.classList.remove('is-flying');
 		els.trayMove.append(d.el);
-		await sleep(160);
-		await moveTray(false, 760, 'cubic-bezier(.5,0,.25,1)');
+		await wait(160);
+		await moveTray(false, dur(760), 'cubic-bezier(.5,0,.25,1)');
 		announce('Clean. Second try.');
 	}
 
@@ -863,6 +905,14 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		els.input.value = '';
 	});
 	els.eject.addEventListener('click', eject);
+	root.addEventListener('pointerdown', () => {
+		if (mode === 'inserting' || mode === 'inserted' || mode === 'ejecting')
+			pressToSkip();
+	});
+	root.addEventListener('keydown', (e) => {
+		if ((mode === 'inserting' || mode === 'inserted' || mode === 'ejecting') && ['Enter', ' ', 'Escape'].includes(e.key) && !e.repeat)
+			pressToSkip();
+	});
 	els.cleanBtn.hidden = !cleanTest;
 	els.cleanBtn.addEventListener('click', () => insert({ clean: true }));
 

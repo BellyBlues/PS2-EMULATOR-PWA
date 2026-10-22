@@ -587,4 +587,6 @@ A second way to choose a disc, from a folder of disc images (`library/disc-libra
 
 **The Easter egg.** One insert in ten (never with reduced motion), the disc won't read: the power light blinks, the tray opens again, and the disc comes up to the front, turns over to its data side (dust, smudges, fingerprints, a hair), is sprayed twice and wiped with a cloth in six strokes from the centre out (the right way), catches the light, turns back and goes in again; about 12 s more, all of it over the boot. The announcer says "The disc won't read. It needs a clean." then "Clean. Second try." `library.html?demo` has "Test the cleaning", which always does it.
 
+**Skipping.** Three quick clicks (within 0.9 s) anywhere in the library, or three presses of Enter, Space or Esc, skip whatever is moving (the insert, the cleaning, the eject) and the wait in the dark: on the player the dialog goes at once and the boot shows as it is.
+
 **Motion.** The tray and the disc move (about 3 s in all); with reduced motion every duration is 0. Departures from §1, on purpose and only here: a photo, moving objects, a translucent disc hub, and the console's power light glowing. The photo carries no Sony or PlayStation marks: they were taken out of it (`tools/wasm/delogo-photo.py`).
