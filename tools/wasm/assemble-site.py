@@ -4,8 +4,8 @@
 
 """Puts the TabStationToo site together for a static host such as GitHub Pages.
 
-Copies the page (every file in pcsx2-wasm/web/) and the emulator (pcsx2-wasm.js, .wasm and .data)
-from a build's bin/ directory into an empty output directory, and nothing else: no headless runner,
+Copies the page (every file in pcsx2-wasm/web/), the emulator (pcsx2-wasm.js, .wasm and .data) and
+the disc library's title index (game-titles.tsv) from a build's bin/ directory into an empty output directory, and nothing else: no headless runner,
 no GS runner, no test or dev files. Then:
 
 - Stamps a build id, a hash of every file's content, into index.html: app.js, style.css,
@@ -38,6 +38,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WEB_SOURCE = REPO_ROOT / "pcsx2-wasm" / "web"
 EMULATOR_FILES = ("pcsx2-wasm.js", "pcsx2-wasm.wasm", "pcsx2-wasm.data")
+# Made by the build next to the page (tools/wasm/make-game-titles.py), for library.html.
+BUILT_FILES = EMULATOR_FILES + ("game-titles.tsv",)
 # Files the page must have; the rest of web/ is copied as it is.
 REQUIRED = ("index.html", "app.js", "style.css", "isolation.js", "coi-serviceworker.js",
             "coi-serviceworker-LICENSE.txt", "disc-worker.js") + EMULATOR_FILES
@@ -66,6 +68,8 @@ STAMPED = (  # (attribute value in index.html, how many times it must appear)
     ('src="isolation.js"', 1),
     ('src="app.js"', 1),
     ('href="style.css"', 1),
+    ('href="library/disc-library.css"', 1),
+    ('src="library/player-library.js"', 1),
 )
 
 
@@ -163,7 +167,7 @@ def main() -> int:
             problems.append(f"pcsx2-wasm/web/{name} is missing")
 
     files: dict[str, bytes] = {}
-    for name in page + list(EMULATOR_FILES):
+    for name in page + list(BUILT_FILES):
         built = bin_dir / name
         if not built.is_file():
             problems.append(f"{built} is missing")

@@ -18,7 +18,11 @@
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="library/disc-library.css">
 <script src="app.js" defer></script>
+<!-- The disc library (UI-SPEC.md §15): a module, after app.js, which it talks to through
+     window.PCSX2WebLibrary. It is the one part of the page that reaches another origin (disc art). -->
+<script type="module" src="library/player-library.js"></script>
 </head>
 <body data-state="nobios" data-bios="none" data-disc="none" data-runtime="loading" data-lights="up" data-chrome="shown" data-capture="na" data-drag="" data-picture="none" data-subtitle="off" data-cards="loading">
 
@@ -44,6 +48,7 @@
         <div class="actions" id="slate-actions">
           <button type="button" class="btn-primary" id="slate-primary"><svg class="icon" id="slate-primary-icon" aria-hidden="true" focusable="false" hidden><use href="icons.svg#i-play"/></svg><span id="slate-primary-label">Choose BIOS file…</span><kbd class="cap-enter" id="slate-primary-cap" aria-hidden="true" hidden>Enter</kbd></button>
           <span class="aside" id="slate-aside">or drop it here</span>
+          <button type="button" class="btn-quiet" id="slate-library" aria-haspopup="dialog" hidden>Disc library…</button>
           <button type="button" class="btn-quiet" id="slate-disc" hidden>Choose a disc…</button>
           <button type="button" class="btn-quiet" id="slate-alt" hidden>Use another BIOS…</button>
           <button type="button" class="btn-quiet" id="slate-remove" hidden>Remove the disc</button>
@@ -368,6 +373,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
   <div class="menu" id="disc-menu" popover role="group" aria-label="Disc">
     <p class="menu-file"><span class="menu-name" id="disc-menu-name"></span><span class="menu-where" id="disc-menu-where"></span></p>
     <div class="menu-items">
+      <button type="button" class="menu-item" id="disc-menu-library" aria-haspopup="dialog"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-disc"/></svg>Disc library…</button>
       <button type="button" class="menu-item" id="disc-menu-choose"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg>Choose another disc…</button>
       <button type="button" class="menu-item" id="disc-menu-remove"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-x"/></svg>Remove the disc</button>
       <p class="menu-reason" id="disc-menu-reason" hidden>Stop the PS2 to change the disc.</p>
@@ -421,6 +427,15 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
 <footer class="credits">
   <p><span class="seg">Use a BIOS and discs from your own console; they never leave this browser&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Built on <a href="https://github.com/PCSX2/pcsx2" target="_blank" rel="noopener noreferrer">PCSX2<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a> (GPL-3.0)&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg"><a class="source-link" href="https://github.com/TabStationToo/TabStationToo" target="_blank" rel="noopener noreferrer">Source<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a>&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Not affiliated with Sony or the PCSX2 project</span></p>
 </footer>
+
+<dialog class="lib-dialog" id="library" aria-labelledby="library-title">
+  <header class="lib-head">
+    <h2 id="library-title"><svg class="mark" aria-hidden="true" focusable="false"><use href="icons.svg#i-mark"/></svg>Disc library</h2>
+    <button type="button" class="btn-quiet" id="library-close" aria-keyshortcuts="Escape"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-x"/></svg>Close</button>
+  </header>
+  <div class="lib" id="library-root"></div>
+  <p class="lib-credit">Console photo: Evan-Amos, public domain <span class="sep">·</span> Disc art: <a href="https://github.com/xlenore/ps2-covers" target="_blank" rel="noopener noreferrer">ps2-covers<span class="vh"> (opens in a new tab)</span></a>, by serial; your files never leave this browser.</p>
+</dialog>
 
 <dialog class="about" id="about" aria-labelledby="about-title">
   <h2 id="about-title" tabindex="-1" autofocus>About TabStationToo.</h2>

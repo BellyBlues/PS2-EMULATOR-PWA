@@ -144,6 +144,20 @@ add_custom_target(pcsx2-wasm-web
 )
 add_dependencies(pcsx2-wasm pcsx2-wasm-web)
 
+# The disc library page (web/library.html) names discs from their serials before they boot, with this
+# index of the game database.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_custom_command(
+	OUTPUT "${PCSX2_WASM_WEB_DIR}/game-titles.tsv"
+	COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/tools/wasm/make-game-titles.py"
+		"${CMAKE_SOURCE_DIR}/bin/resources/GameIndex.yaml" "${PCSX2_WASM_WEB_DIR}/game-titles.tsv"
+	DEPENDS "${CMAKE_SOURCE_DIR}/tools/wasm/make-game-titles.py" "${CMAKE_SOURCE_DIR}/bin/resources/GameIndex.yaml"
+	COMMENT "Indexing game titles for the disc library page"
+	VERBATIM
+)
+add_custom_target(pcsx2-wasm-titles DEPENDS "${PCSX2_WASM_WEB_DIR}/game-titles.tsv")
+add_dependencies(pcsx2-wasm pcsx2-wasm-titles)
+
 # Audio (Main.cpp, "Audio"; docs/web-port/AUDIO-DESIGN.md): an Emscripten Wasm Audio Worklet runs
 # AudioStream::ReadFrames() on the browser's audio rendering thread. The module's JS is evaluated in
 # the AudioWorkletGlobalScope too, so the glue must never touch window or document at load.

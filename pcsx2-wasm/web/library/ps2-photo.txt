@@ -1,0 +1,10 @@
+library/ps2.webp: a Sony PlayStation 2 (SCPH-30001), front left.
+
+Photo by Evan-Amos, released into the public domain:
+https://commons.wikimedia.org/wiki/File:Sony-PlayStation-2-30001-Console-FL.jpg
+
+Changed for this page: scaled to 2200 pixels across, the white background removed and its shadow
+kept as soft black (tools/wasm/cutout-photo.py), saved as WebP.
+
+PlayStation, PS2 and the console's design are trademarks of Sony Interactive Entertainment. This
+project isn't affiliated with or endorsed by Sony.
