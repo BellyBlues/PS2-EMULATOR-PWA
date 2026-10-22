@@ -6504,36 +6504,37 @@
 
 	// ---- the controllers under the console (UI-SPEC §17)
 
-	// Where each control is on a controller's drawing (pad-template, 600 × 380 units): its centre and size, in
+	// Where each control is on a controller's drawing (pad-template, 600 × 310 units): its centre and size, in
 	// tab order. The shoulder buttons sit behind one another, so theirs are at the ends of lines led out of them.
 	const PAD_SPOTS = [
-		{ id: 'L2', x: 70, y: 44, w: 40, h: 22, lead: true },
-		{ id: 'L1', x: 70, y: 94, w: 40, h: 22, lead: true },
-		{ id: 'Up', x: 177, y: 142, w: 24, h: 26 },
-		{ id: 'Left', x: 149, y: 170, w: 26, h: 24 },
-		{ id: 'Right', x: 205, y: 170, w: 26, h: 24 },
-		{ id: 'Down', x: 177, y: 198, w: 24, h: 26 },
-		{ id: 'Select', x: 265, y: 182, w: 30, h: 16 },
-		{ id: 'Start', x: 335, y: 182, w: 30, h: 16 },
-		{ id: 'Analog', x: 300, y: 214, w: 24, h: 16 },
-		{ id: 'LUp', x: 250, y: 236, w: 22, h: 18 },
-		{ id: 'LLeft', x: 224, y: 262, w: 20, h: 22 },
-		{ id: 'L3', x: 250, y: 262, w: 22, h: 22, round: true },
-		{ id: 'LRight', x: 276, y: 262, w: 20, h: 22 },
-		{ id: 'LDown', x: 250, y: 288, w: 22, h: 18 },
-		{ id: 'RUp', x: 350, y: 236, w: 22, h: 18 },
-		{ id: 'RLeft', x: 324, y: 262, w: 20, h: 22 },
-		{ id: 'R3', x: 350, y: 262, w: 22, h: 22, round: true },
-		{ id: 'RRight', x: 376, y: 262, w: 20, h: 22 },
-		{ id: 'RDown', x: 350, y: 288, w: 22, h: 18 },
-		{ id: 'Triangle', x: 423, y: 140, w: 30, h: 30, round: true },
-		{ id: 'Square', x: 393, y: 170, w: 30, h: 30, round: true },
-		{ id: 'Circle', x: 453, y: 170, w: 30, h: 30, round: true },
-		{ id: 'Cross', x: 423, y: 200, w: 30, h: 30, round: true },
-		{ id: 'R1', x: 530, y: 94, w: 40, h: 22, lead: true },
-		{ id: 'R2', x: 530, y: 44, w: 40, h: 22, lead: true },
+		{ id: 'L2', x: 70, y: 30, w: 40, h: 22, lead: true },
+		{ id: 'L1', x: 70, y: 74, w: 40, h: 22, lead: true },
+		{ id: 'Up', x: 184.8, y: 123.7, w: 22, h: 26 },
+		{ id: 'Left', x: 165.9, y: 142.6, w: 26, h: 22 },
+		{ id: 'Right', x: 203.7, y: 142.6, w: 26, h: 22 },
+		{ id: 'Down', x: 184.8, y: 161.4, w: 22, h: 26 },
+		{ id: 'Select', x: 264.2, y: 143.2, w: 26, h: 14 },
+		{ id: 'Start', x: 333, y: 143.2, w: 26, h: 14 },
+		{ id: 'Analog', x: 300, y: 179.4, w: 30, h: 14 },
+		{ id: 'LUp', x: 241.4, y: 164.6, w: 16, h: 14 },
+		{ id: 'LLeft', x: 206.9, y: 199.2, w: 14, h: 16 },
+		{ id: 'L3', x: 241.4, y: 199.2, w: 24, h: 24, round: true },
+		{ id: 'LRight', x: 276, y: 199.2, w: 14, h: 16 },
+		{ id: 'LDown', x: 241.4, y: 233.8, w: 16, h: 14 },
+		{ id: 'RUp', x: 358.6, y: 164.6, w: 16, h: 14 },
+		{ id: 'RLeft', x: 324, y: 199.2, w: 14, h: 16 },
+		{ id: 'R3', x: 358.6, y: 199.2, w: 24, h: 24, round: true },
+		{ id: 'RRight', x: 393.1, y: 199.2, w: 14, h: 16 },
+		{ id: 'RDown', x: 358.6, y: 233.8, w: 16, h: 14 },
+		{ id: 'Triangle', x: 415.2, y: 112.2, w: 26, h: 26, round: true },
+		{ id: 'Square', x: 384.5, y: 142.9, w: 26, h: 26, round: true },
+		{ id: 'Circle', x: 445.9, y: 142.9, w: 26, h: 26, round: true },
+		{ id: 'Cross', x: 415.2, y: 173.6, w: 26, h: 26, round: true },
+		{ id: 'R1', x: 530, y: 74, w: 40, h: 22, lead: true },
+		{ id: 'R2', x: 530, y: 30, w: 40, h: 22, lead: true },
 	];
-	const PAD_CABLE_Y = 100; // where the cable comes out of the drawing, at its middle
+	const PAD_FRAME_H = 310;
+	const PAD_CABLE_Y = 81.4; // where the cable comes out of the drawing, at its middle
 	const PAD_LABELS = {
 		Up: 'D-pad up', Down: 'D-pad down', Left: 'D-pad left', Right: 'D-pad right',
 		Triangle: 'Triangle', Circle: 'Circle', Cross: 'Cross', Square: 'Square', Select: 'Select', Start: 'Start',
@@ -7016,7 +7017,7 @@
 			for (const side of ['L', 'R']) {
 				const x = raw[PAD_INDEX[side + 'Right']] - raw[PAD_INDEX[side + 'Left']];
 				const y = raw[PAD_INDEX[side + 'Down']] - raw[PAD_INDEX[side + 'Up']];
-				u.sticks[side].style.translate = x || y ? `${(x * 8).toFixed(1)}px ${(y * 8).toFixed(1)}px` : '';
+				u.sticks[side].style.translate = x || y ? `${(x * 14).toFixed(1)}px ${(y * 14).toFixed(1)}px` : '';
 			}
 			u.lit = true;
 		}
@@ -7063,7 +7064,7 @@
 				const x0 = pr.left + pr.width / 2 + window.scrollX;
 				const y0 = bar.bottom - 1 + window.scrollY;
 				const x1 = ar.left + ar.width / 2 + window.scrollX;
-				const y1 = ar.top + ar.height * PAD_CABLE_Y / 380 + window.scrollY;
+				const y1 = ar.top + ar.height * PAD_CABLE_Y / PAD_FRAME_H + window.scrollY;
 				if (u.port === 2 && ar.top > first.bottom) {
 					// One controller under the other (narrow windows): the second cable goes down the margin
 					// beside the first, not across it.

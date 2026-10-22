@@ -1,5 +1,5 @@
 /* The controllers on the floor under the console (UI-SPEC.md §17): one per port, drawn as a wireframe like the
-   console (the SVG in pad-template, 600 × 380 units, without any maker's marks), with a button over each
+   console (the SVG in pad-template, 600 × 310 units, without any maker's marks), with a button over each
    control showing the key or gamepad control that plays it. While something plays as a player, a plug sits
    in its port and a cable runs from it down the page to the controller. Places on the drawing are fractions
    of it. Loaded after console-bar.css. */
@@ -127,7 +127,7 @@ body[data-chrome="hidden"] .cables {
 
 .pad-art {
   position: relative;
-  aspect-ratio: 600 / 380;
+  aspect-ratio: 600 / 310;
   container-type: inline-size;
 }
 
@@ -144,28 +144,28 @@ body[data-chrome="hidden"] .cables {
   stroke-width: 1;
 }
 
-/* The body's outline: the shapes drawn 2 px wide, then filled over (.p-body), so half of it shows, outside. */
+/* One line colour over one fill, like a line drawing. Where shapes merge into one outline (the wings and the
+   sticks' housings, the plus-shaped plates), they are drawn 2 px wide (.p-shell), then filled over (.p-body,
+   .p-plate), so that half of the line shows, outside. */
 .pad-svg .p-shell { fill: #6f6a63; stroke: #6f6a63; stroke-width: 2; }
-.p-body { fill: #151413; stroke: none; }
-.p-sh { fill: #1a1917; stroke: #6f6a63; }
-.p-sh2 { fill: #121110; }
+.p-body,
+.p-plate { fill: #151413; stroke: none; }
+.p-sh,
+.p-part,
+.p-relief,
+.p-key,
+.p-stick { fill: #151413; stroke: #6f6a63; }
+.p-line { fill: none; stroke: #6f6a63; }
+.p-stick { stroke: #8a847b; }
 .p-lead { fill: none; stroke: #4a4743; stroke-dasharray: 2 3; }
-.p-relief { fill: #1a1917; stroke: #6f6a63; }
-.p-well { fill: none; stroke: #2a2825; }
-.p-key { fill: #1a1917; stroke: #6f6a63; }
-.p-ring { fill: #0b0a0a; stroke: #3d3a36; }
-.p-stick { fill: #1f1e1c; stroke: #8a847b; }
-.p-led { fill: #2a2825; stroke: none; }
 
-.p-name,
-.p-print {
+.p-name {
   font-family: var(--sans);
   stroke: none;
 }
 
 .p-name { fill: #77726b; font-size: 12px; font-weight: 560; letter-spacing: 0.04em; }
 .p-name-l { text-anchor: end; }
-.p-print { fill: #5d5953; font-size: 6.5px; font-weight: 600; letter-spacing: 0.08em; text-anchor: middle; }
 
 /* Nothing plays as this player: the controller lies there, unplugged. */
 .pad-unit[data-plugged="false"] .pad-svg {
@@ -181,9 +181,9 @@ body[data-chrome="hidden"] .cables {
 .pad-spot {
   position: absolute;
   left: calc(var(--x) / 6 * 1%);
-  top: calc(var(--y) / 3.8 * 1%);
+  top: calc(var(--y) / 3.1 * 1%);
   min-width: calc(var(--w) / 6 * 1%);
-  height: calc(var(--h) / 3.8 * 1%);
+  height: calc(var(--h) / 3.1 * 1%);
   translate: -50% -50%;
   display: flex;
   align-items: center;
