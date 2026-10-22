@@ -154,6 +154,13 @@ simpler distant figures), so each row compares one version with itself.
 
 Measured, exact or not, and not kept because the gain was too small for the change:
 
+- **32-bit values in i32 locals** (2026-10-22, measured, not built): keeping registers that hold a
+  sign-extended 32-bit value in i32 locals, to drop the `i32.wrap_i64` / `i64.extend_i32_s` pairs around
+  32-bit ops. In three of GTA's hottest modules those conversions are 2.3-3.1 % of all wasm operations
+  (a quarter of them zero extensions of addresses, which this would not touch), and 12 of the 293
+  operations (4.1 %) of the hot byte-copy loop at `0x54ec3c`, a block of nearly only 32-bit register
+  ops. Only part of them could go, and on ARM64 a wrap is free (a w register) and TurboFan folds an
+  extend followed by a wrap, so the gain in instructions retired would be well under the 5 % bar.
 - **EE JIT units** (one function per module, registers kept across blocks): no gain, slower compiling
   (`7f41a4f0a`, reverted).
 - **Lean branch ends** (no PC, code and branch flag stores after a register-only delay slot): exact,
