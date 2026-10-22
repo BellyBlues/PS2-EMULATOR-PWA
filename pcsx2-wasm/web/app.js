@@ -6563,6 +6563,10 @@
 		seen: false, // the controllers are on screen
 		cableFrame: 0,
 		cablesLive: false,
+		cableKey: '',
+		cablePaths: null,
+		cableAsked: 0,
+		cableWorker: undefined,
 	};
 
 	const letterCode = (name) => (/^[A-Z]$/.test(name) ? 'Key' + name : '');
@@ -7085,64 +7089,32 @@
 			pads.cableFrame = requestAnimationFrame(drawCables);
 	}
 
-	// Cables, in page coordinates: they lie behind the page. Both are as long, and longer than either needs: the
-	// slack lies in round loops on the floor between the credits and the controllers, as many on each (one, or more
-	// when one would not fit), the shorter run's wider. A loop leaves and rejoins the cable along it, so the cable
-	// never bends tighter than the loop. One under the other (narrow windows), the same.
-	const CABLE_LOOP_MIN = 24; // px: the radius of the longer run's loops; the shorter run's are wider
-	const CABLE_LOOPS_MAX = 6;
-	const CABLE_LOOP_WIDE = 64; // px: wider loops only when more of them would not fit
-	const CABLE_LOOP_STEP = 0.7; // radii from one loop to the next down the cable: they overlap, like a coiled cord
-	const CABLE_FLOOR_GAP = 16; // px kept clear above and below the loops and from the window's sides
-	const CABLE_LOOP_STEPS = 360; // a loop is drawn as so many straight steps (SVG arcs measure a little long)
-	const CABLE_LOOP_LENGTH = 2 * CABLE_LOOP_STEPS * Math.sin(Math.PI / CABLE_LOOP_STEPS); // per unit radius
+	// Cables, in page coordinates: they lie behind the page. Each is a rope that settles on the floor, both as long
+	// and longer than either needs (cable-worker.js, which runs matter-js off the page's thread). The page sends the
+	// straight runs from the plugs to the controllers and where the ropes may lie; until the answer comes, the
+	// cables stay as they were.
+	const CABLE_WORKER_FILE = 'cable-worker.js';
+	const CABLE_GAP = 12; // px kept from the window's sides
 
-	const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-
-	function cubicPoint(c, t) {
-		const [p0, p1, p2, p3] = c;
-		const a = lerp(p0, p1, t), b = lerp(p1, p2, t), d = lerp(p2, p3, t);
-		return lerp(lerp(a, b, t), lerp(b, d, t), t);
-	}
-
-	// A run of cubics as points about 1 px apart.
-	function runPoints(run) {
-		const pts = [run[0][0]];
-		for (const c of run) {
-			const n = Math.max(8, Math.ceil(Math.hypot(c[3][0] - c[0][0], c[3][1] - c[0][1]) * 1.5));
-			for (let i = 1; i <= n; i++)
-				pts.push(cubicPoint(c, i / n));
+	function cableWorker() {
+		if (pads.cableWorker === undefined) {
+			try {
+				pads.cableWorker = new Worker(versioned(CABLE_WORKER_FILE));
+				pads.cableWorker.addEventListener('message', (e) => {
+					if (e.data && e.data.id === pads.cableAsked) {
+						pads.cablePaths = e.data.paths;
+						scheduleCables();
+					}
+				});
+				pads.cableWorker.addEventListener('error', () => {
+					pageLog('The cables could not be laid out (cable-worker.js failed).', 'warn');
+					pads.cableWorker = null;
+				});
+			} catch {
+				pads.cableWorker = null;
+			}
 		}
-		return pts;
-	}
-
-	// Where the points first reach the height y.
-	function pointIndexAt(pts, y) {
-		for (let i = 1; i < pts.length - 1; i++)
-			if (pts[i][1] >= y)
-				return i;
-		return -1;
-	}
-
-	// The direction along the points at i, and the side (1 or -1) towards which a loop of radius r there fits
-	// between left and right, preferring the given side; 0 when neither does.
-	function loopSide(pts, i, r, prefer, left, right) {
-		const a = pts[i - 1], b = pts[i + 1];
-		const m = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
-		const dir = [(b[0] - a[0]) / m, (b[1] - a[1]) / m];
-		const fits = (side) => {
-			const cx = pts[i][0] + side * dir[1] * r;
-			return cx - r >= left && cx + r <= right;
-		};
-		const side = fits(prefer) ? prefer : fits(-prefer) ? -prefer : 0;
-		return { dir, side };
-	}
-
-	function polyLength(pts) {
-		let len = 0;
-		for (let i = 1; i < pts.length; i++)
-			len += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
-		return len;
+		return pads.cableWorker;
 	}
 
 	function drawCables() {
@@ -7175,68 +7147,20 @@
 			const k = Math.max(24, (y1 - y0) * 0.55);
 			return [[[x0, y0], [x0, y0 + k], [x1, y1 - k], [x1, y1]]];
 		});
-		const base = runs.map((run) => (run ? runPoints(run) : null));
-		const lengths = base.map((pts) => (pts ? polyLength(pts) : 0));
-		const longest = Math.max(...lengths);
-		// The loops lie on the floor under the credits, above the controllers' shoulder labels.
-		const credits = document.querySelector('.credits').getBoundingClientRect();
-		const y0 = credits.bottom + CABLE_FLOOR_GAP + sy;
-		const y1 = first.top - CABLE_FLOOR_GAP + sy;
-		const left = sx + CABLE_FLOOR_GAP, right = sx + document.documentElement.clientWidth - CABLE_FLOOR_GAP;
-		// The fewest loops each that fit, all cables with as many: n loops of radius r, a little apart down the run.
-		const plan = (n) => {
-			const target = longest + n * CABLE_LOOP_LENGTH * CABLE_LOOP_MIN;
-			const out = [];
-			for (let i = 0; i < base.length; i++) {
-				if (!base[i]) {
-					out.push(null);
-					continue;
-				}
-				const r = (target - lengths[i]) / (n * CABLE_LOOP_LENGTH);
-				const step = r * CABLE_LOOP_STEP;
-				if ((n - 1) * step + 2 * r > y1 - y0)
-					return null;
-				const loops = [];
-				for (let j = 0; j < n; j++) {
-					const k = pointIndexAt(base[i], (y0 + y1) / 2 + (j - (n - 1) / 2) * step);
-					if (k < 0)
-						return null;
-					const { dir, side } = loopSide(base[i], k, r, i === 0 ? -1 : 1, left, right);
-					if (!side)
-						return null;
-					loops.push({ k, dir, side });
-				}
-				out.push({ r, loops });
-			}
-			return out;
-		};
-		const plans = [];
-		for (let n = 1; n <= CABLE_LOOPS_MAX && y1 - y0 > 2 * CABLE_LOOP_MIN; n++)
-			plans.push(plan(n));
-		const fitting = plans.filter(Boolean);
-		const loops = fitting.find((p) => p.every((c) => !c || c.r <= CABLE_LOOP_WIDE)) || fitting[0] || null;
+		const vw = document.documentElement.clientWidth;
+		const arts = pads.units.map((u) => {
+			const r = u.art.getBoundingClientRect();
+			return { left: r.left + sx, right: r.right + sx, top: r.top + sy, bottom: r.bottom + sy };
+		});
+		const job = { runs, arts, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP } };
+		const key = JSON.stringify(job);
+		const worker = key !== pads.cableKey && cableWorker();
+		if (worker) {
+			pads.cableKey = key;
+			worker.postMessage({ id: ++pads.cableAsked, ...job });
+		}
 		pads.units.forEach((u, i) => {
-			let d = '';
-			if (base[i]) {
-				const f = (n) => n.toFixed(2);
-				const at = new Map(loops && loops[i] ? loops[i].loops.map((l) => [l.k, l]) : []);
-				const r = loops && loops[i] ? loops[i].r : 0;
-				d = base[i].map(([x, y], k) => {
-					let seg = `${k ? 'L' : 'M'}${f(x)} ${f(y)}`;
-					const l = at.get(k);
-					if (l) { // round, and back here going the same way
-						const n = [l.side * l.dir[1], -l.side * l.dir[0]];
-						const turn = l.dir[0] * n[1] - l.dir[1] * n[0] > 0 ? 1 : -1;
-						const cx = x + r * n[0], cy = y + r * n[1];
-						const a0 = Math.atan2(y - cy, x - cx);
-						for (let j = 1; j <= CABLE_LOOP_STEPS; j++) {
-							const a = a0 + turn * 2 * Math.PI * j / CABLE_LOOP_STEPS;
-							seg += ` L${f(cx + r * Math.cos(a))} ${f(cy + r * Math.sin(a))}`;
-						}
-					}
-					return seg;
-				}).join(' ');
-			}
+			const d = (pads.cablePaths && pads.cablePaths[i]) || '';
 			const on = String(u.el.dataset.plugged === 'true');
 			for (const p of u.cable) {
 				if (p.getAttribute('d') !== d)

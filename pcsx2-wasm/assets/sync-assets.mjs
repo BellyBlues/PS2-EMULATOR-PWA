@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-// Copies the self-hosted fonts, the cross-origin isolation service worker and their licences from
+// Copies the self-hosted fonts, the cross-origin isolation service worker, matter-js and their licences from
 // the pinned packages (see package.json and pnpm-lock.yaml) into ../web, and builds ../web/icons.svg:
 // the Phosphor icons listed below as <symbol>s (paths copied verbatim) followed by the in-house
 // symbols in icons-local.svg.
@@ -26,6 +26,9 @@ const FILES = [
 	// Verbatim, next to index.html: a service worker only controls pages at or below its own URL.
 	['coi-serviceworker/coi-serviceworker.js', 'coi-serviceworker.js'],
 	['coi-serviceworker/LICENSE', 'coi-serviceworker-LICENSE.txt'],
+	// The physics that lays the controllers' cables on the floor (UI-SPEC.md §17).
+	['matter-js/build/matter.min.js', 'vendor/matter.min.js'],
+	['matter-js/LICENSE', 'vendor/matter-js-LICENSE.txt'],
 ];
 
 // Phosphor Regular icons used by the page; each becomes <symbol id="i-NAME">.
