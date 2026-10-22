@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 // The disc library: a folder of disc images becomes a shelf of discs, and the chosen one goes into
-// the tray of a photographed PS2. One component for both places it lives: the player's "Disc
-// library" dialog (index.html, through player-library.js), where the insert covers the boot, and the
-// standalone study (library.html), where it only rehearses it.
+// the tray of a photographed PS2. It lives in the player's "Disc library" dialog (index.html, through
+// player-library.js), where the insert covers the boot.
 //
 // The scene is flat: one photo of the console (library/ps2.webp, Evan-Amos, public domain), and on
 // top of it the layers that open the tray. The tray's front is the photo's own panel, cut out and
@@ -18,13 +17,12 @@
 //         page ({ view, error }). Without a host the insert is only rehearsed.
 //   onBooted(): with a host, called once the game's first frame is up (or the boot failed, or took
 //         too long): the player then takes the dialog away.
-//   demo: a shelf of made-up games.
-//   cleanChance: how often a disc won't read and has to be cleaned first (the Easter egg, cleanDisc).
-//   cleanTest: a "Test the cleaning" button next to the folder button, which always cleans.
+//   cleanChance: how often a disc won't read and has to be cleaned first (the Easter egg, cleanDisc);
+//         index.html?clean=1 makes it every time.
 
 import {
-	readFolder, filesFromDrop, filesFromDirectory, onlineCover, discMeta, noDiscsText, shelfAnnouncement, demoDiscs,
-	fontsReady, canPickFolder, pickFolder, rememberFolder, rememberedFolder, folderPermission,
+	readFolder, filesFromDrop, filesFromDirectory, onlineCover, discMeta, noDiscsText, shelfAnnouncement,
+	canPickFolder, pickFolder, rememberFolder, rememberedFolder, folderPermission,
 } from './folder.js';
 import { discSvg, hash } from './disc-art.js';
 import { makeDataSide, BOTTLE_SVG, BOTTLE_SIZE, NOZZLE, CLOTH_SVG, CLOTH_SIZE } from './disc-clean.js';
@@ -125,7 +123,6 @@ const MARKUP = `
   </div>
   <div class="lib-bar" data-el="bar" hidden>
     <p class="lib-count" data-el="count"></p>
-    <button type="button" class="btn-quiet" data-el="cleanBtn" hidden>Test the cleaning</button>
     <button type="button" class="btn-quiet lib-folder-btn" data-el="folderBtn"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg><span>${COPY.another}</span></button>
   </div>
   <section class="lib-info" data-el="info">
@@ -157,7 +154,7 @@ const MARKUP = `
   <input type="file" data-el="input" webkitdirectory multiple hidden>
 </div>`;
 
-export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo = false, cleanChance = 0.1, cleanTest = false } = {}) {
+export function createDiscLibrary(root, { host = null, onBooted = () => {}, cleanChance = 0.1 } = {}) {
 	root.classList.add('lib');
 	root.innerHTML = MARKUP;
 	const els = {};
@@ -913,8 +910,6 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		if ((mode === 'inserting' || mode === 'inserted' || mode === 'ejecting') && ['Enter', ' ', 'Escape'].includes(e.key) && !e.repeat)
 			pressToSkip();
 	});
-	els.cleanBtn.hidden = !cleanTest;
-	els.cleanBtn.addEventListener('click', () => insert({ clean: true }));
 
 	const typeahead = { text: '', at: 0 };
 	els.shelf.addEventListener('keydown', (e) => {
@@ -1066,12 +1061,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 	new ResizeObserver(applyLayout).observe(els.room);
 	applyLayout();
 	setMode('empty');
-	if (demo) {
-		discs = demoDiscs();
-		fontsReady().then(() => showShelf());
-	} else {
-		restoreFolder();
-	}
+	restoreFolder();
 
 	return {
 		// The library has just been shown (the dialog opened): lay it out and put focus in it.
@@ -1086,11 +1076,6 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		// Whether the insert is under way: the dialog then stays until the boot is covered.
 		get busy() {
 			return mode === 'inserting' || mode === 'inserted' || mode === 'ejecting';
-		},
-		// ?tray=open on the study: the tray open, for checking the cut-out against the photo.
-		openTray() {
-			data.tray = 'open';
-			setTray(true);
 		},
 	};
 }

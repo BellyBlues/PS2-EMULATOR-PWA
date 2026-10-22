@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 # SPDX-License-Identifier: GPL-3.0+
 
-"""Writes game-titles.tsv for the disc library page (pcsx2-wasm/web/library.html).
+"""Writes game-titles.tsv for the disc library (pcsx2-wasm/web/library/).
 
 One line per serial in PCSX2's game database, "SERIAL<TAB>Title<TAB>Region", so the page can name a
 disc from the serial in its SYSTEM.CNF before anything boots. The English name is used where the

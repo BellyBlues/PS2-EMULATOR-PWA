@@ -38,7 +38,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WEB_SOURCE = REPO_ROOT / "pcsx2-wasm" / "web"
 EMULATOR_FILES = ("pcsx2-wasm.js", "pcsx2-wasm.wasm", "pcsx2-wasm.data")
-# Made by the build next to the page (tools/wasm/make-game-titles.py), for library.html.
+# Made by the build next to the page (tools/wasm/make-game-titles.py), for the disc library.
 BUILT_FILES = EMULATOR_FILES + ("game-titles.tsv",)
 # Files the page must have; the rest of web/ is copied as it is.
 REQUIRED = ("index.html", "app.js", "style.css", "isolation.js", "coi-serviceworker.js",

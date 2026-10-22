@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
-// What both disc library pages (library.html, library-3d.html) share: a folder of disc images read
-// into a list of discs, folders dropped on the page, disc art from the internet, and the ?demo shelf.
+// The disc library's files (disc-library.js): a folder of disc images read into a list of discs,
+// folders dropped on the page or picked and remembered, and disc art from the internet.
 
 import { readDiscInfo, DISC_RE, COMPRESSED_RE, IMAGE_RE, titleFromFileName, regionOf, loadTitleIndex, coverKey, findCover } from './disc-info.js';
 
@@ -219,21 +219,4 @@ export function shelfAnnouncement(count, compressed) {
 	if (compressed)
 		text += ` ${compressed} compressed ${compressed === 1 ? 'image was' : 'images were'} left out; they aren’t supported yet.`;
 	return text;
-}
-
-// ?demo: a shelf of made-up games, for looking at the pages without disc images.
-const DEMO = [
-	['Harbor Lights - Night Shift', 'NTSC-U'], ['Rally Cinder', 'PAL'], ['Moth and Lantern', 'NTSC-J'],
-	['Kiln', 'PAL'], ['Orbital Tennis 2', 'NTSC-U'], ['The Quiet Tower - Book One', 'PAL'],
-	['Pocket Sumo', 'NTSC-J'], ['Glass Canyon', 'NTSC-U'], ['Ferro Drift: Street Legal', 'PAL'],
-	['Lighthouse Keeper', 'PAL'], ['Signal Lost', 'NTSC-U'], ['Paper Samurai - Second Fold', 'NTSC-J'],
-	['Tidepool', 'PAL'], ['Velvet Engine', 'NTSC-U'],
-];
-
-export function demoDiscs() {
-	return DEMO.map(([title, region], i) => ({
-		file: null, fileName: `${title.replace(/[:]/g, '')}.iso`, size: (1.2 + ((i * 7) % 30) / 10) * 1e9,
-		serial: `DEMO-${String(10001 + i * 37).padStart(5, '0')}`, platform: 'ps2', media: i % 4 === 3 ? 'CD' : 'DVD',
-		title, region, cover: null,
-	})).sort((a, b) => a.title.localeCompare(b.title));
 }

@@ -24,7 +24,8 @@ function open() {
 	if (!host || !host.canOpen() || dialog.open)
 		return;
 	if (!lib)
-		lib = createDiscLibrary(root, { host, onBooted: leave });
+		// ?clean=1: every disc has to be cleaned first (the Easter egg, for trying it).
+		lib = createDiscLibrary(root, { host, onBooted: leave, cleanChance: new URLSearchParams(location.search).get('clean') === '1' ? 1 : 0.1 });
 	lib.reset();
 	dialog.classList.remove('is-dark', 'is-leaving');
 	dialog.showModal();

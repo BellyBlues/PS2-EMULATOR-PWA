@@ -356,17 +356,13 @@ the disc menu) opens it again. Putting one in chooses it and queues its boot at
 once; the insert plays while the PS2 starts, and the dialog stays dark until the game shows a
 picture, so the boot is never seen. The component is `library/disc-library.js` (with
 `disc-library.css`); `library/player-library.js` wires it to `app.js` through
-`window.PCSX2WebLibrary`. `library.html` forwards to the player, except with `?demo` (made-up games),
-`?tray=open` (the tray open, for checking it against the photo) or `?study` (your folder): then it
-shows the same component without the emulator, and the insert is only rehearsed.
+`window.PCSX2WebLibrary`. `?clean=1` makes every insert play the Easter egg (a disc that has to be
+cleaned before it reads), which otherwise comes one time in ten.
 
 - The console is a photo (`library/ps2.webp`, Evan-Amos, public domain; `library/ps2-photo.txt`).
   The tray is the photo's own front panel, cut out and slid along the console's depth; the plate
   and the disc behind it are drawn on the tray's plane with an affine transform measured from the
   photo (`TRAY` in `disc-library.js`).
-- `library-3d.html` (`scene-3d.js`, `scene-3d.css`) is the first take, kept as a copy: an original
-  console in CSS 3D. The library pages share `page.css`, `folder.js`, `disc-info.js` and
-  `disc-art.js`.
 - `library/disc-info.js` reads the start of each file (the ISO 9660 volume at the layouts PCSX2
   detects, then `SYSTEM.CNF`) for the serial; it also runs in Node. Titles come from
   `game-titles.tsv`, an index of PCSX2's game database the build writes next to the page

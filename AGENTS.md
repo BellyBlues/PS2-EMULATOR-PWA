@@ -133,8 +133,8 @@ bring any new engineering guidance over here.
 - Follow `docs/web-port/UI-SPEC.md`. No generic "dashboard" styling, no decoration the spec does
   not ask for, and no controls for features that do not exist yet.
 - The page is cross-origin isolated and makes no requests to other origins: self-host every
-  asset. The one exception, allowed by the owner for the disc library (the player's dialog,
-  `library.html`, `library-3d.html`): disc art fetched by serial from the ps2-covers collection on
+  asset. The one exception, allowed by the owner for the disc library (`pcsx2-wasm/web/library/`):
+  disc art fetched by serial from the ps2-covers collection on
   GitHub. Fonts
   and icons come from `pcsx2-wasm/assets/` (`pnpm install`, then `pnpm run sync`); record each
   asset's licence next to it.

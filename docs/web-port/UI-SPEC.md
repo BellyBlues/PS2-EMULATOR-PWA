@@ -575,7 +575,7 @@ The PS2 has two memory card slots, Card 1 and Card 2. The page keeps a library o
 
 ## 15. Disc library
 
-A second way to choose a disc, from a folder of disc images (`library/disc-library.js`; the standalone `library.html` shows the same component without the emulator, and `library-3d.html` keeps the first, 3D study).
+A second way to choose a disc, from a folder of disc images (`library/disc-library.js`, wired to the page by `library/player-library.js`).
 
 **Opening.** The library is the page's home: it opens by itself when the page becomes ready to boot a disc (a remembered BIOS on load, even while the emulator still downloads, or a BIOS just chosen), but not when the address asks for a boot (`?bios=`, `?disc=`, `?elf=`) or over another dialog. Close (Esc) leaves the player's slate (Boot opens the console's menus); it does not open again by itself until the BIOS changes or a boot ends. "Disc library…" sits on the slate before "Choose a disc…" wherever that button shows, and first in the disc menu (`aria-disabled` while the PS2 runs, like its other items). It opens a full-window `dialog` titled "Disc library", with Close (Esc) at the top right and a credit line at the bottom: "Console photo: Evan-Amos, public domain · Disc art: ps2-covers, by serial; your files never leave this browser."
 
@@ -585,7 +585,7 @@ A second way to choose a disc, from a folder of disc images (`library/disc-libra
 
 **The insert.** Inside the press, the disc is chosen and its boot queued, as "Choose a disc…" then Boot. The tray (the photo's own front panel) slides out, the disc arcs over and flattens into it, the tray closes, the power light in the Reset button comes on, and the room goes dark with "Starting <title>." The dialog stays, dark, until the game shows a picture (a frame with more than near-black in it), the boot fails, or 25 s pass; then it fades out over 500 ms and the screen takes the keyboard. So the boot and the game's black loading frames are never seen. Esc and Close do nothing while a disc goes in. A disc that cannot go in (no BIOS, the PS2 running) says why in coral under the shelf's text.
 
-**The Easter egg.** One insert in ten (never with reduced motion), the disc won't read: the power light blinks, the tray opens again, and the disc comes up to the front, turns over to its data side (dust, smudges, fingerprints, a hair), is sprayed twice and wiped with a cloth in six strokes from the centre out (the right way), catches the light, turns back and goes in again; about 12 s more, all of it over the boot. The announcer says "The disc won't read. It needs a clean." then "Clean. Second try." `library.html?demo` has "Test the cleaning", which always does it.
+**The Easter egg.** One insert in ten (never with reduced motion), the disc won't read: the power light blinks, the tray opens again, and the disc comes up to the front, turns over to its data side (dust, smudges, fingerprints, a hair), is sprayed twice and wiped with a cloth in six strokes from the centre out (the right way), catches the light, turns back and goes in again; about 12 s more, all of it over the boot. The announcer says "The disc won't read. It needs a clean." then "Clean. Second try." `index.html?clean=1` makes every insert do it, for trying it.
 
 **Skipping.** Three quick clicks (within 0.9 s) anywhere in the library, or three presses of Enter, Space or Esc, skip whatever is moving (the insert, the cleaning, the eject) and the wait in the dark: on the player the dialog goes at once and the boot shows as it is.
 

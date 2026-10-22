@@ -1,5 +1,4 @@
-/* The disc library component (disc-library.js), on the player (index.html, in a dialog) and on the
-   study (library.html). Everything is scoped to .lib and named lib-*, so it never meets the player's
+/* The disc library component (disc-library.js), in the player's dialog (index.html). Everything is scoped to .lib and named lib-*, so it never meets the player's
    own rules; it uses the player's tokens and its .btn-primary / .btn-quiet / .icon / .vh. States are
    on the root: data-mode, data-lights, data-tray, data-disc, data-drag.
    Departures from the player's rules, on purpose: physical objects move (the tray, the discs), the
