@@ -23,15 +23,13 @@
 //   DIV but not SQRT, RSQRT) are emitted; everything else (COP0, other FPU and COP2 ops, MMI, divides, other unaligned
 //   and I/O accesses, traps, syscalls) calls the interpreter's function for that opcode with cpuRegs.pc and cpuRegs.code set as execI() sets
 //   them. After such a call, a changed PC (an exception) leaves the block.
-// - Dispatch: a module's blocks are one function, its unit (CompileGroup()), with an entry per block for the
-//   dispatcher. A block that ends goes on to the next one itself (Leave()): a jump within the unit when the target
-//   is in the same module, else a lookup of the dispatcher's cache in wasm, so that the C++ dispatcher (Execute())
+// - Dispatch: a block that ends goes on to the next one itself (Leave()): a tail call to the target's function when
+//   it is in the same module, else a lookup of the dispatcher's cache in wasm, so that the C++ dispatcher (Execute())
 //   only runs for compiles, invalidations and the straight-line event test. -eejit-link 0 turns that off.
-// - Registers: the low doublewords of the GPRs, HI and LO live in wasm locals (RegCache.h), loaded when the unit is
-//   entered and kept from one block to the next within it, and written back to cpuRegs before every call into C++
-//   (interpreter functions, slow paths of memory accesses, which may raise an exception or longjmp out, the branch
-//   end and event test) and at every exit; after a call, the locals of the registers it may write are dropped and
-//   loaded again before the next block. 128-bit accesses go through cpuRegs.
+// - Registers: the low doublewords of the GPRs, HI and LO that a block uses live in wasm locals (RegCache.h), loaded
+//   on first use and written back to cpuRegs before every call into C++ (interpreter functions, slow paths of
+//   memory accesses, which may raise an exception or longjmp out, the branch end and event test) and at every exit;
+//   after a call, the locals of the registers it may write are dropped. 128-bit accesses go through cpuRegs.
 // - Self-modifying code: each block checks, on entry, its page's vtlb mapping (TLB changes) and, after a write to
 //   its page (write tracking, CodeWrites.h), its instruction words against the values it was compiled from, and is
 //   recompiled when they differ. Code that changes the rest of its own block while it runs is not detected (the
@@ -137,13 +135,11 @@ namespace
 	using BlockFn = int (*)();
 	constexpr u32 kAnyPc = 1; // Leave(): an exit to whatever cpuRegs.pc is
 
-	// Each module's functions: the branch end and the branch test's condition (EmitBranchEndFunction() and
-	// EmitBranchDueFunction()), the unit with the code of all its blocks (CompileGroup()), one entry per block
-	// that runs the unit at that block (the functions the dispatcher calls), then the lookup (EmitLookup()).
+	// Each module's first functions: the branch end and the branch test's condition (EmitBranchEndFunction() and
+	// EmitBranchDueFunction()), then its blocks, then the lookup (EmitLookup()).
 	constexpr u32 kFnBranchEnd = 0;
 	constexpr u32 kFnBranchDue = 1;
-	constexpr u32 kFnUnit = 2;
-	constexpr u32 kFnFirstBlock = 3;
+	constexpr u32 kFnFirstBlock = 2;
 
 	struct Group
 	{
@@ -868,12 +864,14 @@ namespace
 	class BlockCompiler
 	{
 	public:
-		// Compiles the blocks of one module into one function, the module's unit (see CompileGroup()): its parameter
-		// (local 0) is the index of the block to run.
-		BlockCompiler(u32 type_v_v, u32 type_i_v)
-			: m_tvv(type_v_v)
+		BlockCompiler(u32 type_v_v, u32 type_i_v, u32 page_vaddr, const u32* host_page, u64 vmap_raw, u32* checked)
+			: m_checked(checked)
+			, m_tvv(type_v_v)
 			, m_tiv(type_i_v)
-			, m_fn(1)
+			, m_page(page_vaddr)
+			, m_host(host_page)
+			, m_vmap_raw(vmap_raw)
+			, m_fn(0)
 			, m_regs(m_fn, ValType::I64, kNumRegs, &RegAddr)
 		{
 			m_a = m_fn.local(ValType::I32);
@@ -882,25 +880,6 @@ namespace
 			m_f = m_fn.local(ValType::I32);
 			m_v = m_fn.local(ValType::I64);
 			m_k = m_fn.local(ValType::I64);
-			m_clean = m_fn.local(ValType::I32);
-		}
-
-		// Starts block `index` of the unit, whose code is in the page at page_vaddr. Every block starts with the
-		// guest registers loaded and clean (kUnitRegs), nothing pending, and no temporary local holding anything.
-		void Begin(u32 index, u32 page_vaddr, const u32* host_page, u64 vmap_raw, u32* checked)
-		{
-			m_index = index;
-			m_page = page_vaddr;
-			m_host = host_page;
-			m_vmap_raw = vmap_raw;
-			m_checked = checked;
-			m_pending = 0;
-			m_cyc_dirty = false;
-			m_t_ok = false;
-			m_hb_ok = false;
-			std::fill(std::begin(m_iloc_ok), std::end(m_iloc_ok), false);
-			std::fill(std::begin(m_vloc_ok), std::end(m_vloc_ok), false);
-			Regs() = kUnitRegs;
 		}
 
 		u32 m_next_pc = 0;
@@ -1096,9 +1075,6 @@ namespace
 		// Invalidate() after a write).
 		static constexpr u32 kHI = 32, kLO = 33, kNumRegs = 34;
 		using RegState = WasmJit::RegCache::State;
-		// The state every block of a unit starts in: all registers in their locals, none dirty (the unit loads the
-		// locals it has on entry, and jumps between its blocks reload what a block invalidated).
-		static constexpr RegState kUnitRegs = {(1ull << kNumRegs) - 1, 0};
 
 		static u32 RegAddr(u32 r)
 		{
@@ -1170,14 +1146,6 @@ namespace
 		// branch end can take an exception) is tail-called directly; anything else goes through the module's
 		// lookup function (EmitLookup()), the dispatcher's cache lookup in wasm. CompileGroup() patches the calls
 		// with the index of the target's function in this module, or of the lookup function.
-		// Leaves the block for `target` (kAnyPc: whatever cpuRegs.pc is) with everything written, as the dispatcher
-		// expects. Block linking: when the dispatcher would not run its straight-line event test (cpuBlockCycles
-		// below 2^20), the next block runs without going back to it. A target this module compiled runs next in
-		// this unit (the loop in CompileGroup()), with the registers kept in their locals: that needs the PC to be
-		// the target with nothing having run in C++ since the registers were written (pc_known, or m_clean after a
-		// branch end); the block's own entry checks run as they would from the dispatcher. Anything else goes through
-		// the module's lookup function (EmitLookup()), the dispatcher's cache lookup in wasm. CompileGroup() patches
-		// the block index and the depth of the jump into the loop, and the lookup's function index.
 		void Leave(u32 target, bool pc_known)
 		{
 			Function& f = m_fn;
@@ -1188,7 +1156,7 @@ namespace
 				f.return_();
 				return;
 			}
-			if (target != kAnyPc && !(target & 3))
+			if (target >= m_page && target < m_page + 4096 && !(target & 3))
 			{
 				f.i32_const(0);
 				f.i32_load(Addr(intJitBlockCycles()));
@@ -1196,21 +1164,14 @@ namespace
 				f.i32_lt_u();
 				if (!pc_known)
 				{
-					f.local_get(m_clean);
+					f.i32_const(0);
+					f.i32_load(Addr(&cpuRegs.pc));
+					f.i32_const(static_cast<s32>(target));
+					f.i32_eq();
 					f.i32_and();
 				}
 				f.if_();
-				const RegState saved = Regs();
-				Reconcile(kUnitRegs);
-				UnitJump jump;
-				jump.index_at = f.i32_const_patchable();
-				f.local_set(0);
-				jump.depth = f.depth();
-				jump.br_at = f.br_patchable();
-				jump.target = target;
-				jump.block = m_index;
-				m_jumps.push_back(jump);
-				Regs() = saved;
+				m_links.push_back({f.return_call_patchable(), target});
 				f.end();
 			}
 			m_links.push_back({f.return_call_patchable(), kAnyPc});
@@ -3144,8 +3105,7 @@ namespace
 		}
 
 		// A taken branch after its delay slot, with cpuBlockCycles written: intJitBranchEnd(target)
-		// (EmitBranchEndFunction()). `target` is the branch target, or kAnyPc for m_j's. Pushes 1 when nothing ran
-		// in C++ (the registers in memory are still those of the locals), else 0.
+		// (EmitBranchEndFunction()). `target` is the branch target, or kAnyPc for m_j's.
 		void EmitBranchEnd(u32 target)
 		{
 			if (target != kAnyPc)
@@ -3219,15 +3179,12 @@ namespace
 				FlushCycles();
 				WritebackAll();
 				EmitBranchEnd(target);
-				f.local_set(m_clean);
 				if (const s32 site = target == btarget && SpinClassOf(d.kind) == SpinClass::Branch ? AddSpinSite(pc, btarget) : -1;
 					site >= 0)
 				{
 					f.i32_const(site);
 					f.i32_const(static_cast<s32>(FnIndex(&SpinTry)));
 					f.call_indirect(m_tiv, 0);
-					f.i32_const(0); // SpinTry() ran C++: leave through the lookup
-					f.local_set(m_clean);
 				}
 				Leave(target, false);
 				m_pending = saved_pending;
@@ -3339,16 +3296,7 @@ namespace
 			return CompileLoop(start, next);
 		}
 		Function& Body() { return m_fn; }
-		WasmJit::RegCache& RegCache() { return m_regs; }
-		std::vector<std::pair<size_t, u32>> m_links; // tail calls to the lookup to patch: body offset, target PC
-		struct UnitJump
-		{
-			size_t index_at, br_at; // the i32.const of the block index and the br into the unit's loop
-			u32 depth; // structures open in the block at the br
-			u32 target; // guest PC
-			u32 block; // the block the jump is in
-		};
-		std::vector<UnitJump> m_jumps;
+		std::vector<std::pair<size_t, u32>> m_links; // tail calls to patch: body offset, target PC
 
 	private:
 		Function& CompileLoop(u32 start, std::vector<u32>* next)
@@ -3421,18 +3369,14 @@ namespace
 				pc += 4;
 			}
 			f.i32_const(0);
-			f.return_();
-			f.end_outer(); // the unit's block that the next block's code follows (CompileGroup())
 			return f;
 		}
 
 		u32 m_tvv, m_tiv;
-		u32 m_index = 0; // in the unit
-		u32 m_page = 0;
-		const u32* m_host = nullptr;
-		u64 m_vmap_raw = 0;
-		u32* m_checked = nullptr; // the page generation this block's code was last compared at
-		u32 m_clean = 0; // after a taken branch's branch end: 1 if it ran nothing in C++
+		u32 m_page;
+		const u32* m_host;
+		u64 m_vmap_raw;
+		u32* m_checked; // the page generation this block's code was last compared at
 		Function m_fn;
 		WasmJit::RegCache m_regs;
 		u32 m_a, m_j, m_cyc, m_f;
@@ -3607,7 +3551,7 @@ namespace
 	// active, or on a wait loop (the same target as the last branch, with the WaitLoop speedhack) that may be
 	// skipped: the BIOS idle loop at 0x81fc0, a branch to the word after its delay slot, or a loop of up to 10
 	// words whose first one has no physical pointer (PSM(target) == 0, vtlb_GetPhyPtr()). The JIT only runs from
-	// intExecute(), so Cpu is the interpreter there. (target) -> 1 if nothing ran in C++, else 0.
+	// intExecute(), so Cpu is the interpreter there. (target) -> ().
 	Function EmitBranchEndFunction(u32 type_v_v, u32 type_i_v)
 	{
 		Function f(1);
@@ -3701,16 +3645,12 @@ namespace
 		f.if_();
 		f.i32_const(static_cast<s32>(FnIndex(&intJitBranchTest)));
 		f.call_indirect(type_v_v, 0);
-		f.i32_const(0);
-		f.return_();
 		f.end();
-		f.i32_const(1); // nothing ran in C++
 		f.return_();
 		f.end(); // slow
 		f.local_get(target);
 		f.i32_const(static_cast<s32>(FnIndex(&intJitBranchEnd)));
 		f.call_indirect(type_i_v, 0);
-		f.i32_const(0);
 		return f;
 	}
 
@@ -3772,13 +3712,12 @@ namespace
 		const u32 t_v_v = m.type({}, {});
 		const u32 t_i_v = m.type({ValType::I32}, {});
 		const u32 t_v_i = m.type({}, {ValType::I32});
-		const u32 t_i_i = m.type({ValType::I32}, {ValType::I32});
 		m.import_memory("env", "mem", 0, 65536, true);
 		m.import_table("env", "table", 0);
 
 		std::unique_ptr<u32[]> checked = std::make_unique<u32[]>(kMaxModuleBlocks);
 		std::vector<u32> pcs;
-		BlockCompiler unit(t_v_v, t_i_v);
+		std::vector<std::unique_ptr<BlockCompiler>> blocks;
 		std::vector<u32> work{entry};
 		u32 first = entry; // the entry whose neighbours `work` holds
 		size_t warm_taken = 0;
@@ -3812,77 +3751,32 @@ namespace
 			const VTLBVirtual vmv = vtlbdata.vmap[pc >> VTLB_PAGE_BITS];
 			const u32* host = reinterpret_cast<const u32*>(vmv.assumePtr(page));
 			std::vector<u32> next;
-			unit.Begin(static_cast<u32>(pcs.size()), page, host, vmv.raw(), &checked[pcs.size()]);
-			unit.Run(pc, &next);
+			blocks.push_back(std::make_unique<BlockCompiler>(t_v_v, t_i_v, page, host, vmv.raw(), &checked[pcs.size()]));
+			blocks.back()->Run(pc, &next);
 			pcs.push_back(pc);
 			for (u32 n : next)
 				work.push_back(n);
 		}
 		s_warm.erase(s_warm.begin(), s_warm.begin() + warm_taken);
-		// The unit: its blocks' code, one after the other, in a loop that runs the block whose index is in local 0:
-		//   (registers that have locals loaded)
-		//   loop
-		//     block (block_{n-1} ... (block_0 (br_table 0 .. n-1, n (local 0))) block 0's code) ... block n-2's code)
-		//     block n-1's code)
-		//     return_call lookup
-		//   end
-		// Block i's code is followed by the end that the next one starts after (BlockCompiler::Run()). A jump to
-		// block j sets local 0 to j and branches to the loop; a target that is not in the module is n, the lookup.
+		// Block i is function kFnFirstBlock + i; the next one returns 0 (links to blocks outside the module).
 		const u32 nblocks = static_cast<u32>(pcs.size());
-		Function& fn = unit.Body();
-		unit.m_links.push_back({fn.return_call_patchable(), kAnyPc});
-		fn.end_outer(); // loop
-		fn.unreachable();
-		{
-			Function head(0);
-			WasmJit::RegCache& regs = unit.RegCache();
-			for (u32 r = 0; r < 34; r++) // the GPRs, HI, LO (BlockCompiler::kNumRegs)
-			{
-				if (!regs.HasLocal(r))
-					continue;
-				const u64* reg = r < 32 ? &cpuRegs.GPR.r[r].UD[0] : r == 32 ? &cpuRegs.HI.UD[0] :
-				                                                              &cpuRegs.LO.UD[0];
-				head.i32_const(0);
-				head.i64_load(Addr(reg));
-				head.local_set(regs.LocalOf(r));
-			}
-			head.loop();
-			for (u32 i = 0; i <= nblocks; i++)
-				head.block();
-			head.local_get(0);
-			std::vector<u32> depths(nblocks);
-			for (u32 i = 0; i < nblocks; i++)
-				depths[i] = i;
-			head.br_table(depths, nblocks);
-			head.end_outer();
-			fn.append_prologue(head.body());
-		}
-		const u32 lookup_fn = kFnFirstBlock + nblocks;
-		for (const auto& [at, target] : unit.m_links)
-			fn.patch_func(at, lookup_fn);
-		for (const BlockCompiler::UnitJump& j : unit.m_jumps)
-		{
-			const auto it = std::find(pcs.begin(), pcs.end(), j.target);
-			fn.patch_func(j.index_at, static_cast<u32>(it - pcs.begin())); // nblocks when not found: the lookup
-			fn.patch_func(j.br_at, j.depth + nblocks - j.block);
-		}
-		m.add_function(t_i_i, EmitBranchEndFunction(t_v_v, t_i_v));
+		m.add_function(t_i_v, EmitBranchEndFunction(t_v_v, t_i_v));
 		m.add_function(t_v_i, EmitBranchDueFunction());
-		m.add_function(t_i_i, fn);
 		if (EEJit::g_stats)
 		{
 			m.name_function(kFnBranchEnd, "ee_branch_end");
 			m.name_function(kFnBranchDue, "ee_branch_due");
-			char name[24];
-			std::snprintf(name, sizeof(name), "ee_unit_%08x", pcs[0]);
-			m.name_function(kFnUnit, name);
 		}
 		for (u32 i = 0; i < nblocks; i++)
 		{
-			Function stub(0);
-			stub.i32_const(static_cast<s32>(i));
-			stub.patch_func(stub.return_call_patchable(), kFnUnit);
-			const u32 index = m.add_function(t_v_i, stub);
+			Function& fn = blocks[i]->Body();
+			for (const auto& [at, target] : blocks[i]->m_links)
+			{
+				const auto it = std::find(pcs.begin(), pcs.end(), target);
+				// kFnFirstBlock + nblocks (the lookup) when not found
+				fn.patch_func(at, kFnFirstBlock + static_cast<u32>(it - pcs.begin()));
+			}
+			const u32 index = m.add_function(t_v_i, fn);
 			char name[16];
 			std::snprintf(name, sizeof(name), "b%u", i);
 			m.export_function(name, index);
@@ -3893,9 +3787,9 @@ namespace
 			}
 		}
 		const u32 lookup = m.add_function(t_v_i, EmitLookup(t_v_i));
-		EEJIT_CHECK(lookup == lookup_fn);
 		if (EEJit::g_stats)
 			m.name_function(lookup, "ee_lookup");
+		blocks.clear();
 
 		const std::vector<u8> bytes = m.finish();
 		s_wasm_bytes += bytes.size();
