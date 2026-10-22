@@ -207,21 +207,22 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 }
 
 .bar-slot .card-dot {
-  top: 50%;
+  top: 10%;
   left: auto;
   right: 9%;
   z-index: 1;
 }
 
-/* The card, drawn like the console: the whole card, 42 × 56 mm, hanging from the slot's mouth (44% down
-   the button). Only what is out of the slot shows (.mc clips above the mouth). Plugged, it is pushed in
-   until just its end shows, with the card's name on its label; plugging slides it up into the slot,
-   unplugging pulls it back down and away. */
+/* The card, drawn like the console: the whole card, 42 × 56 mm, hanging from the slot's top edge (the slot is
+   7.4% down the button, which reaches 20% of the slot's height above it and 150% below). Only what is
+   out of the slot shows (.mc clips above that edge). Plugged, it is pushed in until only its end shows,
+   filling the slot's opening; plugging shows the whole card below the slot and slides it up in, unplugging
+   pulls it back down and away. The card's end is 8% of its height, the slot's height. */
 .mc {
   position: absolute;
   left: 6%;
   width: 88%;
-  top: 44.4%;
+  top: 7.4%;
   aspect-ratio: 3 / 4;
   z-index: 2;
   clip-path: inset(0 -40px -400px -40px);
@@ -232,9 +233,9 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   position: absolute;
   inset: 0;
   border: 1px solid var(--ink-3);
-  border-radius: 3px 3px 6px 6px;
-  background: #1c1b19;
-  transform: translateY(-79%);
+  border-radius: 3px 3px 4px 4px;
+  background: #2a2825;
+  transform: translateY(-92%);
   opacity: 1;
   transition: transform 760ms cubic-bezier(0.3, 0, 0.15, 1), opacity 160ms var(--ease-out);
 }
@@ -259,41 +260,46 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   color: var(--ink-3);
 }
 
-/* The label, at the end that stays out: the card's name. */
-.mc-label {
+/* Grip ridges along its end: what shows in the slot once it is in. */
+.mc-grip {
   position: absolute;
-  left: 12%;
-  right: 12%;
-  bottom: 9%;
-  height: 11%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  left: 22%;
+  right: 22%;
+  bottom: 2.4%;
+  height: 3.4%;
+  border-top: 1px solid #5d5953;
+  border-bottom: 1px solid #5d5953;
+}
+
+/* The card's name, beside the slot's number above it: "1 · RPG saves". */
+.mc-name {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 1px);
+  translate: -50% 0;
+  max-width: 170%;
+  padding: 3px 4px 0;
   overflow: hidden;
-  border: 1px solid #4a4743;
-  border-radius: 2px;
+  background: #151413;
   font-family: var(--sans);
   font-size: clamp(7px, 0.9cqw, 10px);
   font-weight: 560;
-  line-height: 1;
+  line-height: 1.3;
   white-space: nowrap;
   text-overflow: ellipsis;
-  color: var(--ink);
+  color: var(--ink-2);
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 240ms 400ms var(--ease-out);
 }
 
-.mc-label:empty {
-  border-color: transparent;
+.mc-num {
+  color: #77726b;
 }
 
-/* Grip ridges along the end. */
-.mc-grip {
-  position: absolute;
-  left: 30%;
-  right: 30%;
-  bottom: 3%;
-  height: 4%;
-  border-top: 1px solid #3d3a36;
-  border-bottom: 1px solid #3d3a36;
+.card-btn.empty .mc-name {
+  opacity: 0;
+  transition: opacity 160ms var(--ease-in);
 }
 
 /* ---------------------------------------------------------------- the TV remote, lying under the tray */

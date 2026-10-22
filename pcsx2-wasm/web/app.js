@@ -4685,6 +4685,7 @@
 		const menu = tpl.querySelector('.card-menu').cloneNode(true);
 		menu.id = `card-menu-${n}`;
 		btn.id = `card-btn-${n}`;
+		btn.querySelector('.mc-num').textContent = String(n);
 		btn.setAttribute('popovertarget', menu.id);
 		// The first card (UI-SPEC §16): one click on an empty slot, with no card yet, makes one and plugs it
 		// in. Otherwise the slot opens its menu (the picker).
