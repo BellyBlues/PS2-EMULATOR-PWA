@@ -682,8 +682,16 @@
   grid-template-rows: 48px minmax(0, 1fr) auto;
 }
 
+/* The backdrop fades with the dialog: else it stays over the player until the dialog closes, and the game
+   appears all at once after a fade that shows nothing. */
 .lib-dialog::backdrop {
   background: var(--house-down);
+  opacity: 1;
+  transition: opacity 700ms var(--ease-out);
+}
+
+.lib-dialog.is-leaving::backdrop {
+  opacity: 0;
 }
 
 .lib-dialog.is-dark {
