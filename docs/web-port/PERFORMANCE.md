@@ -178,6 +178,13 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
   vtlb's table read hits the cache and its branch predicts well on the M1, so a true "fastmem" would gain
   little more here, and WebAssembly cannot map memory twice or resume after a fault anyway.
+- **Copy and fill loops run natively** (2026-10-22, measured only): EE thread profile samples per
+  generated block, the blocks' code decoded from RAM. In GTA San Andreas gameplay (from vsync 720 of
+  2400), every block that branches back to its own start is 0.81 % of the EE thread, and the simple
+  memory loops among them (byte copy at `0x54ec3c`, byte and word fills, quadword copies) 0.29 %; in
+  Naruto's boot (3000 vsyncs, second half) 3.6 % and 0.57 %. Under the 2 % that would justify an
+  exact loop accelerator, so none was built: the EE time is spread over thousands of blocks (GTA's
+  hottest is 0.48 %).
 
 ## Known to be left
 
