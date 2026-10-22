@@ -440,6 +440,7 @@ namespace
 		// and loads.
 		bool memo = false;
 		bool wait_loop = false; // EmuConfig.Speedhacks.WaitLoop when it was made
+		s8 cycle_rate = 0; // EmuConfig.Speedhacks.EECycleRate when it was made (delta, next_bc)
 		SpinSnap start;
 		std::vector<SpinTest> tests;
 		std::vector<SpinSnap> snaps;
@@ -554,10 +555,20 @@ namespace
 		}
 	}
 
-	// intUpdateCPUCycles() with an EE cycle rate of 0.
+	// intUpdateCPUCycles() (pcsx2/Interpreter.cpp) on (cycle, bc), for EE cycle rates from -3 to 1, which keep the low
+	// 3 bits of bc (SpinTry() refuses the others): the same scaling, step by step.
 	void SpinUpdate(u64& cycle, u32& bc)
 	{
-		const u32 c = bc >> 3;
+		const s8 rate = EmuConfig.Speedhacks.EECycleRate;
+		u32 c;
+		if (rate == 0 || bc <= 40 || rate < -99)
+			c = bc >> 3;
+		else if (rate == 1)
+			c = static_cast<u32>((bc >> 3) / 1.3f);
+		else if (rate == -1)
+			c = (bc <= 80 || bc > 168 ? 5 : 7) * bc / 32;
+		else
+			c = ((5 + (-2 * (rate + 1))) * bc) >> 5;
 		cycle += c ? c : 1;
 		bc &= 7;
 	}
@@ -681,7 +692,7 @@ namespace
 	// Called by generated code after the end of a taken branch that is a site (index `index`).
 	void SpinTry(u32 index)
 	{
-		if (s_spin_off || !EEJit::g_spin || *intJitBiosHooksActive() || EmuConfig.Speedhacks.EECycleRate != 0 ||
+		if (s_spin_off || !EEJit::g_spin || *intJitBiosHooksActive() || EmuConfig.Speedhacks.EECycleRate > 1 ||
 			CHECK_CACHE)
 			return;
 		SpinSite& site = *s_spin_sites[index];
@@ -703,7 +714,8 @@ namespace
 		}
 
 		// The remembered iteration: same registers, same loaded values.
-		if (site.memo && site.wait_loop == EmuConfig.Speedhacks.WaitLoop && SpinSameRegs(site.start) &&
+		if (site.memo && site.wait_loop == EmuConfig.Speedhacks.WaitLoop &&
+			site.cycle_rate == EmuConfig.Speedhacks.EECycleRate && SpinSameRegs(site.start) &&
 			std::all_of(site.loads.begin(), site.loads.end(), SpinSame))
 		{
 			s_spin_hits++;
@@ -855,6 +867,7 @@ namespace
 		}
 		site.memo = true;
 		site.wait_loop = EmuConfig.Speedhacks.WaitLoop;
+		site.cycle_rate = EmuConfig.Speedhacks.EECycleRate;
 		SpinSkip(site);
 	}
 
@@ -3481,11 +3494,18 @@ namespace
 		s_flushes++;
 	}
 
-	// intUpdateCPUCycles() with an EE cycle rate of 0: cpuRegs.cycle += max(cpuBlockCycles >> 3, 1), and
-	// cpuBlockCycles keeps its low 3 bits. `tmp`: an i32 local.
-	void EmitUpdateCycles(Function& f, u32 tmp)
+	// intUpdateCPUCycles(). With an EE cycle rate of 0, here: cpuRegs.cycle += max(cpuBlockCycles >> 3, 1), and
+	// cpuBlockCycles keeps its low 3 bits. With another rate (the EE underclock or overclock speedhack), the
+	// interpreter's own function. `tmp`: an i32 local.
+	void EmitUpdateCycles(Function& f, u32 tmp, u32 type_v_v)
 	{
 		const u32 bc = Addr(intJitBlockCycles());
+		f.i32_const(0);
+		f.i32_load8_s(Addr(&EmuConfig.Speedhacks.EECycleRate));
+		f.if_();
+		f.i32_const(static_cast<s32>(FnIndex(&intUpdateCPUCycles)));
+		f.call_indirect(type_v_v, 0);
+		f.else_();
 		f.i32_const(0);
 		f.i32_const(0);
 		f.i64_load(Addr(&cpuRegs.cycle));
@@ -3506,6 +3526,7 @@ namespace
 		f.i32_const(7);
 		f.i32_and();
 		f.i32_store(bc);
+		f.end();
 	}
 
 	// Pushes whether intBranchTest() has something to do: the trace, an event due, or the BIOS hooks.
@@ -3547,11 +3568,11 @@ namespace
 
 	// intJitBranchEnd(target) after a taken branch's delay slot: its usual case here, the same steps in the same
 	// order (_doBranch_afterDelaySlot(), intUpdateCPUCycles(), intBranchTest()), and intJitBranchEnd() itself when
-	// the delay slot took an exception (cpuRegs.branch is 0), with an EE cycle rate other than 0, with the BIOS hooks
-	// active, or on a wait loop (the same target as the last branch, with the WaitLoop speedhack) that may be
-	// skipped: the BIOS idle loop at 0x81fc0, a branch to the word after its delay slot, or a loop of up to 10
-	// words whose first one has no physical pointer (PSM(target) == 0, vtlb_GetPhyPtr()). The JIT only runs from
-	// intExecute(), so Cpu is the interpreter there. (target) -> ().
+	// the delay slot took an exception (cpuRegs.branch is 0), with the BIOS hooks active, or on a wait loop (the same
+	// target as the last branch, with the WaitLoop speedhack) that may be skipped: the BIOS idle loop at 0x81fc0, a
+	// branch to the word after its delay slot, or a loop of up to 10 words whose first one has no physical pointer
+	// (PSM(target) == 0, vtlb_GetPhyPtr()). The JIT only runs from intExecute(), so Cpu is the interpreter there.
+	// (target) -> ().
 	Function EmitBranchEndFunction(u32 type_v_v, u32 type_i_v)
 	{
 		Function f(1);
@@ -3562,9 +3583,6 @@ namespace
 		f.i32_const(0);
 		f.i32_load(Addr(&cpuRegs.branch));
 		f.i32_eqz();
-		f.i32_const(0);
-		f.i32_load8_s(Addr(&EmuConfig.Speedhacks.EECycleRate));
-		f.i32_or();
 		f.i32_const(0);
 		f.i32_load8_u(Addr(intJitBiosHooksActive()));
 		f.i32_or();
@@ -3626,7 +3644,7 @@ namespace
 			}
 			f.end();
 			// Not skipped: _doBranch_afterDelaySlot() still updates the cycles.
-			EmitUpdateCycles(f, t);
+			EmitUpdateCycles(f, t, type_v_v);
 		}
 		f.end();
 		// intLastBranchTo = cpuRegs.pc = target; cpuRegs.branch = 0.
@@ -3639,7 +3657,7 @@ namespace
 		f.i32_const(0);
 		f.i32_const(0);
 		f.i32_store(Addr(&cpuRegs.branch));
-		EmitUpdateCycles(f, t);
+		EmitUpdateCycles(f, t, type_v_v);
 		// intBranchTest(), as intJitBranchTest(), when it has something to do.
 		EmitBranchDue(f);
 		f.if_();

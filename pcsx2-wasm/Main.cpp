@@ -152,6 +152,11 @@ static std::atomic<u32> s_vsync_count{0};
 // Crisp: nearest-neighbour presentation (WebGPU path). -1 = unchanged since the last apply.
 static std::atomic<int> s_crisp_request{-1};
 static bool s_crisp = false; // CPU thread
+// The EE cycle rate the page asked for (EmuConfig.Speedhacks.EECycleRate: 0, or -1 to -3 to underclock the EE),
+// kCycleRateNone when there is no new request.
+static constexpr int kCycleRateNone = -128;
+static std::atomic<int> s_cycle_rate_request{kCycleRateNone};
+static int s_cycle_rate = 0; // CPU thread
 
 // Test hooks (README "Automated runs"): a screenshot at a vsync, and copies of presented 2D-path
 // frames by vsync number. The capture slots are written once by the GS thread and published
@@ -1654,6 +1659,22 @@ static void CheckCrispRequest(bool apply_now)
 		ApplyCrispSetting(request != 0, apply_now);
 }
 
+// The EE underclock (PCSX2's EE Cycle Rate speedhack), which the page keeps per game. CPU thread.
+static void CheckCycleRateRequest(bool apply_now)
+{
+	const int request = s_cycle_rate_request.exchange(kCycleRateNone, std::memory_order_acq_rel);
+	if (request == kCycleRateNone || request == s_cycle_rate)
+		return;
+	s_cycle_rate = request;
+	{
+		auto lock = Host::GetSettingsLock();
+		s_settings_interface.SetIntValue("EmuCore/Speedhacks", "EECycleRate", request);
+	}
+	Console.WriteLnFmt("pcsx2-wasm: EE cycle rate {}", request);
+	if (apply_now && VMManager::HasValidVM())
+		VMManager::ApplySettings();
+}
+
 static void ResolvePadBindIndexes()
 {
 	const Pad::ControllerInfo* info = Pad::GetControllerInfo(Pad::ControllerType::DualShock2);
@@ -1868,6 +1889,7 @@ static void RunVM(const std::string& bios_name)
 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", s_vu1jit_enabled.load(std::memory_order_acquire));
 	}
 	CheckCrispRequest(false);
+	CheckCycleRateRequest(false);
 	CheckMemcardRequests(false);
 	VMManager::ApplySettings();
 
@@ -2161,6 +2183,14 @@ EMSCRIPTEN_KEEPALIVE void pcsx2web_surface_size(int width, int height, float sca
 		WebGPUHost::SetSurfaceSize(static_cast<u32>(width), static_cast<u32>(height), scale);
 }
 
+/// The EE underclock: PCSX2's EE cycle rate, 0 (off) or -1 to -3 (the PS2's main processor at 75, 60 or 50 %),
+/// applied at the next vsync or boot. Other values are ignored.
+EMSCRIPTEN_KEEPALIVE void pcsx2web_set_ee_cycle_rate(int rate)
+{
+	if (rate >= -3 && rate <= 0)
+		s_cycle_rate_request.store(rate, std::memory_order_release);
+}
+
 /// Crisp: nearest-neighbour presentation instead of bilinear (applied at the next vsync or boot).
 EMSCRIPTEN_KEEPALIVE void pcsx2web_set_crisp(int crisp)
 {
@@ -2293,6 +2323,7 @@ void Host::PumpMessagesOnCPUThread()
 	RunCPUThreadQueue();
 	CheckStopRequest();
 	CheckCrispRequest(true);
+	CheckCycleRateRequest(true);
 	CheckMemcardRequests(true);
 	s_memcard_status[0].store(MemcardBusy::IsBusy() ? MEMCARD_STATUS_BUSY : 0, std::memory_order_release);
 
