@@ -83,6 +83,7 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | Runs of loads and stores through one base register checked once (alignment, page, mapping). This roughly halves the kernel's thread context save and restore. | `pcsx2/wasm/EEJit.cpp` | Naruto video: +7-9 % more, about +24 % in total (47 → 58.5 VPS headless); Zen at 300 figures: 133 → 150-154 % | `693c92743` |
 | Idle loops skipped up to the next event. GTA San Andreas waits for a DMA interrupt by polling two counters (a 10-instruction loop at `0x34dfd8`, run 250 M times per 1200 vsyncs): a third of the EE thread. At a taken backward branch whose loop has only register ALU ops, loads, branches and jumps, one iteration runs on the interpreter, checked step by step; if it changed no register, the iterations whose last branch test comes before the next event only add cycles (memory changes only in event tests), so they are skipped. The site remembers the registers and the values loaded, so the same state skips without running the iteration again. Exact: `-eejit-trace` replays every skipped branch test with its state, and the hashes over 1000 GTA vsyncs (906 M branch tests, 210 M of them skipped) are the same with the skip on, off (`-eejit-spin 0`) and in the build before it; the end state of 1000 non-traced vsyncs is the same on and off. | `pcsx2/wasm/EEJit.cpp` | GTA SA gameplay (headless): 34.7 → 46.2 VPS | `0b9ac18f0`, `582755a74`, `ef46ac2fc` |
 | PEXEH, PEXEW, PREVH, PROT3W as byte shuffles, and DIV.S, generated natively: GTA's interpreter calls 21.4 M → 13.6 M per 1200 vsyncs | `pcsx2/wasm/EEJit.cpp` | within noise | `ef46ac2fc`, `035e32569` |
+| One function per module (its unit): a module's blocks run in one loop, jump to each other directly, and keep the guest registers in locals from one block to the next. Exact: state hashes identical to the build before over GTA gameplay (600 vsyncs), the BIOS and the benchmark. On its own it does not change the speed: GTA's blocks are 4-5 instructions, and the time goes into the bookkeeping at each taken branch (PC, branch flag, cycles, the branch end call, the next block's checks: about 30 memory operations), which the units make it possible to keep in locals next. | `pcsx2/wasm/EEJit.cpp`, `RegCache.h`, `WasmEmitter.h` | GTA SA headless: 98.6 → 97.8 % (within noise) | `7f41a4f0a` |
 
 ### GPU pipelines (stutter when something new appears)
 
@@ -128,8 +129,15 @@ simpler distant figures), so each row compares one version with itself.
 
 ## In progress
 
-- **GTA San Andreas in the page** after the limiter change: the owner is to record again. What is
-  left in the dips is EE throughput (see below): the heavy vsyncs are 35-60 ms of EE work.
+- **EE JIT: the bookkeeping at each taken branch** (started 2026-10-22). GTA's hottest blocks are 1-7
+  instructions long, and each taken branch costs about 30 memory operations of bookkeeping (the PC and
+  branch flag, the cycle counters, the branch end function, the next block's code and mapping checks)
+  against the one or two of the game's own work. Plan: keep the cycle count and the next event's cycle in
+  locals within a unit and compare them there, skip the PC and branch flag stores where the delay slot
+  cannot reach C++, and skip the next block's checks on jumps within a unit when nothing could have
+  changed its code. Each step checked with state hashes.
+- **GTA San Andreas in the page** after the limiter change: the owner's recording shows 99.3 % on
+  average in gameplay, with EE-bound dips to 81-89 % at the start of the game.
 
 ## Known to be left
 
