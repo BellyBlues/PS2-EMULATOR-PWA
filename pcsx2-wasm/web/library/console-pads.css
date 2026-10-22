@@ -351,6 +351,87 @@ body[data-chrome="hidden"] .cables {
   margin: 4px 0 0 -12px;
 }
 
+/* ---------------------------------------------------------------- the cable tuner (?tune-cables) */
+
+/* A tool for the owner, not part of the player: sliders for how the cables lie (app.js, buildCableTuner). */
+.cable-tuner {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 50;
+  width: min(360px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  overflow: auto;
+  padding: 8px 12px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: var(--slate);
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--ink-2);
+}
+
+.cable-tuner summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.cable-tuner-note {
+  margin: 6px 0 8px;
+}
+
+.cable-tuner-row {
+  display: grid;
+  grid-template-columns: 1fr 120px 52px;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+}
+
+.cable-tuner-row input {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--amber);
+}
+
+.cable-tuner-row input[type="number"] {
+  padding: 2px 4px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: var(--house);
+  color: var(--ink);
+  font: inherit;
+}
+
+.cable-tuner-row output {
+  font-family: var(--mono);
+  text-align: right;
+  color: var(--ink);
+}
+
+.cable-tuner-row .btn-quiet {
+  min-height: 26px;
+  padding: 0 6px;
+}
+
+.cable-tuner-actions {
+  display: flex;
+  gap: 4px;
+  margin: 8px 0 6px -12px;
+}
+
+.cable-tuner-out {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: var(--house);
+  color: var(--ink-2);
+  font: 11px/15px var(--mono);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .ps2bar.live .bar-port .plug,
   .ps2bar.live .bar-port[data-plugged="true"] .plug,

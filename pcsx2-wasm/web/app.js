@@ -6567,6 +6567,7 @@
 		cablePaths: null,
 		cableAsked: 0,
 		cableWorker: undefined,
+		cableParams: null, // the cable tuner's settings (?tune-cables), else the worker's own
 	};
 
 	const letterCode = (name) => (/^[A-Z]$/.test(name) ? 'Key' + name : '');
@@ -6835,6 +6836,8 @@
 				ro.observe(el);
 		}
 		window.addEventListener('resize', scheduleCables);
+		if (params.has('tune-cables'))
+			buildCableTuner();
 		renderPads();
 	}
 
@@ -7156,7 +7159,7 @@
 		tr.selectNodeContents($('pads-title'));
 		const t = tr.getBoundingClientRect(); // the heading's words, not its whole row
 		const avoid = t.width ? [{ left: t.left + sx - 8, right: t.right + sx + 8, top: t.top + sy - 8, bottom: t.bottom + sy + 8 }] : [];
-		const job = { runs, arts, avoid, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP } };
+		const job = { runs, arts, avoid, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP }, params: pads.cableParams };
 		const key = JSON.stringify(job);
 		const worker = key !== pads.cableKey && cableWorker();
 		if (worker) {
@@ -7165,7 +7168,7 @@
 		}
 		pads.units.forEach((u, i) => {
 			const d = (pads.cablePaths && pads.cablePaths[i]) || '';
-			const on = String(u.el.dataset.plugged === 'true');
+			const on = String(u.el.dataset.plugged === 'true' || !!pads.cableParams); // the tuner shows both
 			for (const p of u.cable) {
 				if (p.getAttribute('d') !== d)
 					p.setAttribute('d', d);
@@ -7180,6 +7183,148 @@
 				$('ps2bar').classList.add('live');
 			}));
 		}
+	}
+
+	// ---- the cable tuner (?tune-cables): sliders for how the cables lie, for the owner to try and copy out
+
+	const PREF_CABLE_TUNE = 'pcsx2web.cableTune';
+	// [setting, label, min, max, step]; the defaults are the worker's (cable-worker.js, CABLE_DEFAULTS).
+	const CABLE_TUNE = [
+		['seed1', 'Cable 1 shape (seed)', 0, 99999, 1],
+		['seed2', 'Cable 2 shape (seed)', 0, 99999, 1],
+		['slack', 'Slack (times the longer run)', 1, 1.8, 0.01],
+		['extra', 'Extra length (px)', 0, 300, 5],
+		['link', 'Link length (px)', 3, 10, 1],
+		['bendMin', 'Bend stiffness, least', 0, 1, 0.01],
+		['bendMax', 'Bend stiffness, most', 0, 1, 0.01],
+		['bend4Min', 'Long bend stiffness, least', 0, 0.5, 0.01],
+		['bend4Max', 'Long bend stiffness, most', 0, 0.5, 0.01],
+		['memory', 'Coil memory', 0, 1.5, 0.05],
+		['memoryWaves', 'Coil memory changes', 0, 8, 1],
+		['dropWaves', 'Drop curves', 1, 9, 1],
+		['dropDetail', 'Drop: small curves fade (higher, smoother)', 0.5, 3, 0.1],
+		['friction', 'Drag', 0.02, 0.4, 0.01],
+		['steps', 'Settling steps', 20, 800, 20],
+		['smooth', 'Smoothing after settling', 0, 10, 1],
+		['finalSmooth', 'Smoothing at the end', 0, 10, 1],
+	];
+	const CABLE_TUNE_DEFAULTS = {
+		seed1: 24301, seed2: 32220, slack: 1.15, extra: 70, link: 5, bendMin: 0.15, bendMax: 0.45, bend4Min: 0.03,
+		bend4Max: 0.09, memory: 0.5, memoryWaves: 5, dropWaves: 7, dropDetail: 1.4, friction: 0.12, steps: 260, smooth: 3,
+		finalSmooth: 4,
+	};
+
+	function buildCableTuner() {
+		let saved = {};
+		try {
+			saved = JSON.parse(readPref(PREF_CABLE_TUNE) || '{}') || {};
+		} catch {
+			saved = {};
+		}
+		const values = { ...CABLE_TUNE_DEFAULTS };
+		for (const key of Object.keys(values))
+			if (typeof saved[key] === 'number')
+				values[key] = saved[key];
+		pads.cableParams = { ...values };
+		const panel = document.createElement('details');
+		panel.className = 'cable-tuner';
+		panel.open = true;
+		const summary = document.createElement('summary');
+		summary.textContent = 'Cable tuner';
+		const note = document.createElement('p');
+		note.className = 'cable-tuner-note';
+		note.textContent = 'Move the sliders until the cables look right (try other window sizes too), then Copy settings and paste them in the chat.';
+		const rows = document.createElement('div');
+		rows.className = 'cable-tuner-rows';
+		const out = document.createElement('textarea');
+		out.className = 'cable-tuner-out';
+		out.readOnly = true;
+		out.rows = 4;
+		out.setAttribute('aria-label', 'Settings to copy');
+		let timer = 0;
+		const apply = () => {
+			writePref(PREF_CABLE_TUNE, JSON.stringify(values));
+			out.value = JSON.stringify(values);
+			clearTimeout(timer);
+			timer = setTimeout(() => { // settle again once the slider rests a moment
+				pads.cableParams = { ...values };
+				scheduleCables();
+			}, 150);
+		};
+		const inputs = new Map();
+		for (const [key, label, min, max, step] of CABLE_TUNE) {
+			const id = `cable-tune-${key}`;
+			const row = document.createElement('div');
+			row.className = 'cable-tuner-row';
+			const lab = document.createElement('label');
+			lab.htmlFor = id;
+			lab.textContent = label;
+			const range = document.createElement('input');
+			range.type = key.startsWith('seed') ? 'number' : 'range';
+			range.id = id;
+			Object.assign(range, { min: String(min), max: String(max), step: String(step), value: String(values[key]) });
+			const shown = document.createElement('output');
+			shown.htmlFor = id;
+			shown.textContent = String(values[key]);
+			range.addEventListener('input', () => {
+				const v = Number(range.value);
+				if (!Number.isFinite(v))
+					return;
+				values[key] = v;
+				shown.textContent = String(v);
+				apply();
+			});
+			row.append(lab, range);
+			if (key.startsWith('seed')) {
+				const shuffle = document.createElement('button');
+				shuffle.type = 'button';
+				shuffle.className = 'btn-quiet';
+				shuffle.textContent = 'Shuffle';
+				shuffle.addEventListener('click', () => {
+					range.value = String(Math.floor(Math.random() * 100000));
+					range.dispatchEvent(new Event('input'));
+				});
+				row.append(shuffle);
+			} else {
+				row.append(shown);
+			}
+			rows.append(row);
+			inputs.set(key, [range, shown]);
+		}
+		const actions = document.createElement('div');
+		actions.className = 'cable-tuner-actions';
+		const copy = document.createElement('button');
+		copy.type = 'button';
+		copy.className = 'btn-quiet';
+		copy.textContent = 'Copy settings';
+		copy.addEventListener('click', async () => {
+			out.value = JSON.stringify(values);
+			try {
+				await navigator.clipboard.writeText(out.value);
+				copy.textContent = 'Copied';
+			} catch {
+				out.select();
+				copy.textContent = 'Select and copy below';
+			}
+			setTimeout(() => { copy.textContent = 'Copy settings'; }, 1600);
+		});
+		const reset = document.createElement('button');
+		reset.type = 'button';
+		reset.className = 'btn-quiet';
+		reset.textContent = 'Reset';
+		reset.addEventListener('click', () => {
+			Object.assign(values, CABLE_TUNE_DEFAULTS);
+			for (const [key, [range, shown]] of inputs) {
+				range.value = String(values[key]);
+				shown.textContent = String(values[key]);
+			}
+			apply();
+		});
+		actions.append(copy, reset);
+		out.value = JSON.stringify(values);
+		panel.append(summary, note, rows, actions, out);
+		document.body.append(panel);
+		scheduleCables();
 	}
 
 	// ---- gamepads the browser does not lay out in the standard way: the user maps them

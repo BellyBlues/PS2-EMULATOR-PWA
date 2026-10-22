@@ -15,15 +15,25 @@
 //   arts: per controller, its drawing's box {left, right, top, bottom};
 //   avoid: rects to keep out of as well (the controllers' heading);
 //   box: {left, right}, the window's sides less a margin.
+//   params: optional, any of CABLE_DEFAULTS below (the page's cable tuner, ?tune-cables, sends them).
 // Answer: {id, paths}, an SVG path per cable ('' for none).
 
 importScripts('vendor/matter.min.js');
 
-const CABLE_LINK = 5; // px between links: the cable is drawn through them
-const CABLE_SLACK = 1.15; // the common length, against the longer of the two straight runs ...
-const CABLE_EXTRA = 70; // ... plus this, in px
-const CABLE_STEPS = 260; // simulation steps to settle
+// How the cables lie. The page's cable tuner (?tune-cables) changes them live and copies them out.
+const CABLE_DEFAULTS = {
+	seed1: 24301, seed2: 32220, // each cable's random draw
+	slack: 1.15, extra: 70, // the common length: the longer straight run times slack, plus extra px
+	link: 5, // px between links: the cable is drawn through them
+	bendMin: 0.15, bendMax: 0.45, // stiffness against bending over two links, at random between these per link
+	bend4Min: 0.03, bend4Max: 0.09, // and over four links
+	memory: 0.5, memoryWaves: 5, // how much it remembers being coiled, and how many changes along it
+	dropWaves: 7, dropDetail: 1.4, // the drop's random curves: how many, and how fast the smaller ones fade
+	friction: 0.12, steps: 260, // the air's drag on each link, and how long it settles
+	smooth: 3, finalSmooth: 4, // smoothing passes after settling, and after the last steps
+};
 const CABLE_CLEAR = 10; // px kept above the controllers' drawings
+let P = CABLE_DEFAULTS;
 
 const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 
@@ -85,7 +95,7 @@ function settleRope(run, links, tail, seed, box, keepOut) {
 	const rnd = seeded(seed);
 	// The drop: the run pushed out to its side by random waves, broad ones and smaller ones on them, as far as
 	// makes it the rope's length.
-	const waves = [1, 2, 3, 4, 5, 6, 8].map((k) => ({ k, amp: (rnd() - 0.5) * 2 * k ** -1.4, phase: rnd() * Math.PI * 2 }));
+	const waves = [1, 2, 3, 4, 5, 6, 8, 10, 12].slice(0, P.dropWaves).map((k) => ({ k, amp: (rnd() - 0.5) * 2 * k ** -P.dropDetail, phase: rnd() * Math.PI * 2 }));
 	const normals = pts.map((p, i) => {
 		const a = pts[Math.max(0, i - 2)], b = pts[Math.min(pts.length - 1, i + 2)];
 		const m = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
@@ -96,7 +106,7 @@ function settleRope(run, links, tail, seed, box, keepOut) {
 		const off = amp * waves.reduce((n, w) => n + w.amp * Math.sin(w.k * Math.PI * u + w.phase), 0) * Math.sin(Math.PI * u);
 		return [x + off * normals[i][0], y + off * normals[i][1]];
 	});
-	const ropeLen = (links - 1) * CABLE_LINK;
+	const ropeLen = (links - 1) * P.link;
 	let lo = 0, hi = 600;
 	for (let k = 0; k < 30; k++) {
 		const mid = (lo + hi) / 2;
@@ -111,30 +121,30 @@ function settleRope(run, links, tail, seed, box, keepOut) {
 	const a = run[0][0], z = run[run.length - 1][3];
 	for (let i = 0; i < links; i++) {
 		const back = links - 1 - i; // links from the end
-		const [x, y] = i === 0 ? a : i === 1 ? [a[0], a[1] + CABLE_LINK] : back < tail ? [z[0], z[1] - back * CABLE_LINK] :
-			pointAlong(drop, i * CABLE_LINK);
-		bodies.push(M.Bodies.circle(x, y, 2, { isStatic: i < 2 || back < tail, frictionAir: 0.12, collisionFilter: { group: -1 } }));
+		const [x, y] = i === 0 ? a : i === 1 ? [a[0], a[1] + P.link] : back < tail ? [z[0], z[1] - back * P.link] :
+			pointAlong(drop, i * P.link);
+		bodies.push(M.Bodies.circle(x, y, 2, { isStatic: i < 2 || back < tail, frictionAir: P.friction, collisionFilter: { group: -1 } }));
 	}
 	const constraints = [];
 	for (let i = 1; i < links; i++)
-		constraints.push(M.Constraint.create({ bodyA: bodies[i - 1], bodyB: bodies[i], length: CABLE_LINK, stiffness: 1, damping: 0.05 }));
+		constraints.push(M.Constraint.create({ bodyA: bodies[i - 1], bodyB: bodies[i], length: P.link, stiffness: 1, damping: 0.05 }));
 	// Stiffness against bending, over two and over four links. A real cable remembers being coiled: each stretch
 	// of it would rather bend a little (memory, a random bend per link, varying smoothly along it), and some
 	// stretches are stiffer than others. Without that, every turn settles into the same perfect arc.
-	const memoryWaves = [2, 3, 4, 6, 8].map((k) => ({ k, amp: (rnd() - 0.5) * 0.5 * k ** -0.6, phase: rnd() * Math.PI * 2 }));
+	const memoryWaves = [2, 3, 4, 6, 8, 10, 12, 15].slice(0, P.memoryWaves).map((k) => ({ k, amp: (rnd() - 0.5) * P.memory * k ** -0.6, phase: rnd() * Math.PI * 2 }));
 	const memory = (i) => Math.min(0.4, Math.abs(memoryWaves.reduce((n, w) => n + w.amp * Math.sin(w.k * Math.PI * i / links + w.phase), 0)));
 	for (let i = 2; i < links; i++) {
 		const t = memory(i - 1);
-		constraints.push(M.Constraint.create({ bodyA: bodies[i - 2], bodyB: bodies[i], length: 2 * CABLE_LINK * Math.cos(t / 2),
-			stiffness: 0.15 + 0.3 * rnd(), damping: 0.05 }));
+		constraints.push(M.Constraint.create({ bodyA: bodies[i - 2], bodyB: bodies[i], length: 2 * P.link * Math.cos(t / 2),
+			stiffness: P.bendMin + (P.bendMax - P.bendMin) * rnd(), damping: 0.05 }));
 	}
 	for (let i = 4; i < links; i++) {
 		const t = memory(i - 2);
 		constraints.push(M.Constraint.create({ bodyA: bodies[i - 4], bodyB: bodies[i],
-			length: t > 1e-3 ? CABLE_LINK * Math.sin(2 * t) / Math.sin(t / 2) : 4 * CABLE_LINK, stiffness: 0.03 + 0.06 * rnd(), damping: 0.05 }));
+			length: t > 1e-3 ? P.link * Math.sin(2 * t) / Math.sin(t / 2) : 4 * P.link, stiffness: P.bend4Min + (P.bend4Max - P.bend4Min) * rnd(), damping: 0.05 }));
 	}
 	M.Composite.add(engine.world, [...bodies, ...constraints]);
-	for (let step = 0; step < CABLE_STEPS; step++) {
+	for (let step = 0; step < P.steps; step++) {
 		M.Engine.update(engine, 1000 / 60);
 		for (const b of bodies) {
 			if (b.isStatic)
@@ -153,7 +163,7 @@ function settleRope(run, links, tail, seed, box, keepOut) {
 	// The links' own little kinks smoothed out (the pinned ends stay), then a few steps more so that every link is
 	// its length again: both cables as long.
 	let out = bodies.map((b) => [b.position.x, b.position.y]);
-	for (let pass = 0; pass < 3; pass++) {
+	for (let pass = 0; pass < P.smooth; pass++) {
 		out = out.map((p, i) => (bodies[i].isStatic ? p :
 			[(out[i - 1][0] + 2 * p[0] + out[i + 1][0]) / 4, (out[i - 1][1] + 2 * p[1] + out[i + 1][1]) / 4]));
 	}
@@ -167,7 +177,7 @@ function settleRope(run, links, tail, seed, box, keepOut) {
 		M.Engine.update(engine, 1000 / 60);
 	// Smoothed once more where the window's sides held it (they leave it jagged); toLength restores the length.
 	let rope = bodies.map((b) => [b.position.x, b.position.y]);
-	for (let pass = 0; pass < 4; pass++) {
+	for (let pass = 0; pass < P.finalSmooth; pass++) {
 		rope = rope.map((p, i) => (bodies[i].isStatic ? p :
 			[(rope[i - 1][0] + 2 * p[0] + rope[i + 1][0]) / 4, (rope[i - 1][1] + 2 * p[1] + rope[i + 1][1]) / 4]));
 	}
@@ -192,20 +202,21 @@ function toLength(rope, run, length) {
 }
 
 self.onmessage = (e) => {
-	const { id, runs, arts, avoid, box } = e.data;
+	const { id, runs, arts, avoid, box, params } = e.data;
+	P = { ...CABLE_DEFAULTS, ...(params || {}) };
 	const lengths = runs.map((run) => (run ? polyLength(runPoints(run)) : 0));
-	const links = Math.round((Math.max(...lengths) * CABLE_SLACK + CABLE_EXTRA) / CABLE_LINK) + 1;
+	const links = Math.round((Math.max(...lengths) * P.slack + P.extra) / P.link) + 1;
 	const ropes = runs.map((run, i) => {
 		if (!run)
 			return null;
 		const end = run[run.length - 1][3];
 		// Straight up out of the controller to above its drawing (its shoulder labels too); the rest lies above.
 		const above = arts[i].top - CABLE_CLEAR;
-		const tail = Math.max(2, Math.ceil((end[1] - above) / CABLE_LINK) + 1);
-		const area = { left: box.left, right: box.right, top: run[0][0][1] + CABLE_LINK, bottom: above };
+		const tail = Math.max(2, Math.ceil((end[1] - above) / P.link) + 1);
+		const area = { left: box.left, right: box.right, top: run[0][0][1] + P.link, bottom: above };
 		// Out of the other controller's way.
 		const keepOut = [...arts.filter((_, j) => j !== i).map((r) => ({ ...r, top: r.top - CABLE_CLEAR })), ...(avoid || [])];
-		return settleRope(run, links, tail, 0x5eed + i * 7919, area, keepOut);
+		return settleRope(run, links, tail, i === 0 ? P.seed1 : P.seed2, area, keepOut);
 	});
 	// The links come out within a hair of their length; both cables are made exactly the same.
 	const settled = ropes.filter(Boolean);
