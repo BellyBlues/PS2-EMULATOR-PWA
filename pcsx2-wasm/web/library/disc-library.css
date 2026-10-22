@@ -229,6 +229,69 @@
   opacity: 1;
 }
 
+/* ---------------------------------------------------------------- the Easter egg: cleaning a disc */
+
+.lib-clean {
+  position: absolute;
+  inset: 0;
+  z-index: 200;
+  pointer-events: none;
+}
+
+.lib-bottle,
+.lib-cloth,
+.lib-mist {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+.lib-bottle svg,
+.lib-cloth svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.lib-mist {
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  background: rgb(228 238 242 / 0.85);
+}
+
+/* The data side: silver, with the rainbow a disc's tracks throw back, the clear hub and its hole. */
+.lib-data {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  background:
+    radial-gradient(circle closest-side, transparent 0 12.4%, rgb(214 216 222 / 0.35) 12.6% 27%, #9b9da4 27.4% 39%, transparent 39.4%),
+    conic-gradient(from 10deg, hsl(220 14% 70%), hsl(280 24% 78%), hsl(185 26% 76%), hsl(48 30% 78%), hsl(325 22% 76%), hsl(205 22% 74%), hsl(220 14% 70%));
+  mask: radial-gradient(circle closest-side, transparent 12.4%, #000 12.6%);
+  box-shadow: inset 0 0 0 3px rgb(255 255 255 / 0.3);
+}
+
+.lib-dirt {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.lib-glint {
+  position: absolute;
+  inset: -20% 30%;
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.55), transparent);
+  transform: translateX(-120%) rotate(20deg);
+}
+
+/* While it is turned over, its label shows edge on. */
+.lib-disc .disc-svg {
+  position: absolute;
+  inset: 0;
+}
+
 /* ---------------------------------------------------------------- text over the room */
 
 .lib-bar {

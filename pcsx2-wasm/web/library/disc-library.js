@@ -19,12 +19,15 @@
 //   onBooted(): with a host, called once the game's first frame is up (or the boot failed, or took
 //         too long): the player then takes the dialog away.
 //   demo: a shelf of made-up games.
+//   cleanChance: how often a disc won't read and has to be cleaned first (the Easter egg, cleanDisc).
+//   cleanTest: a "Test the cleaning" button next to the folder button, which always cleans.
 
 import {
 	readFolder, filesFromDrop, filesFromDirectory, onlineCover, discMeta, noDiscsText, shelfAnnouncement, demoDiscs,
 	fontsReady, canPickFolder, pickFolder, rememberFolder, rememberedFolder, folderPermission,
 } from './folder.js';
 import { discSvg, hash } from './disc-art.js';
+import { makeDataSide, BOTTLE_SVG, BOTTLE_SIZE, NOZZLE, CLOTH_SVG, CLOTH_SIZE } from './disc-clean.js';
 
 const PHOTO_URL = new URL('./ps2.webp', import.meta.url).href;
 
@@ -39,8 +42,8 @@ const TRAY = {
 const DISC_PX = 250; // a disc element, before any transform
 
 const LAYOUTS = {
-	wide: { w: 1240, h: 1090, photo: [70, 410], shelfY: 178, scale: 1, gap1: 236, gapN: 104, span: 5, infoY: 316, cardY: 0.14 },
-	tall: { w: 1100, h: 1560, photo: [0, 880], shelfY: 380, scale: 1.6, gap1: 330, gapN: 80, span: 3, infoY: 640, cardY: 0.12 },
+	wide: { w: 1240, h: 1090, photo: [70, 410], shelfY: 178, scale: 1, gap1: 236, gapN: 104, span: 5, infoY: 316, cardY: 0.14, bench: [600, 330, 1.5] },
+	tall: { w: 1100, h: 1560, photo: [0, 880], shelfY: 380, scale: 1.6, gap1: 330, gapN: 80, span: 3, infoY: 640, cardY: 0.12, bench: [500, 560, 2.1] },
 };
 
 // With a host: the room stays dark until the game shows a picture (not just black frames), but no
@@ -110,7 +113,7 @@ const MARKUP = `
     <div class="lib-console" data-el="console" aria-hidden="true">
       <img class="lib-photo" src="${PHOTO_URL}" alt="" width="1100" height="662" draggable="false">
       <div class="lib-hole"></div>
-      <div class="lib-led lib-led-power"></div>
+      <div class="lib-led lib-led-power" data-el="ledPower"></div>
     </div>
     <div class="lib-tray-clip" aria-hidden="true">
       <div class="lib-tray-move" data-el="trayMove">
@@ -120,9 +123,11 @@ const MARKUP = `
     </div>
     <div class="lib-panel" data-el="panel" aria-hidden="true"><img src="${PHOTO_URL}" alt="" width="1100" height="662" draggable="false"></div>
     <div class="lib-shelf" data-el="shelf" role="listbox" tabindex="0" aria-label="Discs" aria-orientation="horizontal"></div>
+    <div class="lib-clean" data-el="clean" aria-hidden="true"></div>
   </div>
   <div class="lib-bar" data-el="bar" hidden>
     <p class="lib-count" data-el="count"></p>
+    <button type="button" class="btn-quiet" data-el="cleanBtn" hidden>Test the cleaning</button>
     <button type="button" class="btn-quiet lib-folder-btn" data-el="folderBtn"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg><span>${COPY.another}</span></button>
   </div>
   <section class="lib-info" data-el="info">
@@ -154,7 +159,7 @@ const MARKUP = `
   <input type="file" data-el="input" webkitdirectory multiple hidden>
 </div>`;
 
-export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo = false } = {}) {
+export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo = false, cleanChance = 0.1, cleanTest = false } = {}) {
 	root.classList.add('lib');
 	root.innerHTML = MARKUP;
 	const els = {};
@@ -541,7 +546,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		});
 	}
 
-	async function insert() {
+	async function insert({ clean = false } = {}) {
 		if (mode !== 'shelf' || !discs.length)
 			return;
 		const d = discs[target];
@@ -578,6 +583,8 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		els.trayMove.append(d.el);
 		await sleep(ms(160));
 		await moveTray(false, ms(760), 'cubic-bezier(.5,0,.25,1)');
+		if (!reducedMotion.matches && (clean || Math.random() < cleanChance))
+			await cleanDisc(d);
 		data.disc = 'in';
 		await sleep(ms(520));
 		data.lights = 'down';
@@ -645,6 +652,205 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 			renderInfo(discs[target]);
 	}
 
+	// ------------------------------------------------------------------ the Easter egg: a disc that won't read
+	// It goes in, the power light blinks, the tray opens again, and the disc comes up to the front, turns
+	// over to its dusty data side, is sprayed and wiped from the centre out (the right way), turns back
+	// and goes in again. About 12 s; on the player the boot goes on underneath all the while.
+
+	const smooth = (a, b, x) => {
+		const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+		return t * t * (3 - 2 * t);
+	};
+
+	// From lying in the open tray to upright at the front of the room (the bench), as frames.
+	function benchFrames(d) {
+		const from = trayCentre(true);
+		const [bx, by, bs] = G.bench;
+		const ctrl = [lerp(from[0], bx, 0.5), Math.min(from[1], by) - 170];
+		const frames = [];
+		const N = 30;
+		for (let i = 0; i <= N; i++) {
+			const t = i / N;
+			const u = easeInOut(t);
+			const c = [
+				(1 - u) ** 2 * from[0] + 2 * (1 - u) * u * ctrl[0] + u * u * bx,
+				(1 - u) ** 2 * from[1] + 2 * (1 - u) * u * ctrl[1] + u * u * by,
+			];
+			const flat = 1 - smooth(0.05, 0.7, u);
+			const spin = d.spinIn * (1 - u);
+			const scale = lerp(G.scale, G.scale * bs, u);
+			const tray = trayLinear(spin);
+			const r = (spin * Math.PI) / 180;
+			const up = [scale * Math.cos(r), scale * Math.sin(r), -scale * Math.sin(r), scale * Math.cos(r)];
+			frames.push({ transform: matrix([...up.map((v, j) => lerp(v, tray[j], flat)), ...c]), offset: t });
+		}
+		return frames;
+	}
+
+	// Turns the disc over: one face narrows to nothing, the other opens out.
+	async function flip(from, to) {
+		await from.animate([{ transform: 'scaleX(1)' }, { transform: 'scaleX(0)' }], { duration: 190, easing: 'cubic-bezier(.5,0,1,1)', fill: 'forwards' }).finished;
+		from.style.visibility = 'hidden';
+		to.getAnimations().forEach((a) => a.cancel());
+		to.style.visibility = '';
+		await to.animate([{ transform: 'scaleX(0)' }, { transform: 'scaleX(1)' }], { duration: 210, easing: 'cubic-bezier(0,0,.5,1)' }).finished;
+	}
+
+	function place(el, x, y, rotate = 0) {
+		el.style.transform = `translate(${f(x)}px, ${f(y)}px) translate(-50%, -50%) rotate(${f(rotate)}deg)`;
+	}
+
+	async function spray(side, c, radius) {
+		const bottle = document.createElement('div');
+		bottle.className = 'lib-bottle';
+		bottle.innerHTML = BOTTLE_SVG;
+		const K = 1.4 * G.scale; // the drawing's units to the stage's
+		bottle.style.width = `${BOTTLE_SIZE[0] * K}px`;
+		bottle.style.height = `${BOTTLE_SIZE[1] * K}px`;
+		els.clean.append(bottle);
+		// The nozzle a little right of the disc, level with its upper half.
+		const nozzle = [c[0] + radius * 1.3, c[1] - radius * 0.2];
+		const left = nozzle[0] - NOZZLE[0] * K, top = nozzle[1] - NOZZLE[1] * K;
+		const at = (dx) => `translate(${f(left + dx)}px, ${f(top)}px) rotate(-8deg)`;
+		bottle.style.transformOrigin = `${(NOZZLE[0] + 54) * K}px ${(NOZZLE[1] + 70) * K}px`;
+		await bottle.animate([{ transform: at(520), opacity: 0 }, { transform: at(0), opacity: 1 }], { duration: 520, easing: 'cubic-bezier(.2,0,0,1)', fill: 'forwards' }).finished;
+		const shuffled = side.drops.slice().sort(() => Math.random() - 0.5);
+		for (let pass = 0; pass < 2; pass++) {
+			// The trigger, then the mist.
+			bottle.animate([{ transform: at(0) }, { transform: `${at(0)} rotate(-5deg)` }, { transform: at(0) }], { duration: 220, easing: 'ease-out' });
+			const mist = [];
+			for (let i = 0; i < 30; i++) {
+				const p = document.createElement('div');
+				p.className = 'lib-mist';
+				els.clean.append(p);
+				const ang = Math.PI + (Math.random() - 0.5) * 0.75 + 0.18;
+				const dist = radius * (0.7 + Math.random() * 1.3);
+				const size = 3 + Math.random() * 7;
+				p.style.width = p.style.height = `${f(size)}px`;
+				mist.push(p.animate([
+					{ transform: `translate(${f(nozzle[0])}px, ${f(nozzle[1])}px) scale(0.6)`, opacity: 0.95 },
+					{ transform: `translate(${f(nozzle[0] + Math.cos(ang) * dist)}px, ${f(nozzle[1] + Math.sin(ang) * dist)}px) scale(2.6)`, opacity: 0 },
+				], { duration: 520 + Math.random() * 260, delay: Math.random() * 120, easing: 'cubic-bezier(.1,.6,.3,1)' }).finished.then(() => p.remove()));
+			}
+			const half = shuffled.slice(pass * 13, pass * 13 + 13);
+			for (const [drop] of half)
+				drop.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, delay: 200 + Math.random() * 260, fill: 'forwards' });
+			await Promise.all(mist);
+			await sleep(120);
+		}
+		await bottle.animate([{ transform: at(0), opacity: 1 }, { transform: at(520), opacity: 0 }], { duration: 420, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' }).finished;
+		bottle.remove();
+	}
+
+	async function wipe(side, c, radius) {
+		const cloth = document.createElement('div');
+		cloth.className = 'lib-cloth';
+		cloth.innerHTML = CLOTH_SVG;
+		cloth.style.width = `${CLOTH_SIZE[0] * 1.35 * G.scale}px`;
+		cloth.style.height = `${CLOTH_SIZE[1] * 1.35 * G.scale}px`;
+		els.clean.append(cloth);
+		const strokes = 6;
+		const start = Math.random() * 360;
+		const angles = Array.from({ length: strokes }, (_, k) => start + k * (360 / strokes));
+		// Each speck of dirt and drop goes with the stroke nearest to it.
+		const owner = (a) => {
+			let best = 0, bestD = 999;
+			angles.forEach((s, k) => {
+				const dd = Math.abs((((a - s) % 360) + 540) % 360 - 180);
+				if (dd < bestD) {
+					bestD = dd;
+					best = k;
+				}
+			});
+			return best;
+		};
+		const groups = angles.map(() => []);
+		for (const [node, a] of [...side.dirt, ...side.drops])
+			groups[owner(a)].push(node);
+		const pos = (a, k) => [c[0] + Math.cos((a * Math.PI) / 180) * radius * k, c[1] + Math.sin((a * Math.PI) / 180) * radius * k];
+		const enter = pos(angles[0], 0.3);
+		await cloth.animate([
+			{ transform: `translate(${f(enter[0] - 300)}px, ${f(enter[1] + 380)}px) translate(-50%, -50%) rotate(-30deg)`, opacity: 0 },
+			{ transform: `translate(${f(enter[0])}px, ${f(enter[1])}px) translate(-50%, -50%) rotate(${f(angles[0] + 90)}deg)`, opacity: 1 },
+		], { duration: 480, easing: 'cubic-bezier(.2,0,0,1)', fill: 'forwards' }).finished;
+		for (let k = 0; k < strokes; k++) {
+			const a = angles[k];
+			const from = pos(a, 0.3), to = pos(a, 1.05);
+			const rot = a + 90;
+			const going = cloth.animate([
+				{ transform: `translate(${f(from[0])}px, ${f(from[1])}px) translate(-50%, -50%) rotate(${f(rot)}deg)` },
+				{ transform: `translate(${f(to[0])}px, ${f(to[1])}px) translate(-50%, -50%) rotate(${f(rot)}deg)` },
+			], { duration: 300, easing: 'cubic-bezier(.4,0,.2,1)', fill: 'forwards' });
+			for (const node of groups[k])
+				node.animate([{ opacity: getComputedStyle(node).opacity }, { opacity: 0 }], { duration: 240, delay: 60, fill: 'forwards' });
+			await going.finished;
+			if (k + 1 < strokes) {
+				const next = pos(angles[k + 1], 0.3);
+				await cloth.animate([
+					{ transform: `translate(${f(to[0])}px, ${f(to[1])}px) translate(-50%, -50%) rotate(${f(rot)}deg)` },
+					{ transform: `translate(${f(next[0])}px, ${f(next[1])}px) translate(-50%, -50%) rotate(${f(angles[k + 1] + 90)}deg)` },
+				], { duration: 150, easing: 'ease-in-out', fill: 'forwards' }).finished;
+			}
+		}
+		const last = pos(angles[strokes - 1], 1.05);
+		await cloth.animate([
+			{ transform: `translate(${f(last[0])}px, ${f(last[1])}px) translate(-50%, -50%) rotate(${f(angles[strokes - 1] + 90)}deg)`, opacity: 1 },
+			{ transform: `translate(${f(last[0] - 260)}px, ${f(last[1] + 360)}px) translate(-50%, -50%) rotate(-30deg)`, opacity: 0 },
+		], { duration: 420, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' }).finished;
+		cloth.remove();
+	}
+
+	async function cleanDisc(d) {
+		announce('The disc won’t read. It needs a clean.');
+		await sleep(300);
+		// The power light comes on and blinks: nothing reads.
+		data.disc = 'in';
+		await els.ledPower.animate([{ opacity: 1 }, { opacity: 0.1 }, { opacity: 1 }, { opacity: 0.1 }, { opacity: 1 }, { opacity: 0.1 }, { opacity: 1 }],
+			{ duration: 1100 }).finished;
+		data.disc = '';
+		await sleep(150);
+		await moveTray(true, 700, 'cubic-bezier(.3,0,.15,1)');
+		await sleep(120);
+
+		// Out of the tray and up to the front.
+		els.shelf.append(d.el);
+		d.el.classList.add('is-flying');
+		const up = benchFrames(d);
+		await animate(d.el, up, { duration: 950 });
+
+		// Turned over: the data side, with what years on a shelf leave on it.
+		const label = d.el.querySelector('.disc-svg');
+		const side = makeDataSide(hash(d.fileName));
+		side.el.style.visibility = 'hidden';
+		d.el.append(side.el);
+		await sleep(150);
+		await flip(label, side.el);
+		await sleep(350);
+
+		const [bx, by, bs] = G.bench;
+		const radius = (DISC_PX / 2) * G.scale * bs;
+		await spray(side, [bx, by], radius);
+		await sleep(150);
+		await wipe(side, [bx, by], radius);
+		// Clean: it catches the light.
+		await side.glint.animate([{ transform: 'translateX(-120%) rotate(20deg)' }, { transform: 'translateX(120%) rotate(20deg)' }],
+			{ duration: 650, easing: 'ease-in-out' }).finished;
+		await sleep(200);
+
+		// Back over, and back in.
+		await flip(side.el, label);
+		label.getAnimations().forEach((a) => a.cancel());
+		label.style.visibility = '';
+		side.el.remove();
+		await sleep(200);
+		await animate(d.el, up.slice().reverse().map((fr) => ({ ...fr, offset: 1 - fr.offset })), { duration: 900 });
+		d.el.classList.remove('is-flying');
+		els.trayMove.append(d.el);
+		await sleep(160);
+		await moveTray(false, 760, 'cubic-bezier(.5,0,.25,1)');
+		announce('Clean. Second try.');
+	}
+
 	// ------------------------------------------------------------------ input
 
 	els.intakeBtn.addEventListener('click', () => (folder && els.intakeOther.hidden === false ? openRemembered() : chooseFolder()));
@@ -657,6 +863,8 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, demo
 		els.input.value = '';
 	});
 	els.eject.addEventListener('click', eject);
+	els.cleanBtn.hidden = !cleanTest;
+	els.cleanBtn.addEventListener('click', () => insert({ clean: true }));
 
 	const typeahead = { text: '', at: 0 };
 	els.shelf.addEventListener('keydown', (e) => {

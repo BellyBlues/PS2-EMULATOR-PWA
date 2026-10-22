@@ -25,7 +25,8 @@ const params = new URLSearchParams(location.search);
 // library without the emulator (?demo, ?tray=open, or ?study with your own folder).
 if (!['demo', 'tray', 'study'].some((k) => params.has(k)))
 	location.replace('index.html');
-const lib = createDiscLibrary(document.getElementById('library'), { demo: params.has('demo') });
+// ?demo has a button that plays the Easter egg (a disc cleaned before it reads).
+const lib = createDiscLibrary(document.getElementById('library'), { demo: params.has('demo'), cleanTest: params.has('demo') });
 // ?tray=open opens the tray, for checking the cut-out against the photo.
 if (params.get('tray') === 'open')
 	lib.openTray();
