@@ -149,6 +149,22 @@ simpler distant figures), so each row compares one version with itself.
 - **GTA San Andreas in the page** after the limiter change: the owner's recording shows 99.3 % on
   average in gameplay, with EE-bound dips to 81-89 % at the start of the game.
 
+## Tried and dropped
+
+Measured, exact or not, and not kept because the gain was too small for the change:
+
+- **EE JIT units** (one function per module, registers kept across blocks): no gain, slower compiling
+  (`7f41a4f0a`, reverted).
+- **Lean branch ends** (no PC, code and branch flag stores after a register-only delay slot): exact,
+  0.9 % fewer instructions retired on GTA (branch `lean-branch-end`, not merged).
+- **A lower V8 tier-up budget** (`--wasm-tiering-budget` 1 M or 200 k against 13 M): 6-8 % more
+  instructions on GTA, from the extra optimising compiles.
+- **Main RAM without the vtlb** (2026-10-22): accesses below 32 MB taken straight to main RAM, a range
+  check instead of the table read. Exact on GTA (state hashes identical over 600 vsyncs), but 0.5 % more
+  instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
+  vtlb's table read hits the cache and its branch predicts well on the M1, so a true "fastmem" would gain
+  little more here, and WebAssembly cannot map memory twice or resume after a fault anyway.
+
 ## Known to be left
 
 - **EE JIT compiling** (after `2a94d1f30`): the engine's compile and instantiation (about a quarter
