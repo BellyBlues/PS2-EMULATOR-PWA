@@ -805,8 +805,14 @@ p.fine {
   color: var(--ink-2);
 }
 
-/* Pressed toggles: a 2 px ink bar under the icon. */
+/* A label's short form, for phones (below). */
+.t-label .t-short {
+  display: none;
+}
+
+/* Pressed toggles, and a tool whose setting is on (Underclock): a 2 px ink bar under the icon. */
 .t-btn[aria-pressed="true"]::before,
+.t-btn.on::before,
 .t-btn[aria-expanded="true"]::before {
   content: "";
   position: absolute;
@@ -2319,6 +2325,7 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   }
 
   .t-btn[aria-pressed="true"]::before,
+  .t-btn.on::before,
   .t-btn[aria-expanded="true"]::before {
     left: calc(50% - 10px);
   }
@@ -2345,6 +2352,7 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   }
 
   .t-btn[aria-pressed="true"]::before,
+  .t-btn.on::before,
   .t-btn[aria-expanded="true"]::before {
     left: calc(50% - 10px);
   }
@@ -2386,6 +2394,7 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   }
 
   .t-btn[aria-pressed="true"]::before,
+  .t-btn.on::before,
   .t-btn[aria-expanded="true"]::before {
     top: 28px;
     bottom: auto;
@@ -2627,11 +2636,25 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   }
 }
 
-/* Phones by touch: six tools (Sound, Graphics, Crisp, Keys, Log, Fullscreen) fit 358 px at 56 px each. */
+/* Phones by touch: seven tools (Sound, Graphics, Underclock, Crisp, Keys, Log, Fullscreen) fit 358 px, at least
+   48 px each with no gap (the labels of Graphics and Fullscreen make theirs wider); Underclock's label is "Clock"
+   there. */
 @media (max-width: 639px) and (hover: none) {
+  .t-label .t-full {
+    display: none;
+  }
+
+  .t-label .t-short {
+    display: inline;
+  }
+
+  .t-right {
+    gap: 0;
+  }
+
   .t-right .t-btn {
-    min-width: 56px;
-    padding-inline: 4px;
+    min-width: 48px;
+    padding-inline: 2px;
   }
 }
 
@@ -2707,6 +2730,7 @@ body[data-chrome="hidden"] .theatre:fullscreen .sill {
   }
 
   .t-btn[aria-pressed="true"]::before,
+  .t-btn.on::before,
   .t-btn[aria-expanded="true"]::before {
     forced-color-adjust: none;
     background: Highlight;

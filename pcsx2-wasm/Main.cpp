@@ -124,9 +124,11 @@ static std::atomic<float> s_vps{0.0f};
 // The per-vsync recorder (pcsx2web_perf_ring()): one record per vsync in a ring the page reads.
 // Each record is PERF_FIELDS doubles: vsync number, wall time (ms), cumulative busy time (ms) of the
 // EE, GS and VU1 threads, cumulative JIT compile time (ms), cumulative time waiting for GPU pipelines
-// (ms) and their count, and the emulated vsync rate (Hz) the record's speed is relative to.
+// (ms) and their count, the emulated vsync rate (Hz) the record's speed is relative to, cumulative time
+// the EE JIT's code generation thread spent building modules (ms), and the cumulative counts of EE JIT
+// modules installed and of those built or compiled ahead from a code list.
 static constexpr u32 PERF_RECORDS = 8192;
-static constexpr u32 PERF_FIELDS = 9;
+static constexpr u32 PERF_FIELDS = 12;
 alignas(8) static double s_perf_ring[PERF_RECORDS * PERF_FIELDS];
 static std::atomic<u32> s_perf_written{0};
 
@@ -152,6 +154,11 @@ static std::atomic<u32> s_vsync_count{0};
 // Crisp: nearest-neighbour presentation (WebGPU path). -1 = unchanged since the last apply.
 static std::atomic<int> s_crisp_request{-1};
 static bool s_crisp = false; // CPU thread
+// The EE cycle rate the page asked for (EmuConfig.Speedhacks.EECycleRate: 0, or -1 to -3 to underclock the EE),
+// kCycleRateNone when there is no new request.
+static constexpr int kCycleRateNone = -128;
+static std::atomic<int> s_cycle_rate_request{kCycleRateNone};
+static int s_cycle_rate = 0; // CPU thread
 
 // Test hooks (README "Automated runs"): a screenshot at a vsync, and copies of presented 2D-path
 // frames by vsync number. The capture slots are written once by the GS thread and published
@@ -1654,6 +1661,22 @@ static void CheckCrispRequest(bool apply_now)
 		ApplyCrispSetting(request != 0, apply_now);
 }
 
+// The EE underclock (PCSX2's EE Cycle Rate speedhack), which the page keeps per game. CPU thread.
+static void CheckCycleRateRequest(bool apply_now)
+{
+	const int request = s_cycle_rate_request.exchange(kCycleRateNone, std::memory_order_acq_rel);
+	if (request == kCycleRateNone || request == s_cycle_rate)
+		return;
+	s_cycle_rate = request;
+	{
+		auto lock = Host::GetSettingsLock();
+		s_settings_interface.SetIntValue("EmuCore/Speedhacks", "EECycleRate", request);
+	}
+	Console.WriteLnFmt("pcsx2-wasm: EE cycle rate {}", request);
+	if (apply_now && VMManager::HasValidVM())
+		VMManager::ApplySettings();
+}
+
 static void ResolvePadBindIndexes()
 {
 	const Pad::ControllerInfo* info = Pad::GetControllerInfo(Pad::ControllerType::DualShock2);
@@ -1868,6 +1891,7 @@ static void RunVM(const std::string& bios_name)
 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", s_vu1jit_enabled.load(std::memory_order_acquire));
 	}
 	CheckCrispRequest(false);
+	CheckCycleRateRequest(false);
 	CheckMemcardRequests(false);
 	VMManager::ApplySettings();
 
@@ -1892,6 +1916,7 @@ static void RunVM(const std::string& bios_name)
 
 	MakeBootParameters(bios_name, disc, &params);
 	Error error;
+	EEJit::NewCodeLogSession();
 	const VMBootResult result = VMManager::Initialize(params, &error);
 	if (result != VMBootResult::StartupSuccess)
 	{
@@ -2161,6 +2186,14 @@ EMSCRIPTEN_KEEPALIVE void pcsx2web_surface_size(int width, int height, float sca
 		WebGPUHost::SetSurfaceSize(static_cast<u32>(width), static_cast<u32>(height), scale);
 }
 
+/// The EE underclock: PCSX2's EE cycle rate, 0 (off) or -1 to -3 (the PS2's main processor at 75, 60 or 50 %),
+/// applied at the next vsync or boot. Other values are ignored.
+EMSCRIPTEN_KEEPALIVE void pcsx2web_set_ee_cycle_rate(int rate)
+{
+	if (rate >= -3 && rate <= 0)
+		s_cycle_rate_request.store(rate, std::memory_order_release);
+}
+
 /// Crisp: nearest-neighbour presentation instead of bilinear (applied at the next vsync or boot).
 EMSCRIPTEN_KEEPALIVE void pcsx2web_set_crisp(int crisp)
 {
@@ -2193,6 +2226,21 @@ EMSCRIPTEN_KEEPALIVE const void* pcsx2web_tfx_log(void)
 EMSCRIPTEN_KEEPALIVE void* pcsx2web_tfx_prewarm(void)
 {
 	return WebGPUHost::TFXPrewarmSlot();
+}
+
+/// Address of the EE JIT's code log: the blocks it compiled since the VM started (EEJit::CodeListBlock: session,
+/// count, version lo/hi, then count entries of PC and code hash). The page keeps them per game to hand them back
+/// at the game's next boot (README "Code lists").
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_ee_code_log(void)
+{
+	return EEJit::CodeLog();
+}
+
+/// Address of the slot the page writes a game's stored code list into (the same layout; its first word is the
+/// slot's state, EEJit::CODE_SLOT_*). The EE thread takes it at its next vsync.
+EMSCRIPTEN_KEEPALIVE void* pcsx2web_ee_code_list(void)
+{
+	return EEJit::CodeListSlot();
 }
 
 /// Test hook: the WebGPU device destroys itself at its next present, as on a device loss.
@@ -2281,6 +2329,9 @@ static void RecordPerfVsync(u32 vsync)
 	r[6] = PerfCounters::gpu_pipeline_ns.load(std::memory_order_relaxed) / 1e6;
 	r[7] = PerfCounters::gpu_pipelines.load(std::memory_order_relaxed);
 	r[8] = VMManager::GetFrameRate();
+	r[9] = PerfCounters::ee_build_ns.load(std::memory_order_relaxed) / 1e6;
+	r[10] = static_cast<double>(PerfCounters::ee_modules.load(std::memory_order_relaxed));
+	r[11] = static_cast<double>(PerfCounters::ee_ahead_modules.load(std::memory_order_relaxed));
 	s_perf_written.store(n + 1, std::memory_order_release);
 }
 
@@ -2293,6 +2344,7 @@ void Host::PumpMessagesOnCPUThread()
 	RunCPUThreadQueue();
 	CheckStopRequest();
 	CheckCrispRequest(true);
+	CheckCycleRateRequest(true);
 	CheckMemcardRequests(true);
 	s_memcard_status[0].store(MemcardBusy::IsBusy() ? MEMCARD_STATUS_BUSY : 0, std::memory_order_release);
 

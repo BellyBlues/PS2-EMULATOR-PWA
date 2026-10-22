@@ -44,6 +44,7 @@
 #include "VMManager.h"
 #include "ps2/BiosTools.h"
 #ifdef ARCH_WASM
+#include "wasm/EEJit.h"
 #include "wasm/VU0Jit.h"
 #include "wasm/VU1Jit.h"
 #endif
@@ -2315,6 +2316,10 @@ void VMManager::Internal::Throttle(bool vsync_start)
 	const u64 uExpectedEnd =
 		s_limiter_frame_start +
 		(vsync_start ? (s_limiter_ticks_per_frame * 0.9) : s_limiter_ticks_per_frame); // Compute when we would expect this frame to end, assuming everything goes perfectly perfect.
+#ifdef __EMSCRIPTEN__
+	if (EEJit::g_ahead_test && !vsync_start)
+		EEJit::CompileAhead(GetCPUTicks() + GetTickFrequency() / 200);
+#endif
 	const u64 iEnd = GetCPUTicks(); // The current tick we actually stopped on.
 	const s64 sDeltaTime = iEnd - uExpectedEnd; // The diff between when we stopped and when we expected to.
 
@@ -2342,13 +2347,19 @@ void VMManager::Internal::Throttle(bool vsync_start)
 	}
 
 #ifdef __EMSCRIPTEN__
+	// Time the frame does not need: the EE JIT compiles code it expects to run (EEJit::CompileAhead()). Then the
+	// rest is waited.
+	EEJit::CompileAhead(uExpectedEnd);
 	// Waiting for the frame's time is not work: keep it out of the CPU thread's usage (thread usage on
 	// wasm is wall time minus waits, see Threading::ScopedWaitTimer).
 	Threading::ScopedWaitTimer limiter_wait;
+	const s64 sWaitTime = static_cast<s64>(GetCPUTicks()) - static_cast<s64>(uExpectedEnd);
+#else
+	const s64 sWaitTime = sDeltaTime;
 #endif
 
 	// Conversion of delta from CPU ticks (microseconds) to milliseconds
-	const s32 msec = static_cast<s32>((sDeltaTime * -1000) / static_cast<s64>(GetTickFrequency()));
+	const s32 msec = static_cast<s32>((sWaitTime * -1000) / static_cast<s64>(GetTickFrequency()));
 
 	// If any integer value of milliseconds exists, sleep it off.
 	// Prior comments suggested that 1-2 ms sleeps were inaccurate on some OSes;

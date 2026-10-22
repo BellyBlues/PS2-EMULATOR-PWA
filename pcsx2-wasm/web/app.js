@@ -326,6 +326,9 @@
 		stateSaveLabel: $('state-save-label'),
 		stateLoad: $('state-load'),
 		stateLoadLabel: $('state-load-label'),
+		stateReload: $('state-reload'),
+		stateReloadLabel: $('state-reload-label'),
+		stateInput: $('state-input'),
 		recEmpty: $('rec-empty'),
 		recChart: $('rec-chart'),
 		recCrop: $('rec-crop'),
@@ -1463,6 +1466,7 @@
 	function onVmStateChange(prev, state) {
 		page.vmState = state;
 		stateRender();
+		renderEe();
 		pageLog(`VM state: ${STATE_NAMES[prev] || prev} -> ${STATE_NAMES[state] || state}`);
 		if (state !== STATE.RUNNING)
 			releaseAllKeys(true);
@@ -2938,12 +2942,12 @@
 	}
 
 	// Developer save states (?threads=1, ?state=): snapshots of the whole emulated machine, not memory card saves.
-	// Save state writes one at the CPU thread's next pause and downloads it; Load state puts the last one saved
-	// (or given with ?state=) back into the running game. ?state=<url>, a file on this server (dev-bios/<name> with
-	// serve.py --bios-dir), is also loaded by the next boot once the game has started.
+	// Save state writes one at the CPU thread's next pause and downloads it; Load state… puts a .p2s file the user
+	// picks into the running game; Reload state puts the last one saved or loaded back. ?state=<url>, a file on this
+	// server (dev-bios/<name> with serve.py --bios-dir), is also loaded by the next boot once the game has started.
 	const STATE_DIR = '/states';
 	const STATE_TIMEOUT_MS = 60000;
-	const devState = { pending: false, bootName: null, bootBytes: null, bytes: null, busy: null };
+	const devState = { pending: false, bootName: null, bootBytes: null, bytes: null, busy: null, picked: false };
 
 	async function loadStateFromUrl(param) {
 		const fail = (text, detail) => {
@@ -3028,6 +3032,7 @@
 		const started = performance.now();
 		const finish = (ok, why) => {
 			devState.busy = null;
+			devState.picked = false;
 			if (ok && save) {
 				const bytes = M.FS.readFile(path);
 				devState.bytes = bytes;
@@ -3066,19 +3071,45 @@
 		setTimeout(check, 100);
 	}
 
+	// Load state…: the chosen file is loaded into the running game, and kept for Reload state.
+	async function stateFileChosen() {
+		const file = els.stateInput.files && els.stateInput.files[0];
+		els.stateInput.value = '';
+		if (!file || devState.busy || page.vmState !== STATE.RUNNING)
+			return;
+		let bytes;
+		try {
+			bytes = new Uint8Array(await file.arrayBuffer());
+		} catch (err) {
+			pageLog(`Could not read the save state ${file.name}: ${errorText(err)}`, 'warn');
+			announce('Loading the state failed');
+			return;
+		}
+		pageLog(`Save state chosen: ${file.name} (${bytes.length.toLocaleString('en-US')} bytes).`);
+		devState.bytes = bytes;
+		devState.picked = true;
+		stateOperation('load');
+		if (!devState.busy)
+			devState.picked = false;
+	}
+
 	function stateRender() {
 		if (!els.stateSave)
 			return;
 		const running = page.vmState === STATE.RUNNING;
 		els.stateSave.disabled = !running || !!devState.busy;
-		els.stateLoad.disabled = !running || !!devState.busy || !devState.bytes;
+		els.stateLoad.disabled = !running || !!devState.busy;
+		els.stateReload.disabled = !running || !!devState.busy || !devState.bytes;
 		setText(els.stateSaveLabel, devState.busy === 'save' ? 'Saving…' : 'Save state');
-		setText(els.stateLoadLabel, devState.busy === 'load' ? 'Loading…' : 'Load state');
+		const loading = devState.busy === 'load';
+		setText(els.stateLoadLabel, loading && devState.picked ? 'Loading…' : 'Load state…');
+		setText(els.stateReloadLabel, loading && !devState.picked ? 'Loading…' : 'Reload state');
 	}
 
 	// startVm(): an ELF boot with ?elf=, a disc boot when a disc is open, otherwise the BIOS alone.
 	function bootRequest() {
 		setBootState();
+		eeBoot();
 		if (devElf.bytes) {
 			disc.runIsDisc = false;
 			return bootElfRequest();
@@ -3125,8 +3156,11 @@
 		disc.runTitle = title;
 		disc.runSerial = serial;
 		pageLog(`Game: ${title || 'not in the game database'}${serial ? ` (${serial})` : ''}`);
-		if (newSerial)
+		if (newSerial) {
 			pipeGameKnown(serial);
+			codeGameKnown(serial);
+			eeGameKnown(serial);
+		}
 		const d = disc.current;
 		if (title && d && d.title !== title) {
 			d.title = title;
@@ -3144,9 +3178,11 @@
 				if (page.vmState === STATE.STOPPED || page.vmState === STATE.FAILED) {
 					checkMemoryCards(true); // a normal Stop closed the card: keep it now
 					pipeVmStopped();
+					codeVmStopped();
 				}
 			}
 			pipeTick();
+			codeTick();
 		}
 		checkMemoryCards(false);
 		const running = disc.runIsDisc && disc.current && pageState() === 'running';
@@ -3346,6 +3382,185 @@
 		if (buf && M && typeof M._pcsx2web_tfx_log === 'function')
 			pipes.staleSession = Atomics.load(new Uint32Array(buf, M._pcsx2web_tfx_log() >>> 0, 1), 0);
 		pipes.serial = '';
+	}
+
+	// ------------------------------------------------------------------ code lists
+	// The EE JIT logs the blocks it compiles (pcsx2web_ee_code_log(): a PC and a hash of its code each). The page
+	// keeps them per game serial in IndexedDB (CODE_IDB_NAME) and, when the same game boots again, hands the list
+	// to the EE thread (pcsx2web_ee_code_list()), which compiles those blocks ahead when the frame limiter has time
+	// left, before the game runs them (README "Code lists"). ?codelist=0 keeps the lists but does not hand them over.
+	const CODE_IDB_NAME = 'pcsx2-web-code';
+	const CODE_IDB_STORE = 'ee';
+	const CODE_ENTRY_BYTES = 8; // PC, hash
+	const CODE_CAPACITY = 32768; // EEJit::kCodeListCapacity
+	const CODE_HEADER_BYTES = 16; // session or state, count, version lo, version hi
+	const CODE_SLOT_FREE = 0;
+	const CODE_SLOT_WRITING = 1;
+	const CODE_SLOT_READY = 2;
+	const CODE_READ_MS = 2000;
+	const CODE_SAVE_MS = 15000;
+	const codes = {
+		serial: '', session: -1, staleSession: -1, read: 0, version: null, used: [], usedSet: new Set(),
+		stored: null, handOver: null, dirty: false, lastRead: 0, lastSave: 0, writes: Promise.resolve(), warned: false,
+	};
+
+	function codeIdb(mode, fn) {
+		return new Promise((resolve, reject) => {
+			if (typeof indexedDB === 'undefined') {
+				reject(new Error('IndexedDB is not available'));
+				return;
+			}
+			const open = indexedDB.open(CODE_IDB_NAME, 1);
+			open.onupgradeneeded = () => open.result.createObjectStore(CODE_IDB_STORE);
+			open.onblocked = () => reject(new Error('IndexedDB open blocked'));
+			open.onerror = () => reject(open.error);
+			open.onsuccess = () => {
+				const db = open.result;
+				const tx = db.transaction(CODE_IDB_STORE, mode);
+				const req = fn(tx.objectStore(CODE_IDB_STORE));
+				let result;
+				req.onsuccess = () => { result = req.result; };
+				tx.oncomplete = () => { db.close(); resolve(result); };
+				tx.onerror = () => { db.close(); reject(tx.error || req.error); };
+				tx.onabort = () => { db.close(); reject(tx.error || new Error('IndexedDB transaction aborted')); };
+			};
+		});
+	}
+
+	function codeWarn(what, err) {
+		if (codes.warned)
+			return;
+		codes.warned = true;
+		pageLog(`Code list: could not ${what} (${err && err.message}); the game compiles its code as it runs it.`, 'warn');
+	}
+
+	// The game's serial is known (readGameDetails()): start its list, and hand the stored one over.
+	function codeGameKnown(serial) {
+		const M = window.Module;
+		codes.serial = serial;
+		codes.read = 0;
+		codes.used = [];
+		codes.usedSet = new Set();
+		codes.stored = null;
+		codes.handOver = null;
+		codes.dirty = false;
+		if (!serial || !M || typeof M._pcsx2web_ee_code_log !== 'function')
+			return;
+		codeIdb('readonly', (s) => s.get(serial)).then((rec) => {
+			if (codes.serial !== serial || !rec || !(rec.entries instanceof ArrayBuffer) || !Array.isArray(rec.version))
+				return;
+			codes.stored = rec;
+			if (params.get('codelist') === '0')
+				return;
+			codes.handOver = rec;
+			codeHandOver();
+		}).catch((err) => codeWarn('read the stored list', err));
+	}
+
+	// Writes the list into the EE thread's slot, unless it is taking an earlier one (then the next tick tries again).
+	function codeHandOver() {
+		const rec = codes.handOver;
+		const buf = heapBuffer();
+		if (!rec || !buf)
+			return;
+		const ptr = window.Module._pcsx2web_ee_code_list() >>> 0;
+		const words = new Int32Array(buf, ptr, CODE_HEADER_BYTES / 4);
+		if (Atomics.compareExchange(words, 0, CODE_SLOT_FREE, CODE_SLOT_WRITING) !== CODE_SLOT_FREE &&
+			Atomics.compareExchange(words, 0, CODE_SLOT_READY, CODE_SLOT_WRITING) !== CODE_SLOT_READY)
+			return;
+		codes.handOver = null;
+		const n = Math.min(Math.floor(rec.entries.byteLength / CODE_ENTRY_BYTES), CODE_CAPACITY);
+		new Uint8Array(buf, ptr + CODE_HEADER_BYTES, n * CODE_ENTRY_BYTES).set(new Uint8Array(rec.entries, 0, n * CODE_ENTRY_BYTES));
+		words[2] = rec.version[0] | 0;
+		words[3] = rec.version[1] | 0;
+		Atomics.store(words, 1, n);
+		Atomics.store(words, 0, CODE_SLOT_READY);
+		pageLog(`Code list: ${n} blocks of code this game ran before, to compile ahead.`);
+	}
+
+	// Copies the entries logged since the last read (a session is one VM's log).
+	function codeRead() {
+		const M = window.Module;
+		const buf = heapBuffer();
+		if (!codes.serial || !buf || !M || typeof M._pcsx2web_ee_code_log !== 'function')
+			return;
+		const ptr = M._pcsx2web_ee_code_log() >>> 0;
+		const words = new Uint32Array(buf, ptr, CODE_HEADER_BYTES / 4);
+		const session = Atomics.load(words, 0);
+		if (session === codes.staleSession)
+			return; // the log of the VM that ran before this game's
+		if (session !== codes.session) {
+			codes.session = session;
+			codes.read = 0;
+		}
+		const count = Math.min(Atomics.load(words, 1), CODE_CAPACITY);
+		const version = [Atomics.load(words, 2) >>> 0, Atomics.load(words, 3) >>> 0];
+		if (count <= codes.read)
+			return;
+		const entries = new Uint32Array(buf, ptr + CODE_HEADER_BYTES + codes.read * CODE_ENTRY_BYTES, (count - codes.read) * 2).slice();
+		if (Atomics.load(words, 0) !== session)
+			return; // a new log started meanwhile: the next read starts it over
+		codes.version = version;
+		for (let i = 0; i < entries.length; i += 2) {
+			const id = `${entries[i]}:${entries[i + 1]}`;
+			if (!codes.usedSet.has(id)) {
+				codes.usedSet.add(id);
+				codes.used.push([entries[i], entries[i + 1]]);
+				codes.dirty = true;
+			}
+		}
+		codes.read = count;
+	}
+
+	// Stores this session's blocks, in the order they were compiled, then the stored ones of the same version it
+	// did not compile, up to CODE_CAPACITY.
+	function codeSave() {
+		codeRead();
+		if (!codes.dirty || !codes.serial || !codes.version)
+			return;
+		const serial = codes.serial;
+		const version = codes.version;
+		const list = codes.used.slice(0, CODE_CAPACITY);
+		const old = codes.stored;
+		if (old && old.version[0] === version[0] && old.version[1] === version[1]) {
+			const ob = new Uint32Array(old.entries);
+			for (let i = 0; i + 1 < ob.length && list.length < CODE_CAPACITY; i += 2) {
+				if (!codes.usedSet.has(`${ob[i]}:${ob[i + 1]}`))
+					list.push([ob[i], ob[i + 1]]);
+			}
+		}
+		const out = new Uint32Array(list.length * 2);
+		list.forEach(([pc, hash], i) => { out[2 * i] = pc; out[2 * i + 1] = hash; });
+		const rec = { version, entries: out.buffer, savedAt: Date.now() };
+		codes.dirty = false;
+		codes.stored = rec;
+		codes.lastSave = performance.now();
+		// One write after another, so that an older list never lands after a newer one.
+		codes.writes = codes.writes.then(() => codeIdb('readwrite', (s) => s.put(rec, serial)))
+			.catch((err) => codeWarn('store the list', err));
+	}
+
+	function codeTick() {
+		if (codes.handOver)
+			codeHandOver();
+		const now = performance.now();
+		if (!codes.serial || now - codes.lastRead < CODE_READ_MS)
+			return;
+		codes.lastRead = now;
+		codeRead();
+		if (codes.dirty && now - codes.lastSave >= CODE_SAVE_MS)
+			codeSave();
+	}
+
+	// The VM stopped: keep what it compiled, and ignore its log from now on (the next VM starts a new session).
+	function codeVmStopped() {
+		const M = window.Module;
+		const buf = heapBuffer();
+		if (codes.serial)
+			codeSave();
+		if (buf && M && typeof M._pcsx2web_ee_code_log === 'function')
+			codes.staleSession = Atomics.load(new Uint32Array(buf, M._pcsx2web_ee_code_log() >>> 0, 1), 0);
+		codes.serial = '';
 	}
 
 	// ---- the slate, the disc menu
@@ -5887,7 +6102,7 @@
 
 	// Esc: native dialog/popover close first, then a drawer, then the keyboard.
 	function onEscape(e) {
-		if (els.about.open || menuOpen() || discMenuOpen() || cardMenuOpen() || soundMenuOpen() || gfxMenuOpen())
+		if (els.about.open || menuOpen() || discMenuOpen() || cardMenuOpen() || soundMenuOpen() || gfxMenuOpen() || eeMenuOpen())
 			return;
 		dismissTips();
 		const a = document.activeElement;
@@ -8065,6 +8280,128 @@
 		renderGfx();
 	}
 
+	// ------------------------------------------------------------------ underclock (UI-SPEC.md §12a)
+
+	// PCSX2's EE Cycle Rate speedhack, chosen per game (by serial) and remembered in this browser: the PS2's main
+	// processor runs fewer instructions per frame, which lightens heavy scenes; some games then run in slow motion or
+	// glitch, so it is off unless chosen.
+	const PREF_EE_RATE = 'pcsx2web.eeRate.';
+	const EE_RATE_NAMES = { 0: 'off', '-1': 'light', '-2': 'medium', '-3': 'strong' };
+	const eeEls = {
+		btn: $('btn-ee'),
+		menu: $('ee-menu'),
+		game: $('ee-game'),
+		reason: $('ee-reason'),
+		radios: [...document.querySelectorAll('input[name="ee-rate"]')],
+	};
+	const ee = { serial: '', rate: 0 };
+
+	function eeMenuOpen() {
+		try {
+			return eeEls.menu.matches(':popover-open');
+		} catch {
+			return false;
+		}
+	}
+
+	function placeEeMenu() {
+		const r = eeEls.btn.getBoundingClientRect();
+		const width = Math.min(320, window.innerWidth - 32);
+		const right = Math.max(16, Math.min(window.innerWidth - r.right, window.innerWidth - width - 16));
+		eeEls.menu.style.right = `${Math.round(right)}px`;
+		eeEls.menu.style.bottom = `${Math.round(Math.max(8, window.innerHeight - r.top + 8))}px`;
+	}
+
+	function eeStoredRate(serial) {
+		const v = Number(readPref(PREF_EE_RATE + serial));
+		return v === -1 || v === -2 || v === -3 ? v : 0;
+	}
+
+	function eeApply(rate) {
+		ee.rate = rate;
+		const M = window.Module;
+		if (M && typeof M._pcsx2web_set_ee_cycle_rate === 'function')
+			M._pcsx2web_set_ee_cycle_rate(rate);
+	}
+
+	// bootRequest(): every boot starts at full speed, until the game is known.
+	function eeBoot() {
+		ee.serial = '';
+		eeApply(0);
+		renderEe();
+	}
+
+	// The running game's serial is known: its own choice.
+	function eeGameKnown(serial) {
+		ee.serial = serial || '';
+		const rate = ee.serial ? eeStoredRate(ee.serial) : 0;
+		eeApply(rate);
+		if (rate)
+			pageLog(`Underclock for ${ee.serial}: ${EE_RATE_NAMES[rate]} (EE cycle rate ${rate}).`);
+		renderEe();
+	}
+
+	function renderEe() {
+		const running = page.vmState === STATE.RUNNING || page.vmState === STATE.STARTING;
+		const known = running && !!ee.serial;
+		for (const r of eeEls.radios) {
+			r.checked = Number(r.value) === (known ? ee.rate : 0);
+			r.disabled = !known;
+		}
+		eeEls.game.textContent = known ? (disc.runTitle || ee.serial) : running ? 'Not a game with a serial' : 'No game running';
+		eeEls.reason.textContent = known ? 'Remembered for this game. Some games run in slow motion or glitch underclocked.' :
+			'Start a game to choose. Each game keeps its own choice.';
+		eeEls.btn.setAttribute('aria-label', `Underclock, ${EE_RATE_NAMES[known ? ee.rate : 0]}`);
+		eeEls.btn.classList.toggle('on', known && ee.rate !== 0);
+		const tip = eeEls.btn.querySelector('.tip');
+		if (tip)
+			tip.textContent = known && ee.rate ? `Underclock: ${EE_RATE_NAMES[ee.rate]}` : 'Underclock';
+	}
+
+	function wireEeUi() {
+		for (const r of eeEls.radios) {
+			r.addEventListener('change', () => {
+				if (!r.checked || !ee.serial)
+					return;
+				const rate = Number(r.value);
+				writePref(PREF_EE_RATE + ee.serial, String(rate));
+				eeApply(rate);
+				pageLog(`Underclock for ${ee.serial}: ${EE_RATE_NAMES[rate]} (EE cycle rate ${rate}).`);
+				renderEe();
+			});
+		}
+		eeEls.menu.addEventListener('beforetoggle', (e) => {
+			if (e.newState === 'open') {
+				renderEe();
+				placeEeMenu();
+			}
+		});
+		eeEls.menu.addEventListener('toggle', (e) => {
+			const open = e.newState === 'open';
+			eeEls.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+			if (open) {
+				const first = eeEls.radios.find((x) => x.checked && !x.disabled) || eeEls.radios.find((x) => !x.disabled);
+				(first || eeEls.menu).focus({ preventScroll: true });
+			} else {
+				const a = document.activeElement;
+				if (!a || a === document.body || eeEls.menu.contains(a))
+					eeEls.btn.focus({ preventScroll: true });
+			}
+			updateChrome();
+		});
+		eeEls.menu.addEventListener('focusout', (e) => {
+			const to = e.relatedTarget;
+			if (to && !eeEls.menu.contains(to) && to !== eeEls.btn)
+				eeEls.menu.hidePopover();
+		});
+		for (const type of ['resize', 'fullscreenchange'])
+			(type === 'resize' ? window : document).addEventListener(type, () => {
+				if (eeMenuOpen())
+					placeEeMenu();
+			});
+		renderEe();
+	}
+
 	// ------------------------------------------------------------------ preferences
 
 	function readPref(key) {
@@ -8256,7 +8593,7 @@
 
 	function chromeMayHide() {
 		return pageState() === 'running' && captureActive() && document.hasFocus() &&
-			!page.drawer && !menuOpen() && !discMenuOpen() && !cardMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
+			!page.drawer && !menuOpen() && !discMenuOpen() && !cardMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !eeMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
 			!pointerOverChrome && !page.keepChrome && hoverQuery.matches;
 	}
 
@@ -8301,12 +8638,14 @@
 	// ------------------------------------------------------------------ recorder (?threads=1)
 	// The CPU thread writes one record per vsync into a ring (pcsx2web_perf_ring(), PERF_FIELDS
 	// doubles each: vsync, wall ms, cumulative busy ms of the EE, GS and VU1 threads, cumulative JIT
-	// compile ms, cumulative GPU pipeline ms and count, vsync rate in Hz). While recording, poll()
+	// compile ms, cumulative GPU pipeline ms and count, vsync rate in Hz, cumulative ms the EE JIT's
+	// code generation thread built modules, cumulative EE modules installed and those built or
+	// compiled ahead from the game's code list). While recording, poll()
 	// drains it into rows, one per vsync: its speed (the PS2's frame time over the wall time it
 	// took), each thread's busy share and what was compiled during it. A drop shorter than the
 	// readout's averaging window shows here. Up to 10 minutes are kept.
 	const PERF_RECORDS = 8192;
-	const PERF_FIELDS = 9;
+	const PERF_FIELDS = 12;
 	const REC_MAX_ROWS = 30000;
 	// With the frame limiter on, single vsyncs jitter around their target (the limiter sleeps in whole
 	// milliseconds), so the chart and the summary lead with the speed over the last REC_WINDOW vsyncs.
@@ -8353,7 +8692,7 @@
 		for (; i < written; i++) {
 			const o = (i % PERF_RECORDS) * PERF_FIELDS;
 			const r = { v: ring[o], t: ring[o + 1], ee: ring[o + 2], gs: ring[o + 3], vu: ring[o + 4], jit: ring[o + 5],
-				gpu: ring[o + 6], pipes: ring[o + 7], hz: ring[o + 8] };
+				gpu: ring[o + 6], pipes: ring[o + 7], hz: ring[o + 8], bg: ring[o + 9], mods: ring[o + 10], ahead: ring[o + 11] };
 			const p = rec.prev;
 			rec.prev = r;
 			if (!rec.t0)
@@ -8366,6 +8705,7 @@
 				v: r.v, t: (p.t - rec.t0) / 1000, ms, speed: r.hz > 0 ? (1000 / r.hz / ms) * 100 : 0,
 				ee: pct(r.ee, p.ee), gs: pct(r.gs, p.gs), vu: pct(r.vu, p.vu),
 				jit: Math.max(0, r.jit - p.jit), gpu: Math.max(0, r.gpu - p.gpu), pipes: Math.max(0, r.pipes - p.pipes), hz: r.hz,
+				bg: Math.max(0, r.bg - p.bg), mods: Math.max(0, r.mods - p.mods), ahead: Math.max(0, r.ahead - p.ahead),
 			});
 			const row = rec.rows[rec.rows.length - 1];
 			const win = rec.rows.slice(-REC_WINDOW);
@@ -8402,6 +8742,8 @@
 			worstEe: mean('ee', worst), worstGs: mean('gs', worst), worstVu: mean('vu', worst), worstN: worst.length,
 			jitMs: rows.reduce((a, r) => a + r.jit, 0), jitVsyncs: jitRows.length,
 			gpuMs: rows.reduce((a, r) => a + r.gpu, 0), pipes: rows.reduce((a, r) => a + r.pipes, 0), gpuVsyncs: gpuRows.length,
+			bgMs: rows.reduce((a, r) => a + r.bg, 0), mods: rows.reduce((a, r) => a + r.mods, 0), ahead: rows.reduce((a, r) => a + r.ahead, 0),
+			quietSlow: rows.filter((r) => r.speed10 < 95 && r.jit <= 0.05 && r.bg <= 0.05 && r.pipes === 0).length,
 		};
 	}
 
@@ -8416,12 +8758,15 @@
 			`${st.under90} vsyncs under 90%, ${st.under75} under 75%; slowest single vsync ${fmt0(st.minRaw)}%\n` +
 			`busy, mean: EE ${fmt0(st.ee)}%  GS ${fmt0(st.gs)}%  VU ${fmt0(st.vu)}%; ` +
 			`in the slowest ${st.worstN}: EE ${fmt0(st.worstEe)}%  GS ${fmt0(st.worstGs)}%  VU ${fmt0(st.worstVu)}%\n` +
-			`compiling: JITs ${fmt1(st.jitMs)} ms over ${st.jitVsyncs} vsyncs; GPU pipelines ${st.pipes} (${fmt1(st.gpuMs)} ms) over ${st.gpuVsyncs} vsyncs`;
+			`compiling: JITs ${fmt1(st.jitMs)} ms over ${st.jitVsyncs} vsyncs; GPU pipelines ${st.pipes} (${fmt1(st.gpuMs)} ms) over ${st.gpuVsyncs} vsyncs\n` +
+			`EE code: ${st.mods} modules (${st.ahead} of them compiled ahead), ${fmt1(st.bgMs)} ms built on the helper thread; ` +
+			`${st.quietSlow} vsyncs under 95% with nothing compiling`;
 	}
 
-	const REC_COLUMNS = 'vsync,time_s,ms,speed_pct,speed10_pct,ee_pct,gs_pct,vu_pct,jit_ms,gpu_pipeline_ms,gpu_pipelines';
+	const REC_COLUMNS = 'vsync,time_s,ms,speed_pct,speed10_pct,ee_pct,gs_pct,vu_pct,jit_ms,gpu_pipeline_ms,gpu_pipelines,' +
+		'jit_helper_ms,ee_modules,ee_modules_ahead';
 	const recRowCsv = (r) => [r.v, fmt2(r.t), fmt2(r.ms), fmt1(r.speed), fmt1(r.speed10), fmt0(r.ee), fmt0(r.gs), fmt0(r.vu), fmt1(r.jit), fmt1(r.gpu),
-		r.pipes].join(',');
+		r.pipes, fmt1(r.bg), r.mods, r.ahead].join(',');
 
 	// For pasting into a message: the context, the summary and the cropped vsyncs (averaged in groups
 	// when there are more than 1500, so the text stays short).
@@ -8447,7 +8792,7 @@
 			const speed = (g.length * 100) / g.reduce((a, r) => a + 100 / Math.max(r.speed, 0.001), 0);
 			lines.push([g[0].v, fmt2(g[0].t), fmt2(ms / g.length), fmt1(speed), fmt1(speed),
 				fmt0(sum('ee') / g.length), fmt0(sum('gs') / g.length), fmt0(sum('vu') / g.length), fmt1(sum('jit')), fmt1(sum('gpu')),
-				sum('pipes'), fmt1(Math.min(...g.map((r) => r.speed)))].join(','));
+				sum('pipes'), fmt1(sum('bg')), sum('mods'), sum('ahead'), fmt1(Math.min(...g.map((r) => r.speed)))].join(','));
 		}
 		return lines.join('\n');
 	}
@@ -8491,7 +8836,8 @@
 		}
 		const rows = done ? recSelection() : rec.rows;
 		const st = recStats(rows);
-		setText(els.recSummary, done ? recSummaryText(st, rows) : '');
+		setText(els.recSummary, done ? `${recSummaryText(st, rows)}\nmarks under the chart, top to bottom: compiling on the EE or VU thread (coral); ` +
+			'EE code built on the helper thread (grey, amber where code compiled ahead went in); GPU pipelines (sand)' : '');
 		els.recChart.setAttribute('aria-label', st ? `Speed over ${REC_WINDOW} vsyncs, lowest ${fmt0(st.min)}%, ${st.under90} vsyncs under 90%` : 'No recording yet');
 		if (has && page.drawer === 'rec')
 			recDrawChart();
@@ -8511,7 +8857,7 @@
 		ctx.clearRect(0, 0, w, h);
 		const rows = rec.rows, n = rows.length;
 		const x = (i) => (n > 1 ? (i / (n - 1)) * (w - 1) : 0);
-		const top = 4 * dpr, bottom = h - 8 * dpr; // the bottom strip holds the compile marks
+		const top = 4 * dpr, bottom = h - 12 * dpr; // the bottom strip holds the compile marks, three rows
 		const y = (pct) => bottom - (Math.min(Math.max(pct, 0), 150) / 150) * (bottom - top);
 		if (!rec.recording) {
 			ctx.fillStyle = 'rgb(242 181 68 / 0.12)';
@@ -8544,6 +8890,11 @@
 			const r = rows[i];
 			if (r.jit > 0.05) {
 				ctx.fillStyle = color('--coral');
+				ctx.fillRect(x(i), h - 11 * dpr, Math.max(1, dpr), 3 * dpr);
+			}
+			if (r.bg > 0.05 || r.ahead > 0) {
+				// Built on the helper thread; amber where modules compiled ahead were installed.
+				ctx.fillStyle = r.ahead > 0 ? color('--amber') : color('--ink-2');
 				ctx.fillRect(x(i), h - 7 * dpr, Math.max(1, dpr), 3 * dpr);
 			}
 			if (r.pipes > 0) {
@@ -9591,7 +9942,9 @@
 		els.recCopy.addEventListener('click', () => copyText(recText(), els.recCopyLabel));
 		els.recDownload.addEventListener('click', recDownload);
 		els.stateSave.addEventListener('click', () => stateOperation('save'));
-		els.stateLoad.addEventListener('click', () => stateOperation('load'));
+		els.stateLoad.addEventListener('click', () => els.stateInput.click());
+		els.stateInput.addEventListener('change', stateFileChosen);
+		els.stateReload.addEventListener('click', () => stateOperation('load'));
 		for (const input of [els.recFrom, els.recTo]) {
 			input.addEventListener('input', () => {
 				const a = Number(els.recFrom.value), b = Number(els.recTo.value);
@@ -9700,6 +10053,7 @@
 		observeCanvasSize();
 		wireSoundUi();
 		wireGfxUi();
+		wireEeUi();
 		wirePlayersUi();
 		setCrisp(readPref(PREF_CRISP) === '1');
 		page.keepChrome = readPref(PREF_KEEP_CHROME) === '1';

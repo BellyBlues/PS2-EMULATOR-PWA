@@ -400,15 +400,17 @@ async function main() {
 		};
 		let lastSubtitle = "";
 		let lastSample = 0;
-		// --perf: records drained from the page's per-vsync ring (pcsx2web_perf_ring()).
+		// --perf: records drained from the page's per-vsync ring (pcsx2web_perf_ring(), PERF_FIELDS doubles each,
+		// as pcsx2-wasm/Main.cpp).
+		const PERF_FIELDS = 12;
 		const perf = { read: -1, rows: [], prev: null, lastDrain: 0 };
 		const drainPerf = async () => {
 			const r = await evaluate(`(() => { const M = window.Module; if (!M || !M._pcsx2web_perf_ring) return null;
 				const ptr = M._pcsx2web_perf_ring() >>> 0, written = M._pcsx2web_perf_written() >>> 0;
-				const ring = new Float64Array(M.wasmMemory.buffer, ptr, 8192 * 9);
+				const ring = new Float64Array(M.wasmMemory.buffer, ptr, 8192 * ${PERF_FIELDS});
 				let i = ${perf.read} < 0 ? Math.max(0, written - 8192 + 16) : Math.max(${perf.read}, written - 8192 + 16);
 				const out = [];
-				for (; i < written; i++) { const o = (i % 8192) * 9; out.push(Array.from(ring.subarray(o, o + 9))); }
+				for (; i < written; i++) { const o = (i % 8192) * ${PERF_FIELDS}; out.push(Array.from(ring.subarray(o, o + ${PERF_FIELDS}))); }
 				return { written, out }; })()`).catch(() => null);
 			if (!r) return;
 			perf.read = r.written;
@@ -417,7 +419,8 @@ async function main() {
 				perf.prev = rec;
 				if (!p || rec[0] !== p[0] + 1 || !(rec[1] > p[1])) continue;
 				perf.rows.push({ v: rec[0], ms: rec[1] - p[1], gpu: Math.max(0, rec[6] - p[6]), pipes: Math.max(0, rec[7] - p[7]),
-					jit: Math.max(0, rec[5] - p[5]), hz: rec[8] });
+					jit: Math.max(0, rec[5] - p[5]), hz: rec[8], helper: Math.max(0, rec[9] - p[9]),
+					modules: Math.max(0, rec[10] - p[10]), ahead: Math.max(0, rec[11] - p[11]) });
 			}
 		};
 		let gsWorker = null;
@@ -611,13 +614,14 @@ async function main() {
 				vsyncs: rows.length, over25: slow.length,
 				lostMs: Math.round(slow.reduce((a, r) => a + Math.max(0, r.ms - (r.hz > 0 ? 1000 / r.hz : 0)), 0)),
 				pipelineMs: Math.round(sum(rows, "gpu")), pipelines: sum(rows, "pipes"), jitMs: Math.round(sum(rows, "jit")),
+				jitHelperMs: Math.round(sum(rows, "helper")), eeModules: sum(rows, "modules"), eeModulesAhead: sum(rows, "ahead"),
 				pipelineVsyncs: rows.filter((r) => r.pipes > 0).length,
 				worst: [...rows].sort((a, b) => b.ms - a.ms).slice(0, 10).map((r) => ({ v: r.v, ms: +r.ms.toFixed(1), gpu: +r.gpu.toFixed(1), pipes: r.pipes })),
 				worstPipeline: [...rows].sort((a, b) => b.gpu - a.gpu).slice(0, 5).map((r) => ({ v: r.v, ms: +r.ms.toFixed(1), gpu: +r.gpu.toFixed(1), pipes: r.pipes })),
 			};
 			if (outDir)
-				writeFileSync(path.join(outDir, "perf.csv"), "vsync,ms,gpu_pipeline_ms,gpu_pipelines,jit_ms,hz\n" +
-					rows.map((r) => [r.v, r.ms.toFixed(2), r.gpu.toFixed(2), r.pipes, r.jit.toFixed(2), r.hz].join(",")).join("\n") + "\n");
+				writeFileSync(path.join(outDir, "perf.csv"), "vsync,ms,gpu_pipeline_ms,gpu_pipelines,jit_ms,hz,jit_helper_ms,ee_modules,ee_modules_ahead\n" +
+					rows.map((r) => [r.v, r.ms.toFixed(2), r.gpu.toFixed(2), r.pipes, r.jit.toFixed(2), r.hz, r.helper.toFixed(2), r.modules, r.ahead].join(",")).join("\n") + "\n");
 		}
 		summary.ok = status === 0 && summary.errors.length === 0;
 		summary.navAt = navAt;

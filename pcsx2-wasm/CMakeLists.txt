@@ -69,6 +69,7 @@ set(PCSX2_WASM_EXPORTS
 	_pcsx2web_frame
 	_pcsx2web_surface_size
 	_pcsx2web_set_crisp
+	_pcsx2web_set_ee_cycle_rate
 	_pcsx2web_vsync_count
 	_pcsx2web_test_snapshot
 	_pcsx2web_test_lose_device
@@ -91,6 +92,11 @@ list(APPEND PCSX2_WASM_EXPORTS
 list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_tfx_log
 	_pcsx2web_tfx_prewarm
+)
+# Per-game EE JIT code lists (Main.cpp, EEJit.h).
+list(APPEND PCSX2_WASM_EXPORTS
+	_pcsx2web_ee_code_log
+	_pcsx2web_ee_code_list
 )
 # Audio (Main.cpp, "Audio").
 list(APPEND PCSX2_WASM_EXPORTS

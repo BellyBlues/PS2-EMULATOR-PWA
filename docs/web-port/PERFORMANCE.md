@@ -71,6 +71,7 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | A program's blocks jump to each other inside one wasm module, with learned JR/JALR targets and cheaper XGKICK catch-up. Guitar Hero's branchy VU1 code went back to the C++ dispatcher about every 9 instructions. | `pcsx2/wasm/VU1Jit.cpp`, `VU1JitEmit.cpp` | Guitar Hero in a song: VU1 15.1 → 10.0 ms per vsync (12.1 → 7.1 ns per instruction); song opening in Chrome 87 → 130-138 % | `ced73c7b6` |
 | A branch or XGKICK in a branch's delay slot runs in generated code | same | (part of the above) | `c45dbbc50` |
 | The same generator runs VU0 micro programs, now on by default (`EnableVU0`). GTA San Andreas ran VU0 programs on the interpreter for about 13 % of the EE thread. Checked with `-vu0jit-lockstep` on GTA gameplay (600 vsyncs, 1,008,250 programs, 0 differences), the fuzzer on VU0 (about 17,000 programs each with Liftoff only, TurboFan only and default tiering, 0 differences), GTA state hashes (VU0 registers included, 1000 vsyncs) and software-renderer screenshots. | `pcsx2-wasm/Main.cpp`, `pcsx2-headless/Main.cpp` | GTA SA gameplay (headless): 46.2 → 50.2 VPS | `6c4a3d41f` |
+| VU0 blocks stop where the EE's slice ends. The EE runs VU0 in slices of its own cycles, mostly under 16; a block that did not fit a slice whole was not entered, and the interpreter stepped it instead: 23.7 M of the 77.5 M VU0 instructions in 1800 vsyncs of GTA San Andreas, about 6 % of the EE thread. Generated code now leaves before the first instruction that would start past the slice, with the state the interpreter has there; before a run of delay slots (a branch's, an E bit's, an E bit in an E bit's delay slot) it leaves before the instruction that sets them, so the interpreter stops among them as it would. Checked with VU0 lockstep on GTA (1,008,250 runs, 0 differences); the fuzzer, whose VU0 mode now runs a third of its programs in 1-32 cycle slices (Liftoff only, TurboFan only and default tiering, 2 rounds of 20,000 and 40,000 programs, 0 differences; VU1 0 differences); EE/IOP state hashes identical to the build before on GTA, the BIOS and the benchmark. `-vu0jit-slices 0` turns it off. | `pcsx2/wasm/VU0Jit.cpp`, `VU1JitEmit.cpp`, `VU1JitEmit.h`, `VU1JitFuzz.cpp` | GTA SA: VU0 interpreter steps 23.7 M -> 12,800 per 1800 vsyncs; instructions retired 1,045 G -> 995 G per 2400 vsyncs (-4.8 %, the whole process), cycles -4 %; speed from vsync 600 (noisy machine): 86.8 and 97.2 % off, 103.4 and 101.4 % on; re-measured on a quiet machine, medians of 3 interleaved: 93.4 → 96.3 %, instructions 1,042-1,045 G → 995 G | `b67ed7c8b` |
 
 ### EE and IOP JITs (game code)
 
@@ -80,10 +81,13 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | Compile hot code only. New code runs on the interpreter until it has run 128 times. Modules are larger, and compiling has a budget of 4 ms per vsync. | `pcsx2/wasm/JitHeat.h`, `EEJit.cpp`, `IopJit.cpp` | Worst compile in one vsync: Guitar Hero 69 → 7.9 ms, Naruto menus 56.7 → 5.0 ms; total compile 1.3 → 0.34 s | `7852633ef`, `c88cd23f3` |
 | Guest registers in wasm locals. The EE keeps the low 64 bits of the 32 GPRs plus HI/LO; the IOP keeps its GPRs plus HI/LO. They load on first use and are written back before every C++ call and at exits. MMI lane ops, MFC0/MTC0 to plain registers and ADDI are now generated natively: the Naruto video's interpreter calls went from 189 M to 19 M per 600 vsyncs. | `pcsx2/wasm/RegCache.h`, `EEJit.cpp`, `IopJit.cpp` | Naruto video (headless): about +11 % | `0391d4a0d` |
 | IOP branch start and end stores emitted inline; one EE helper fewer per module | `pcsx2/wasm/IopJit.cpp`, `EEJit.cpp` | (part of the above) | `0db7d0b22` |
+| EE modules built on a thread of their own. Building a module (the generated code and its bytes) was 75 % of compiling it, the engine's compile 25 %. When a block is hot, the EE thread copies the pages the build reads and goes on interpreting; a thread builds the module, and the dispatcher compiles and installs it once ready, after checking that its blocks' words are still those it was built from (it then records them as a compile at that moment would, `CodeWrites.h`). Idle loop sites are added under a lock and never changed once made. `-eejit-bg 0` builds on the EE thread. Exact: state hashes identical to the build before over GTA (600 vsyncs), the BIOS (600) and the crowd benchmark (1150). | `pcsx2/wasm/EEJit.cpp`, `CodeWrites.h` | GTA SA from a save state (headless): EE-thread compile time 714-751 → 205-220 ms, worst module 8.4-8.7 → 2.4-7.6 ms; first 750 vsyncs 93 → 95 % and 88 → 92 % | `2a94d1f30` |
+| Code lists: the EE JIT logs each block it compiles (PC and code hash); the page keeps the list per game in IndexedDB (`pcsx2-web-code`) and hands it back at the game's next boot. When the frame limiter has time left, listed blocks whose code is in memory are compiled before the game runs them (loading screens, light scenes). Tried and dropped: marking listed blocks hot, or spending each vsync's compile budget on the list, which made the first seconds after a load slower (64-76 % against 80-84 %). `?codelist=0`, `-eejit-ahead 0` turn it off. | `pcsx2/wasm/EEJit.cpp`, `pcsx2/VMManager.cpp`, `pcsx2-wasm/web/app.js` | GTA with the limiter on: 88 modules compiled ahead in spare time; checked in Chrome that the list is stored and handed back (14,375 blocks) | `2a94d1f30` |
+| Code lists on the build thread: the build thread builds the list's modules whenever it has nothing else to build (at most 16 waiting); each goes in when the game reaches one of its blocks, or in the frame limiter's spare time. Before, compiling ahead ran only in spare time on the EE thread, so a game already behind got nothing ahead. EE/IOP state hashes with a list identical to the build before (GTA, 600 vsyncs). | `pcsx2/wasm/EEJit.cpp` | GTA right after loading a state, first 750 vsyncs: 317 modules from the list switched in, interpreted steps 19.3 M → 15.4 M | `f06948832` |
 | Runs of loads and stores through one base register checked once (alignment, page, mapping). This roughly halves the kernel's thread context save and restore. | `pcsx2/wasm/EEJit.cpp` | Naruto video: +7-9 % more, about +24 % in total (47 → 58.5 VPS headless); Zen at 300 figures: 133 → 150-154 % | `693c92743` |
 | Idle loops skipped up to the next event. GTA San Andreas waits for a DMA interrupt by polling two counters (a 10-instruction loop at `0x34dfd8`, run 250 M times per 1200 vsyncs): a third of the EE thread. At a taken backward branch whose loop has only register ALU ops, loads, branches and jumps, one iteration runs on the interpreter, checked step by step; if it changed no register, the iterations whose last branch test comes before the next event only add cycles (memory changes only in event tests), so they are skipped. The site remembers the registers and the values loaded, so the same state skips without running the iteration again. Exact: `-eejit-trace` replays every skipped branch test with its state, and the hashes over 1000 GTA vsyncs (906 M branch tests, 210 M of them skipped) are the same with the skip on, off (`-eejit-spin 0`) and in the build before it; the end state of 1000 non-traced vsyncs is the same on and off. | `pcsx2/wasm/EEJit.cpp` | GTA SA gameplay (headless): 34.7 → 46.2 VPS | `0b9ac18f0`, `582755a74`, `ef46ac2fc` |
 | PEXEH, PEXEW, PREVH, PROT3W as byte shuffles, and DIV.S, generated natively: GTA's interpreter calls 21.4 M → 13.6 M per 1200 vsyncs | `pcsx2/wasm/EEJit.cpp` | within noise | `ef46ac2fc`, `035e32569` |
-| One function per module (its unit): a module's blocks run in one loop, jump to each other directly, and keep the guest registers in locals from one block to the next. Exact: state hashes identical to the build before over GTA gameplay (600 vsyncs), the BIOS and the benchmark. On its own it does not change the speed: GTA's blocks are 4-5 instructions, and the time goes into the bookkeeping at each taken branch (PC, branch flag, cycles, the branch end call, the next block's checks: about 30 memory operations), which the units make it possible to keep in locals next. | `pcsx2/wasm/EEJit.cpp`, `RegCache.h`, `WasmEmitter.h` | GTA SA headless: 98.6 → 97.8 % (within noise) | `7f41a4f0a` |
+| One function per module (its unit): a module's blocks run in one loop, jump to each other directly, and keep the guest registers in locals from one block to the next. Exact: state hashes identical to the build before over GTA gameplay (600 vsyncs), the BIOS and the benchmark. On its own it does not change the speed: GTA's blocks are 4-5 instructions, and the time goes into the bookkeeping at each taken branch (PC, branch flag, cycles, the branch end call, the next block's checks: about 30 memory operations), which the units make it possible to keep in locals next. | `pcsx2/wasm/EEJit.cpp`, `RegCache.h`, `WasmEmitter.h` | GTA SA headless: 98.6 → 97.8 % (within noise); in the owner's page recordings from one save state, no gain (98.5 against 98.7 %), with 48 % more compile time (1.19 against 0.81 s per 2400 vsyncs headless) and 27 % more generated code, which slowed the first seconds after a load. **Reverted** | `7f41a4f0a`, reverted in the next commit |
 
 ### GPU pipelines (stutter when something new appears)
 
@@ -100,6 +104,12 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | IOP import calls skip a debug name lookup unless IOP BIOS tracing is on (shared code, not guarded; the name only feeds that log) | `pcsx2/IopBios.cpp` | about 1 % of the EE thread | `6f4323163` |
 
 Together: Naruto's intro video, headless, 95.3 → 96.9 %.
+
+### Opt-in speedhacks (they change emulation; off unless chosen)
+
+| What | Where | Gain | Commit |
+|---|---|---|---|
+| Underclock: PCSX2's EE cycle rate (0, -1, -2, -3: the EE at 100, 75, 60, 50 %), chosen per game in the page and remembered per serial; every boot starts at Off. The EE JIT used to leave wasm for every taken branch and turn the idle loop skip off with any rate but 0, so the hack made things slower; now the branch end stays in wasm (the interpreter's own `intUpdateCPUCycles()` for the cycle update) and the idle loop skip models the rate. The JIT is exact against the interpreter at -1 and -2 (state hashes over 600 GTA vsyncs), and unchanged at 0. | `pcsx2/wasm/EEJit.cpp`, `pcsx2-wasm/Main.cpp`, the page | GTA SA gameplay headless, unlimited, medians of 3 interleaved on a busy machine (from vsync 600 of 2400): Off 86.4 %, Light 81.3 % (slower), Medium 108.6 % but CJ falls through the ground there (the game renders almost nothing), Strong 95.9 % (+11 %). GTA's clock keeps the same time at Off, Light and Strong (no slow motion). So for GTA only Strong helps; each game needs trying. | `6d4587379`, `c202859c6` |
 
 ### Measuring tools (no speed of their own)
 
@@ -134,15 +144,40 @@ simpler distant figures), so each row compares one version with itself.
 - **EE JIT: the bookkeeping at each taken branch** (started 2026-10-22). GTA's hottest blocks are 1-7
   instructions long, and each taken branch costs about 30 memory operations of bookkeeping (the PC and
   branch flag, the cycle counters, the branch end function, the next block's code and mapping checks)
-  against the one or two of the game's own work. Plan: keep the cycle count and the next event's cycle in
-  locals within a unit and compare them there, skip the PC and branch flag stores where the delay slot
-  cannot reach C++, and skip the next block's checks on jumps within a unit when nothing could have
-  changed its code. Each step checked with state hashes.
+  against the one or two of the game's own work. The units were meant to make room for keeping it in
+  locals and were reverted (no gain, slower compiling); the bookkeeping is to be cut in the block per
+  function design instead. Each step checked with state hashes.
 - **GTA San Andreas in the page** after the limiter change: the owner's recording shows 99.3 % on
   average in gameplay, with EE-bound dips to 81-89 % at the start of the game.
 
+## Tried and dropped
+
+Measured, exact or not, and not kept because the gain was too small for the change:
+
+- **EE JIT units** (one function per module, registers kept across blocks): no gain, slower compiling
+  (`7f41a4f0a`, reverted).
+- **Lean branch ends** (no PC, code and branch flag stores after a register-only delay slot): exact,
+  0.9 % fewer instructions retired on GTA (branch `lean-branch-end`, not merged).
+- **A lower V8 tier-up budget** (`--wasm-tiering-budget` 1 M or 200 k against 13 M): 6-8 % more
+  instructions on GTA, from the extra optimising compiles.
+- **The last EE interpreter fallbacks generated natively** (2026-10-22): LWL/LWR/SWL/SWR, CACHE DXLTG,
+  EI/DI, ADD, MULT1/MULTU1/MADD/MADDU, DIV/DIVU, SQRT_S/RSQRT_S, BC0F/BC0T as branches, the saturating
+  PADD/PSUB ops. Exact (GTA, BIOS and benchmark hashes, a 1000-vsync end state, an op test against the
+  interpreter), interpreter calls 13.5 M → 1.5 M per 1,200 GTA vsyncs, but 1,043.4 G → 1,042.4 G
+  instructions retired per 2,400 vsyncs (within noise): their interpreter bodies were 0.5 % of the EE
+  thread. Branch `native-fallbacks` (`950539bc7`), not merged.
+- **Main RAM without the vtlb** (2026-10-22): accesses below 32 MB taken straight to main RAM, a range
+  check instead of the table read. Exact on GTA (state hashes identical over 600 vsyncs), but 0.5 % more
+  instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
+  vtlb's table read hits the cache and its branch predicts well on the M1, so a true "fastmem" would gain
+  little more here, and WebAssembly cannot map memory twice or resume after a fault anyway.
+
 ## Known to be left
 
+- **EE JIT compiling** (after `2a94d1f30`): the engine's compile and instantiation (about a quarter
+  of compiling) stay on the EE thread, which runs the code; the IOP JIT still builds on the EE thread;
+  modules from a code list go in when the game reaches them or in spare time; their engine compile is
+  still the EE thread's.
 - **GTA San Andreas** (on foot, headless, after the idle loop skip and the VU0 JIT; second half of
   2400 vsyncs). Share of the EE thread:
 

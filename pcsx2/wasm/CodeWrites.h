@@ -50,15 +50,19 @@ namespace CodeWrites
 	// Generated code (a WasmJit::Function). In a block's entry checks, which branch to depth 0 when its code changed:
 	// branches to depth 1 (the code is the same) when no write hit the block's host bytes [host, host + bytes) since
 	// its last compare, keeping the page's generation (never 0) in local `gen`. False if the block spans two host
-	// pages: it then always compares.
+	// pages: it then always compares. With record false (code generated on another thread, EEJit.cpp), the caller
+	// does AddCodePage() and sets *checked on the thread that installs the code, once it found the code unchanged.
 	template <typename F>
-	bool EmitSkipCompare(F& f, u32 host, u32 bytes, u32* checked, u32 gen)
+	bool EmitSkipCompare(F& f, u32 host, u32 bytes, u32* checked, u32 gen, bool record = true)
 	{
 		const u32 page = host >> 12;
 		if (page != (host + bytes - 1) >> 12)
 			return false;
-		AddCodePage(page);
-		*checked = Current(page);
+		if (record)
+		{
+			AddCodePage(page);
+			*checked = Current(page);
+		}
 		const u32 page_addr = static_cast<u32>(reinterpret_cast<uptr>(&g_gen[page]));
 		const u32 counter = static_cast<u32>(reinterpret_cast<uptr>(Counter()));
 		f.i32_const(0);

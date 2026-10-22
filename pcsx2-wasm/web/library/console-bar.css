@@ -434,12 +434,17 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   font-size: 8px;
 }
 
-.rm-rec { left: 222px; top: 15px; }
+/* CLOCK (Underclock) over INFO; with the recorder shown, REC above them, the three closer together. */
+.rm-clock { left: 222px; top: 15px; }
 .rm-info { left: 222px; top: 47px; }
+.rm-rec { left: 222px; top: 4px; }
 
-/* Without the recorder, INFO sits alone in the middle of its column. */
-.remote:not(:has(#btn-rec:not([hidden]))) .rm-info {
+.remote:has(#btn-rec:not([hidden])) .rm-clock {
   top: 31px;
+}
+
+.remote:has(#btn-rec:not([hidden])) .rm-info {
+  top: 58px;
 }
 
 .rm-dot {
@@ -450,11 +455,11 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 }
 
 /* On: Mute, PICTURE (crisp pixels), and a drawer or menu that is open. */
-.rm-btn:is([aria-pressed="true"], [aria-expanded="true"]) {
+.rm-btn:is([aria-pressed="true"], [aria-expanded="true"], .on) {
   border-color: var(--ink-2);
 }
 
-.rm-btn:is([aria-pressed="true"], [aria-expanded="true"])::after {
+.rm-btn:is([aria-pressed="true"], [aria-expanded="true"], .on)::after {
   content: "";
   position: absolute;
   top: -3px;

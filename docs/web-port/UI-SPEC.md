@@ -23,7 +23,7 @@ The page is one column, top to bottom:
 - **drawer:** Keys or Log
 - **credits:** the footer
 
-There is also a BIOS-menu popover, a Sound popover (§11) and an About dialog. Before play, the slate holds the single primary action. During play, the transport does.
+There is also a BIOS-menu popover, a Sound popover (§11), Graphics and Underclock popovers (§12, §12a) and an About dialog. Before play, the slate holds the single primary action. During play, the transport does.
 
 Space reserved for later, with no controls today:
 - save-state slots, left of the memory cards (the disc slot and the memory-card slots are in use, see §10 and §14)
@@ -191,7 +191,7 @@ The total is about 124 KB.
 - **Subtitle** (`role="status"`). The newest replaces the last. It stays 4 s (8 s for the first-boot hint) and pauses on hover. It is only for confirmations and hints.
 - **Transport** (`role="group"`).
   - Left: Stop (while starting or running), then Card 1 and Card 2 (§14), then the disc menu (while a disc is chosen, §10), then the BIOS menu.
-  - Right: Sound (a popover, §11), Crisp (`aria-pressed`), Keys and Log (`aria-expanded`), Fullscreen.
+  - Right: Sound (a popover, §11), Graphics (a popover, §12), Underclock (a popover, §12a), Crisp (`aria-pressed`), Keys and Log (`aria-expanded`), Fullscreen.
   - Labels show at 1024 px and wider. Narrower than that, buttons are icons only, with a CSS tooltip on hover and `:focus-visible` that includes the shortcut. On `hover: none` devices the labels sit under the icons.
 - **BIOS menu** (popover).
   - The trigger has `aria-expanded` and `aria-controls` and is never disabled. The menu opens upward and focuses its first item.
@@ -495,11 +495,24 @@ The picture comes one of three ways, and the page says which. **GPU renderer**: 
 
 **Why an unflagged Linux Chromium gets the 2D canvas.** It exposes `navigator.gpu` but answers `requestAdapter()` with null on GPUs outside its allowlist (measured on Brave 155 with a Radeon 780M on Mesa RADV: null without `--enable-unsafe-webgpu`, a full-featured adapter with it). The GS retries six times over about 3 s, alternating power preferences, then draws through the 2D canvas and says so.
 
-**Phone (under 640 px).** The tools row is Sound, Graphics, Crisp, Keys, Log, Fullscreen; on touch each tool is at least 56 px wide so the six fit in 358 px. The menu is at most the width between the gutters and scrolls if taller than the screen.
+**Phone (under 640 px).** The tools row is Sound, Graphics, Underclock, Crisp, Keys, Log, Fullscreen; on touch each tool is at least 48 px wide, with no gap, so the seven fit in 358 px. The menu is at most the width between the gutters and scrolls if taller than the screen.
 
 **Firefox.** Auto tries WebGPU in Firefox (Zen and other Gecko browsers) as in the others. Firefox drops the GS canvas's WebGPU configuration each time it hands a frame over, so the GS configures it again after every frame (`docs/web-port/WEBGPU-DESIGN.md` §12.1); without that only the first frame showed.
 
 **Microcopy:** "Graphics" · "Now" · "Not started yet" · "GPU renderer" · "GPU display, software drawing" · "Software on a 2D canvas" · "Because …" · "Renderer" · "Auto" · "GPU" · "Software" · "Check WebGPU" · "Checking…".
+
+## 12a. Underclock
+
+PCSX2's EE Cycle Rate speedhack, chosen per game: the PS2's main processor (the EE) runs at 75, 60 or 50 % of its speed, so a heavy scene needs fewer instructions per frame and runs faster in the browser. Some games then run their own logic in slow motion or glitch, so it is off unless chosen, and only for the game it was chosen for.
+
+**Underclock button** (`#btn-ee`, `.t-btn`, `popovertarget="ee-menu"`), right after Graphics. Icon Phosphor `gauge`, label "Underclock" ("Clock" under the icon on touch phones, where the seven tools share 358 px); its accessible name adds the choice ("Underclock, off", "Underclock, medium") and its tooltip names a choice that is on ("Underclock: medium"). While a choice other than Off is on, it carries the pressed toggles' 2 px ink bar (`.on`). Never disabled.
+
+**Underclock menu** (`#ee-menu`, popover, `role="group"`, 320 px, styled and placed like the Graphics menu).
+- **This game:** the running game's title (or its serial), "Not a game with a serial", or "No game running".
+- **Underclock the PS2's processor:** a fieldset of four radios, focused on open: **Off** "Full speed, as on a PS2" · **Light** "75 %" · **Medium** "60 %" · **Strong** "50 %" (EE cycle rate 0, -1, -2, -3). They are disabled until the running game's serial is known. A choice applies at once (`pcsx2web_set_ee_cycle_rate()`, at the next vsync) and is remembered per serial in `pcsx2web.eeRate.<serial>`; every boot starts at Off, and the game's choice applies when its serial is known.
+- Fine print (the fieldset's description): "Remembered for this game. Some games run in slow motion or glitch underclocked." or, without a game, "Start a game to choose. Each game keeps its own choice."
+
+**Microcopy:** "Underclock" · "Clock" · "This game" · "No game running" · "Not a game with a serial" · "Underclock the PS2's processor" · "Off" · "Light" · "Medium" · "Strong" · "Full speed, as on a PS2".
 
 ## 13. Players and gamepads
 

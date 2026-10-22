@@ -152,7 +152,8 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       </button>
     </div>
     <!-- The remote of the first mockup, turned on its side: IR window, the volume rocker over MUTE and WIDE,
-         PICTURE over MENU, REC over INFO. The controls (keys, players) open from the console's ports. -->
+         PICTURE over MENU, CLOCK (Underclock) over INFO, REC above them when shown. The controls (keys, players)
+         open from the console's ports. -->
     <div class="remote t-right" id="remote" role="group" aria-label="Remote">
       <span class="rm-ir" aria-hidden="true"></span>
       <button type="button" class="rm-btn rm-round rm-mute" id="remote-mute" aria-pressed="false" aria-keyshortcuts="M" aria-label="Mute"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g transform="translate(-1.75 0)"><path d="M6 9 h4 l4 -4 v14 l-4 -4 h-4 z" fill="currentColor"/><path d="M16.5 9 l5 6 M21.5 9 l-5 6" fill="none" stroke="currentColor" stroke-width="1.4"/></g></svg></button>
@@ -165,6 +166,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <span class="rm-cap rm-cap-vol" aria-hidden="true">VOL</span>
       <button type="button" class="rm-btn rm-pill rm-picture" id="btn-crisp" aria-pressed="false" aria-label="Crisp pixels">PICTURE</button>
       <button type="button" class="rm-btn rm-pill rm-menu" id="btn-gfx" popovertarget="gfx-menu" aria-controls="gfx-menu" aria-expanded="false" aria-label="Graphics">MENU</button>
+      <button type="button" class="rm-btn rm-small rm-clock" id="btn-ee" popovertarget="ee-menu" aria-controls="ee-menu" aria-expanded="false" aria-label="Underclock, off">CLOCK</button>
       <button type="button" class="rm-btn rm-small rm-info" id="btn-log" aria-expanded="false" aria-controls="log-drawer" aria-keyshortcuts="`" aria-label="Log">INFO</button>
       <button type="button" class="rm-btn rm-small rm-rec" id="btn-rec" aria-expanded="false" aria-controls="rec-drawer" aria-label="Recorder" hidden><span class="rm-dot" aria-hidden="true"></span>REC</button>
       <!-- The sound menu stays for the M shortcut's state and its fine print; the remote sets the volume. -->
@@ -346,7 +348,8 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <span class="log-count" id="rec-status"></span>
       <span class="grow"></span>
       <button type="button" class="btn-quiet" id="state-save" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-camera"/></svg><span id="state-save-label">Save state</span></button>
-      <button type="button" class="btn-quiet" id="state-load" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-clock-counter-clockwise"/></svg><span id="state-load-label">Load state</span></button>
+      <button type="button" class="btn-quiet" id="state-load" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg><span id="state-load-label">Load state…</span></button>
+      <button type="button" class="btn-quiet" id="state-reload" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-clock-counter-clockwise"/></svg><span id="state-reload-label">Reload state</span></button>
       <button type="button" class="btn-quiet" id="rec-toggle"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-record"/></svg><span id="rec-toggle-label">Record</span></button>
       <button type="button" class="btn-quiet" id="rec-copy" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-copy"/></svg><span id="rec-copy-label">Copy</span></button>
       <button type="button" class="btn-quiet" id="rec-download" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-download-simple"/></svg>Download</button>
@@ -457,6 +460,18 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <button type="button" class="menu-item" id="gfx-check"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-graphics-card"/></svg>Check WebGPU</button>
       <div class="gfx-result" id="gfx-result" role="status" aria-live="polite"></div>
     </div>
+  </div>
+
+  <div class="menu gfx-menu" id="ee-menu" popover role="group" aria-label="Underclock">
+    <p class="menu-file"><span class="menu-where">This game</span><span class="gfx-mode" id="ee-game">No game running</span></p>
+    <fieldset class="gfx-choice" id="ee-choice" aria-describedby="ee-reason">
+      <legend class="sound-label">Underclock the PS2’s processor</legend>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="0" checked><span>Off<span class="gfx-hint">Full speed, as on a PS2</span></span></label>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="-1"><span>Light<span class="gfx-hint">75 %</span></span></label>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="-2"><span>Medium<span class="gfx-hint">60 %</span></span></label>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="-3"><span>Strong<span class="gfx-hint">50 %</span></span></label>
+      <p class="menu-reason" id="ee-reason">Start a game to choose. Each game keeps its own choice.</p>
+    </fieldset>
   </div>
 
   <div class="menu" id="bios-menu" popover role="group" aria-label="BIOS">
@@ -589,6 +604,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
 <input type="file" id="bios-input" hidden accept=".bin,.BIN,.rom,.ROM,.rom0,.ROM0,application/octet-stream">
 <input type="file" id="disc-input" hidden accept=".iso,.ISO,.bin,.BIN,.img,.IMG">
 <input type="file" id="card-input" hidden accept=".ps2,.PS2">
+<input type="file" id="state-input" hidden accept=".p2s,.P2S">
 <noscript><p class="noscript">TabStationToo needs JavaScript and WebAssembly to run.</p></noscript>
 </body>
 </html>

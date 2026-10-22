@@ -86,6 +86,9 @@ namespace VU1Jit
 		std::vector<BlockExit> exits;
 		u32 instrs = 0;
 		u32 last_start = 0; // cycles from the entry to the start of the last instruction (the budget test)
+		// VU0 slices (g_vu0_slices): the dispatcher enters the block only with more cycles left than this; generated
+		// code leaves at the first instruction past the slice (0 when the first instruction runs alone).
+		u32 first_need = 0;
 		u32 native_ops = 0;
 		u32 helper_ops = 0;
 		bool loops = false; // a taken branch back to the entry with the entry's signature stays in generated code
@@ -144,6 +147,11 @@ namespace VU1Jit
 	// to the start of each pass, so after it returns it is the base of the pass that exited.
 	extern u64 g_block_base;
 	extern u64 g_block_base0; // the same for VU0
+	// VU0's slice (InterpVU0::Execute's cycles): VU0.cycle at the start of its Execute plus its cycles. With
+	// g_vu0_slices, VU0 blocks leave before the first instruction that would start at or after it, so a block runs in
+	// part of a slice instead of the interpreter stepping it.
+	extern u64 g_budget_end0;
+	extern bool g_vu0_slices;
 
 	// The dispatcher's budget (VU1): VU1.cycle at the start of its Execute plus its cycles. Generated code leaves
 	// before a block (or a loop's pass) whose last instruction would start at or after it, as the dispatcher would

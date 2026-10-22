@@ -172,6 +172,26 @@ key means (the key's layout, `tfx.wgsl`, the shader macros each selector bit set
 formats); the GS thread ignores a list made by a build whose keys meant something else, and the next
 save replaces it. Only disc boots with a serial keep a list.
 
+### Code lists
+
+The EE JIT compiles game code once a block has run often enough, within 4 ms of compiling per vsync
+(`pcsx2/wasm/JitHeat.h`); until then the interpreter runs it. Building a module, about three quarters
+of compiling it, runs on a thread of its own: the EE thread copies the code it reads, goes on
+interpreting, and only compiles the finished module with the browser's engine (`pcsx2/wasm/EEJit.cpp`,
+`CompileJob`). The page also keeps, per game, the list of blocks the JIT compiled, so that the next
+time the game runs, they compile before the game reaches them: the build thread builds the list's
+modules whenever it has nothing else to build (at most 16 waiting), and each waits until the game
+reaches one of its blocks, which then switches it in at once, or until the frame limiter has time left
+to compile it with the engine (loading screens, light scenes). Without the build thread
+(`-eejit-bg 0`), listed blocks compile on the EE thread in the limiter's spare time only. The JIT logs each block it compiles, its PC and a hash of its
+first words (`pcsx2web_ee_code_log()`); every 2 s the page copies new ones and stores the list in the
+IndexedDB database `pcsx2-web-code` (store `ee`, keyed by the game's serial:
+`{version, entries, savedAt}`, `entries` two 32-bit words per block, at most 32768) every 15 s while it
+grows and when the VM stops. When the game's serial is known, the page writes the stored list into the
+EE thread's slot (`pcsx2web_ee_code_list()`), which takes it at its next vsync. A listed block is
+compiled ahead only when its code is in memory with the same hash; compiling earlier changes when
+code is compiled, never what it does. `?codelist=0` keeps the lists without handing them over.
+
 A linked card is read from its file when it is plugged in (the file wins over the browser's copy).
 After a reload it stays plugged in only if the browser still allows the page to write the file;
 otherwise it comes back unplugged, and choosing it in the slot's menu asks for permission. A file that
@@ -213,7 +233,7 @@ Switches for comparisons and tests (all optional):
 | `?renderer=sw` | Draws with PCSX2's software renderer instead of the hardware renderer on the WebGPU device (the default, `?renderer=hw`). Without a WebGPU device the GS uses the software renderer |
 | `?set=Section/Key=Value` | Overrides one setting after the defaults (repeatable), e.g. `?set=EmuCore/GS/deinterlace_mode=2` |
 | `?surface=WxH` | Presents at a fixed size on both paths (e.g. `640x448` with `?set=EmuCore/GS/AspectRatio=Stretch` for 1:1) |
-| `?threads=1` | Adds how busy the EE, GS and VU1 threads are to the speed readout (`pcsx2web_thread_usage()`), to see which one limits a game without the developer tools, which slow WebAssembly down a lot while open; and a Recorder button: it records every vsync (its speed, each thread's load, JIT and GPU pipeline compiling, from `pcsx2web_perf_ring()`) until stopped, then charts it, crops it to an interval and copies it as text or downloads it as CSV. The Recorder also has Save state, which snapshots the whole emulated machine and downloads it as a `.p2s` file, and Load state, which puts the last state saved (or given with `?state=`) back into the running game, to replay the same moment while measuring |
+| `?threads=1` | Adds how busy the EE, GS and VU1 threads are to the speed readout (`pcsx2web_thread_usage()`), to see which one limits a game without the developer tools, which slow WebAssembly down a lot while open; and a Recorder button: it records every vsync (its speed, each thread's load, JIT compiling on the EE and VU1 threads and on the EE JIT's build thread, EE modules compiled and compiled ahead, GPU pipeline compiling, from `pcsx2web_perf_ring()`) until stopped, then charts it, crops it to an interval and copies it as text or downloads it as CSV. The Recorder also has Save state, which snapshots the whole emulated machine and downloads it as a `.p2s` file; Load state…, which loads a `.p2s` file you pick into the running game; and Reload state, which goes back to the last state saved or loaded, to replay the same moment while measuring |
 | `?tune-cables` | Shows the cable tuner: sliders for how the controllers' cables lie (`cable-worker.js`, `CABLE_DEFAULTS`: each cable's seed, slack, stiffness, coil memory, drop, settling and smoothing), both cables shown even unplugged; the settings are kept in this browser and Copy settings copies them as JSON, to become the defaults |
 | `?capture=N,M,...` | Keeps a copy of the first frame presented at vsync N or later, read with `window.PCSX2Web.capture(N)` |
 | `?eejit=0` | Runs the EE (main CPU) interpreter instead of the EE JIT, which compiles EE code to WebAssembly at run time |
@@ -223,7 +243,7 @@ Switches for comparisons and tests (all optional):
 | `?pipelines=wait` | The hardware renderer waits for every new TFX pipeline to the end, as before pipelines were created in the background, so no draw is skipped (for pixel-exact comparisons; see Pipeline lists) |
 | `?unlimited=1` | Boots with the frame limiter off (as `pcsx2-headless -unlimited`), to measure speed above 100 % |
 | `?elf=<url>` | Fetches a PS2 program (same origin only) and boots it instead of a disc or the BIOS menu, with the `?bios=` BIOS and fast boot (see below) |
-| `?state=<url>` | Fetches a save state (same origin only; for example `dev-bios/<file>.p2s` with a state file in `serve.py --bios-dir`'s folder), which the next disc boot loads once the game started, and Load state too. The state must come from the same game |
+| `?state=<url>` | Fetches a save state (same origin only; for example `dev-bios/<file>.p2s` with a state file in `serve.py --bios-dir`'s folder), which the next disc boot loads once the game started, and Reload state too. The state must come from the same game |
 
 `tools/wasm/pad-test.mjs` tests the players (the keyboard and gamepads going to port 1 or 2): it
 plays a mocked `navigator.getGamepads()` and the keyboard in headless Chrome and reads each port's
@@ -525,17 +545,20 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_state()` | 0 waiting, 1 starting, 2 running, 3 stopped, 4 failed (polled every 500 ms) |
 | `pcsx2web_speed()`, `pcsx2web_vps()` | speed in percent, vertical syncs per second |
 | `pcsx2web_thread_usage(t)` | how busy the EE (0), GS (1) and VU1 (2) threads were, in percent: wall time not spent waiting for another thread (WebAssembly has no per-thread CPU clocks) |
-| `pcsx2web_perf_ring()`, `pcsx2web_perf_written()` | the per-vsync recorder's ring (8192 records of 9 doubles: vsync, wall ms, cumulative busy ms of the EE, GS and VU1 threads, cumulative JIT compile ms, cumulative GPU pipeline ms and count, vsync rate) and how many records were written |
+| `pcsx2web_perf_ring()`, `pcsx2web_perf_written()` | the per-vsync recorder's ring (8192 records of 12 doubles: vsync, wall ms, cumulative busy ms of the EE, GS and VU1 threads, cumulative JIT compile ms on the EE and VU1 threads, cumulative GPU pipeline ms and count, vsync rate, cumulative ms the EE JIT's build thread spent building modules, cumulative EE modules installed and those built or compiled ahead from the code list) and how many records were written |
 | `pcsx2web_key_code(name)`, `pcsx2web_key(code, pressed)` | resolve host key names once, then queue key events |
 | `pcsx2web_pad_input(name)`, `pcsx2web_pad(port, input, value)` | resolve a pad input name ("Cross", "L2", "LUp", ...) once, then queue its state (0 to 1) for port 0 or 1; 1 if queued, 0 if the queue is full. The page routes the keyboard and the gamepads to a port (UI-SPEC §13); the core has no keyboard bindings for the pads |
 | `pcsx2web_test_pad_state(port)` | test hook: the raw value (0 to 255) of each pad input of a port, four to a word, then a flags word (bit 0 connected, bit 1 analog light) |
 | `pcsx2web_frame()` | address of the frame descriptor: `seq, width, height, pixels, vsync` (u32) |
 | `pcsx2web_surface_size(w, h, scale)` | the display canvas's backing size and device pixel ratio (WebGPU presents at it) |
 | `pcsx2web_set_crisp(on)` | nearest (1) or bilinear (0) presentation, applied at the next vsync |
+| `pcsx2web_set_ee_cycle_rate(rate)` | the Underclock (PCSX2's EE cycle rate): 0, or -1 to -3 for the EE at 75, 60 or 50 %, applied at the next vsync or boot; other values are ignored |
 | `pcsx2web_vsync_count()` | vsyncs emulated since the module started |
 | `pcsx2web_audio_start()` | start the sound worklet in `Module.pcsx2webAudioContext` (an AudioContext the page made); it calls `Module.pcsx2webAudioReady(node)` when the node exists, or with `null` if it failed; 0 if started, -1 if a start already ran or there is no context |
 | `pcsx2web_audio()` | address of the audio block: 16 u32 words (see Sound) |
 | `pcsx2web_tfx_log()` | address of the log of TFX pipeline keys the WebGPU HW renderer's draws asked for since its device started: `session, count, version lo, version hi` (u32), then `count` keys of 36 bytes; `session` changes when a new device starts a new log (see Pipeline lists) |
+| `pcsx2web_ee_code_log()` | address of the EE JIT's code log since the VM started: session, count, version (two words), then count entries of PC and code hash |
+| `pcsx2web_ee_code_list()` | address of the slot a stored code list is written into, the same layout with a state for its first word: 0 free, 1 the page is writing, 2 ready. The page claims it by compare-exchange (0 or 2 to 1), writes the entries, version and count, then stores 2; the EE thread takes it at its next vsync |
 | `pcsx2web_tfx_prewarm()` | address of the prewarm slot, the same layout with a state for its first word: 0 free, 1 the page is writing, 2 ready, 3 the GS thread is taking it. The page claims it by compare-exchange (0 or 2 to 1), writes the keys, count and version, then stores 2 |
 
 On the 2D path, each animation frame the page reads `seq` with `Atomics.load`; when it changed, it copies
