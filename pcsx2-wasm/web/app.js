@@ -408,6 +408,8 @@
 		runStartedAt: 0, // performance.now() of the first frame of this run
 		ranMs: 0,
 		frameSinceBoot: false,
+		litWait: false, // the disc library waits for the game's first picture (probeLit)
+		lit: false,
 		seqAtBoot: 0,
 		wasmLoaded: false,
 		outcome: null, // null | 'stopped' | 'failed': what the slate shows after a run
@@ -1187,6 +1189,8 @@
 			els.canvas.height = height;
 		}
 		ctx.putImageData(frame.imageData, 0, 0);
+		if (page.litWait && !page.lit)
+			probeLit(frame.imageData);
 		frame.presented++;
 		frame.width = width;
 		frame.height = height;
@@ -1195,6 +1199,40 @@
 		if (!page.frameSinceBoot && seq !== page.seqAtBoot) {
 			page.frameSinceBoot = true;
 			render();
+		}
+	}
+
+	// The disc library keeps its room dark until the game shows a picture (UI-SPEC.md §15): while it waits
+	// (page.litWait), a frame is looked at every LIT_PROBE_MS for anything brighter than near black. A
+	// boot's first frames are usually black while the game loads.
+	const LIT_PROBE_MS = 200;
+	const LIT_LEVEL = 40; // a channel above this, out of 255, is light
+	const LIT_SHARE = 0.005; // and this share of the sampled pixels being light makes a picture
+	const litProbe = { at: 0, ctx: null };
+	function probeLit(source) {
+		const now = performance.now();
+		if (now - litProbe.at < LIT_PROBE_MS)
+			return;
+		litProbe.at = now;
+		let data;
+		if (source instanceof ImageData) {
+			data = source.data;
+		} else {
+			// A GPU frame: read back a small copy only (64 × 48).
+			if (!litProbe.ctx)
+				litProbe.ctx = new OffscreenCanvas(64, 48).getContext('2d', { willReadFrequently: true });
+			litProbe.ctx.drawImage(source, 0, 0, 64, 48);
+			data = litProbe.ctx.getImageData(0, 0, 64, 48).data;
+		}
+		const step = Math.max(1, Math.floor(data.length / 4 / 4096)) * 4;
+		let light = 0, n = 0;
+		for (let i = 0; i < data.length; i += step, n++) {
+			if (data[i] > LIT_LEVEL || data[i + 1] > LIT_LEVEL || data[i + 2] > LIT_LEVEL)
+				light++;
+		}
+		if (n && light / n >= LIT_SHARE) {
+			page.lit = true;
+			pageLog('Disc library: the game shows a picture.');
 		}
 	}
 
@@ -1241,6 +1279,8 @@
 			els.canvas.height = bitmap.height;
 		}
 		const width = bitmap.width, height = bitmap.height;
+		if (page.litWait && !page.lit)
+			probeLit(bitmap);
 		ctx.transferFromImageBitmap(bitmap);
 		gpu.latencies.push(performance.timeOrigin + performance.now() - m.postedAt);
 		if (gpu.latencies.length > LATENCY_SAMPLES)
@@ -1513,6 +1553,7 @@
 		page.bootsAccepted++;
 		page.bootAt = performance.now();
 		page.frameSinceBoot = false;
+		page.lit = false;
 		gpu.framesAtBoot = gpu.frames;
 		page.seqAtBoot = currentSeq();
 		page.slowSince = 0;
@@ -2001,10 +2042,13 @@
 		announceReady: 'Disc ready.',
 		announceRemoved: 'Disc removed.',
 		announceChecking: 'Reading the disc.',
+		libraryNoBios: 'Add a BIOS first: the PS2 needs one to boot a disc.',
+		libraryUnavailable: 'The disc reader isn’t working in this page. Reload it to boot discs.',
 	};
 
 	const discEls = {
 		slateDisc: $('slate-disc'),
+		slateLibrary: $('slate-library'),
 		slateRemove: $('slate-remove'),
 		input: $('disc-input'),
 		btn: $('disc-btn'),
@@ -2013,6 +2057,7 @@
 		menuName: $('disc-menu-name'),
 		menuWhere: $('disc-menu-where'),
 		menuChoose: $('disc-menu-choose'),
+		menuLibrary: $('disc-menu-library'),
 		menuRemove: $('disc-menu-remove'),
 		menuReason: $('disc-menu-reason'),
 	};
@@ -3240,7 +3285,7 @@
 		setText(discEls.menuName, d.name);
 		rich(discEls.menuWhere, [...discSizeParts(d.size), { sep: 1 }, discWhere(d)]);
 		const locked = !canChangeBios();
-		for (const item of [discEls.menuChoose, discEls.menuRemove]) {
+		for (const item of [discEls.menuChoose, discEls.menuLibrary, discEls.menuRemove]) {
 			if (locked) {
 				item.setAttribute('aria-disabled', 'true');
 				item.setAttribute('aria-describedby', 'disc-menu-reason');
@@ -4905,7 +4950,7 @@
 			const open = e.newState === 'open';
 			discEls.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
 			if (open) {
-				discEls.menuChoose.focus({ preventScroll: true });
+				discEls.menuLibrary.focus({ preventScroll: true });
 			} else {
 				const a = document.activeElement;
 				if (!a || a === document.body || discEls.menu.contains(a))
@@ -4944,6 +4989,50 @@
 			}
 		});
 	}
+
+	// The disc library (library/player-library.js, UI-SPEC.md §15) chooses a disc from a folder and boots
+	// it while its insert plays over the page.
+	window.PCSX2WebLibrary = Object.freeze({
+		// Why a disc can't go in now, or '' when it can.
+		blocked() {
+			if (page.phase === 'dead' || page.phase === 'unsupported' || disc.dead)
+				return DISC_COPY.libraryUnavailable;
+			if (!page.bios && !page.urlBiosName)
+				return DISC_COPY.libraryNoBios;
+			if (!canChangeBios())
+				return DISC_COPY.blocked;
+			return '';
+		},
+		// Inside the user's press: sound may start, the disc opens, and its boot is queued, as a disc
+		// chosen and Boot pressed while it opens.
+		insert(file, handle) {
+			audioUnlock();
+			hideDiscMenu();
+			pageLog(`Disc library: ${file.name}`);
+			page.autoBoot = true;
+			page.litWait = true;
+			page.lit = false;
+			chooseDisc({ kind: 'file', file, name: file.name, size: file.size }, handle || null);
+			ensureRuntime();
+		},
+		// What the library waits on: the page state, and the error the slate would show.
+		status: () => ({
+			view: pageState(),
+			lit: !!page.lit,
+			error: page.error || '',
+			busy: !!(disc.opening || disc.checking || (page.autoBoot && page.phase !== 'ready')),
+		}),
+		// The dialog has gone: the picture (or the slate) takes the keyboard.
+		focusScreen() {
+			page.litWait = false;
+			if (pageState() === 'running' || pageState() === 'starting')
+				els.screen.focus({ preventScroll: true });
+			else
+				focusPrimary();
+		},
+		// Whether the library may be opened now (its buttons are aria-disabled otherwise).
+		canOpen: () => canChangeBios() && !!page.bios,
+	});
 
 	// Read-only hooks for automated tests, next to window.PCSX2Web.
 	window.PCSX2WebDisc = Object.freeze({
@@ -7845,6 +7934,7 @@
 		discEls.slateDisc.hidden = !m.disc;
 		if (m.disc)
 			setText(discEls.slateDisc, m.disc);
+		discEls.slateLibrary.hidden = !m.disc; // wherever a disc can be chosen, the library can choose it
 		discEls.slateRemove.hidden = !m.remove;
 		els.slateActions.hidden = !(p || m.aside || m.alt || m.openLog || m.copy || m.disc || m.remove);
 

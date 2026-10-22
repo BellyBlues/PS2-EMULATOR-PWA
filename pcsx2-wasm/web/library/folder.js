@@ -21,7 +21,9 @@ export const fontsReady = () =>
 
 // { discs, compressed } for the files of a folder: every disc image with an ISO 9660 volume, named
 // from its serial, with the folder's own image for it if there is one. onProgress(done, total).
-export async function readFolder(files, onProgress = () => {}) {
+// handles: each file's FileSystemFileHandle when the folder came from showDirectoryPicker(), so the
+// player can remember the disc it boots.
+export async function readFolder(files, onProgress = () => {}, handles = null) {
 	const list = [...files].filter((f) => !/(^|\/)\._/.test(f.webkitRelativePath || f.name) && !f.name.startsWith('._'));
 	const candidates = list.filter((f) => DISC_RE.test(f.name));
 	const compressed = list.filter((f) => COMPRESSED_RE.test(f.name)).length;
@@ -64,7 +66,7 @@ export async function readFolder(files, onProgress = () => {}) {
 			serial: info.serial, platform: info.platform, media: info.media,
 			title: db?.title || titleFromFileName(file.name),
 			region: regionOf(info.serial, db?.region),
-			cover: null,
+			cover: null, handle: handles?.get(file) || null,
 		};
 		const image = findCover(images, d);
 		if (image) {
@@ -100,6 +102,82 @@ export async function filesFromDrop(dt) {
 	for (const e of entries)
 		await walk(e, 0);
 	return out;
+}
+
+// ---- a folder from showDirectoryPicker() (Chromium), remembered in IndexedDB for the next visit
+
+const FOLDER_DB = 'tabstationtoo-library';
+const FOLDER_STORE = 'folder';
+
+export const canPickFolder = () => typeof window.showDirectoryPicker === 'function';
+
+// The folder the user picks, or null when they cancel. Throws when the picker fails.
+export async function pickFolder() {
+	try {
+		return await window.showDirectoryPicker({ id: 'tabstationtoo-library', mode: 'read' });
+	} catch (err) {
+		if (err && err.name === 'AbortError')
+			return null;
+		throw err;
+	}
+}
+
+// { files, handles } for the disc images and pictures in a folder and its subfolders (three deep).
+export async function filesFromDirectory(dir) {
+	const files = [];
+	const handles = new Map();
+	async function walk(d, depth) {
+		for await (const h of d.values()) {
+			if (h.kind === 'directory') {
+				if (depth < 3)
+					await walk(h, depth + 1);
+			} else if (DISC_RE.test(h.name) || COMPRESSED_RE.test(h.name) || IMAGE_RE.test(h.name)) {
+				const file = await h.getFile();
+				files.push(file);
+				handles.set(file, h);
+			}
+		}
+	}
+	await walk(dir, 0);
+	return { files, handles };
+}
+
+function folderDb(mode, fn) {
+	return new Promise((resolve, reject) => {
+		if (!('indexedDB' in window)) {
+			reject(new Error('IndexedDB is not available'));
+			return;
+		}
+		const req = indexedDB.open(FOLDER_DB, 1);
+		req.onupgradeneeded = () => req.result.createObjectStore(FOLDER_STORE);
+		req.onerror = () => reject(req.error);
+		req.onsuccess = () => {
+			const db = req.result;
+			const tx = db.transaction(FOLDER_STORE, mode);
+			const r = fn(tx.objectStore(FOLDER_STORE));
+			tx.oncomplete = () => {
+				db.close();
+				resolve(r && r.result);
+			};
+			tx.onerror = () => {
+				db.close();
+				reject(tx.error);
+			};
+		};
+	});
+}
+
+export const rememberFolder = (handle) => folderDb('readwrite', (s) => s.put(handle, 'last')).catch(() => {});
+export const rememberedFolder = () => folderDb('readonly', (s) => s.get('last')).catch(() => null);
+
+// 'granted', 'prompt' or 'denied' for reading a remembered folder; ask=true asks (needs a gesture).
+export async function folderPermission(handle, ask) {
+	try {
+		const opts = { mode: 'read' };
+		return ask ? await handle.requestPermission(opts) : await handle.queryPermission(opts);
+	} catch {
+		return 'denied';
+	}
 }
 
 // The URL of the game's cover from the internet once it has loaded, or null (no serial, not in the

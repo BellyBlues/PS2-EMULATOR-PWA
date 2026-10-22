@@ -347,21 +347,24 @@ compile a block once it has run 128 times, within 4 ms of compiling per vsync (`
 `-eejit-hot N[,M[,B]]`, `-iopjit-hot N[,M[,B]]` and `-jit-budget US` change that, and
 `-jit-compile-stats VSYNCS` prints their compile time, total and worst vsync, every VSYNCS vsyncs.
 
-### Disc library (a study)
+### Disc library
 
-`library.html` is a standalone page, not linked from the player yet, for a nicer way to pick a
-game: choose (or drop) a folder, and every disc image in it becomes a disc on a shelf; click one, or
-press Enter, and it flies into the tray of a PS2, the tray closes and the lights go down. Nothing
-boots: on the player page the boot would start with the insert, which would cover the BIOS logos and
-the game's loading (`onInserted()` in `library/scene-2d.js` is where that goes). `?demo` shows a
-shelf of made-up games; `?tray=open` opens the tray, for checking it against the photo.
+"Disc library…" (on the slate and in the disc menu) opens a dialog with a shelf of the discs in a
+folder and a PS2 to put them in (UI-SPEC.md §15). Putting one in chooses it and queues its boot at
+once; the insert plays while the PS2 starts, and the dialog stays dark until the game shows a
+picture, so the boot is never seen. The component is `library/disc-library.js` (with
+`disc-library.css`); `library/player-library.js` wires it to `app.js` through
+`window.PCSX2WebLibrary`. `library.html` shows the same component on its own, without the emulator
+(the insert is only rehearsed; `?demo` shows made-up games, `?tray=open` opens the tray for checking
+it against the photo).
 
 - The console is a photo (`library/ps2.webp`, Evan-Amos, public domain; `library/ps2-photo.txt`).
   The tray is the photo's own front panel, cut out and slid along the console's depth; the plate
   and the disc behind it are drawn on the tray's plane with an affine transform measured from the
-  photo (`TRAY` in `scene-2d.js`).
+  photo (`TRAY` in `disc-library.js`).
 - `library-3d.html` (`scene-3d.js`, `scene-3d.css`) is the first take, kept as a copy: an original
-  console in CSS 3D. Both pages share `page.css`, `folder.js`, `disc-info.js` and `disc-art.js`.
+  console in CSS 3D. The library pages share `page.css`, `folder.js`, `disc-info.js` and
+  `disc-art.js`.
 - `library/disc-info.js` reads the start of each file (the ISO 9660 volume at the layouts PCSX2
   detects, then `SYSTEM.CNF`) for the serial; it also runs in Node. Titles come from
   `game-titles.tsv`, an index of PCSX2's game database the build writes next to the page

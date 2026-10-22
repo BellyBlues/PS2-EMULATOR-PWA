@@ -68,6 +68,8 @@ STAMPED = (  # (attribute value in index.html, how many times it must appear)
     ('src="isolation.js"', 1),
     ('src="app.js"', 1),
     ('href="style.css"', 1),
+    ('href="library/disc-library.css"', 1),
+    ('src="library/player-library.js"', 1),
 )
 
 
