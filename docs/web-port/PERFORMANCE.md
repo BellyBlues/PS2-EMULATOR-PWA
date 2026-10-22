@@ -187,6 +187,19 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   GTA (profile share, two runs each). In GTA both cores keep their IRQ enabled all the time, about 45 % of the 48
   voices play, the stopped ones still advance through memory at their pitch, and about 19 % of the volumes slide,
   so the per-voice, per-sample work is what the SPU2 does, not waste. Not kept.
+- **IOP block linking** (2026-10-22): the IOP is 21-24 % of the EE thread in Naruto's intro video, DBZ BT3 and
+  Guitar Hero (helper A's survey). In Naruto's video it splits into the generated IOP code 10.4 %, the work
+  around each run of IOP code 8-9 % (`intExecuteBlock` 3.5 %, `iopEventTest` 2.7 %, the branch start and end
+  1 %, `psxJ` fallbacks 0.65 %, the counters 0.65 %), SPU2 3.3 % and the IOP's hardware registers about 1 %. The
+  IOP runs in short timeslices, one per EE event test: about 48,000 runs of IOP code per vsync, each of
+  about one block (from one taken branch to the next). Tried: after a taken branch, `iopEventTest()`'s usual
+  case and the next run of `intExecuteBlock()`'s loop done in generated code, tail-calling the target's
+  block when nothing is due and the timeslice has cycles left (with the pending but not due interrupts tested
+  as `_psxTestInterrupts()` does): it linked 28-43 M of the taken branches per 900 vsyncs and cut the runs
+  started from C++ by a third. Inline in every block it was slower (Naruto 55 against 59.7 VPS, the event test
+  inline alone 57); as one function per module it was the same as without it (Naruto 58.7-59.8 against
+  59.4-59.9 VPS, DBZ 131.5-133.7 against 131.5-132.3, Guitar Hero 186.3-187.1 against 180.1-186.2, in quiet
+  windows): each return to C++ costs about what the generated path does. Not kept.
 - **Main RAM without the vtlb** (2026-10-22): accesses below 32 MB taken straight to main RAM, a range
   check instead of the table read. Exact on GTA (state hashes identical over 600 vsyncs), but 0.5 % more
   instructions retired (1,049 G against 1,043 G per 2,400 vsyncs) and the same cycles within noise: the
