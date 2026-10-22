@@ -35,7 +35,7 @@ const ICONS = [
 	'arrow-line-down', 'arrow-up', 'arrow-down', 'arrow-left', 'arrow-right', 'disc',
 	'speaker-high', 'speaker-low', 'speaker-x', 'speaker-slash', 'graphics-card', 'sim-card', 'eject',
 	'pencil-simple', 'download-simple', 'plus', 'dots-three', 'record', 'chart-line', 'camera',
-	'clock-counter-clockwise',
+	'clock-counter-clockwise', 'gauge',
 ];
 // Phosphor Fill icons; each becomes <symbol id="i-NAME-fill">.
 const FILL_ICONS = ['sim-card'];

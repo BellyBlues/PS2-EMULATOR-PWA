@@ -1461,6 +1461,7 @@
 	function onVmStateChange(prev, state) {
 		page.vmState = state;
 		stateRender();
+		renderEe();
 		pageLog(`VM state: ${STATE_NAMES[prev] || prev} -> ${STATE_NAMES[state] || state}`);
 		if (state !== STATE.RUNNING)
 			releaseAllKeys(true);
@@ -3103,6 +3104,7 @@
 	// startVm(): an ELF boot with ?elf=, a disc boot when a disc is open, otherwise the BIOS alone.
 	function bootRequest() {
 		setBootState();
+		eeBoot();
 		if (devElf.bytes) {
 			disc.runIsDisc = false;
 			return bootElfRequest();
@@ -3149,8 +3151,10 @@
 		disc.runTitle = title;
 		disc.runSerial = serial;
 		pageLog(`Game: ${title || 'not in the game database'}${serial ? ` (${serial})` : ''}`);
-		if (newSerial)
+		if (newSerial) {
 			pipeGameKnown(serial);
+			eeGameKnown(serial);
+		}
 		const d = disc.current;
 		if (title && d && d.title !== title) {
 			d.title = title;
@@ -5858,7 +5862,7 @@
 
 	// Esc: native dialog/popover close first, then a drawer, then the keyboard.
 	function onEscape(e) {
-		if (els.about.open || menuOpen() || discMenuOpen() || cardMenuOpen() || soundMenuOpen() || gfxMenuOpen())
+		if (els.about.open || menuOpen() || discMenuOpen() || cardMenuOpen() || soundMenuOpen() || gfxMenuOpen() || eeMenuOpen())
 			return;
 		dismissTips();
 		const a = document.activeElement;
@@ -7080,6 +7084,128 @@
 		renderGfx();
 	}
 
+	// ------------------------------------------------------------------ underclock (UI-SPEC.md §12a)
+
+	// PCSX2's EE Cycle Rate speedhack, chosen per game (by serial) and remembered in this browser: the PS2's main
+	// processor runs fewer instructions per frame, which lightens heavy scenes; some games then run in slow motion or
+	// glitch, so it is off unless chosen.
+	const PREF_EE_RATE = 'pcsx2web.eeRate.';
+	const EE_RATE_NAMES = { 0: 'off', '-1': 'light', '-2': 'medium', '-3': 'strong' };
+	const eeEls = {
+		btn: $('btn-ee'),
+		menu: $('ee-menu'),
+		game: $('ee-game'),
+		reason: $('ee-reason'),
+		radios: [...document.querySelectorAll('input[name="ee-rate"]')],
+	};
+	const ee = { serial: '', rate: 0 };
+
+	function eeMenuOpen() {
+		try {
+			return eeEls.menu.matches(':popover-open');
+		} catch {
+			return false;
+		}
+	}
+
+	function placeEeMenu() {
+		const r = eeEls.btn.getBoundingClientRect();
+		const width = Math.min(320, window.innerWidth - 32);
+		const right = Math.max(16, Math.min(window.innerWidth - r.right, window.innerWidth - width - 16));
+		eeEls.menu.style.right = `${Math.round(right)}px`;
+		eeEls.menu.style.bottom = `${Math.round(Math.max(8, window.innerHeight - r.top + 8))}px`;
+	}
+
+	function eeStoredRate(serial) {
+		const v = Number(readPref(PREF_EE_RATE + serial));
+		return v === -1 || v === -2 || v === -3 ? v : 0;
+	}
+
+	function eeApply(rate) {
+		ee.rate = rate;
+		const M = window.Module;
+		if (M && typeof M._pcsx2web_set_ee_cycle_rate === 'function')
+			M._pcsx2web_set_ee_cycle_rate(rate);
+	}
+
+	// bootRequest(): every boot starts at full speed, until the game is known.
+	function eeBoot() {
+		ee.serial = '';
+		eeApply(0);
+		renderEe();
+	}
+
+	// The running game's serial is known: its own choice.
+	function eeGameKnown(serial) {
+		ee.serial = serial || '';
+		const rate = ee.serial ? eeStoredRate(ee.serial) : 0;
+		eeApply(rate);
+		if (rate)
+			pageLog(`Underclock for ${ee.serial}: ${EE_RATE_NAMES[rate]} (EE cycle rate ${rate}).`);
+		renderEe();
+	}
+
+	function renderEe() {
+		const running = page.vmState === STATE.RUNNING || page.vmState === STATE.STARTING;
+		const known = running && !!ee.serial;
+		for (const r of eeEls.radios) {
+			r.checked = Number(r.value) === (known ? ee.rate : 0);
+			r.disabled = !known;
+		}
+		eeEls.game.textContent = known ? (disc.runTitle || ee.serial) : running ? 'Not a game with a serial' : 'No game running';
+		eeEls.reason.textContent = known ? 'Remembered for this game. Some games run in slow motion or glitch underclocked.' :
+			'Start a game to choose. Each game keeps its own choice.';
+		eeEls.btn.setAttribute('aria-label', `Underclock, ${EE_RATE_NAMES[known ? ee.rate : 0]}`);
+		eeEls.btn.classList.toggle('on', known && ee.rate !== 0);
+		const tip = eeEls.btn.querySelector('.tip');
+		if (tip)
+			tip.textContent = known && ee.rate ? `Underclock: ${EE_RATE_NAMES[ee.rate]}` : 'Underclock';
+	}
+
+	function wireEeUi() {
+		for (const r of eeEls.radios) {
+			r.addEventListener('change', () => {
+				if (!r.checked || !ee.serial)
+					return;
+				const rate = Number(r.value);
+				writePref(PREF_EE_RATE + ee.serial, String(rate));
+				eeApply(rate);
+				pageLog(`Underclock for ${ee.serial}: ${EE_RATE_NAMES[rate]} (EE cycle rate ${rate}).`);
+				renderEe();
+			});
+		}
+		eeEls.menu.addEventListener('beforetoggle', (e) => {
+			if (e.newState === 'open') {
+				renderEe();
+				placeEeMenu();
+			}
+		});
+		eeEls.menu.addEventListener('toggle', (e) => {
+			const open = e.newState === 'open';
+			eeEls.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+			if (open) {
+				const first = eeEls.radios.find((x) => x.checked && !x.disabled) || eeEls.radios.find((x) => !x.disabled);
+				(first || eeEls.menu).focus({ preventScroll: true });
+			} else {
+				const a = document.activeElement;
+				if (!a || a === document.body || eeEls.menu.contains(a))
+					eeEls.btn.focus({ preventScroll: true });
+			}
+			updateChrome();
+		});
+		eeEls.menu.addEventListener('focusout', (e) => {
+			const to = e.relatedTarget;
+			if (to && !eeEls.menu.contains(to) && to !== eeEls.btn)
+				eeEls.menu.hidePopover();
+		});
+		for (const type of ['resize', 'fullscreenchange'])
+			(type === 'resize' ? window : document).addEventListener(type, () => {
+				if (eeMenuOpen())
+					placeEeMenu();
+			});
+		renderEe();
+	}
+
 	// ------------------------------------------------------------------ preferences
 
 	function readPref(key) {
@@ -7271,7 +7397,7 @@
 
 	function chromeMayHide() {
 		return pageState() === 'running' && captureActive() && document.hasFocus() &&
-			!page.drawer && !menuOpen() && !discMenuOpen() && !cardMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
+			!page.drawer && !menuOpen() && !discMenuOpen() && !cardMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !eeMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
 			!pointerOverChrome && !page.keepChrome && hoverQuery.matches;
 	}
 
@@ -8709,6 +8835,7 @@
 		observeCanvasSize();
 		wireSoundUi();
 		wireGfxUi();
+		wireEeUi();
 		wirePlayersUi();
 		setCrisp(readPref(PREF_CRISP) === '1');
 		page.keepChrome = readPref(PREF_KEEP_CHROME) === '1';

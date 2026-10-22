@@ -106,6 +106,10 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
         <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-graphics-card"/></svg><span class="t-label">Graphics</span>
         <span class="tip" aria-hidden="true">Graphics</span>
       </button>
+      <button type="button" class="t-btn" id="btn-ee" popovertarget="ee-menu" aria-controls="ee-menu" aria-expanded="false" aria-label="Underclock, off">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-gauge"/></svg><span class="t-label"><span class="t-full">Underclock</span><span class="t-short">Clock</span></span>
+        <span class="tip" aria-hidden="true">Underclock</span>
+      </button>
       <button type="button" class="t-btn" id="btn-crisp" aria-pressed="false">
         <svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-checkerboard"/></svg><span class="t-label">Crisp</span>
         <span class="tip" aria-hidden="true">Crisp pixels</span>
@@ -408,6 +412,18 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <button type="button" class="menu-item" id="gfx-check"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-graphics-card"/></svg>Check WebGPU</button>
       <div class="gfx-result" id="gfx-result" role="status" aria-live="polite"></div>
     </div>
+  </div>
+
+  <div class="menu gfx-menu" id="ee-menu" popover role="group" aria-label="Underclock">
+    <p class="menu-file"><span class="menu-where">This game</span><span class="gfx-mode" id="ee-game">No game running</span></p>
+    <fieldset class="gfx-choice" id="ee-choice" aria-describedby="ee-reason">
+      <legend class="sound-label">Underclock the PS2’s processor</legend>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="0" checked><span>Off<span class="gfx-hint">Full speed, as on a PS2</span></span></label>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="-1"><span>Light<span class="gfx-hint">75 %</span></span></label>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="-2"><span>Medium<span class="gfx-hint">60 %</span></span></label>
+      <label class="gfx-option"><input type="radio" name="ee-rate" value="-3"><span>Strong<span class="gfx-hint">50 %</span></span></label>
+      <p class="menu-reason" id="ee-reason">Start a game to choose. Each game keeps its own choice.</p>
+    </fieldset>
   </div>
 
   <div class="menu" id="bios-menu" popover role="group" aria-label="BIOS">
