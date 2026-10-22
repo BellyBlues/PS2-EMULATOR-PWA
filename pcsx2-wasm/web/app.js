@@ -323,6 +323,9 @@
 		stateSaveLabel: $('state-save-label'),
 		stateLoad: $('state-load'),
 		stateLoadLabel: $('state-load-label'),
+		stateReload: $('state-reload'),
+		stateReloadLabel: $('state-reload-label'),
+		stateInput: $('state-input'),
 		recEmpty: $('rec-empty'),
 		recChart: $('rec-chart'),
 		recCrop: $('rec-crop'),
@@ -2933,12 +2936,12 @@
 	}
 
 	// Developer save states (?threads=1, ?state=): snapshots of the whole emulated machine, not memory card saves.
-	// Save state writes one at the CPU thread's next pause and downloads it; Load state puts the last one saved
-	// (or given with ?state=) back into the running game. ?state=<url>, a file on this server (dev-bios/<name> with
-	// serve.py --bios-dir), is also loaded by the next boot once the game has started.
+	// Save state writes one at the CPU thread's next pause and downloads it; Load state… puts a .p2s file the user
+	// picks into the running game; Reload state puts the last one saved or loaded back. ?state=<url>, a file on this
+	// server (dev-bios/<name> with serve.py --bios-dir), is also loaded by the next boot once the game has started.
 	const STATE_DIR = '/states';
 	const STATE_TIMEOUT_MS = 60000;
-	const devState = { pending: false, bootName: null, bootBytes: null, bytes: null, busy: null };
+	const devState = { pending: false, bootName: null, bootBytes: null, bytes: null, busy: null, picked: false };
 
 	async function loadStateFromUrl(param) {
 		const fail = (text, detail) => {
@@ -3023,6 +3026,7 @@
 		const started = performance.now();
 		const finish = (ok, why) => {
 			devState.busy = null;
+			devState.picked = false;
 			if (ok && save) {
 				const bytes = M.FS.readFile(path);
 				devState.bytes = bytes;
@@ -3061,14 +3065,39 @@
 		setTimeout(check, 100);
 	}
 
+	// Load state…: the chosen file is loaded into the running game, and kept for Reload state.
+	async function stateFileChosen() {
+		const file = els.stateInput.files && els.stateInput.files[0];
+		els.stateInput.value = '';
+		if (!file || devState.busy || page.vmState !== STATE.RUNNING)
+			return;
+		let bytes;
+		try {
+			bytes = new Uint8Array(await file.arrayBuffer());
+		} catch (err) {
+			pageLog(`Could not read the save state ${file.name}: ${errorText(err)}`, 'warn');
+			announce('Loading the state failed');
+			return;
+		}
+		pageLog(`Save state chosen: ${file.name} (${bytes.length.toLocaleString('en-US')} bytes).`);
+		devState.bytes = bytes;
+		devState.picked = true;
+		stateOperation('load');
+		if (!devState.busy)
+			devState.picked = false;
+	}
+
 	function stateRender() {
 		if (!els.stateSave)
 			return;
 		const running = page.vmState === STATE.RUNNING;
 		els.stateSave.disabled = !running || !!devState.busy;
-		els.stateLoad.disabled = !running || !!devState.busy || !devState.bytes;
+		els.stateLoad.disabled = !running || !!devState.busy;
+		els.stateReload.disabled = !running || !!devState.busy || !devState.bytes;
 		setText(els.stateSaveLabel, devState.busy === 'save' ? 'Saving…' : 'Save state');
-		setText(els.stateLoadLabel, devState.busy === 'load' ? 'Loading…' : 'Load state');
+		const loading = devState.busy === 'load';
+		setText(els.stateLoadLabel, loading && devState.picked ? 'Loading…' : 'Load state…');
+		setText(els.stateReloadLabel, loading && !devState.picked ? 'Loading…' : 'Reload state');
 	}
 
 	// startVm(): an ELF boot with ?elf=, a disc boot when a disc is open, otherwise the BIOS alone.
@@ -8569,7 +8598,9 @@
 		els.recCopy.addEventListener('click', () => copyText(recText(), els.recCopyLabel));
 		els.recDownload.addEventListener('click', recDownload);
 		els.stateSave.addEventListener('click', () => stateOperation('save'));
-		els.stateLoad.addEventListener('click', () => stateOperation('load'));
+		els.stateLoad.addEventListener('click', () => els.stateInput.click());
+		els.stateInput.addEventListener('change', stateFileChosen);
+		els.stateReload.addEventListener('click', () => stateOperation('load'));
 		for (const input of [els.recFrom, els.recTo]) {
 			input.addEventListener('input', () => {
 				const a = Number(els.recFrom.value), b = Number(els.recTo.value);
