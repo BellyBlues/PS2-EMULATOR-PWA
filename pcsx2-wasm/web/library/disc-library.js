@@ -14,9 +14,12 @@
 // createDiscLibrary(root, options) fills `root` and returns { shown, reset }. Options:
 //   host: the player (window.PCSX2WebLibrary from app.js): blocked() gives why a disc can't go in now
 //         (or ''), insert(file, handle) chooses the disc and queues its boot, status() reports the
-//         page ({ view, error }). Without a host the insert is only rehearsed.
+//         page ({ view, error }); bios() says whether it has a BIOS ({ ok, reading, error }), and
+//         chooseBios() and takeBios(file) give it one: without one, the library asks for it first.
+//         Without a host the insert is only rehearsed.
 //   onBooted(): with a host, called once the game's first frame is up (or the boot failed, or took
-//         too long): the player then takes the dialog away.
+//         too long): the player then takes the dialog away. Before that, once the PS2 starts, the
+//         console slides down out of the room (sink); rise() brings it back up when the library returns.
 //   cleanChance: how often a disc won't read and has to be cleaned first (the Easter egg, cleanDisc);
 //         index.html?clean=1 makes it every time.
 
@@ -49,6 +52,11 @@ const LAYOUTS = {
 const BOOT_COVER_MAX_MS = 25000;
 
 const COPY = {
+	biosTitle: 'Start with your BIOS.',
+	biosBody: 'TabStationToo needs the BIOS from a PS2 you own, usually a 4 MB .bin file. Then choose the folder with your games.',
+	biosChoose: 'Choose BIOS file…',
+	biosFine: 'It stays in this browser. Nothing is uploaded.',
+	biosReading: 'Reading the BIOS…',
 	intakeTitle: 'Choose the folder with your games.',
 	intakeBody: 'Each disc image in it becomes a disc on the shelf. The page reads the first few sectors of each file to name it; nothing is uploaded.',
 	choose: 'Choose a folder…',
@@ -131,6 +139,16 @@ const MARKUP = `
     <p class="lib-file" data-el="infoFile"></p>
     <p class="lib-hint"><kbd><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-left"/></svg><span class="vh">Left arrow</span></kbd><kbd><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-right"/></svg><span class="vh">Right arrow</span></kbd> browse <span class="lib-sep">·</span> <kbd>Enter</kbd> puts it in</p>
     <p class="lib-error" data-el="note" role="alert" hidden></p>
+  </section>
+  <section class="lib-card" data-el="biosCard" hidden>
+    <h3 data-el="biosTitle" tabindex="-1">${COPY.biosTitle}</h3>
+    <p class="lib-body">${COPY.biosBody}</p>
+    <div class="lib-actions">
+      <button type="button" class="btn-primary" data-el="biosBtn">${COPY.biosChoose}</button>
+      <span class="lib-aside" data-el="biosAside">${COPY.drop}</span>
+    </div>
+    <p class="lib-fine">${esc(COPY.biosFine)}</p>
+    <p class="lib-error" data-el="biosError" role="alert" hidden></p>
   </section>
   <section class="lib-card" data-el="intake">
     <h3 data-el="intakeTitle" tabindex="-1">${COPY.intakeTitle}</h3>
@@ -287,6 +305,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		const top = room.height / 2 + (G.infoY - G.h / 2) * k;
 		els.info.style.setProperty('--info-top', `${Math.round(top)}px`);
 		els.intake.style.setProperty('--card-top', `${Math.round(room.height * G.cardY)}px`);
+		els.biosCard.style.setProperty('--card-top', `${Math.round(room.height * G.cardY)}px`);
 		placeDiscs();
 		if (current && (mode === 'inserted' || mode === 'inserting'))
 			current.el.style.transform = matrix([...trayLinear(current.spinIn), ...trayCentre(true)]); // the tray moves it
@@ -294,10 +313,16 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 
 	// ------------------------------------------------------------------ state
 
+	// Without a BIOS the library asks for one first: the folder and the shelf wait.
+	const needBios = () => !!host && !!host.bios && !host.bios().ok;
+
 	function setMode(m) {
 		mode = m;
 		data.mode = m;
-		els.intake.hidden = !(m === 'empty' || m === 'scanning');
+		const bios = needBios();
+		data.bios = bios ? 'none' : '';
+		els.biosCard.hidden = !bios;
+		els.intake.hidden = bios || !(m === 'empty' || m === 'scanning');
 		els.started.hidden = m !== 'inserted';
 		els.bar.hidden = !(discs.length && m === 'shelf');
 		els.count.hidden = !discs.length;
@@ -637,8 +662,60 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		els.startedTitle.focus({ preventScroll: true });
 		announce(COPY.starting(d.title));
 		if (host) {
+			// Once the PS2 starts, the console slides down out of the room; the game comes up in its place.
+			await psStarted();
+			if (mode === 'inserted')
+				await sink();
 			await bootSettled();
 			onBooted();
+		}
+	}
+
+	// With a host: resolves once the PS2 starts (or the boot is over one way or another).
+	function psStarted() {
+		const until = performance.now() + BOOT_COVER_MAX_MS;
+		return new Promise((resolve) => {
+			const check = () => {
+				const s = host.status();
+				if (skipping || !['queued', 'ready'].includes(s.view) || (s.error && !s.busy) || performance.now() > until) {
+					resolve();
+					return;
+				}
+				setTimeout(check, 100);
+			};
+			check();
+		});
+	}
+
+	// The console slides down out of the room, and back up into it.
+	function sink() {
+		return animate(els.room, [{ translate: '0 0' }, { translate: '0 110%' }],
+			{ duration: dur(1100), easing: 'cubic-bezier(.55, 0, .8, .25)' });
+	}
+
+	function rise() {
+		els.room.style.translate = '0 110%';
+		return animate(els.room, [{ translate: '0 110%' }, { translate: '0 0' }],
+			{ duration: dur(1000), easing: 'cubic-bezier(.2, .7, .25, 1)' }).then(() => {
+			els.room.style.translate = '';
+		});
+	}
+
+	// The BIOS step: its error, the read under way, and on to the folder once there is a BIOS.
+	let biosWas = null;
+	function renderBios() {
+		if (!host || !host.bios)
+			return;
+		const b = host.bios();
+		els.biosError.textContent = b.error;
+		els.biosError.hidden = !b.error;
+		els.biosAside.textContent = b.reading ? COPY.biosReading : COPY.drop;
+		if (biosWas !== b.ok) {
+			const first = biosWas === null;
+			biosWas = b.ok;
+			setMode(mode);
+			if (!first && b.ok && root.isConnected && root.closest('dialog[open]'))
+				(mode === 'shelf' ? els.shelf : els.intakeBtn.hidden ? els.intakeTitle : els.intakeBtn).focus({ preventScroll: true });
 		}
 	}
 
@@ -681,6 +758,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		for (const o of discs)
 			o.el.classList.remove('is-away');
 		current = null;
+		els.room.style.translate = '';
 		data.lights = 'up';
 		data.disc = '';
 		data.tray = 'closed';
@@ -1027,7 +1105,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		e.stopPropagation();
 		e.preventDefault();
 		dragDepth++;
-		data.drag = mode === 'empty' || mode === 'shelf' ? 'ok' : '';
+		data.drag = needBios() || mode === 'empty' || mode === 'shelf' ? 'ok' : '';
 	});
 	root.addEventListener('dragleave', (e) => {
 		if (!filesIn(e))
@@ -1051,6 +1129,12 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		e.preventDefault();
 		dragDepth = 0;
 		data.drag = '';
+		if (needBios()) { // the BIOS file, first
+			const file = e.dataTransfer.files && e.dataTransfer.files[0];
+			if (file)
+				host.takeBios(file);
+			return;
+		}
 		if (mode !== 'empty' && mode !== 'shelf')
 			return;
 		const files = await filesFromDrop(e.dataTransfer);
@@ -1058,21 +1142,30 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 			scan(files);
 	});
 
+	els.biosBtn.addEventListener('click', () => host.chooseBios());
 	new ResizeObserver(applyLayout).observe(els.room);
 	applyLayout();
 	setMode('empty');
 	restoreFolder();
+	if (host && host.bios) {
+		renderBios();
+		setInterval(renderBios, 300);
+	}
 
 	return {
 		// The library has just been shown (the dialog opened): lay it out and put focus in it.
 		shown() {
 			applyLayout();
-			if (mode === 'shelf')
+			renderBios();
+			if (needBios())
+				els.biosBtn.focus({ preventScroll: true });
+			else if (mode === 'shelf')
 				els.shelf.focus({ preventScroll: true });
 			else
 				(els.intakeBtn.hidden ? els.intakeTitle : els.intakeBtn).focus({ preventScroll: true });
 		},
 		reset,
+		rise,
 		// Whether the insert is under way: the dialog then stays until the boot is covered.
 		get busy() {
 			return mode === 'inserting' || mode === 'inserted' || mode === 'ejecting';

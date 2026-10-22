@@ -34,6 +34,11 @@
   cursor: grabbing;
 }
 
+/* Without a BIOS the library asks for one first: no shelf yet. */
+.lib[data-bios="none"] :is(.lib-shelf, .lib-info, .lib-bar) {
+  visibility: hidden;
+}
+
 .lib[data-drag="ok"] .lib-room {
   outline: 2px solid var(--amber);
   outline-offset: -8px;
@@ -520,7 +525,7 @@
   color: var(--ink);
   overflow: hidden;
   opacity: 1;
-  transition: opacity 500ms var(--ease-out), background-color 900ms var(--ease-out);
+  transition: opacity 700ms var(--ease-out), background-color 900ms var(--ease-out);
 }
 
 .lib-dialog[open] {
