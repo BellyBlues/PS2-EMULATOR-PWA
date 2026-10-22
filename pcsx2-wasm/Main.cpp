@@ -153,6 +153,9 @@ static std::atomic<u32> s_vsync_count{0};
 
 // Crisp: nearest-neighbour presentation (WebGPU path). -1 = unchanged since the last apply.
 static std::atomic<int> s_crisp_request{-1};
+// The page's picture filter (PCSX2's TV shader, GSConfig.TVShader: 0 none, 5 Lottes CRT...), -1: no request.
+static std::atomic<int> s_tv_shader_request{-1};
+static int s_tv_shader = 0;
 static bool s_crisp = false; // CPU thread
 // The EE cycle rate the page asked for (EmuConfig.Speedhacks.EECycleRate: 0, or -1 to -3 to underclock the EE),
 // kCycleRateNone when there is no new request.
@@ -1661,6 +1664,21 @@ static void CheckCrispRequest(bool apply_now)
 		ApplyCrispSetting(request != 0, apply_now);
 }
 
+// The picture filter: one of PCSX2's TV shaders, applied when the GS presents (the WebGPU device has them all).
+static void CheckTvShaderRequest(bool apply_now)
+{
+	const int request = s_tv_shader_request.exchange(-1, std::memory_order_acq_rel);
+	if (request < 0 || request == s_tv_shader)
+		return;
+	s_tv_shader = request;
+	{
+		auto lock = Host::GetSettingsLock();
+		s_settings_interface.SetIntValue("EmuCore/GS", "TVShader", request);
+	}
+	if (apply_now && VMManager::HasValidVM())
+		VMManager::ApplySettings();
+}
+
 // The EE underclock (PCSX2's EE Cycle Rate speedhack), which the page keeps per game. CPU thread.
 static void CheckCycleRateRequest(bool apply_now)
 {
@@ -1891,6 +1909,7 @@ static void RunVM(const std::string& bios_name)
 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", s_vu1jit_enabled.load(std::memory_order_acquire));
 	}
 	CheckCrispRequest(false);
+	CheckTvShaderRequest(false);
 	CheckCycleRateRequest(false);
 	CheckMemcardRequests(false);
 	VMManager::ApplySettings();
@@ -2200,6 +2219,14 @@ EMSCRIPTEN_KEEPALIVE void pcsx2web_set_crisp(int crisp)
 	s_crisp_request.store(crisp ? 1 : 0, std::memory_order_release);
 }
 
+/// The picture filter: PCSX2's TV shader (0 none, 1 scanlines, 2 diagonal, 3 triangular, 4 wave, 5 Lottes CRT,
+/// 6 4xRGSS, 7 NxAGSS), applied at the next vsync or boot.
+EMSCRIPTEN_KEEPALIVE void pcsx2web_set_tv_shader(int shader)
+{
+	if (shader >= 0 && shader <= 7)
+		s_tv_shader_request.store(shader, std::memory_order_release);
+}
+
 /// Vsyncs emulated since the module started.
 EMSCRIPTEN_KEEPALIVE unsigned int pcsx2web_vsync_count(void)
 {
@@ -2344,6 +2371,7 @@ void Host::PumpMessagesOnCPUThread()
 	RunCPUThreadQueue();
 	CheckStopRequest();
 	CheckCrispRequest(true);
+	CheckTvShaderRequest(true);
 	CheckCycleRateRequest(true);
 	CheckMemcardRequests(true);
 	s_memcard_status[0].store(MemcardBusy::IsBusy() ? MEMCARD_STATUS_BUSY : 0, std::memory_order_release);

@@ -69,6 +69,7 @@ set(PCSX2_WASM_EXPORTS
 	_pcsx2web_frame
 	_pcsx2web_surface_size
 	_pcsx2web_set_crisp
+	_pcsx2web_set_tv_shader
 	_pcsx2web_set_ee_cycle_rate
 	_pcsx2web_vsync_count
 	_pcsx2web_test_snapshot

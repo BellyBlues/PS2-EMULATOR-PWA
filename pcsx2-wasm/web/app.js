@@ -54,7 +54,8 @@
 	const IDB_NAME = 'pcsx2-web';
 	const IDB_STORE = 'bios';
 	const IDB_KEY = 'last';
-	const PREF_CRISP = 'pcsx2web.crisp';
+	const PREF_CRISP = 'pcsx2web.crisp'; // before the picture modes: '1' was Crisp
+	const PREF_PICTURE = 'pcsx2web.picture';
 	// The Graphics menu's choice (UI-SPEC.md §12): 'auto', 'gpu' or 'sw'; ?gpu= and ?renderer= win over it.
 	const PREF_RENDERER = 'pcsx2web.renderer';
 	const PREF_KEEP_CHROME = 'pcsx2web.keepChrome';
@@ -402,6 +403,7 @@
 	const reducedMotionQuery = media('(prefers-reduced-motion: reduce)');
 
 	const page = {
+		picture: 'smooth', // the remote's picture mode (PICTURE_MODES)
 		phase: 'loading', // loading | ready | unsupported | dead
 		runtimeRequested: false, // false while a touch-only device waits for a BIOS
 		vmState: STATE.WAITING,
@@ -879,6 +881,7 @@
 			frame: () => M._pcsx2web_frame() >>> 0,
 			surfaceSize: (w, h, scale) => M._pcsx2web_surface_size && M._pcsx2web_surface_size(w, h, scale),
 			setCrisp: (on) => M._pcsx2web_set_crisp && M._pcsx2web_set_crisp(on ? 1 : 0),
+			setTvShader: (n) => M._pcsx2web_set_tv_shader && M._pcsx2web_set_tv_shader(n),
 		};
 	}
 
@@ -925,6 +928,7 @@
 		renderProgress();
 		feedSurfaceSize(0, 0, 0);
 		api.setCrisp(els.body.dataset.crisp === 'on');
+		api.setTvShader(PICTURE_MODES[page.picture].shader);
 		audioStart(); // the context exists already when a boot was queued while the runtime loaded
 		frame.lastPollTime = performance.now();
 		pollTimer = setInterval(poll, POLL_MS);
@@ -8422,11 +8426,36 @@
 
 	function setCrisp(on) {
 		setData('crisp', on ? 'on' : 'off');
-		els.btnCrisp.setAttribute('aria-pressed', on ? 'true' : 'false');
 		// The 2D path scales with CSS (image-rendering); the WebGPU device presents at the canvas's
 		// own size, so it filters (or not) itself.
 		if (api)
 			api.setCrisp(on);
+	}
+
+	// The remote's PICTURE button cycles the picture modes. CRT is PCSX2's own Lottes CRT shader (its TV shader 5,
+	// applied when the WebGPU device presents); the 2D path's device has no TV shaders, so there it is left out.
+	const PICTURE_MODES = {
+		smooth: { name: 'Smooth', crisp: false, shader: 0, next: 'crisp' },
+		crisp: { name: 'Crisp', crisp: true, shader: 0, next: 'crt' },
+		crt: { name: 'CRT', crisp: false, shader: 5, next: 'smooth' },
+	};
+
+	function readPicturePref() {
+		const v = readPref(PREF_PICTURE);
+		if (v in PICTURE_MODES)
+			return v;
+		return readPref(PREF_CRISP) === '1' ? 'crisp' : 'smooth';
+	}
+
+	function setPicture(mode) {
+		page.picture = mode;
+		const m = PICTURE_MODES[mode];
+		setCrisp(m.crisp);
+		setData('picmode', mode);
+		els.btnCrisp.setAttribute('aria-label', `Picture: ${m.name}`);
+		els.btnCrisp.classList.toggle('on', mode !== 'smooth');
+		if (api)
+			api.setTvShader(m.shader);
 	}
 
 	// ------------------------------------------------------------------ fullscreen
@@ -9683,9 +9712,13 @@
 		});
 
 		els.btnCrisp.addEventListener('click', (e) => {
-			const on = els.body.dataset.crisp !== 'on';
-			setCrisp(on);
-			writePref(PREF_CRISP, on ? '1' : '0');
+			let next = PICTURE_MODES[page.picture].next;
+			const noCrt = next === 'crt' && display.kind === '2d';
+			if (noCrt)
+				next = PICTURE_MODES.crt.next;
+			setPicture(next);
+			writePref(PREF_PICTURE, next);
+			subtitle(`Picture: ${PICTURE_MODES[next].name}.${noCrt ? ' CRT needs WebGPU graphics (Menu).' : ''}`);
 			returnFocusAfterPointer(e);
 		});
 		// The controller ports (UI-SPEC §16): the controls for that player. Another port while they are
@@ -10055,7 +10088,7 @@
 		wireGfxUi();
 		wireEeUi();
 		wirePlayersUi();
-		setCrisp(readPref(PREF_CRISP) === '1');
+		setPicture(readPicturePref());
 		page.keepChrome = readPref(PREF_KEEP_CHROME) === '1';
 		els.keepChrome.checked = page.keepChrome;
 		setData('fs', 'off');
