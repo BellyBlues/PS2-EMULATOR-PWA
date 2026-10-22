@@ -7,15 +7,18 @@
 <meta name="theme-color" content="#121110">
 <meta name="description" content="TabStationToo's disc library: your disc images on a shelf, and a console to put them in.">
 <title>Disc library · TabStationToo</title>
-<!-- A standalone study for picking a game (not linked from index.html yet). Same-origin only, like the
-     player page: no request ever leaves this server. The page reads the start of each disc image in
-     the chosen folder to name it; nothing is uploaded and nothing boots. -->
+<!-- A standalone study for picking a game (not linked from index.html yet; library-3d.html is the
+     first, 3D take). The page reads the start of each disc image in the chosen folder to name it;
+     nothing is uploaded and nothing boots. Unlike the player, it fetches disc art from one other
+     origin (library/folder.js), which the owner allowed for these pages. -->
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="preload" href="fonts/archivo.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="library/library.css">
-<script type="module" src="library/library.js"></script>
+<link rel="preload" href="library/ps2.webp" as="image">
+<link rel="stylesheet" href="library/page.css">
+<link rel="stylesheet" href="library/scene-2d.css">
+<script type="module" src="library/scene-2d.js"></script>
 </head>
-<body data-mode="empty" data-lights="up" data-tray="closed" data-drag="">
+<body data-mode="empty" data-lights="up" data-tray="closed" data-drag="" data-disc="">
 
 <header class="marquee">
   <h1 class="wordmark"><svg class="mark" aria-hidden="true" focusable="false"><use href="icons.svg#i-mark"/></svg><span class="wm">TabStation<span class="wm-too">Too</span></span><span class="wm-page">Disc library</span></h1>
@@ -25,31 +28,25 @@
 
 <main class="room" id="room">
   <div class="stage" id="stage">
-    <div class="world" id="world">
-      <div class="console" id="console" aria-hidden="true">
-        <div class="c-face c-top"><div class="c-top-panel"></div><div class="c-vents"></div></div>
-        <div class="c-face c-left"></div>
-        <div class="c-face c-right"></div>
-        <div class="c-face c-front">
-          <div class="c-band">
-            <svg class="c-mark"><use href="icons.svg#i-mark"/></svg>
-            <div class="c-slot"></div>
-            <div class="c-buttons"><span class="c-eject"></span><span class="c-power"></span><span class="c-tally"></span></div>
-          </div>
-          <div class="c-ports"><span></span><span></span><i></i><i></i></div>
-        </div>
-        <div class="tray" id="tray">
-          <div class="t-face t-plate"><div class="t-well"></div><div class="t-spindle"></div></div>
-          <div class="t-face t-lip"></div>
-          <div class="t-face t-side t-side-l"></div>
-          <div class="t-face t-side t-side-r"></div>
-        </div>
-      </div>
-      <div class="shelf" id="shelf" role="listbox" tabindex="0" aria-label="Discs" aria-orientation="horizontal"></div>
+    <div class="console" id="console" aria-hidden="true">
+      <img class="photo" id="photo" src="library/ps2.webp" alt="" width="1100" height="662" draggable="false">
+      <div class="hole" id="hole"></div>
+      <div class="led led-power" id="led-power"></div>
+      <div class="led led-eject" id="led-eject"></div>
     </div>
+    <!-- The tray's plate, and the disc once it lies on it, seen only in front of the console's face. -->
+    <div class="tray-clip" id="tray-clip" aria-hidden="true">
+      <div class="tray-move" id="tray-move">
+        <div class="plate" id="plate"><div class="well"></div><div class="channel"></div></div>
+        <div class="plate-side" id="plate-side"></div>
+      </div>
+    </div>
+    <!-- The tray's front: the same photo, cut to the panel, sliding out. -->
+    <div class="panel" id="panel" aria-hidden="true"><img src="library/ps2.webp" alt="" width="1100" height="662" draggable="false"></div>
+    <div class="shelf" id="shelf" role="listbox" tabindex="0" aria-label="Discs" aria-orientation="horizontal"></div>
   </div>
 
-  <section class="info" id="info" aria-live="off">
+  <section class="info" id="info">
     <h2 id="info-title"></h2>
     <p class="meta" id="info-meta"></p>
     <p class="file" id="info-file"></p>
@@ -63,7 +60,7 @@
       <button type="button" class="btn-primary" id="intake-btn"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg>Choose a folder…</button>
       <span class="aside" id="intake-aside">or drop it here</span>
     </div>
-    <p class="fine" id="intake-fine">Disc art comes from images next to the discs, named like PCSX2’s covers (<span class="mono">SLUS-20946.jpg</span>, or the game’s title). Without one, the disc gets a label of its own.</p>
+    <p class="fine">Disc art is downloaded by serial from the ps2-covers collection on GitHub, unless the folder has an image named like PCSX2’s covers (<span class="mono">SLUS-20946.jpg</span>). Only the serial is sent.</p>
     <p class="error" id="intake-error" hidden></p>
   </section>
 
@@ -76,7 +73,7 @@
   </section>
 </main>
 
-<footer class="credits">Built on PCSX2 (GPL-3.0) <span class="sep">·</span> Not affiliated with Sony or the PCSX2 project</footer>
+<footer class="credits">Built on PCSX2 (GPL-3.0) <span class="sep">·</span> Not affiliated with Sony or the PCSX2 project <span class="sep">·</span> Console photo: Evan-Amos, public domain <span class="sep">·</span> Disc art: <a href="https://github.com/xlenore/ps2-covers" target="_blank" rel="noopener noreferrer">ps2-covers<span class="vh"> (opens in a new tab)</span></a></footer>
 
 <p class="vh" id="announce" role="status"></p>
 <input type="file" id="folder-input" webkitdirectory multiple hidden>

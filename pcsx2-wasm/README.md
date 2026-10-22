@@ -351,19 +351,28 @@ compile a block once it has run 128 times, within 4 ms of compiling per vsync (`
 
 `library.html` is a standalone page, not linked from the player yet, for a nicer way to pick a
 game: choose (or drop) a folder, and every disc image in it becomes a disc on a shelf; click one, or
-press Enter, and it flies into the tray of a console (an original design, not a likeness of any real
-one), the tray closes and the lights go down. Nothing boots: on the player page the boot would start
-with the insert, which would cover the BIOS logos and the game's loading (`onInserted()` in
-`library/library.js` is where that goes). `library.html?demo` shows a shelf of made-up games.
+press Enter, and it flies into the tray of a PS2, the tray closes and the lights go down. Nothing
+boots: on the player page the boot would start with the insert, which would cover the BIOS logos and
+the game's loading (`onInserted()` in `library/scene-2d.js` is where that goes). `?demo` shows a
+shelf of made-up games; `?tray=open` opens the tray, for checking it against the photo.
 
+- The console is a photo (`library/ps2.webp`, Evan-Amos, public domain; `library/ps2-photo.txt`).
+  The tray is the photo's own front panel, cut out and slid along the console's depth; the plate
+  and the disc behind it are drawn on the tray's plane with an affine transform measured from the
+  photo (`TRAY` in `scene-2d.js`).
+- `library-3d.html` (`scene-3d.js`, `scene-3d.css`) is the first take, kept as a copy: an original
+  console in CSS 3D. Both pages share `page.css`, `folder.js`, `disc-info.js` and `disc-art.js`.
 - `library/disc-info.js` reads the start of each file (the ISO 9660 volume at the layouts PCSX2
   detects, then `SYSTEM.CNF`) for the serial; it also runs in Node. Titles come from
   `game-titles.tsv`, an index of PCSX2's game database the build writes next to the page
   (`tools/wasm/make-game-titles.py`). Served straight from `web/`, without it, titles come from the
   file names.
 - Disc images carry no box art. A disc is printed with an image from the same folder named like
-  PCSX2's covers (`SLUS-20946.jpg`, `.png` or `.webp`, or the game's title, or the disc's file name);
-  otherwise `library/disc-art.js` draws a label from the title and serial.
+  PCSX2's covers (`SLUS-20946.jpg`, `.png` or `.webp`, or the game's title, or the disc's file name),
+  else with the game's cover from the [ps2-covers](https://github.com/xlenore/ps2-covers) collection
+  on GitHub, fetched by serial (the one request these pages make to another origin; GitHub sends
+  `Cross-Origin-Resource-Policy: cross-origin`, so it loads in an isolated page), else with a label
+  `library/disc-art.js` draws from the title and serial.
 
 ## UI assets
 

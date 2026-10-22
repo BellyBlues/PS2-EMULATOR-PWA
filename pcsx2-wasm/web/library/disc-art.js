@@ -169,7 +169,7 @@ export function discSvg(disc) {
 	let print;
 	if (disc.cover) {
 		print = `<rect width="1000" height="1000" fill="#1c1b19"/>` +
-			`<image href="${esc(disc.cover)}" x="0" y="0" width="1000" height="1000" preserveAspectRatio="xMidYMin slice"/>`;
+			`<image href="${esc(disc.cover)}" x="0" y="0" width="1000" height="1000" preserveAspectRatio="xMidYMid slice"/>`;
 	} else {
 		const initial = (main.match(/[A-Za-z0-9]/) || ['?'])[0].toUpperCase();
 		print = `<rect width="1000" height="1000" fill="${pal[0]}"/>` + motif(kind, h, pal, initial) +
