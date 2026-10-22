@@ -111,7 +111,6 @@ const MARKUP = `
       <img class="lib-photo" src="${PHOTO_URL}" alt="" width="1100" height="662" draggable="false">
       <div class="lib-hole"></div>
       <div class="lib-led lib-led-power"></div>
-      <div class="lib-led lib-led-eject"></div>
     </div>
     <div class="lib-tray-clip" aria-hidden="true">
       <div class="lib-tray-move" data-el="trayMove">

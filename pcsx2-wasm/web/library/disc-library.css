@@ -148,7 +148,7 @@
   background: #0d0d0e;
 }
 
-/* The power light (green) and the eject button's light (blue) come on with a disc in. */
+/* The power light (green, in the Reset button) comes on with a disc in. */
 .lib-led {
   position: absolute;
   width: 22px;
@@ -163,12 +163,6 @@
   left: 788px;
   top: 466px;
   background: radial-gradient(closest-side, rgb(90 255 140 / 0.85), rgb(40 200 90 / 0.35) 60%, transparent);
-}
-
-.lib-led-eject {
-  left: 784px;
-  top: 518px;
-  background: radial-gradient(closest-side, rgb(90 150 255 / 0.8), rgb(50 100 230 / 0.3) 60%, transparent);
 }
 
 .lib[data-disc="in"] .lib-led {
