@@ -164,7 +164,7 @@ Measured, exact or not, and not kept because the gain was too small for the chan
 - **EE JIT units** (one function per module, registers kept across blocks): no gain, slower compiling
   (`7f41a4f0a`, reverted).
 - **Lean branch ends** (no PC, code and branch flag stores after a register-only delay slot): exact,
-  0.9 % fewer instructions retired on GTA (branch `lean-branch-end`, not merged).
+  0.9 % fewer instructions retired on GTA (branch `lean-branch-end`, not merged; also on `perf-experiments`).
 - **A lower V8 tier-up budget** (`--wasm-tiering-budget` 1 M or 200 k against 13 M): 6-8 % more
   instructions on GTA, from the extra optimising compiles.
 - **The last EE interpreter fallbacks generated natively** (2026-10-22): LWL/LWR/SWL/SWR, CACHE DXLTG,
@@ -172,7 +172,7 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   PADD/PSUB ops. Exact (GTA, BIOS and benchmark hashes, a 1000-vsync end state, an op test against the
   interpreter), interpreter calls 13.5 M → 1.5 M per 1,200 GTA vsyncs, but 1,043.4 G → 1,042.4 G
   instructions retired per 2,400 vsyncs (within noise): their interpreter bodies were 0.5 % of the EE
-  thread. Branch `native-fallbacks` (`950539bc7`), not merged.
+  thread. Branch `native-fallbacks` (`950539bc7`), not merged; also on `perf-experiments`, which keeps both up to date with Yousri-v2.
 - **IOP idle loops** (2026-10-22): in GTA San Andreas gameplay the IOP's hottest block (43 % of its block
   entries, `-eejit-stats` now lists the IOP's blocks too) is the kernel's idle loop, `J self; NOP` at
   0xbe9c, entered once per EE event test (about 6,300 times a vsync). The interpreter's wait loop skip
