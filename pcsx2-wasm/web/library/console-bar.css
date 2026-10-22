@@ -207,48 +207,71 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 }
 
 .bar-slot .card-dot {
-  top: 52%;
+  top: 50%;
   left: auto;
   right: 9%;
   z-index: 1;
 }
 
-/* The card's end, drawn like the console, out of the slot's mouth (44% down the button). */
+/* The card, drawn like the console: the whole card, 42 × 56 mm, hanging from the slot's mouth (44% down
+   the button). Only what is out of the slot shows (.mc clips above the mouth). Plugged, it is pushed in
+   until just its end shows, with the card's name on its label; plugging slides it up into the slot,
+   unplugging pulls it back down and away. */
 .mc {
   position: absolute;
   left: 6%;
   width: 88%;
   top: 44.4%;
-  height: 46%;
-  overflow: hidden;
+  aspect-ratio: 3 / 4;
+  z-index: 2;
+  clip-path: inset(0 -40px -400px -40px);
   pointer-events: none;
 }
 
 .mc-card {
   position: absolute;
-  inset: 0 0 1px;
+  inset: 0;
+  border: 1px solid var(--ink-3);
+  border-radius: 3px 3px 6px 6px;
+  background: #1c1b19;
+  transform: translateY(-79%);
+  opacity: 1;
+  transition: transform 760ms cubic-bezier(0.3, 0, 0.15, 1), opacity 160ms var(--ease-out);
+}
+
+.card-btn.empty .mc-card {
+  transform: translateY(6%);
+  opacity: 0;
+  transition: transform 620ms cubic-bezier(0.45, 0, 0.6, 1), opacity 220ms 520ms var(--ease-in);
+}
+
+/* What is printed on it: near the end that goes in. */
+.mc-print {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 22%;
+  text-align: center;
+  font-family: var(--sans);
+  font-size: clamp(5px, 0.62cqw, 7px);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+
+/* The label, at the end that stays out: the card's name. */
+.mc-label {
+  position: absolute;
+  left: 12%;
+  right: 12%;
+  bottom: 9%;
+  height: 11%;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--ink-3);
-  border-top: 0;
-  border-radius: 0 0 5px 5px;
-  background: #1c1b19;
-  transform: translateY(0);
-  opacity: 1;
-  transition: transform 520ms var(--ease-out), opacity 240ms var(--ease-out);
-}
-
-/* Out of the slot: it moves away and goes. Plugging it in brings it back up into its place. */
-.card-btn.empty .mc-card {
-  transform: translateY(70%);
-  opacity: 0;
-  transition: transform 420ms var(--ease-in), opacity 300ms 120ms var(--ease-in);
-}
-
-.mc-label {
-  max-width: 90%;
   overflow: hidden;
+  border: 1px solid #4a4743;
+  border-radius: 2px;
   font-family: var(--sans);
   font-size: clamp(7px, 0.9cqw, 10px);
   font-weight: 560;
@@ -256,6 +279,21 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
   white-space: nowrap;
   text-overflow: ellipsis;
   color: var(--ink);
+}
+
+.mc-label:empty {
+  border-color: transparent;
+}
+
+/* Grip ridges along the end. */
+.mc-grip {
+  position: absolute;
+  left: 30%;
+  right: 30%;
+  bottom: 3%;
+  height: 4%;
+  border-top: 1px solid #3d3a36;
+  border-bottom: 1px solid #3d3a36;
 }
 
 /* ---------------------------------------------------------------- the TV remote, lying under the tray */
@@ -500,7 +538,7 @@ body:is([data-state="starting"], [data-state="running"]) .bar-led {
 @media (prefers-reduced-motion: reduce) {
   .mc-card,
   .card-btn.empty .mc-card {
-    transition-duration: 0ms;
+    transition: none;
   }
 }
 
