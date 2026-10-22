@@ -5198,7 +5198,7 @@
 		// opens without a BIOS too, and asks for one first.
 		canOpen: () => canChangeBios(),
 		// The BIOS, for the library's first step: whether there is one, one being read, and why the last failed.
-		bios: () => ({ ok: !!page.bios || !!page.urlBiosName, reading: !!page.biosReading,
+		bios: () => ({ ok: !!page.bios || !!page.urlBiosName, name: page.bios ? page.bios.name : page.urlBiosName || '', reading: !!page.biosReading,
 			error: pageState() === 'nobios' && !page.errorIsDisc ? page.error || '' : '' }),
 		// Inside the user's press: the BIOS file picker.
 		chooseBios: () => openPicker(),

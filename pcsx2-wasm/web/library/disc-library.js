@@ -17,9 +17,9 @@
 //         page ({ view, error }); bios() says whether it has a BIOS ({ ok, reading, error }), and
 //         chooseBios() and takeBios(file) give it one: without one, the library asks for it first.
 //         Without a host the insert is only rehearsed.
-//   onBooted(): with a host, called once the game's first frame is up (or the boot failed, or took
-//         too long): the player then takes the dialog away. Before that, once the PS2 starts, the
-//         console slides down out of the room (sink); rise() brings it back up when the library returns.
+//   onBooted(): with a host, called once the disc is in and the console has slid down out of the room
+//         (sink): the player then takes the dialog away and its screen shows the boot. rise() brings the
+//         console back up when the library returns.
 //   cleanChance: how often a disc won't read and has to be cleaned first (the Easter egg, cleanDisc);
 //         index.html?clean=1 makes it every time.
 
@@ -47,26 +47,25 @@ const LAYOUTS = {
 	tall: { w: 1100, h: 1560, photo: [0, 880], shelfY: 380, scale: 1.6, gap1: 330, gapN: 80, span: 3, infoY: 640, cardY: 0.12, bench: [500, 560, 2.1] },
 };
 
-// With a host: the room stays dark until the game shows a picture (not just black frames), but no
-// longer than this; then the player's own "still starting" messages take over.
-const BOOT_COVER_MAX_MS = 25000;
 
 const COPY = {
-	biosTitle: 'Start with your BIOS.',
-	biosBody: 'TabStationToo needs the BIOS from a PS2 you own, usually a 4 MB .bin file. Then choose the folder with your games.',
-	biosChoose: 'Choose BIOS file…',
-	biosFine: 'It stays in this browser. Nothing is uploaded.',
-	biosReading: 'Reading the BIOS…',
-	intakeTitle: 'Choose the folder with your games.',
-	intakeBody: 'Each disc image in it becomes a disc on the shelf. The page reads the first few sectors of each file to name it; nothing is uploaded.',
-	choose: 'Choose a folder…',
-	again: (name) => `Open ${name} again`,
-	againTitle: (name) => `Your games are in ${name}.`,
-	againBody: 'The browser asks once per visit before the page may read the folder again.',
-	another: 'Choose another folder…',
-	drop: 'or drop it here',
-	reading: (done, total) => `Reading ${done} of ${total}…`,
-	fine: 'Disc art is downloaded by serial from the ps2-covers collection on GitHub, unless the folder has an image named like PCSX2’s covers (SLUS-20946.jpg). Only the serial is sent.',
+	setup: 'Set up your PS2',
+	biosTitle: 'BIOS',
+	biosBody: 'Dumped from your own PS2 (.bin)',
+	biosChoose: 'Choose file',
+	biosChange: 'Change',
+	biosReading: 'Reading…',
+	intakeTitle: 'Games',
+	intakeBody: 'A folder with your disc images (.iso)',
+	choose: 'Choose folder',
+	again: () => 'Open again',
+	againTitle: () => 'Games',
+	againBody: (name) => `In “${name}”; the browser asks once per visit`,
+	another: 'Another folder…',
+	drop: '',
+	// Cover art comes from the folder (PCSX2's names, SLUS-20946.jpg) or ps2-covers by serial: the dialog's credit line.
+	setupFine: 'Choose them or drop them here. They stay in this browser; nothing is uploaded.',
+	reading: (done, total) => (total ? `Reading ${done} of ${total}…` : 'Reading…'),
 	rehearsal: 'This page only rehearses the insert. On the player page, the game would boot while the disc goes in, and its first frame would come up here.',
 	starting: (title) => `Starting ${title}.`,
 	unreadable: 'Couldn’t read that folder. Try choosing it again.',
@@ -140,26 +139,32 @@ const MARKUP = `
     <p class="lib-hint"><kbd><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-left"/></svg><span class="vh">Left arrow</span></kbd><kbd><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-right"/></svg><span class="vh">Right arrow</span></kbd> browse <span class="lib-sep">·</span> <kbd>Enter</kbd> puts it in</p>
     <p class="lib-error" data-el="note" role="alert" hidden></p>
   </section>
-  <section class="lib-card" data-el="biosCard" hidden>
-    <h3 data-el="biosTitle" tabindex="-1">${COPY.biosTitle}</h3>
-    <p class="lib-body">${COPY.biosBody}</p>
-    <div class="lib-actions">
-      <button type="button" class="btn-primary" data-el="biosBtn">${COPY.biosChoose}</button>
-      <span class="lib-aside" data-el="biosAside">${COPY.drop}</span>
+  <section class="lib-setup" data-el="setup" aria-labelledby="lib-setup-title">
+    <h3 class="vh" id="lib-setup-title" data-el="setupTitle" tabindex="-1">${COPY.setup}</h3>
+    <div class="lib-steps">
+      <div class="lib-step" data-el="biosCard">
+        <span class="lib-step-icon" aria-hidden="true"><svg class="icon lib-step-todo" focusable="false"><use href="icons.svg#i-cpu"/></svg><svg class="icon lib-step-done" focusable="false"><use href="icons.svg#i-check-circle"/></svg></span>
+        <h4 class="lib-step-title" data-el="biosTitle" tabindex="-1">${COPY.biosTitle}</h4>
+        <p class="lib-step-sub" data-el="biosSub">${COPY.biosBody}</p>
+        <div class="lib-step-actions">
+          <button type="button" class="btn-primary" data-el="biosBtn">${COPY.biosChoose}</button>
+          <span class="lib-step-aside" data-el="biosAside"></span>
+        </div>
+        <p class="lib-step-error" data-el="biosError" role="alert" hidden></p>
+      </div>
+      <div class="lib-step" data-el="intake">
+        <span class="lib-step-icon" aria-hidden="true"><svg class="icon" focusable="false"><use href="icons.svg#i-folder-open"/></svg></span>
+        <h4 class="lib-step-title" data-el="intakeTitle" tabindex="-1">${COPY.intakeTitle}</h4>
+        <p class="lib-step-sub" data-el="intakeBody">${COPY.intakeBody}</p>
+        <div class="lib-step-actions">
+          <button type="button" class="btn-primary" data-el="intakeBtn"><span data-el="intakeLabel">${COPY.choose}</span></button>
+          <button type="button" class="btn-quiet" data-el="intakeOther" hidden>${COPY.another}</button>
+          <span class="lib-step-aside" data-el="intakeAside"></span>
+        </div>
+        <p class="lib-step-error" data-el="intakeError" hidden></p>
+      </div>
     </div>
-    <p class="lib-fine">${esc(COPY.biosFine)}</p>
-    <p class="lib-error" data-el="biosError" role="alert" hidden></p>
-  </section>
-  <section class="lib-card" data-el="intake">
-    <h3 data-el="intakeTitle" tabindex="-1">${COPY.intakeTitle}</h3>
-    <p class="lib-body" data-el="intakeBody">${COPY.intakeBody}</p>
-    <div class="lib-actions">
-      <button type="button" class="btn-primary" data-el="intakeBtn"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg><span data-el="intakeLabel">${COPY.choose}</span></button>
-      <button type="button" class="btn-quiet" data-el="intakeOther" hidden>${COPY.another}</button>
-      <span class="lib-aside" data-el="intakeAside">${COPY.drop}</span>
-    </div>
-    <p class="lib-fine">${esc(COPY.fine)}</p>
-    <p class="lib-error" data-el="intakeError" hidden></p>
+    <p class="lib-setup-fine">${esc(COPY.setupFine)}</p>
   </section>
   <section class="lib-card lib-card-dark" data-el="started" hidden>
     <h3 data-el="startedTitle" tabindex="-1"></h3>
@@ -304,8 +309,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 
 		const top = room.height / 2 + (G.infoY - G.h / 2) * k;
 		els.info.style.setProperty('--info-top', `${Math.round(top)}px`);
-		els.intake.style.setProperty('--card-top', `${Math.round(room.height * G.cardY)}px`);
-		els.biosCard.style.setProperty('--card-top', `${Math.round(room.height * G.cardY)}px`);
+		els.setup.style.setProperty('--card-top', `${Math.round(room.height * G.cardY)}px`);
 		placeDiscs();
 		if (current && (mode === 'inserted' || mode === 'inserting'))
 			current.el.style.transform = matrix([...trayLinear(current.spinIn), ...trayCentre(true)]); // the tray moves it
@@ -321,8 +325,12 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		data.mode = m;
 		const bios = needBios();
 		data.bios = bios ? 'none' : '';
-		els.biosCard.hidden = !bios;
-		els.intake.hidden = bios || !(m === 'empty' || m === 'scanning');
+		// The setup panel: the BIOS (done once there is one), then the games' folder (waiting until then).
+		els.setup.hidden = !(bios || m === 'empty' || m === 'scanning');
+		els.biosCard.dataset.done = String(!bios);
+		els.intake.classList.toggle('is-waiting', bios);
+		els.intakeBtn.disabled = bios;
+		els.intakeOther.disabled = bios;
 		els.started.hidden = m !== 'inserted';
 		els.bar.hidden = !(discs.length && m === 'shelf');
 		els.count.hidden = !discs.length;
@@ -525,7 +533,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 			return;
 		}
 		els.intakeTitle.textContent = COPY.againTitle(dir.name);
-		els.intakeBody.textContent = COPY.againBody;
+		els.intakeBody.textContent = COPY.againBody(dir.name);
 		els.intakeLabel.textContent = COPY.again(dir.name);
 		els.intakeOther.hidden = false;
 	}
@@ -590,23 +598,6 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		return frames;
 	}
 
-	// With a host: resolves once the game shows its first frame, the boot fails, or it has taken long
-	// enough that the player's own messages should take over.
-	function bootSettled() {
-		const until = performance.now() + BOOT_COVER_MAX_MS;
-		return new Promise((resolve) => {
-			const check = () => {
-				const s = host.status();
-				if (skipping || (s.view === 'running' && s.lit) || ['failed', 'stopped', 'dead', 'unsupported'].includes(s.view) ||
-					(s.error && !s.busy) || performance.now() > until) {
-					resolve(s);
-					return;
-				}
-				setTimeout(check, 100);
-			};
-			check();
-		});
-	}
 
 	async function insert({ clean = false } = {}) {
 		if (mode !== 'shelf' || !discs.length)
@@ -649,6 +640,14 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		if (!reducedMotion.matches && (clean || Math.random() < cleanChance))
 			await cleanDisc(d);
 		data.disc = 'in';
+		if (host) {
+			// The PS2 slides down out of the room at once, and the player comes in under it: its screen shows the
+			// boot.
+			await wait(dur(260));
+			await sink();
+			onBooted();
+			return;
+		}
 		await wait(dur(520));
 		data.lights = 'down';
 		els.startedTitle.textContent = COPY.starting(d.title);
@@ -661,31 +660,8 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		setMode('inserted');
 		els.startedTitle.focus({ preventScroll: true });
 		announce(COPY.starting(d.title));
-		if (host) {
-			// Once the PS2 starts, the console slides down out of the room; the game comes up in its place.
-			await psStarted();
-			if (mode === 'inserted')
-				await sink();
-			await bootSettled();
-			onBooted();
-		}
 	}
 
-	// With a host: resolves once the PS2 starts (or the boot is over one way or another).
-	function psStarted() {
-		const until = performance.now() + BOOT_COVER_MAX_MS;
-		return new Promise((resolve) => {
-			const check = () => {
-				const s = host.status();
-				if (skipping || !['queued', 'ready'].includes(s.view) || (s.error && !s.busy) || performance.now() > until) {
-					resolve();
-					return;
-				}
-				setTimeout(check, 100);
-			};
-			check();
-		});
-	}
 
 	// The console slides down out of the room, and back up into it.
 	function sink() {
@@ -709,7 +685,10 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		const b = host.bios();
 		els.biosError.textContent = b.error;
 		els.biosError.hidden = !b.error;
-		els.biosAside.textContent = b.reading ? COPY.biosReading : COPY.drop;
+		els.biosAside.textContent = b.reading ? COPY.biosReading : '';
+		els.biosSub.textContent = b.ok && b.name ? b.name : COPY.biosBody;
+		els.biosBtn.textContent = b.ok ? COPY.biosChange : COPY.biosChoose;
+		els.biosBtn.className = b.ok ? 'btn-quiet' : 'btn-primary';
 		if (biosWas !== b.ok) {
 			const first = biosWas === null;
 			biosWas = b.ok;
