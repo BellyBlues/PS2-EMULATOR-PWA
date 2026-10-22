@@ -124,9 +124,11 @@ static std::atomic<float> s_vps{0.0f};
 // The per-vsync recorder (pcsx2web_perf_ring()): one record per vsync in a ring the page reads.
 // Each record is PERF_FIELDS doubles: vsync number, wall time (ms), cumulative busy time (ms) of the
 // EE, GS and VU1 threads, cumulative JIT compile time (ms), cumulative time waiting for GPU pipelines
-// (ms) and their count, and the emulated vsync rate (Hz) the record's speed is relative to.
+// (ms) and their count, the emulated vsync rate (Hz) the record's speed is relative to, cumulative time
+// the EE JIT's code generation thread spent building modules (ms), and the cumulative counts of EE JIT
+// modules installed and of those built or compiled ahead from a code list.
 static constexpr u32 PERF_RECORDS = 8192;
-static constexpr u32 PERF_FIELDS = 9;
+static constexpr u32 PERF_FIELDS = 12;
 alignas(8) static double s_perf_ring[PERF_RECORDS * PERF_FIELDS];
 static std::atomic<u32> s_perf_written{0};
 
@@ -2327,6 +2329,9 @@ static void RecordPerfVsync(u32 vsync)
 	r[6] = PerfCounters::gpu_pipeline_ns.load(std::memory_order_relaxed) / 1e6;
 	r[7] = PerfCounters::gpu_pipelines.load(std::memory_order_relaxed);
 	r[8] = VMManager::GetFrameRate();
+	r[9] = PerfCounters::ee_build_ns.load(std::memory_order_relaxed) / 1e6;
+	r[10] = static_cast<double>(PerfCounters::ee_modules.load(std::memory_order_relaxed));
+	r[11] = static_cast<double>(PerfCounters::ee_ahead_modules.load(std::memory_order_relaxed));
 	s_perf_written.store(n + 1, std::memory_order_release);
 }
 

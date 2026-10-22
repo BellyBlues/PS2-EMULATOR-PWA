@@ -7624,12 +7624,14 @@
 	// ------------------------------------------------------------------ recorder (?threads=1)
 	// The CPU thread writes one record per vsync into a ring (pcsx2web_perf_ring(), PERF_FIELDS
 	// doubles each: vsync, wall ms, cumulative busy ms of the EE, GS and VU1 threads, cumulative JIT
-	// compile ms, cumulative GPU pipeline ms and count, vsync rate in Hz). While recording, poll()
+	// compile ms, cumulative GPU pipeline ms and count, vsync rate in Hz, cumulative ms the EE JIT's
+	// code generation thread built modules, cumulative EE modules installed and those built or
+	// compiled ahead from the game's code list). While recording, poll()
 	// drains it into rows, one per vsync: its speed (the PS2's frame time over the wall time it
 	// took), each thread's busy share and what was compiled during it. A drop shorter than the
 	// readout's averaging window shows here. Up to 10 minutes are kept.
 	const PERF_RECORDS = 8192;
-	const PERF_FIELDS = 9;
+	const PERF_FIELDS = 12;
 	const REC_MAX_ROWS = 30000;
 	// With the frame limiter on, single vsyncs jitter around their target (the limiter sleeps in whole
 	// milliseconds), so the chart and the summary lead with the speed over the last REC_WINDOW vsyncs.
@@ -7676,7 +7678,7 @@
 		for (; i < written; i++) {
 			const o = (i % PERF_RECORDS) * PERF_FIELDS;
 			const r = { v: ring[o], t: ring[o + 1], ee: ring[o + 2], gs: ring[o + 3], vu: ring[o + 4], jit: ring[o + 5],
-				gpu: ring[o + 6], pipes: ring[o + 7], hz: ring[o + 8] };
+				gpu: ring[o + 6], pipes: ring[o + 7], hz: ring[o + 8], bg: ring[o + 9], mods: ring[o + 10], ahead: ring[o + 11] };
 			const p = rec.prev;
 			rec.prev = r;
 			if (!rec.t0)
@@ -7689,6 +7691,7 @@
 				v: r.v, t: (p.t - rec.t0) / 1000, ms, speed: r.hz > 0 ? (1000 / r.hz / ms) * 100 : 0,
 				ee: pct(r.ee, p.ee), gs: pct(r.gs, p.gs), vu: pct(r.vu, p.vu),
 				jit: Math.max(0, r.jit - p.jit), gpu: Math.max(0, r.gpu - p.gpu), pipes: Math.max(0, r.pipes - p.pipes), hz: r.hz,
+				bg: Math.max(0, r.bg - p.bg), mods: Math.max(0, r.mods - p.mods), ahead: Math.max(0, r.ahead - p.ahead),
 			});
 			const row = rec.rows[rec.rows.length - 1];
 			const win = rec.rows.slice(-REC_WINDOW);
@@ -7725,6 +7728,8 @@
 			worstEe: mean('ee', worst), worstGs: mean('gs', worst), worstVu: mean('vu', worst), worstN: worst.length,
 			jitMs: rows.reduce((a, r) => a + r.jit, 0), jitVsyncs: jitRows.length,
 			gpuMs: rows.reduce((a, r) => a + r.gpu, 0), pipes: rows.reduce((a, r) => a + r.pipes, 0), gpuVsyncs: gpuRows.length,
+			bgMs: rows.reduce((a, r) => a + r.bg, 0), mods: rows.reduce((a, r) => a + r.mods, 0), ahead: rows.reduce((a, r) => a + r.ahead, 0),
+			quietSlow: rows.filter((r) => r.speed10 < 95 && r.jit <= 0.05 && r.bg <= 0.05 && r.pipes === 0).length,
 		};
 	}
 
@@ -7739,12 +7744,15 @@
 			`${st.under90} vsyncs under 90%, ${st.under75} under 75%; slowest single vsync ${fmt0(st.minRaw)}%\n` +
 			`busy, mean: EE ${fmt0(st.ee)}%  GS ${fmt0(st.gs)}%  VU ${fmt0(st.vu)}%; ` +
 			`in the slowest ${st.worstN}: EE ${fmt0(st.worstEe)}%  GS ${fmt0(st.worstGs)}%  VU ${fmt0(st.worstVu)}%\n` +
-			`compiling: JITs ${fmt1(st.jitMs)} ms over ${st.jitVsyncs} vsyncs; GPU pipelines ${st.pipes} (${fmt1(st.gpuMs)} ms) over ${st.gpuVsyncs} vsyncs`;
+			`compiling: JITs ${fmt1(st.jitMs)} ms over ${st.jitVsyncs} vsyncs; GPU pipelines ${st.pipes} (${fmt1(st.gpuMs)} ms) over ${st.gpuVsyncs} vsyncs\n` +
+			`EE code: ${st.mods} modules (${st.ahead} of them compiled ahead), ${fmt1(st.bgMs)} ms built on the helper thread; ` +
+			`${st.quietSlow} vsyncs under 95% with nothing compiling`;
 	}
 
-	const REC_COLUMNS = 'vsync,time_s,ms,speed_pct,speed10_pct,ee_pct,gs_pct,vu_pct,jit_ms,gpu_pipeline_ms,gpu_pipelines';
+	const REC_COLUMNS = 'vsync,time_s,ms,speed_pct,speed10_pct,ee_pct,gs_pct,vu_pct,jit_ms,gpu_pipeline_ms,gpu_pipelines,' +
+		'jit_helper_ms,ee_modules,ee_modules_ahead';
 	const recRowCsv = (r) => [r.v, fmt2(r.t), fmt2(r.ms), fmt1(r.speed), fmt1(r.speed10), fmt0(r.ee), fmt0(r.gs), fmt0(r.vu), fmt1(r.jit), fmt1(r.gpu),
-		r.pipes].join(',');
+		r.pipes, fmt1(r.bg), r.mods, r.ahead].join(',');
 
 	// For pasting into a message: the context, the summary and the cropped vsyncs (averaged in groups
 	// when there are more than 1500, so the text stays short).
@@ -7770,7 +7778,7 @@
 			const speed = (g.length * 100) / g.reduce((a, r) => a + 100 / Math.max(r.speed, 0.001), 0);
 			lines.push([g[0].v, fmt2(g[0].t), fmt2(ms / g.length), fmt1(speed), fmt1(speed),
 				fmt0(sum('ee') / g.length), fmt0(sum('gs') / g.length), fmt0(sum('vu') / g.length), fmt1(sum('jit')), fmt1(sum('gpu')),
-				sum('pipes'), fmt1(Math.min(...g.map((r) => r.speed)))].join(','));
+				sum('pipes'), fmt1(sum('bg')), sum('mods'), sum('ahead'), fmt1(Math.min(...g.map((r) => r.speed)))].join(','));
 		}
 		return lines.join('\n');
 	}
@@ -7814,7 +7822,8 @@
 		}
 		const rows = done ? recSelection() : rec.rows;
 		const st = recStats(rows);
-		setText(els.recSummary, done ? recSummaryText(st, rows) : '');
+		setText(els.recSummary, done ? `${recSummaryText(st, rows)}\nmarks under the chart, top to bottom: compiling on the EE or VU thread (coral); ` +
+			'EE code built on the helper thread (grey, amber where code compiled ahead went in); GPU pipelines (sand)' : '');
 		els.recChart.setAttribute('aria-label', st ? `Speed over ${REC_WINDOW} vsyncs, lowest ${fmt0(st.min)}%, ${st.under90} vsyncs under 90%` : 'No recording yet');
 		if (has && page.drawer === 'rec')
 			recDrawChart();
@@ -7834,7 +7843,7 @@
 		ctx.clearRect(0, 0, w, h);
 		const rows = rec.rows, n = rows.length;
 		const x = (i) => (n > 1 ? (i / (n - 1)) * (w - 1) : 0);
-		const top = 4 * dpr, bottom = h - 8 * dpr; // the bottom strip holds the compile marks
+		const top = 4 * dpr, bottom = h - 12 * dpr; // the bottom strip holds the compile marks, three rows
 		const y = (pct) => bottom - (Math.min(Math.max(pct, 0), 150) / 150) * (bottom - top);
 		if (!rec.recording) {
 			ctx.fillStyle = 'rgb(242 181 68 / 0.12)';
@@ -7867,6 +7876,11 @@
 			const r = rows[i];
 			if (r.jit > 0.05) {
 				ctx.fillStyle = color('--coral');
+				ctx.fillRect(x(i), h - 11 * dpr, Math.max(1, dpr), 3 * dpr);
+			}
+			if (r.bg > 0.05 || r.ahead > 0) {
+				// Built on the helper thread; amber where modules compiled ahead were installed.
+				ctx.fillStyle = r.ahead > 0 ? color('--amber') : color('--ink-2');
 				ctx.fillRect(x(i), h - 7 * dpr, Math.max(1, dpr), 3 * dpr);
 			}
 			if (r.pipes > 0) {
