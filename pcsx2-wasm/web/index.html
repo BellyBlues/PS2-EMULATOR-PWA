@@ -28,7 +28,7 @@
 </head>
 <body data-state="nobios" data-bios="none" data-disc="none" data-runtime="loading" data-lights="up" data-chrome="shown" data-capture="na" data-drag="" data-picture="none" data-subtitle="off" data-cards="loading">
 
-<!-- The room: the first screen, as tall as the window. The controllers lie on the floor below it. -->
+<!-- The room: the first screen, as tall as the window. The controllers lie on the floor below it, then the credits. -->
 <div class="room" id="room">
 <header class="marquee">
   <h1 class="wordmark"><svg class="mark" aria-hidden="true" focusable="false"><use href="icons.svg#i-mark"/></svg><span class="wm">TabStation<span class="wm-too">Too</span></span></h1>
@@ -475,10 +475,6 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
     </div>
   </div>
 </main>
-
-<footer class="credits">
-  <p><span class="seg">Use a BIOS and discs from your own console; they never leave this browser&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Built on <a href="https://github.com/PCSX2/pcsx2" target="_blank" rel="noopener noreferrer">PCSX2<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a> (GPL-3.0)&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg"><a class="source-link" href="https://github.com/TabStationToo/TabStationToo" target="_blank" rel="noopener noreferrer">Source<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a>&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Not affiliated with Sony or the PCSX2 project</span></p>
-</footer>
 </div>
 
 <!-- The controllers on the floor under the console (UI-SPEC.md §17), one per port, each plugged in by a cable
@@ -487,6 +483,10 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
   <h2 class="lbl pads-title" id="pads-title">Controllers</h2>
   <div class="pads-row" id="pads-row"></div>
 </section>
+<!-- The credits, on the floor's far side, below the controllers. -->
+<footer class="credits">
+  <p><span class="seg">Use a BIOS and discs from your own console; they never leave this browser&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Built on <a href="https://github.com/PCSX2/pcsx2" target="_blank" rel="noopener noreferrer">PCSX2<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a> (GPL-3.0)&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg"><a class="source-link" href="https://github.com/TabStationToo/TabStationToo" target="_blank" rel="noopener noreferrer">Source<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a>&nbsp;<span class="sep" aria-hidden="true">·</span></span> <span class="seg">Not affiliated with Sony or the PCSX2 project</span></p>
+</footer>
 <svg class="cables" id="cables" aria-hidden="true" focusable="false">
   <path class="cable-wall" id="cable-1-wall" pathLength="1"/><path class="cable-core" id="cable-1" pathLength="1"/>
   <path class="cable-wall" id="cable-2-wall" pathLength="1"/><path class="cable-core" id="cable-2" pathLength="1"/>

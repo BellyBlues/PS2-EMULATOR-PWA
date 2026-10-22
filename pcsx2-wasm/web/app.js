@@ -7152,7 +7152,11 @@
 			const r = u.art.getBoundingClientRect();
 			return { left: r.left + sx, right: r.right + sx, top: r.top + sy, bottom: r.bottom + sy };
 		});
-		const job = { runs, arts, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP } };
+		const tr = document.createRange();
+		tr.selectNodeContents($('pads-title'));
+		const t = tr.getBoundingClientRect(); // the heading's words, not its whole row
+		const avoid = t.width ? [{ left: t.left + sx - 8, right: t.right + sx + 8, top: t.top + sy - 8, bottom: t.bottom + sy + 8 }] : [];
+		const job = { runs, arts, avoid, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP } };
 		const key = JSON.stringify(job);
 		const worker = key !== pads.cableKey && cableWorker();
 		if (worker) {

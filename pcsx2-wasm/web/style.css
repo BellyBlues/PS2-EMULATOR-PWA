@@ -196,10 +196,10 @@ a:hover {
 
 /* ---------------------------------------------------------------- layout */
 
-/* The room is the first screen; the controllers (console-pads.css) lie below it. */
+/* The room is the first screen; the controllers (console-pads.css) lie below it, then the credits. */
 .room {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
   min-height: 560px;
