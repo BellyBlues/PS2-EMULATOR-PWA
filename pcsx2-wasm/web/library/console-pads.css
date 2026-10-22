@@ -66,6 +66,12 @@
   transition: opacity var(--d-chrome-show) var(--ease-out);
 }
 
+/* Laid out for an older layout (the window was resized): hidden until the current layout's cables come. */
+.cables.stale {
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
 /* The copy in front, clipped to the console's face: over the plug, under the boot and the remote. */
 .cables-front {
   z-index: 0;

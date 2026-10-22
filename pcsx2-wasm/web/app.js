@@ -6807,6 +6807,8 @@
 		cableKey: '',
 		cablePaths: null,
 		cableAsked: 0,
+		cableJob: null, // the layout waiting for the worker (the latest only)
+		cableInFlight: null, // the key of the layout the worker is settling
 		cableWorker: undefined,
 		cableParams: null, // the cable tuner's settings (?tune-cables), else the worker's own
 	};
@@ -7345,20 +7347,43 @@
 			try {
 				pads.cableWorker = new Worker(versioned(CABLE_WORKER_FILE));
 				pads.cableWorker.addEventListener('message', (e) => {
-					if (e.data && e.data.id === pads.cableAsked) {
+					const fresh = pads.cableInFlight === pads.cableKey;
+					pads.cableInFlight = null;
+					if (fresh && e.data) { // the layout it was laid out for is still the page's
 						pads.cablePaths = e.data.paths;
+						setCablesStale(false);
 						scheduleCables();
 					}
+					postCableJob();
 				});
 				pads.cableWorker.addEventListener('error', () => {
 					pageLog('The cables could not be laid out (cable-worker.js failed).', 'warn');
 					pads.cableWorker = null;
+					pads.cableInFlight = null;
 				});
 			} catch {
 				pads.cableWorker = null;
 			}
 		}
 		return pads.cableWorker;
+	}
+
+	// One layout at a time in the worker: while it settles one, a newer layout replaces the waiting job, so that a
+	// window being resized never leaves a queue of stale layouts to settle first.
+	function postCableJob() {
+		const worker = cableWorker();
+		if (!worker || pads.cableInFlight || !pads.cableJob)
+			return;
+		pads.cableInFlight = pads.cableKey;
+		worker.postMessage({ id: ++pads.cableAsked, ...pads.cableJob });
+		pads.cableJob = null;
+	}
+
+	// Cables laid out for an older layout are hidden until the current one's come (they would lie where the ports
+	// and controllers were).
+	function setCablesStale(stale) {
+		for (const id of ['cables', 'cables-front'])
+			$(id).classList.toggle('stale', stale);
 	}
 
 	function drawCables() {
@@ -7407,10 +7432,12 @@
 		const job = { runs, arts, avoid, barBottom: bar.bottom + sy, box: { left: sx + CABLE_GAP, right: sx + vw - CABLE_GAP },
 			params: pads.cableParams };
 		const key = JSON.stringify(job);
-		const worker = key !== pads.cableKey && cableWorker();
-		if (worker) {
+		if (key !== pads.cableKey) {
 			pads.cableKey = key;
-			worker.postMessage({ id: ++pads.cableAsked, ...job });
+			pads.cableJob = job;
+			if (pads.cablePaths)
+				setCablesStale(true);
+			postCableJob();
 		}
 		pads.units.forEach((u, i) => {
 			const d = (pads.cablePaths && pads.cablePaths[i]) || '';
