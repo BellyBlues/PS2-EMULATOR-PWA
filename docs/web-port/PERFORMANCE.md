@@ -234,6 +234,15 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   a write-back equal to the last one. Exact (fuzzer, Liftoff and TurboFan and VU0 mode, 60,000 programs, 0
   differences), but SVR 2011's fight stayed at 92.2 % against 91.0-92.5 % without it: TurboFan already drops the
   flag work nothing observes once the flags live in locals. Patch kept in the owner's scratch folder, not merged.
+- **Regions for SVR 2011** (2026-10-23, measured, not built; the plan is `EE-JIT-REGIONS.md` on `Yousri-v2`).
+  Phase 1 with synthetic ELFs (one loop of N ALU ops plus a counter load/add/store and a taken branch, Ryzen 7
+  7840U): 14.3 / 15.2 / 17.9 / 41.2 ns per iteration at N = 1 / 4 / 16 / 64, so about 12 ns of bookkeeping per taken
+  branch and 0.25-0.5 ns per ALU op; per op of 16 in a loop, loads and stores 0.5 ns, LQC2/SQC2 1.1-1.3, ADD.S/MUL.S
+  2.7-3.4, VMUL/VMADD (VU0 macro) 6-7. SVR's live fight takes 170,000 branches a vsync (46,000 backward within
+  1 KB, 70,000 forward, 21,000 JAL, 30,000 JR/JALR): about 2 ms of bookkeeping in the EE thread's 28 ms, of which
+  loops are a quarter, so loop regions would give it about 2 %, under the plan's 10 % bar. With `perf` (V8's
+  `--perf-prof`), JIT code is 40 % of the EE thread and almost all TurboFan; V8's tiering budget is about 7 %
+  (60.5 → 64.6 % with `--wasm-tiering-budget=100000`, steady state; a page cannot set it).
 
 ## Known to be left
 
