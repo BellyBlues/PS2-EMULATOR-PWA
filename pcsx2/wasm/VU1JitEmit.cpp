@@ -1668,6 +1668,65 @@ namespace VU1Jit
 					m_out->native_ops++;
 					return true;
 				}
+				case U::OPMULA:
+				case U::OPMSUB:
+				{
+					// _vuOPMULA / _vuOPMSUB (VUops.cpp:844-873): x, y and z of fs.yzx * ft.zxy (subtracted from ACC for
+					// OPMSUB), whatever the dest field says. MAC's w bits stay as the previous op left them, and the
+					// status is taken from all four lanes (VU_STAT_UPDATE).
+					const bool sub = p.ins.up == U::OPMSUB;
+					const u32 a = m_v[0], b = m_v[1], c = m_v[2], r = m_v[3], w = m_i[0];
+					static constexpr u8 yzx[16] = {4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 12, 13, 14, 15};
+					static constexpr u8 zxy[16] = {8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15};
+					ClampedVF(fs, 0xE, a);
+					ClampedVF(ft, 0xE, b);
+					if (sub)
+					{
+						ClampedVF(ACC_INDEX, 0xE, c);
+						m_f.local_get(c);
+					}
+					m_f.local_get(a);
+					m_f.local_get(a);
+					m_f.shuffle(yzx);
+					m_f.local_get(b);
+					m_f.local_get(b);
+					m_f.shuffle(zxy);
+					Simd(Simd::F32x4Mul);
+					if (sub)
+						Simd(Simd::F32x4Sub);
+					m_f.local_set(r);
+					m_f.local_get(m_pmac);
+					m_f.i32_const(0x1111);
+					m_f.i32_and();
+					m_f.local_set(w);
+					Flags(r, 0xE);
+					m_f.local_get(m_pmac);
+					m_f.local_get(w);
+					m_f.i32_or();
+					m_f.local_set(m_pmac);
+					// status |= the groups w has a bit in: Z.w is bit 0, S.w bit 4, U.w bit 8, O.w bit 12
+					m_f.local_get(m_pstat);
+					for (u32 g = 0; g < 4; g++)
+					{
+						m_f.local_get(w);
+						if (g)
+						{
+							m_f.i32_const(static_cast<s32>(3 * g));
+							m_f.i32_shr_u();
+						}
+						m_f.i32_const(1 << g);
+						m_f.i32_and();
+						m_f.i32_or();
+					}
+					m_f.local_set(m_pstat);
+					if (!sub || fd != 0) // fd 0 writes RDzero, which nothing reads
+					{
+						Clamp(r);
+						SetVF(sub ? fd : ACC_INDEX, r, 0xE, 0xf);
+					}
+					m_out->native_ops++;
+					return true;
+				}
 				default: break;
 			}
 			if (k == NONE)
