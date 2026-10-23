@@ -901,6 +901,9 @@ Steps 1–2 compute every flag of every op. Step 3 computes only what an observa
 
 BT3 never reads MAC or status, so in step 3 about 45% of instructions lose most of their flag work.
 
+Done on 2026-10-23 in a lazy form rather than by analysis: each op keeps its raw result and the flags are
+computed at observers and exits, with lane accumulators for the sticky bits (`docs/web-port/PERFORMANCE.md`).
+
 ### 7.4 Q and P
 
 DIV, SQRT and RSQRT write the pending `q` at once; `VI[Q]` and the status bits `& 0xC30` are written when
