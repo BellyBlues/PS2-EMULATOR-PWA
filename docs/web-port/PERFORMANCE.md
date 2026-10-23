@@ -249,6 +249,13 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   frames a second, `PerformanceMetrics::GetInternalFPS()`): it draws fewer frames per vsync, and the owner saw it
   just as laggy. SVR runs at 60 frames a second, so only a faster EE thread helps it; check the internal frame rate,
   not only the speed, before calling a speedhack a gain.
+- **V8's tiers in SVR 2011, and compilation hints** (2026-10-23). `perf` with V8's `--perf-prof` over the live
+  fight (40 s from the save state, EE thread): generated code in Liftoff, V8's baseline tier, is 19-30 % of the
+  thread in the first 15 s and still 16 % after 35 s (TurboFan 41 %), because V8 tiers a function up after about
+  13 MB of its code has run and a block is one small function. Liftoff code is about 20 % slower than TurboFan in
+  a block-like test. The WebAssembly compilation-hints proposal (`metadata.code.compilation_priority`, optimization
+  priority 127) made no difference in Chromium 156, by default or with `--experimental-wasm-compilation-hints`
+  (test page in the owner's scratch folder), so a page cannot ask for TurboFan today.
 
 ## Known to be left
 
