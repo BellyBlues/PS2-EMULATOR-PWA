@@ -243,6 +243,12 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   loops are a quarter, so loop regions would give it about 2 %, under the plan's 10 % bar. With `perf` (V8's
   `--perf-prof`), JIT code is 40 % of the EE thread and almost all TurboFan; V8's tiering budget is about 7 %
   (60.5 → 64.6 % with `--wasm-tiering-budget=100000`, steady state; a page cannot set it).
+- **Cycle skip for SVR 2011** (2026-10-23, built and taken out before it was pushed; patches in the owner's scratch
+  folder). PCSX2's EE cycle skipping from the page, per game. The speed readout of the live fight went from 54-62 %
+  to 92-105 % at level 2 (Chromium on the 780M: 46 → 88-97 %), but the game's own frame rate fell (27-29 to 22-26
+  frames a second, `PerformanceMetrics::GetInternalFPS()`): it draws fewer frames per vsync, and the owner saw it
+  just as laggy. SVR runs at 60 frames a second, so only a faster EE thread helps it; check the internal frame rate,
+  not only the speed, before calling a speedhack a gain.
 
 ## Known to be left
 
