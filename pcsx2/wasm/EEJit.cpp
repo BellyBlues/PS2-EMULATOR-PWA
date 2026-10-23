@@ -153,6 +153,7 @@ namespace
 	{
 		WasmJit::LoadedFunction first; // module and instance handles
 		std::unique_ptr<u32[]> checked; // per block: the page generation its code was last compared at
+		std::vector<std::unique_ptr<u32[]>> cmp_descs; // the blocks' CompareCode() descriptors
 		std::vector<int> slots;
 		int live = 0;
 	};
@@ -205,6 +206,15 @@ namespace
 	{
 		return static_cast<u32>(reinterpret_cast<uptr>(p));
 	}
+	// A block's code compare, called by its entry checks when its page's generation changed (EmitEntryChecks()).
+	// desc: the block's host address, its length in words, the result (1 when the words differ), then the words it
+	// was compiled from. Kept out of the blocks: inline, the compare made every block much larger.
+	void CompareCode(u32* desc)
+	{
+		const u32* host = reinterpret_cast<const u32*>(static_cast<uptr>(desc[0]));
+		desc[2] = std::memcmp(host, &desc[3], desc[1] * 4) != 0;
+	}
+
 	template <typename F>
 	u32 FnIndex(F* f)
 	{
@@ -993,26 +1003,18 @@ namespace
 			// No write to the page since the last compare (CodeWrites.h).
 			const bool tracked = CodeWrites::EmitSkipCompare(f, host, nwords * 4, m_checked, m_a, !m_deferred);
 			m_tracked = tracked;
-			// Same code.
-			u32 i = 0;
-			for (; i + 2 <= nwords; i += 2)
-			{
-				u64 v;
-				std::memcpy(&v, &m_host[((start - m_page) >> 2) + i], 8);
-				f.i32_const(0);
-				f.i64_load(host + i * 4, 2);
-				f.i64_const(static_cast<s64>(v));
-				f.i64_ne();
-				f.br_if(0);
-			}
-			if (i < nwords)
-			{
-				f.i32_const(0);
-				f.i32_load(host + i * 4);
-				f.i32_const(static_cast<s32>(m_host[((start - m_page) >> 2) + i]));
-				f.i32_ne();
-				f.br_if(0);
-			}
+			// Same code (CompareCode()).
+			m_cmp_desc.reset(new u32[3 + nwords]);
+			m_cmp_desc[0] = host;
+			m_cmp_desc[1] = nwords;
+			m_cmp_desc[2] = 0;
+			std::memcpy(&m_cmp_desc[3], &m_host[(start - m_page) >> 2], nwords * 4);
+			f.i32_const(static_cast<s32>(Addr(m_cmp_desc.get())));
+			f.i32_const(static_cast<s32>(FnIndex(&CompareCode)));
+			f.call_indirect(m_tiv, 0);
+			f.i32_const(0);
+			f.i32_load(Addr(&m_cmp_desc[2]));
+			f.br_if(0);
 			if (tracked)
 				CodeWrites::EmitCompared(f, m_checked, m_a);
 			f.br(1);
@@ -3433,6 +3435,7 @@ namespace
 		bool m_deferred;
 		const CodeSnapshot* m_snap; // what a block built on another thread reads (CompileJob), else null
 		u32* m_checked; // the page generation this block's code was last compared at
+		std::unique_ptr<u32[]> m_cmp_desc; // CompareCode()'s descriptor, kept by the module (Group::cmp_descs)
 		u32 m_region_start = 0, m_region_words = 0; // the words its entry checks compare
 		bool m_tracked = false; // ... skipping the compare when the page was not written (CodeWrites.h)
 
@@ -3841,6 +3844,7 @@ namespace
 		std::vector<u8> bytes;
 		std::vector<u32> pcs;
 		std::unique_ptr<u32[]> checked;
+		std::vector<std::unique_ptr<u32[]>> cmp_descs;
 		struct Region
 		{
 			u32 pc, words;
@@ -3984,6 +3988,8 @@ namespace
 		const u32 lookup = m.add_function(t_v_i, EmitLookup(t_v_i));
 		if (EEJit::g_stats)
 			m.name_function(lookup, "ee_lookup");
+		for (const auto& bc : blocks)
+			out->cmp_descs.push_back(std::move(bc->m_cmp_desc));
 		blocks.clear();
 		out->bytes = m.finish();
 		out->checked = std::move(checked);
@@ -4020,6 +4026,7 @@ namespace
 		s_gen_ns += build.gen_ns;
 		auto g = std::make_unique<Group>();
 		g->checked = std::move(build.checked);
+		g->cmp_descs = std::move(build.cmp_descs);
 		const int module = wasmjit_compile(bytes.data(), bytes.size());
 		const int instance = module > 0 ? wasmjit_instantiate(module) : 0;
 		if (module <= 0 || instance <= 0)
