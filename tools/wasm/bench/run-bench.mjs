@@ -29,6 +29,8 @@
 //   --unlimited          frame limiter off (?unlimited=1), to measure speed above 100 %
 //   --param K=V          extra query parameter for the page (repeatable), e.g. --param renderer=sw,
 //                        --param gpu=1, --param set=EmuCore/GS/extrathreads=4
+//   --capture N,M,...    at the end, hash (SHA-1, in the JSON) the first frame the page received at
+//                        vsync N or later (?capture=), to compare output between runs and browsers
 //   --query Q            extra query string, appended as is (e.g. "gpu=0&eejit=0")
 //   --pref K=V           Zen/Firefox only: a preference for the fresh profile (repeatable; V is
 //                        true, false, a number or a string), e.g. to compare JavaScript engine settings
@@ -49,6 +51,7 @@
 // profile is deleted; only the processes this script started are touched.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -70,7 +73,7 @@ function usage() {
 
 function parseArgs(argv) {
 	const o = { bios: null, elf: null, disc: null, keepProfile: null, browser: "zen", browserPath: null, headless: false, seconds: 60, vsyncs: 0,
-		phases: 0, sampleMs: 1000, unlimited: false, params: [], prefs: [], query: "", root: path.join(REPO, "build-wasm/bin"),
+		phases: 0, sampleMs: 1000, unlimited: false, params: [], capture: [], prefs: [], query: "", root: path.join(REPO, "build-wasm/bin"),
 		port: 0, out: null, bootTimeout: 120, quiet: false };
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
@@ -91,6 +94,7 @@ function parseArgs(argv) {
 		else if (a === "--sample-ms") o.sampleMs = Number(v());
 		else if (a === "--unlimited") o.unlimited = true;
 		else if (a === "--param") o.params.push(v());
+		else if (a === "--capture") o.capture.push(...v().split(",").map(Number).filter((n) => n > 0));
 		else if (a === "--query") o.query = v().replace(/^[?&]/, "");
 		else if (a === "--pref") o.prefs.push(v());
 		else if (a === "--root") o.root = path.resolve(v());
@@ -459,6 +463,7 @@ async function main() {
 			const eq = p.indexOf("=");
 			query.push(eq < 0 ? encodeURIComponent(p) : `${encodeURIComponent(p.slice(0, eq))}=${encodeURIComponent(p.slice(eq + 1))}`);
 		}
+		if (o.capture.length) query.push(`capture=${o.capture.join(",")}`);
 		if (o.query) query.push(o.query);
 		const url = `http://127.0.0.1:${port}/index.html?${query.join("&")}`;
 		results.url = url;
@@ -531,6 +536,17 @@ async function main() {
 			const log = await within(browser.evaluate("window.PCSX2Web ? window.PCSX2Web.logText() : ''"), 10000, "log");
 			results.graphicsLine = (log.match(/\[page\] Graphics: .*/g) || []).at(-1) ?? null;
 		} catch { /* optional */ }
+		if (o.capture.length) {
+			results.captures = {};
+			for (const n of o.capture) {
+				const r = JSON.parse(await within(browser.evaluate(
+					`JSON.stringify(window.PCSX2Web.capture ? window.PCSX2Web.capture(${n}) : null)`), 30000, "capture"));
+				results.captures[n] = r ? { frame: r.frame, width: r.width, height: r.height,
+					sha1: createHash("sha1").update(Buffer.from(r.rgba, "base64")).digest("hex") } : null;
+				if (!r) results.errors.push(`no frame captured at vsync ${n} or later`);
+				console.log(`capture ${n}: ${r ? `vsync ${r.frame}, ${r.width}x${r.height}, ${results.captures[n].sha1}` : "none"}`);
+			}
+		}
 
 		const { rows, total } = summarise(results.samples);
 		results.phases = rows;
