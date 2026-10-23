@@ -265,6 +265,11 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   minimum IOP slice in `_cpuEventTest_Shared()` (48 → 256: same, 1,024: slower). V8 tier-up tests in Chromium 156:
   a block that leaves by `return_call` is charged its budget like one that returns, and dead code skipped by a
   branch does not count, so neither can make blocks tier up sooner.
+  After the out-of-line compare (`718ecb92c`) the code checks still cost about 10 % there (61.3 → 67.5 % with none;
+  65.5 % with the generation check but no compare): the compare calls, about 9,000 a vsync, nearly all after
+  `NoteAll()`. Returning to the dispatcher to compare instead of calling (no call left in any block) was slower
+  (58.3 against 61.4 %: each changed generation breaks the chain of linked blocks), and with all blocks checked at
+  vsync too (59.8 against 61.6 %), since that compares every live block, most of which do not run in the frame.
 
 ## Known to be left
 
