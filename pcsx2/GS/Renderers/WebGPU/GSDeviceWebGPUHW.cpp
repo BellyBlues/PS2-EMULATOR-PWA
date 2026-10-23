@@ -8,6 +8,7 @@
 #include "GS/Renderers/WebGPU/GSDeviceWebGPU.h"
 #include "GS/Renderers/WebGPU/WGSLPreprocessor.h"
 #include "GS/GSPerfMon.h"
+#include "Host.h"
 #include "wasm/PerfCounters.h"
 
 #include "common/Console.h"
@@ -18,6 +19,8 @@
 
 #include <emscripten/console.h>
 
+#include <array>
+#include <cmath>
 #include <cstring>
 
 namespace
@@ -41,6 +44,18 @@ namespace
 	constexpr size_t MAX_CACHED_GROUPS = 4096;
 
 	static_assert(VS_CB_SIZE == 48 && PS_CB_SIZE == 272, "tfx.wgsl's uniform structs follow these sizes");
+
+	// tfx.wgsl's CSParams (TryComputeFeedbackDraw()).
+	constexpr u32 CS_MAX_RECTS = 8;
+	struct alignas(16) CSParams
+	{
+		s32 rects[CS_MAX_RECTS][4];
+		u32 count;
+		u32 colormask;
+		u32 pad[2];
+	};
+	static_assert(sizeof(CSParams) == 144);
+	constexpr u32 CS_PARAMS_SLOT = (sizeof(CSParams) + UNIFORM_SLOT - 1) / UNIFORM_SLOT * UNIFORM_SLOT;
 
 	WGPUStringView SV(const char* s)
 	{
@@ -242,12 +257,17 @@ bool GSDeviceWebGPU::CreateHWResources()
 	}
 	m_null_group2 = GetTFXGroup(2, TFXGroupKey{{m_null_view, m_null_view, m_null_view}, nullptr});
 
+	m_cs_enabled = Host::GetBaseBoolSettingValue("EmuCore/GS", "WebGPUComputeFeedback", true) &&
+				   m_null_view && CreateComputeFeedbackResources();
+	Console.WriteLnFmt("WebGPU: feedback draws that read only their own pixel run as compute: {}.", m_cs_enabled ? "yes" : "no");
+
 	return m_tfx_bgl[0] && m_tfx_bgl[1] && m_tfx_bgl[2] && m_tfx_layout && m_tfx_group0 && m_expand_ib &&
 		   m_null_texture && m_null_group2;
 }
 
 void GSDeviceWebGPU::DestroyHWResources()
 {
+	DestroyComputeFeedbackResources();
 	// Requests in flight are dropped; their callbacks free them (when the instance is released at the latest).
 	for (auto& it : m_tfx_pending)
 		DropTFXPending(it.second);
@@ -1470,7 +1490,7 @@ void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
 	auto reserve = [&]() {
 		return m_vertex_buffer.ReserveMemory(vertex_bytes, sizeof(GSVertex)) &&
 			   (index_bytes == 0 || m_index_buffer.ReserveMemory(index_bytes, 4)) &&
-			   m_uniform_buffer.ReserveMemory(VS_CB_SLOT + 2 * PS_CB_SLOT, UNIFORM_SLOT);
+			   m_uniform_buffer.ReserveMemory(VS_CB_SLOT + 2 * PS_CB_SLOT + CS_PARAMS_SLOT, UNIFORM_SLOT);
 	};
 	if (!reserve())
 	{
@@ -1516,6 +1536,12 @@ void GSDeviceWebGPU::RenderHW(GSHWDrawConfig& config)
 		m_ps_cb_cache = config.cb_ps;
 	};
 	upload_ps_cb();
+
+	// A feedback draw that reads only its own pixel: a compute dispatch instead of a copy and a render pass.
+	if (m_cs_enabled && cfg_rt && draw_rt == cfg_rt && !cfg_ds && !colclip_rt && TryComputeFeedbackDraw(config, cfg_rt))
+		return;
+	if (config.require_one_barrier || config.require_full_barrier)
+		m_cs_copied_draws++;
 
 	// The pipelines of every pass of this draw: asked for together, so that they are created in parallel,
 	// and the draw is skipped whole when one of them is not ready yet.
@@ -1712,4 +1738,508 @@ void GSDeviceWebGPU::FilteredDownsampleTexture(GSTexture* sTex, GSTexture* dTex,
 	SetUtilityUniforms(&uniforms, sizeof(uniforms));
 
 	DoStretchRect(sTex, GSVector4::zero(), dTex, dRect, ShaderConvertSelector(ShaderConvert::DOWNSAMPLE_COPY), Nearest);
+}
+
+// ----------------------------------------------------------------------------
+// Feedback draws as compute dispatches
+// ----------------------------------------------------------------------------
+//
+// A draw that reads the colour target it draws into goes through a copy (FeedbackCopy()): the copy ends the
+// render pass, the draw starts a new one. Games that do many such draws (FFXII's effects, hundreds of small
+// quads per frame on a 256x256 target) spend nearly all their GS time on those passes and copies (§10.2).
+// When a run of such draws reads only the pixel each fragment writes, it runs in one compute pass instead:
+// each draw is a dispatch that reads the target as it was before the draw from one scratch texture (as the
+// render path reads its copy, with textureLoad) and writes the whole target to the other, the fragment code's
+// result where the draw covers the pixel and the old value elsewhere (tfx.wgsl, cs_main). Dispatches in a
+// compute pass see each other's writes in order, which draws in a render pass do not. The target is copied
+// into the scratch textures once at the start of the run and back once at its end (FlushComputeRun()).
+//
+// Exactness: the fragment code is tfx.wgsl's own (ps_main_cs, the same body), it gets only the pixel's
+// position (selectors that use texture coordinates, colours, fog or depth do not qualify), and coverage is
+// that of the rasterizer: the draw's rectangles in framebuffer coordinates as the vertex shader and the
+// viewport place them, pixel centres inside with the top-left rule (left and top edges in, right and bottom
+// edges out), restricted to edges far enough from the pixel centres that the rasterizer's sub-pixel snapping
+// and float rounding cannot change which pixels are in.
+
+namespace
+{
+	/// The selectors whose fragment code uses only the pixel's position and the target's value there.
+	bool IsOwnPixelFeedbackSelector(const GSHWDrawConfig::PSSelector& ps)
+	{
+		// tex_is_fb: the texture is the target, read at the fragment's own position (sample_from_rt()); with
+		// ltf 0 the texture coordinates only select which of four equal reads to use. tfx 1 (decal) with tcc 1
+		// leaves the vertex colour unused.
+		if (!ps.tex_is_fb || ps.ltf || ps.depth_fmt != 0 || ps.channel != 0 || ps.pal_fmt != 0)
+			return false;
+		if (ps.tfx != 1 || !ps.tcc || ps.fog || ps.aa1 != GSShader::PS_AA1::NONE || ps.abe)
+			return false;
+		// No depth: no depth test reading the depth copy, no depth output, no stencil DATE, no PrimID DATE.
+		if (ps.ztst >= 2 || ps.zclamp || ps.zfloor || (ps.date != 0 && ps.date < 5))
+			return false;
+		if (ps.afail == GSShader::PS_AFAIL::FB_ONLY || ps.afail == GSShader::PS_AFAIL::RGB_ONLY_DSB || ps.afail == GSShader::PS_AFAIL::RGB_ONLY_SW_Z)
+			return false;
+		// Colour written to an RGBA8 target, no hardware blending folded into the shader.
+		if (ps.no_color || ps.colclip_hw || ps.blend_hw != 0)
+			return false;
+		if (ps.urban_chaos_hle || ps.tales_of_abyss_hle || ps.rov_color || ps.rov_depth != GSShader::PS_ROV_DEPTH::NONE)
+			return false;
+		return true;
+	}
+
+	/// Whether the rasterizer's decision for an edge at framebuffer coordinate e cannot differ from the exact
+	/// one: e is not just above a pixel centre (where snapping down to a 1/256 grid, or a float rounding
+	/// down, would bring the centre inside), nor so close below one that float rounding could put it above.
+	bool IsRobustEdge(double e)
+	{
+		const double d = e - (std::floor(e - 0.5) + 0.5); // above the nearest centre at or below e, [0, 1)
+		return d >= (1.0 / 256.0 + 1.0 / 4096.0) && d <= 1.0 - (1.0 / 4096.0);
+	}
+
+	/// The pixels the draw covers, as up to CS_MAX_RECTS half-open rectangles: two-triangle quads (a triangle
+	/// list in groups of six indices) or expanded sprites, each an axis-aligned rectangle. False if the draw
+	/// has another shape or an edge that is not robust.
+	bool FeedbackDrawRects(const GSHWDrawConfig& config, const GSVector2i& size, std::array<GSVector4i, CS_MAX_RECTS>* out,
+		u32* count)
+	{
+		if (config.topology != GSHWDrawConfig::Topology::Triangle)
+			return false;
+		const double sx = config.cb_vs.vertex_scale.x, sy = config.cb_vs.vertex_scale.y;
+		const double ox = config.cb_vs.vertex_offset.x, oy = config.cb_vs.vertex_offset.y;
+		// tfx.wgsl process_vertex(): clip = (p - 0.05) * (sx, -sy) - (ox, -oy), then the viewport over the
+		// whole target (WebGPU's framebuffer y goes down).
+		auto fb_x = [&](u32 x) { return ((static_cast<double>(x) - 0.05) * sx - ox + 1.0) * 0.5 * size.x; };
+		auto fb_y = [&](u32 y) { return (1.0 - (-(static_cast<double>(y) - 0.05) * sy + oy)) * 0.5 * size.y; };
+
+		const GSVector4i scissor = config.scissor.rintersect(GSVector4i(0, 0, size.x, size.y));
+		u32 n = 0;
+		auto add = [&](u32 xa, u32 xb, u32 ya, u32 yb) {
+			if (xa == xb || ya == yb)
+				return true; // empty
+			if (n >= CS_MAX_RECTS)
+				return false;
+			const double e[4] = {fb_x(std::min(xa, xb)), fb_y(std::min(ya, yb)), fb_x(std::max(xa, xb)), fb_y(std::max(ya, yb))};
+			for (double v : e)
+			{
+				if (!std::isfinite(v) || !IsRobustEdge(v))
+					return false;
+			}
+			// Pixel i is in when e0 <= i + 0.5 < e1.
+			const double x0 = std::min(e[0], e[2]), x1 = std::max(e[0], e[2]);
+			const double y0 = std::min(e[1], e[3]), y1 = std::max(e[1], e[3]);
+			GSVector4i r(static_cast<int>(std::ceil(x0 - 0.5)), static_cast<int>(std::ceil(y0 - 0.5)),
+				static_cast<int>(std::ceil(x1 - 0.5)), static_cast<int>(std::ceil(y1 - 0.5)));
+			r = r.rintersect(scissor);
+			if (!r.rempty())
+				(*out)[n++] = r;
+			return true;
+		};
+
+		if (config.vs.expand == GSHWDrawConfig::VSExpand::Sprite)
+		{
+			// Sprites come in vertex pairs (tfx.wgsl: VS_EXPAND_SPRITE); the fixed index buffer splits each
+			// rectangle along a diagonal.
+			if (config.nverts % 2 != 0 || config.nindices != config.nverts * 3)
+				return false;
+			for (u32 i = 0; i < config.nverts; i += 2)
+			{
+				const GSVertex& a = config.verts[i];
+				const GSVertex& b = config.verts[i + 1];
+				if (!add(a.XYZ.X, b.XYZ.X, a.XYZ.Y, b.XYZ.Y))
+					return false;
+			}
+		}
+		else if (config.vs.expand == GSHWDrawConfig::VSExpand::None)
+		{
+			if (config.nindices % 6 != 0 || config.indices_per_prim != 3)
+				return false;
+			for (u32 i = 0; i < config.nindices; i += 6)
+			{
+				const u16* idx = &config.indices[i];
+				for (u32 k = 0; k < 6; k++)
+				{
+					if (idx[k] >= config.nverts)
+						return false;
+				}
+				// Two triangles that share two vertices, which are opposite corners of an axis-aligned rectangle
+				// whose other corners are the triangles' third vertices.
+				u32 shared[2], ns = 0, other[2], no = 0;
+				for (u32 k = 0; k < 3; k++)
+				{
+					const bool in_b = (idx[k] == idx[3] || idx[k] == idx[4] || idx[k] == idx[5]);
+					if (in_b && ns < 2)
+						shared[ns++] = idx[k];
+					else if (!in_b && no < 1)
+						other[no++] = idx[k];
+					else
+						return false;
+				}
+				for (u32 k = 3; k < 6; k++)
+				{
+					if (idx[k] != shared[0] && idx[k] != shared[1])
+					{
+						if (no != 1)
+							return false;
+						other[no++] = idx[k];
+					}
+				}
+				if (ns != 2 || no != 2)
+					return false;
+				const GSVertex& s0 = config.verts[shared[0]];
+				const GSVertex& s1 = config.verts[shared[1]];
+				const GSVertex& o0 = config.verts[other[0]];
+				const GSVertex& o1 = config.verts[other[1]];
+				const u32 x0 = s0.XYZ.X, y0 = s0.XYZ.Y, x1 = s1.XYZ.X, y1 = s1.XYZ.Y;
+				if (x0 == x1 || y0 == y1)
+					return false; // the shared edge is not a diagonal
+				const bool corners = (o0.XYZ.X == x0 && o0.XYZ.Y == y1 && o1.XYZ.X == x1 && o1.XYZ.Y == y0) ||
+									 (o0.XYZ.X == x1 && o0.XYZ.Y == y0 && o1.XYZ.X == x0 && o1.XYZ.Y == y1);
+				if (!corners || !add(x0, x1, y0, y1))
+					return false;
+			}
+		}
+		else
+		{
+			return false;
+		}
+		*count = n;
+		return true;
+	}
+} // namespace
+
+bool GSDeviceWebGPU::CreateComputeFeedbackResources()
+{
+	auto entry = [](u32 binding) {
+		WGPUBindGroupLayoutEntry e = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+		e.binding = binding;
+		e.visibility = WGPUShaderStage_Compute;
+		return e;
+	};
+	auto layout = [this](const char* label, const WGPUBindGroupLayoutEntry* e, u32 n) {
+		WGPUBindGroupLayoutDescriptor d = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+		d.label = SV(label);
+		d.entryCount = n;
+		d.entries = e;
+		return wgpuDeviceCreateBindGroupLayout(m_device, &d);
+	};
+	{
+		WGPUBindGroupLayoutEntry e = entry(1);
+		e.buffer.type = WGPUBufferBindingType_Uniform;
+		e.buffer.hasDynamicOffset = true;
+		e.buffer.minBindingSize = PS_CB_SIZE;
+		m_cs_bgl[0] = layout("tfx cs constants", &e, 1);
+	}
+	{
+		WGPUBindGroupLayoutEntry e[4] = {entry(0), entry(1), entry(2), entry(3)};
+		for (u32 i = 0; i < 3; i++)
+		{
+			e[i].texture.sampleType = (i == 2) ? WGPUTextureSampleType_UnfilterableFloat : WGPUTextureSampleType_Float;
+			e[i].texture.viewDimension = WGPUTextureViewDimension_2D;
+		}
+		e[3].sampler.type = WGPUSamplerBindingType_Filtering;
+		m_cs_bgl[1] = layout("tfx cs textures", e, 4);
+	}
+	{
+		WGPUBindGroupLayoutEntry e[3] = {entry(0), entry(1), entry(2)};
+		for (WGPUBindGroupLayoutEntry& x : e)
+		{
+			x.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+			x.texture.viewDimension = WGPUTextureViewDimension_2D;
+		}
+		m_cs_bgl[2] = layout("tfx cs feedback", e, 3);
+	}
+	{
+		WGPUBindGroupLayoutEntry e[2] = {entry(0), entry(1)};
+		e[0].storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
+		e[0].storageTexture.format = WGPUTextureFormat_RGBA8Unorm;
+		e[0].storageTexture.viewDimension = WGPUTextureViewDimension_2D;
+		e[1].buffer.type = WGPUBufferBindingType_Uniform;
+		e[1].buffer.hasDynamicOffset = true;
+		e[1].buffer.minBindingSize = sizeof(CSParams);
+		m_cs_bgl[3] = layout("tfx cs output", e, 2);
+	}
+	for (WGPUBindGroupLayout l : m_cs_bgl)
+	{
+		if (!l)
+			return false;
+	}
+	{
+		WGPUPipelineLayoutDescriptor pd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+		pd.label = SV("tfx cs");
+		pd.bindGroupLayoutCount = 4;
+		pd.bindGroupLayouts = m_cs_bgl;
+		m_cs_layout = wgpuDeviceCreatePipelineLayout(m_device, &pd);
+	}
+	{
+		WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
+		e.binding = 1;
+		e.buffer = m_uniform_buffer.GetBuffer();
+		e.size = PS_CB_SIZE;
+		WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+		d.label = SV("tfx cs constants");
+		d.layout = m_cs_bgl[0];
+		d.entryCount = 1;
+		d.entries = &e;
+		m_cs_group0 = wgpuDeviceCreateBindGroup(m_device, &d);
+	}
+	{
+		WGPUBindGroupEntry e[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+			WGPU_BIND_GROUP_ENTRY_INIT};
+		for (u32 i = 0; i < 3; i++)
+		{
+			e[i].binding = i;
+			e[i].textureView = m_null_view;
+		}
+		e[3].binding = 3;
+		e[3].sampler = m_linear_sampler;
+		WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+		d.label = SV("tfx cs no textures");
+		d.layout = m_cs_bgl[1];
+		d.entryCount = 4;
+		d.entries = e;
+		m_cs_group1 = wgpuDeviceCreateBindGroup(m_device, &d);
+	}
+	return m_cs_layout && m_cs_group0 && m_cs_group1;
+}
+
+void GSDeviceWebGPU::DestroyComputeFeedbackResources()
+{
+	if (m_cs_pass)
+	{
+		wgpuComputePassEncoderEnd(m_cs_pass);
+		wgpuComputePassEncoderRelease(m_cs_pass);
+		m_cs_pass = nullptr;
+	}
+	m_cs_run = nullptr;
+	m_cs_rt = nullptr;
+	m_cs_pass_pipeline = nullptr;
+	for (auto& it : m_cs_pipelines)
+	{
+		if (it.second)
+			wgpuComputePipelineRelease(it.second);
+	}
+	m_cs_pipelines.clear();
+	for (auto& sc : m_cs_scratch)
+	{
+		for (u32 i = 0; i < 2; i++)
+		{
+			if (sc->read_group[i])
+				wgpuBindGroupRelease(sc->read_group[i]);
+			if (sc->write_group[i])
+				wgpuBindGroupRelease(sc->write_group[i]);
+			if (sc->view[i])
+				wgpuTextureViewRelease(sc->view[i]);
+			if (sc->tex[i])
+			{
+				wgpuTextureDestroy(sc->tex[i]);
+				wgpuTextureRelease(sc->tex[i]);
+			}
+		}
+	}
+	m_cs_scratch.clear();
+	if (m_cs_group0)
+		wgpuBindGroupRelease(m_cs_group0);
+	if (m_cs_group1)
+		wgpuBindGroupRelease(m_cs_group1);
+	m_cs_group0 = m_cs_group1 = nullptr;
+	if (m_cs_layout)
+		wgpuPipelineLayoutRelease(m_cs_layout);
+	m_cs_layout = nullptr;
+	for (WGPUBindGroupLayout& l : m_cs_bgl)
+	{
+		if (l)
+			wgpuBindGroupLayoutRelease(l);
+		l = nullptr;
+	}
+	m_cs_enabled = false;
+}
+
+WGPUComputePipeline GSDeviceWebGPU::GetTFXComputePipeline(const GSHWDrawConfig::PSSelector& sel)
+{
+	const auto it = m_cs_pipelines.find(sel);
+	if (it != m_cs_pipelines.end())
+		return it->second;
+
+	WGSLPreprocessor::Macros macros = TFXFragmentMacros(sel);
+	macros.emplace_back("COMPUTE_SHADER", "1");
+	std::string error;
+	const std::string code = WGSLPreprocessor::Process(m_tfx_source, macros, &error);
+	if (!error.empty())
+		Console.ErrorFmt("WebGPU: tfx.wgsl (compute {:016x}_{:016x}): {}", sel.key_hi, sel.key_lo, error);
+	const std::string label = fmt::format("tfx cs {:016x}_{:016x}", sel.key_hi, sel.key_lo);
+	WGPUShaderModule mod = CreateShaderModule(label.c_str(), code);
+	WGPUComputePipeline pipeline = nullptr;
+	if (mod)
+	{
+		// Created synchronously: the browser compiles it in the background, and the first dispatch waits for
+		// it on the GPU timeline (no draw is skipped).
+		WGPUComputePipelineDescriptor d = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+		d.label = {label.data(), label.size()};
+		d.layout = m_cs_layout;
+		d.compute.module = mod;
+		d.compute.entryPoint = SV("cs_main");
+		pipeline = wgpuDeviceCreateComputePipeline(m_device, &d);
+		wgpuShaderModuleRelease(mod);
+	}
+	if (!pipeline)
+		Console.ErrorFmt("WebGPU: {} could not be created; its draws use copies.", label);
+	m_cs_pipelines.emplace(sel, pipeline);
+	return pipeline;
+}
+
+GSDeviceWebGPU::ComputeScratch* GSDeviceWebGPU::GetComputeScratch(const GSVector2i& size)
+{
+	for (auto& sc : m_cs_scratch)
+	{
+		if (sc->size == size)
+			return sc.get();
+	}
+
+	auto sc = std::make_unique<ComputeScratch>();
+	std::memset(static_cast<void*>(sc.get()), 0, sizeof(ComputeScratch));
+	sc->size = size;
+	bool ok = true;
+	for (u32 i = 0; i < 2; i++)
+	{
+		WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+		td.label = SV("tfx cs scratch");
+		td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_StorageBinding | WGPUTextureUsage_CopySrc |
+				   WGPUTextureUsage_CopyDst;
+		td.size = {static_cast<u32>(size.x), static_cast<u32>(size.y), 1};
+		td.format = WGPUTextureFormat_RGBA8Unorm;
+		sc->tex[i] = wgpuDeviceCreateTexture(m_device, &td);
+		sc->view[i] = sc->tex[i] ? wgpuTextureCreateView(sc->tex[i], nullptr) : nullptr;
+		ok = ok && sc->view[i];
+	}
+	for (u32 i = 0; ok && i < 2; i++)
+	{
+		WGPUBindGroupEntry r[3] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+		for (u32 k = 0; k < 3; k++)
+		{
+			r[k].binding = k;
+			r[k].textureView = (k == 0) ? sc->view[i] : m_null_view;
+		}
+		WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+		d.label = SV("tfx cs read");
+		d.layout = m_cs_bgl[2];
+		d.entryCount = 3;
+		d.entries = r;
+		sc->read_group[i] = wgpuDeviceCreateBindGroup(m_device, &d);
+
+		WGPUBindGroupEntry w[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+		w[0].binding = 0;
+		w[0].textureView = sc->view[i];
+		w[1].binding = 1;
+		w[1].buffer = m_uniform_buffer.GetBuffer();
+		w[1].size = sizeof(CSParams);
+		d.label = SV("tfx cs write");
+		d.layout = m_cs_bgl[3];
+		d.entryCount = 2;
+		d.entries = w;
+		sc->write_group[i] = wgpuDeviceCreateBindGroup(m_device, &d);
+		ok = sc->read_group[i] && sc->write_group[i];
+	}
+	m_cs_scratch.push_back(std::move(sc));
+	return ok ? m_cs_scratch.back().get() : nullptr;
+}
+
+bool GSDeviceWebGPU::TryComputeFeedbackDraw(GSHWDrawConfig& config, GSTextureWebGPU* rt)
+{
+	if (!config.require_one_barrier || config.require_full_barrier || config.blend.enable ||
+		config.blend_multi_pass.enable || config.alpha_second_pass.enable ||
+		config.destination_alpha != GSHWDrawConfig::DestinationAlphaMode::Off || config.depth.ztst != ZTST_ALWAYS ||
+		config.depth.zwe || config.pal || config.colormask.wrgba == 0 || !IsOwnPixelFeedbackSelector(config.ps) ||
+		rt->GetNativeFormat() != WGPUTextureFormat_RGBA8Unorm)
+	{
+		return false;
+	}
+
+	const GSVector2i size = rt->GetSize();
+	std::array<GSVector4i, CS_MAX_RECTS> rects;
+	u32 nrects = 0;
+	if (!FeedbackDrawRects(config, size, &rects, &nrects))
+		return false;
+
+	const WGPUComputePipeline pipeline = GetTFXComputePipeline(config.ps);
+	ComputeScratch* const sc = pipeline ? GetComputeScratch(size) : nullptr;
+	if (!sc || !m_uniform_buffer.ReserveMemory(CS_PARAMS_SLOT, UNIFORM_SLOT))
+		return false;
+
+	CSParams params = {};
+	for (u32 i = 0; i < nrects; i++)
+	{
+		params.rects[i][0] = rects[i].x;
+		params.rects[i][1] = rects[i].y;
+		params.rects[i][2] = rects[i].z;
+		params.rects[i][3] = rects[i].w;
+	}
+	params.count = nrects;
+	params.colormask = config.colormask.wrgba;
+	const u32 params_offset = m_uniform_buffer.GetCurrentOffset();
+	std::memcpy(m_uniform_buffer.GetCurrentHostPointer(), &params, sizeof(params));
+	m_uniform_buffer.CommitMemory(CS_PARAMS_SLOT);
+
+	// A run on another target, or none: start one with the target's contents in scratch texture 0.
+	if (m_cs_rt != rt || m_cs_run != sc)
+	{
+		FlushComputeRun();
+		EndRenderPass();
+		PrepareForSampling(rt);
+		m_cs_encoding = true;
+		WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+		src.texture = rt->GetTexture();
+		WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+		dst.texture = sc->tex[0];
+		const WGPUExtent3D extent = {static_cast<u32>(size.x), static_cast<u32>(size.y), 1};
+		wgpuCommandEncoderCopyTextureToTexture(GetCommandEncoder(), &src, &dst, &extent);
+		WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+		m_cs_pass = wgpuCommandEncoderBeginComputePass(GetCommandEncoder(), &cd);
+		m_cs_encoding = false;
+		m_cs_rt = rt;
+		m_cs_run = sc;
+		m_cs_current = 0;
+		m_cs_pass_pipeline = nullptr;
+		m_cs_runs++;
+		g_perfmon.Put(GSPerfMon::TextureCopies, 1);
+	}
+
+	if (m_cs_pass_pipeline != pipeline)
+	{
+		wgpuComputePassEncoderSetPipeline(m_cs_pass, pipeline);
+		m_cs_pass_pipeline = pipeline;
+	}
+	const u32 ps_offset = m_ps_cb_offset;
+	wgpuComputePassEncoderSetBindGroup(m_cs_pass, 0, m_cs_group0, 1, &ps_offset);
+	wgpuComputePassEncoderSetBindGroup(m_cs_pass, 1, m_cs_group1, 0, nullptr);
+	wgpuComputePassEncoderSetBindGroup(m_cs_pass, 2, sc->read_group[m_cs_current], 0, nullptr);
+	wgpuComputePassEncoderSetBindGroup(m_cs_pass, 3, sc->write_group[m_cs_current ^ 1], 1, &params_offset);
+	wgpuComputePassEncoderDispatchWorkgroups(m_cs_pass, (static_cast<u32>(size.x) + 7) / 8, (static_cast<u32>(size.y) + 7) / 8, 1);
+	m_cs_current ^= 1;
+	m_cs_draws++;
+	rt->SetUseSerial(m_encoder_serial);
+	rt->SetState(GSTexture::State::Dirty);
+	g_perfmon.Put(GSPerfMon::DrawCalls, 1);
+	return true;
+}
+
+void GSDeviceWebGPU::FlushComputeRun()
+{
+	if (!m_cs_run)
+		return;
+	m_cs_encoding = true;
+	wgpuComputePassEncoderEnd(m_cs_pass);
+	wgpuComputePassEncoderRelease(m_cs_pass);
+	m_cs_pass = nullptr;
+	WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+	src.texture = m_cs_run->tex[m_cs_current];
+	WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+	dst.texture = m_cs_rt->GetTexture();
+	const WGPUExtent3D extent = {static_cast<u32>(m_cs_run->size.x), static_cast<u32>(m_cs_run->size.y), 1};
+	wgpuCommandEncoderCopyTextureToTexture(GetCommandEncoder(), &src, &dst, &extent);
+	m_cs_rt->SetUseSerial(m_encoder_serial);
+	m_cs_rt->SetState(GSTexture::State::Dirty);
+	m_cs_encoding = false;
+	m_cs_run = nullptr;
+	m_cs_rt = nullptr;
+	m_cs_pass_pipeline = nullptr;
+	g_perfmon.Put(GSPerfMon::TextureCopies, 1);
 }

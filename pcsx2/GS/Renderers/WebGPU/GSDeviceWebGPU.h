@@ -340,6 +340,28 @@ private:
 	/// Replaces the open pass's bind state caches after a utility draw in the same pass (and back).
 	void InvalidateBindState();
 
+	// Feedback draws as compute dispatches (GSDeviceWebGPUHW.cpp, TryComputeFeedbackDraw())
+	/// Two textures of one target size that a run of dispatches reads and writes in turn, with the bind
+	/// groups that read texture i (group 2) and write texture i (group 3).
+	struct ComputeScratch
+	{
+		GSVector2i size;
+		WGPUTexture tex[2];
+		WGPUTextureView view[2];
+		WGPUBindGroup read_group[2];
+		WGPUBindGroup write_group[2];
+	};
+	bool CreateComputeFeedbackResources();
+	void DestroyComputeFeedbackResources();
+	WGPUComputePipeline GetTFXComputePipeline(const GSHWDrawConfig::PSSelector& sel);
+	ComputeScratch* GetComputeScratch(const GSVector2i& size);
+	/// Runs a feedback draw that reads only its own pixel as one dispatch of the open compute run on rt
+	/// (starting one), instead of a copy and a render pass. False when the draw does not qualify.
+	bool TryComputeFeedbackDraw(GSHWDrawConfig& config, GSTextureWebGPU* rt);
+	/// Ends the compute run, if one is open, and copies its result into its target. Called before the
+	/// encoder records anything else (GetCommandEncoder()), and before a submit.
+	void FlushComputeRun();
+
 	// Device loss and errors
 	void ReportPendingErrors();
 	void KeepEventLoopTurning();
@@ -460,4 +482,22 @@ private:
 	u32 m_skipped_draws = 0;
 	u64 m_hw_draws = 0;
 	u32 m_presents = 0;
+
+	// Feedback draws as compute dispatches
+	bool m_cs_enabled = false; ///< EmuCore/GS WebGPUComputeFeedback (default on)
+	WGPUBindGroupLayout m_cs_bgl[4] = {};
+	WGPUPipelineLayout m_cs_layout = nullptr;
+	WGPUBindGroup m_cs_group0 = nullptr; ///< the PS constants (dynamic offset)
+	WGPUBindGroup m_cs_group1 = nullptr; ///< no source textures (feedback draws read only the target)
+	std::unordered_map<GSHWDrawConfig::PSSelector, WGPUComputePipeline, GSHWDrawConfig::PSSelectorHash> m_cs_pipelines;
+	std::vector<std::unique_ptr<ComputeScratch>> m_cs_scratch;
+	GSTextureWebGPU* m_cs_rt = nullptr; ///< the target of the open run
+	ComputeScratch* m_cs_run = nullptr; ///< its scratch textures; null when no run is open
+	WGPUComputePassEncoder m_cs_pass = nullptr;
+	u32 m_cs_current = 0; ///< the scratch texture holding the target's contents so far
+	WGPUComputePipeline m_cs_pass_pipeline = nullptr;
+	bool m_cs_encoding = false; ///< the run's own commands are being recorded (GetCommandEncoder())
+	u64 m_cs_draws = 0;
+	u64 m_cs_runs = 0;
+	u64 m_cs_copied_draws = 0; ///< feedback draws that went through copies (did not qualify)
 };

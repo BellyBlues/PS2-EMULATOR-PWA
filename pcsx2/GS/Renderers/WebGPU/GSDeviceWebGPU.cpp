@@ -1148,6 +1148,9 @@ void GSDeviceWebGPU::InsertDebugMessage(DebugMessageCategory category, const cha
 
 WGPUCommandEncoder GSDeviceWebGPU::GetCommandEncoder()
 {
+	// Anything else recorded comes after the compute run's result is back in its target.
+	if (m_cs_run && !m_cs_encoding)
+		FlushComputeRun();
 	if (!m_encoder)
 		m_encoder = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
 	return m_encoder;
@@ -1290,6 +1293,7 @@ void GSDeviceWebGPU::ExecuteCommandBuffer(const char* reason)
 	EndRenderPass();
 	if (!m_device)
 		return;
+	FlushComputeRun();
 
 	// The stream buffers' shadows go up first: queue.writeBuffer runs before the commands below.
 	m_vertex_buffer.Flush(m_queue);
@@ -1330,6 +1334,8 @@ void GSDeviceWebGPU::OnTextureDestroyed(GSTextureWebGPU* tex, WGPUTexture textur
 		m_want_texture = nullptr;
 	if (m_pass_rt == tex || m_pass_ds == tex)
 		EndRenderPass();
+	if (m_cs_rt == tex)
+		FlushComputeRun();
 	DropTFXGroupsUsing(views);
 	for (WGPUBindGroup g : groups)
 	{
@@ -2139,6 +2145,9 @@ void GSDeviceWebGPU::EndPresent()
 						   "before ready); {} in creation.",
 			m_tfx_skipped_pending, m_tfx_async_ready, m_tfx_async_ready ? m_tfx_async_ms / m_tfx_async_ready : 0.0,
 			m_tfx_prewarmed, m_tfx_prewarm_started, m_tfx_prewarm_failed, m_tfx_prewarm_waited, m_tfx_pending.size());
+		if (m_cs_draws || m_cs_copied_draws)
+			Console.WriteLnFmt("WebGPU HW: {} feedback draws ran as compute in {} runs ({} compute pipelines), {} through copies.",
+				m_cs_draws, m_cs_runs, m_cs_pipelines.size(), m_cs_copied_draws);
 	}
 }
 

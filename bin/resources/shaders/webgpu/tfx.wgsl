@@ -1326,10 +1326,22 @@ fn ps_blend(Color: ptr<function, vec4f>, As_rgba: ptr<function, vec4f>)
 #endif
 }
 
-#if FS_HAS_OUTPUT
+#if COMPUTE_SHADER
+struct CSResult
+{
+	written: bool,
+	c: vec4f,
+};
+
+// The compute variant of ps_main (cs_main below): the same body, returning instead of discarding.
+#define PS_DISCARD return CSResult(false, vec4f(0.0f))
+fn ps_main_cs(input: FSInput) -> CSResult
+#elif FS_HAS_OUTPUT
+#define PS_DISCARD discard
 @fragment
 fn ps_main(input: FSInput) -> FSOutput
 #else
+#define PS_DISCARD discard
 @fragment
 fn ps_main(input: FSInput)
 #endif
@@ -1345,12 +1357,12 @@ fn ps_main(input: FSInput)
 #if PS_ZTST == ZTST_GEQUAL
 	if (input_z < sample_from_depth())
 	{
-		discard;
+		PS_DISCARD;
 	}
 #elif PS_ZTST == ZTST_GREATER
 	if (input_z <= sample_from_depth())
 	{
-		discard;
+		PS_DISCARD;
 	}
 #endif
 
@@ -1358,7 +1370,7 @@ fn ps_main(input: FSInput)
 	// fail depth test on prohibited lines
 	if ((i32(input.p.y) & 1) == (PS_SCANMSK & 1))
 	{
-		discard;
+		PS_DISCARD;
 	}
 #endif
 
@@ -1391,7 +1403,7 @@ fn ps_main(input: FSInput)
 
 	if (bad)
 	{
-		discard;
+		PS_DISCARD;
 	}
 
 #endif // PS_DATE >= 5
@@ -1423,7 +1435,7 @@ fn ps_main(input: FSInput)
 #if PS_ATST != PS_ATST_NONE && PS_AFAIL == AFAIL_KEEP
 	if (!atst_pass)
 	{
-		discard;
+		PS_DISCARD;
 	}
 #endif
 
@@ -1560,7 +1572,9 @@ fn ps_main(input: FSInput)
 	#endif
 #endif // PS_DATE
 
-#if FS_HAS_OUTPUT
+#if COMPUTE_SHADER
+	return CSResult(true, o_col0);
+#elif FS_HAS_OUTPUT
 	var result: FSOutput;
 	#if PS_RETURN_COLOR
 		#if PS_DATE == 1 || PS_DATE == 2
@@ -1578,5 +1592,63 @@ fn ps_main(input: FSInput)
 	return result;
 #endif
 }
+
+#if COMPUTE_SHADER
+
+// Feedback draws that read only their own pixel, run as compute dispatches (GSDeviceWebGPU::
+// TryComputeFeedbackDraw()): every invocation reads the target as it was before the draw (RtTexture, as the
+// render path reads its copy) and writes the whole target to cs_out, the draw's result where one of its
+// rectangles covers the pixel and the fragment was not discarded (under the colour mask), the old value
+// elsewhere. The two textures swap for the next draw. Only PS selectors whose fragment code uses nothing of
+// the vertices but the pixel's position are run this way, so the inputs below are the whole of it.
+struct CSParams
+{
+	rects: array<vec4i, 8>, // x0, y0, x1, y1: the pixels covered, half-open
+	count: u32,
+	colormask: u32,
+	_pad0: u32,
+	_pad1: u32,
+};
+
+@group(3) @binding(0) var cs_out: texture_storage_2d<rgba8unorm, write>;
+@group(3) @binding(1) var<uniform> cs: CSParams;
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3u)
+{
+	let size = textureDimensions(RtTexture);
+	if (gid.x >= size.x || gid.y >= size.y)
+	{
+		return;
+	}
+	let xy = vec2i(gid.xy);
+	let old = textureLoad(RtTexture, xy, 0);
+	var covered = false;
+	for (var i = 0u; i < cs.count; i++)
+	{
+		let r = cs.rects[i];
+		covered = covered || (xy.x >= r.x && xy.y >= r.y && xy.x < r.z && xy.y < r.w);
+	}
+	var result_c = old;
+	if (covered)
+	{
+		var input: FSInput;
+		input.p = vec4f(vec2f(gid.xy) + vec2f(0.5f), 0.0f, 1.0f);
+		input.t = vec4f(0.0f);
+		input.ti = vec4f(0.0f);
+		input.c = vec4f(0.0f);
+		input.inv_cov = 0.0f;
+		input.interior = 0u;
+		let res = ps_main_cs(input);
+		if (res.written)
+		{
+			let m = cs.colormask;
+			result_c = select(old, res.c, vec4<bool>((m & 1u) != 0u, (m & 2u) != 0u, (m & 4u) != 0u, (m & 8u) != 0u));
+		}
+	}
+	textureStore(cs_out, xy, result_c);
+}
+
+#endif // COMPUTE_SHADER
 
 #endif // FRAGMENT_SHADER
