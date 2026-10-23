@@ -223,6 +223,10 @@ Measured, exact or not, and not kept because the gain was too small for the chan
 
 ## Known to be left
 
+- **A faster EE compiler** (a future project, not started): translating whole loops and functions instead of
+  blocks of 4-5 instructions, the only remaining lever for the translated code's 50-70 % of the EE thread.
+  Plan, plain-language explanation and exit criteria in `docs/web-port/EE-JIT-REGIONS.md`.
+
 - **Zen against Chrome** (2026-10-22, one clean pair each, unlimited, in a quiet window): GTA from the
   Grove Street state 108.6 % in Zen against 124.6 % in Chrome (0.87; EE-bound in both, so Firefox's engine
   runs the EE JIT's code about 13 % slower); the crowd benchmark at 300 figures 127.5 % against 160 %
