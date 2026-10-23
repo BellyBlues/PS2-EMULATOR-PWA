@@ -291,4 +291,24 @@ Measured, exact or not, and not kept because the gain was too small for the chan
     wasm loops);
   - flag computation costs about 10 instructions per flag;
   - a few rare delay-slot cases still go to the interpreter.
+- **WWE SmackDown vs. Raw 2011** (NTSC-U, SLUS-21939; a 6-man Hell in a Cell fight from the owner's save
+  state, which sits on the pause menu with the whole scene still drawn; Ryzen 7 7840U). 92 % headless with the
+  null renderer, 93 % in Chromium on the 780M (WebGPU): the GPU is not the limit. VU1 is at 100 %: 15,800
+  programs and 2.6 M instructions a vsync, 3.6 MB of PATH1 packets. Share of the VU thread (after `9cf1444b2`):
+
+  | Share | What |
+  |---|---|
+  | 54 % | generated VU1 code |
+  | 16 % | the MTVU ring loop (no heavy call of its own; probably the cache traffic of the data the EE writes) |
+  | 12 % | per program: `Dispatch`, `ApplyExit`, `DeriveSignature`, `Find`, `WasmVU1::Execute` |
+  | 7 % | XGKICK: `_vuXGKICKTransfer`, `TransferGSPacketData` |
+  | 3 % | VIF unpacks on the VU thread |
+
+  With the flag computation removed from generated code (a measurement only, wrong output) the fight runs at
+  100 % with VU1 at 84 %, and the EE becomes the limit at 100 %: the flags that something observes (the status
+  sticky bits, flushed for every FMAC entry) are about a fifth of VU1's time (18.2 → 14 ms a vsync). The game reads no status flag in its
+  VU1 code and MAC flags at only 6 places (FMAND), so computing them lazily, at exits and readers, is the next VU1
+  step. The EE thread is then the wall: a quarter of it moves data to VU1 (`vifCode_Unpack` 9 %, `Gif_Unit::Execute`
+  6 %, `VIF1transfer` 4 %, `vu1ExecMicro` 3 %). A state taken in live action, not on the pause menu, is still to be
+  measured.
 - **SPU2 mixing**: 5-10 % of the EE thread. It processes all 48 voices every sample by design.
