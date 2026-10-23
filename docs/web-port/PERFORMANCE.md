@@ -96,6 +96,12 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | TFX pipelines are created in the background. A draw waits at most 3 ms (4 ms per vsync); if its pipeline is not ready, that draw is skipped for that frame. This is the owner's choice: an object can be missing for a frame or a few the first time an effect appears. `?pipelines=wait` restores waiting. | `pcsx2/GS/Renderers/WebGPU/GSDeviceWebGPUHW.cpp` and related | Naruto boot screens: 658 → 11 ms waiting, worst frame 417 → 29 ms | `d7ae5b791` |
 | Each game's pipeline list is stored in IndexedDB (by serial) and prewarmed in the background at the game's next boot | same, `pcsx2-wasm/web/app.js` | Guitar Hero second boot: 1 ms waiting, nothing skipped; Naruto menus second boot: 0 ms | `d7ae5b791`, `4b37cfc7c` |
 
+### WebGPU drawing
+
+| What | Where | Gain | Commit |
+|---|---|---|---|
+| Feedback draws that read only their own pixel run as compute. WebGPU cannot sample a target inside a pass that draws to it, so each feedback draw copied the target and began a render pass of its own: about 15,000 copies and passes a second in Final Fantasy XII's cutscenes (423,000 in the measured run), which stalled the browser's GPU process. A draw whose shader samples the frame buffer at its own pixel (no filtering or palette, no blending, no depth test or write, area made of up to 8 axis-aligned rectangles) now runs as a dispatch of the fragment shader's own body (`cs_main` in `tfx.wgsl`), reading the old contents from one scratch texture and writing the target to the other; dispatches in one compute pass see each other's writes, so a run of such draws costs one compute pass and two copies (FFXII: 806 runs of about 525 draws). Coverage follows the rasterizer (pixel centres, top-left rule); a draw with an edge within 1/256 of a pixel centre keeps the render path. Pixel-identical: frame hashes on and off the same in FFXII (cutscene and gameplay), GTA SA, Naruto, Dragon Ball Z and Guitar Hero in Chrome, and FFXII in Zen. Not covered: FFXII's other 27 feedback draws in the cutscene (depth-tested triangles with fog and an alpha second pass) and about 700 in gameplay (blended lines; draws reading another texture), and the few in DBZ and Guitar Hero (other shapes and shaders). `?set=EmuCore/GS/WebGPUComputeFeedback=false` turns it off. | `pcsx2/GS/Renderers/WebGPU/GSDeviceWebGPUHW.cpp`, `bin/resources/shaders/webgpu/tfx.wgsl` | FFXII cutscene from vsync 300, Chrome: 50.6 / 51.1 → 99.9 / 100.0 % (limiter on), 54.2 → 114.5 % unlimited; Zen: 25.5 → 97.9 % (median). FFXII gameplay unchanged (100 %) | `5a3dc0238` |
+
 ### Video (FMV)
 
 | What | Where | Gain | Commit |
@@ -119,6 +125,8 @@ Together: Naruto's intro video, headless, 95.3 → 96.9 %.
 - **The Recorder**: `556d474ad`.
 - **Save states in the Recorder** (Save state, Load state, `?state=`), to measure from the same frame
   every time: `5b006b75c`.
+- **Frame hashes in the benchmark runner** (`run-bench.mjs --capture`), to compare output between
+  browsers and settings: `7162e0ba3`.
 - **A Node runner crash fix**: `b16508154`.
 - **Use Node 24 for headless runs**: Node 22's V8 runs out of heap on games. `36c826032`.
 
