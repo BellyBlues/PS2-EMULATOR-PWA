@@ -162,6 +162,11 @@ simpler distant figures), so each row compares one version with itself.
 
 Measured, exact or not, and not kept because the gain was too small for the change:
 
+- **EE loop regions, a quick study** (2026-10-23): in FFXII's speed mode about 12 % of the EE thread is
+  inside loops, spread over many (largest 0.48 %), and 2.3 % in blocks that loop back to their own start; the
+  "units" structure (a module's blocks in one function behind a jump table) makes FFXII's speed mode slower
+  (63.7 against 59.6 % on the build of `7f41a4f0a`). Loop regions alone could give at most about 6 %; no
+  prototype built. See `docs/web-port/EE-JIT-REGIONS.md`.
 - **32-bit values in i32 locals** (2026-10-22, measured, not built): keeping registers that hold a
   sign-extended 32-bit value in i32 locals, to drop the `i32.wrap_i64` / `i64.extend_i32_s` pairs around
   32-bit ops. In three of GTA's hottest modules those conversions are 2.3-3.1 % of all wasm operations

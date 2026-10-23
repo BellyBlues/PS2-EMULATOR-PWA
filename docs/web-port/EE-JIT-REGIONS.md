@@ -1,6 +1,17 @@
 # Future project: a faster EE compiler ("regions instead of blocks")
 
-*Written 2026-10-23 at `b65e149ab` (branch `Yousri-v2`). Not started. A plan to come back to; every number
+*Written 2026-10-23 at `b65e149ab` (branch `Yousri-v2`). Not started.*
+
+**Status (2026-10-23, a quick prototype study).** FFXII's speed mode spends about 12 % of the EE thread
+inside loops (a backward branch to an earlier block in the same page; CPU profile, block code read from the
+state's RAM), spread over many loops, the largest 0.48 %; only 2.3 % is in blocks whose own path loops back
+to their start. Keeping a module's blocks in one function with a jump table between them (the "units" build,
+`7f41a4f0a`) makes FFXII's speed mode slower, 63.7-63.8 % against 59.4-59.9 % (headless, two runs each). So
+loop regions alone could give at most about 6 % even at twice the speed, and only real loops (no jump table)
+can gain: the large part of the time is outside loops, which only function regions would reach. No prototype
+was built.
+
+* A plan to come back to; every number
 below was measured on an M1 Max and is recorded in `docs/web-port/PERFORMANCE.md`.*
 
 ## In plain words
