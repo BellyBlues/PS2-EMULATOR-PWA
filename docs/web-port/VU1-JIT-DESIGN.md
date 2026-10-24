@@ -33,7 +33,8 @@ VU1 program is a paired, software-pipelined vertex loop):
   clamps of registers the block never writes are made once, before the loop.
 - **More native ops:** MAX/MINI (all forms), DIV/SQRT/RSQRT, WAITQ/WAITP, XTOP/XITOP, ILW/ILWR, ISW/ISWR,
   MFIR/MTIR, MFP, RINIT/RGET/RNEXT/RXOR, FSAND/FSEQ/FSOR/FSSET, FMAND/FMEQ/FMOR, FCSET and XGKICK's kick start.
-  Op bodies are left for EFU ops, OPMULA/OPMSUB, ADDi with `VuAddSubHack`, and on VU0 for memory ops and XTOP/XITOP.
+  OPMULA/OPMSUB are native too (2026-10-23), with MAC's w bits kept from the previous op. Op bodies are left for EFU
+  ops, ADDi with `VuAddSubHack`, and on VU0 for memory ops and XTOP/XITOP.
 
 Measured on the 100-figure phase, on a Mac shared with other jobs (Node 22.21 with V8 12.4, Chrome 155; ±10%
 between runs):
@@ -899,6 +900,9 @@ Steps 1–2 compute every flag of every op. Step 3 computes only what an observa
 - The fuzzer must hold at 0 differences with and without these elisions; any doubt keeps the full form.
 
 BT3 never reads MAC or status, so in step 3 about 45% of instructions lose most of their flag work.
+
+Done on 2026-10-23 in a lazy form rather than by analysis: each op keeps its raw result and the flags are
+computed at observers and exits, with lane accumulators for the sticky bits (`docs/web-port/PERFORMANCE.md`).
 
 ### 7.4 Q and P
 

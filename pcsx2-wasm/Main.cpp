@@ -157,6 +157,9 @@ static std::atomic<int> s_crisp_request{-1};
 static std::atomic<int> s_tv_shader_request{-1};
 static int s_tv_shader = 0;
 static bool s_crisp = false; // CPU thread
+// The page's internal resolution (GSConfig.UpscaleMultiplier: 1 native, 2 twice the PS2's lines), 0: no request.
+static std::atomic<int> s_upscale_request{0};
+static int s_upscale = 1; // CPU thread
 // The EE cycle rate the page asked for (EmuConfig.Speedhacks.EECycleRate: 0, or -1 to -3 to underclock the EE),
 // kCycleRateNone when there is no new request.
 static constexpr int kCycleRateNone = -128;
@@ -1664,6 +1667,23 @@ static void CheckCrispRequest(bool apply_now)
 		ApplyCrispSetting(request != 0, apply_now);
 }
 
+// The internal resolution: the hardware renderer draws at this multiple of the PS2's own size (the GS clamps it to
+// what the device's largest texture allows; the software renderer ignores it). Needs proper testing on more games.
+static void CheckUpscaleRequest(bool apply_now)
+{
+	const int request = s_upscale_request.exchange(0, std::memory_order_acq_rel);
+	if (request <= 0 || request == s_upscale)
+		return;
+	s_upscale = request;
+	{
+		auto lock = Host::GetSettingsLock();
+		s_settings_interface.SetFloatValue("EmuCore/GS", "upscale_multiplier", static_cast<float>(request));
+	}
+	Console.WriteLnFmt("pcsx2-wasm: internal resolution {}x", request);
+	if (apply_now && VMManager::HasValidVM())
+		VMManager::ApplySettings();
+}
+
 // The picture filter: one of PCSX2's TV shaders, applied when the GS presents (the WebGPU device has them all).
 static void CheckTvShaderRequest(bool apply_now)
 {
@@ -1909,6 +1929,7 @@ static void RunVM(const std::string& bios_name)
 		s_settings_interface.SetBoolValue("EmuCore/CPU/Recompiler", "EnableVU1", s_vu1jit_enabled.load(std::memory_order_acquire));
 	}
 	CheckCrispRequest(false);
+	CheckUpscaleRequest(false);
 	CheckTvShaderRequest(false);
 	CheckCycleRateRequest(false);
 	CheckMemcardRequests(false);
@@ -2219,6 +2240,14 @@ EMSCRIPTEN_KEEPALIVE void pcsx2web_set_crisp(int crisp)
 	s_crisp_request.store(crisp ? 1 : 0, std::memory_order_release);
 }
 
+/// The internal resolution: 1 (native, as the PS2 draws) or 2 (twice the lines), applied at the next vsync or boot.
+/// Other values are ignored.
+EMSCRIPTEN_KEEPALIVE void pcsx2web_set_upscale(int multiplier)
+{
+	if (multiplier == 1 || multiplier == 2)
+		s_upscale_request.store(multiplier, std::memory_order_release);
+}
+
 /// The picture filter: PCSX2's TV shader (0 none, 1 scanlines, 2 diagonal, 3 triangular, 4 wave, 5 Lottes CRT,
 /// 6 4xRGSS, 7 NxAGSS), applied at the next vsync or boot.
 EMSCRIPTEN_KEEPALIVE void pcsx2web_set_tv_shader(int shader)
@@ -2371,6 +2400,7 @@ void Host::PumpMessagesOnCPUThread()
 	RunCPUThreadQueue();
 	CheckStopRequest();
 	CheckCrispRequest(true);
+	CheckUpscaleRequest(true);
 	CheckTvShaderRequest(true);
 	CheckCycleRateRequest(true);
 	CheckMemcardRequests(true);

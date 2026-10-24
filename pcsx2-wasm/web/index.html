@@ -479,6 +479,12 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <label class="gfx-option"><input type="radio" name="gfx-choice" value="sw"><span>Software<span class="gfx-hint">No WebGPU: drawn by the CPU on a 2D canvas</span></span></label>
       <p class="menu-reason" id="gfx-applies">Applies at the next boot.</p>
     </fieldset>
+    <fieldset class="gfx-choice" aria-describedby="gfx-scale-note">
+      <legend class="sound-label">Resolution</legend>
+      <label class="gfx-option"><input type="radio" name="gfx-scale" value="1" checked><span>Native<span class="gfx-hint">As the PS2 draws it</span></span></label>
+      <label class="gfx-option"><input type="radio" name="gfx-scale" value="2"><span>2×<span class="gfx-hint">Twice the lines; needs a stronger GPU</span></span></label>
+      <p class="menu-reason" id="gfx-scale-note">Remembered in this browser. Applies at once.</p>
+    </fieldset>
     <div class="menu-items">
       <button type="button" class="menu-item" id="gfx-check"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-graphics-card"/></svg>Check WebGPU</button>
       <div class="gfx-result" id="gfx-result" role="status" aria-live="polite"></div>

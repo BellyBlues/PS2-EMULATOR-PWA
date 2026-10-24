@@ -75,6 +75,11 @@ if (host && dialog && root) {
 				host.say(host.blocked() || 'Stop the PS2 first to change the disc.');
 		});
 	}
+	// A gamepad plays the shelf (app.js reads it while the dialog is open): D-pad or left stick to move, Cross to put in.
+	host.onPad((action) => {
+		if (lib && dialog.open)
+			lib.pad(action);
+	});
 	closeBtn.addEventListener('click', () => {
 		if (!lib?.busy)
 			dialog.close();

@@ -295,8 +295,15 @@ namespace VU1Jit
 				m_dx = m_f.local(ValType::I32);
 				m_de = m_f.local(ValType::I32);
 				m_splat = m_f.local(ValType::V128);
-				for (u32* l : {&m_pmac, &m_pstat, &m_pclip, &m_vmac, &m_vstat, &m_vclip})
+				for (u32* l : {&m_pmac, &m_pstat, &m_pclip, &m_vmac, &m_vstat, &m_vclip, &m_lxstat, &m_axs})
 					*l = m_f.local(ValType::I32);
+				for (u32* l : {&m_pr, &m_lr, &m_amin, &m_amax, &m_aor, &m_aun})
+					*l = m_f.local(ValType::V128);
+				for (u32 i = 0; i < 4; i++)
+				{
+					m_snapr[i] = m_f.local(ValType::V128);
+					m_snapr_tmp[i] = m_f.local(ValType::V128);
+				}
 				for (auto& slot : m_snap)
 				{
 					for (u32& l : slot)
@@ -344,6 +351,8 @@ namespace VU1Jit
 					m_f.local_set(m_snap[i][1]);
 					Ld32(A(R.fmac[i].clipflag));
 					m_f.local_set(m_snap[i][2]);
+					NeutralRaw();
+					m_f.local_set(m_snapr[i]);
 				}
 				if (m_vu)
 				{
@@ -413,8 +422,8 @@ namespace VU1Jit
 				StoreFlags();
 				for (u32 s = 0; s < 4; s++)
 				{
-					St32(A(R.fmac[s].macflag), [&] { m_f.local_get(m_snap[s][0]); });
-					St32(A(R.fmac[s].statusflag), [&] { m_f.local_get(m_snap[s][1]); });
+					St32(A(R.fmac[s].macflag), [&] { PushMac(m_snapr[s], m_snap[s][0]); });
+					St32(A(R.fmac[s].statusflag), [&] { PushStat(m_snapr[s], m_snap[s][1]); });
 					St32(A(R.fmac[s].clipflag), [&] { m_f.local_get(m_snap[s][2]); });
 				}
 				if (m_vu)
@@ -788,15 +797,46 @@ namespace VU1Jit
 					Ld32(addrs[i]);
 					m_f.local_set(locals[i]);
 				}
+				// All explicit: no raw value, the last write-back's low 4 bits are VI[STATUS]'s own.
+				m_f.local_get(m_vstat);
+				m_f.local_set(m_lxstat);
+				for (u32 l : {m_pr, m_lr})
+				{
+					NeutralRaw();
+					m_f.local_set(l);
+				}
+				ResetSticky();
 			}
 			void StoreFlags()
 			{
-				const u32 locals[6] = {m_pmac, m_pstat, m_pclip, m_vmac, m_vstat, m_vclip};
-				const u32 addrs[6] = {A(R.macflag), A(R.statusflag), A(R.clipflag), A(R.VI[REG_MAC_FLAG]),
-					A(R.VI[REG_STATUS_FLAG]), A(R.VI[REG_CLIP_FLAG])};
-				for (u32 i = 0; i < 6; i++)
-					St32(addrs[i], [&] { m_f.local_get(locals[i]); });
+				St32(A(R.macflag), [&] { PushMac(m_pr, m_pmac); });
+				St32(A(R.statusflag), [&] { PushStat(m_pr, m_pstat); });
+				St32(A(R.clipflag), [&] { m_f.local_get(m_pclip); });
+				St32(A(R.VI[REG_MAC_FLAG]), [&] { PushMac(m_lr, m_vmac); });
+				St32(A(R.VI[REG_STATUS_FLAG]), [&] { PushVstat(); });
+				St32(A(R.VI[REG_CLIP_FLAG]), [&] { m_f.local_get(m_vclip); });
 			}
+			// A raw value that sets no flag: 1.0 in every lane.
+			void NeutralRaw() { Splat(0x3f800000u); }
+			// The sticky accumulators with nothing written back.
+			void ResetSticky()
+			{
+				Splat(EXP);
+				m_f.local_set(m_amin);
+				Splat(0);
+				m_f.local_set(m_amax);
+				Splat(0);
+				m_f.local_set(m_aor);
+				Splat(0xffffffffu);
+				m_f.local_set(m_aun);
+				m_f.i32_const(0);
+				m_f.local_set(m_axs);
+			}
+			void FlagBytes(u32 r); // m_v[4] = the per-lane flag bytes of the raw value in local r (Flags' old form)
+			// Pushes MacBits(local r) | local x, and StatBits(local r) | local x.
+			void PushMac(u32 r, u32 x);
+			void PushStat(u32 r, u32 x);
+			void PushVstat(); // VI[STATUS]
 			// xgkickenable changes only in generated code (XGKICK) and in the helpers, which reload it after them.
 			void LoadKick()
 			{
@@ -870,8 +910,22 @@ namespace VU1Jit
 			u32 m_i[6];
 			u32 m_hs, m_hn, m_hc_old, m_hc_new; // the upper/lower hazard copies
 			u32 m_dx, m_de; // ScalarDouble
+			// The MAC and status flags are kept lazily (section 7.3): a flag-setting op only records its raw result,
+			// with the lanes outside dest set to 1.0, which sets no flag (Flags), and the flags are computed where they
+			// are observed: at FMAND/FMEQ/FMOR and FSAND/FSEQ/FSOR, around op bodies and at the exits (StoreFlags).
+			// A value is "raw | explicit": the MAC flag is MacBits(raw) | the explicit bits (the bits above 16 and
+			// what op bodies, FSSET, DIV and OPMULA/OPMSUB leave), the status StatBits(raw) | the explicit bits.
+			//   pending: m_pr | m_pmac, m_pstat; ring slot s: m_snapr[s] | m_snap[s][0], m_snap[s][1].
+			//   VI[MAC]: m_lr | m_vmac, the last entry written back. VI[STATUS] (VstatValue): m_vstat's bits 4-11,
+			//   the low 4 of the last entry written back (m_lr | m_lxstat), and as sticky bits the low 4 of every
+			//   entry written back since m_vstat was set, OR-ed as lane accumulators of the raw values (m_amin: the
+			//   minimum exponent, m_amax: the maximum, m_aor: the signs, m_aun: the minimum |x| - 1, under 0x7fffff
+			//   for a denormal) and m_axs (the explicit low 4 bits).
 			u32 m_pmac, m_pstat, m_pclip, m_vmac, m_vstat, m_vclip; // LoadFlags
+			u32 m_pr, m_lr, m_lxstat, m_amin, m_amax, m_aor, m_aun, m_axs;
 			u32 m_snap[4][3]; // per ring slot of the model: the FMAC entry's macflag, statusflag and clipflag
+			u32 m_snapr[4]; // ... and its raw result
+			u32 m_snapr_tmp[4];
 			const BlockExit* m_loop = nullptr; // BeginLoop
 			u32 m_base = 0; // VU1.cycle at the entry of the current block, or of the current pass of a loop
 			u32 m_budget = 0; // g_budget_end
@@ -982,11 +1036,18 @@ namespace VU1Jit
 			}
 			for (u32 i = 0; i < count; i++)
 			{
+				m_f.local_get(m_snapr[(readpos + i) & 3]);
+				m_f.local_set(m_snapr_tmp[i]);
+			}
+			for (u32 i = 0; i < count; i++)
+			{
 				for (u32 j = 0; j < 3; j++)
 				{
 					m_f.local_get(m_snap_tmp[i * 3 + j]);
 					m_f.local_set(m_snap[i][j]);
 				}
+				m_f.local_get(m_snapr_tmp[i]);
+				m_f.local_set(m_snapr[i]);
 			}
 		}
 
@@ -1221,36 +1282,40 @@ namespace VU1Jit
 
 		void Emitter::Flags(u32 r, u32 dest)
 		{
-			// Per lane of the raw result: zero (exponent 0), sign, underflow (exponent 0, mantissa not 0), overflow
-			// (exponent 255). Lanes outside dest are cleared (VU_MACx_CLEAR). MAC bit order: x is bit 3 of each nibble.
-			const u32 e = m_v[6], zm = m_v[7], sm = m_v[5], n = m_v[4];
-			const bool all = (dest & 0xf) == 0xf;
+			// VU_MAC_UPDATE on the dest lanes, VU_MACx_CLEAR on the others, then VU_STAT_UPDATE, lazily: the raw
+			// result with 1.0 outside dest, the bits above MAC's 16 kept, no explicit status bits.
+			m_f.local_get(r);
+			if ((dest & 0xf) != 0xf)
+			{
+				NeutralRaw();
+				DestConst(dest);
+				Simd(Simd::V128Bitselect);
+			}
+			m_f.local_set(m_pr);
+			m_f.local_get(m_pmac);
+			m_f.i32_const(static_cast<s32>(0xffff0000u));
+			m_f.i32_and();
+			m_f.local_set(m_pmac);
+			m_f.i32_const(0);
+			m_f.local_set(m_pstat);
+		}
+
+		void Emitter::FlagBytes(u32 r)
+		{
+			// Per lane of the raw value: zero (exponent 0), sign, underflow (exponent 0, mantissa not 0), overflow
+			// (exponent 255) (VU_MAC_UPDATE). Bytes: zero xyzw, sign xyzw, underflow xyzw, overflow xyzw.
+			const u32 e = m_v[6], zm = m_v[7], n = m_v[4];
 			m_f.local_get(r);
 			Splat(EXP);
 			Simd(Simd::V128And);
 			m_f.local_set(e);
-			// zero
 			m_f.local_get(e);
 			Splat(0);
 			Simd(Simd::I32x4Eq);
-			if (!all)
-			{
-				DestConst(dest);
-				Simd(Simd::V128And);
-			}
-			m_f.local_set(zm);
-			// sign
+			m_f.local_tee(zm);
 			m_f.local_get(r);
 			m_f.i32_const(31);
 			Simd(Simd::I32x4ShrS);
-			if (!all)
-			{
-				DestConst(dest);
-				Simd(Simd::V128And);
-			}
-			m_f.local_set(sm);
-			m_f.local_get(zm);
-			m_f.local_get(sm);
 			Simd(Simd::I16x8NarrowI32x4S);
 			// underflow: zero and a mantissa
 			m_f.local_get(zm);
@@ -1260,83 +1325,157 @@ namespace VU1Jit
 			Splat(0);
 			Simd(Simd::I32x4Eq);
 			Simd(Simd::V128AndNot);
-			// overflow
 			m_f.local_get(e);
 			Splat(EXP);
 			Simd(Simd::I32x4Eq);
-			if (!all)
-			{
-				DestConst(dest);
-				Simd(Simd::V128And);
-			}
 			Simd(Simd::I16x8NarrowI32x4S);
-			Simd(Simd::I8x16NarrowI16x8S); // bytes: zero xyzw, sign xyzw, underflow xyzw, overflow xyzw
+			Simd(Simd::I8x16NarrowI16x8S);
 			m_f.local_set(n);
+		}
 
-			// macflag = (macflag & ~0xffff) | mac
-			m_f.local_get(m_pmac);
-			m_f.i32_const(static_cast<s32>(0xffff0000u));
-			m_f.i32_and();
-			m_f.local_get(n);
-			m_f.local_get(n);
+		void Emitter::PushMac(u32 r, u32 x)
+		{
+			// MAC bit order: x is bit 3 of each nibble.
+			FlagBytes(r);
+			m_f.local_get(m_v[4]);
+			m_f.local_get(m_v[4]);
 			static constexpr u8 rev[16] = {3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12};
 			m_f.shuffle(rev);
 			Simd(Simd::I8x16Bitmask);
+			m_f.local_get(x);
 			m_f.i32_or();
-			m_f.local_set(m_pmac);
-			// statusflag = one bit per group with any lane set (VU_STAT_UPDATE)
-			m_f.local_get(n);
+		}
+
+		void Emitter::PushStat(u32 r, u32 x)
+		{
+			// One bit per group with any lane set (VU_STAT_UPDATE).
+			FlagBytes(r);
+			m_f.local_get(m_v[4]);
 			Splat(0);
 			Simd(Simd::I32x4Ne);
 			Simd(Simd::I32x4Bitmask);
-			m_f.local_set(m_pstat);
+			m_f.local_get(x);
+			m_f.i32_or();
+		}
+
+		void Emitter::PushVstat()
+		{
+			// _vuFMACflush's update, (status & 0xFF0) | low4 | low4 << 6, applied for every entry written back since
+			// m_vstat was set: m_vstat's bits 4-11, the last entry's low 4 bits, and the OR of all their low 4 bits
+			// shifted to the sticky ones.
+			m_f.local_get(m_vstat);
+			m_f.i32_const(0xFF0);
+			m_f.i32_and();
+			PushStat(m_lr, m_lxstat);
+			m_f.i32_const(0xF);
+			m_f.i32_and();
+			m_f.i32_or();
+			// zero: an exponent 0 in some lane
+			m_f.local_get(m_amin);
+			Splat(0);
+			Simd(Simd::I32x4Eq);
+			Simd(Simd::V128AnyTrue);
+			// sign
+			m_f.local_get(m_aor);
+			Simd(Simd::I32x4Bitmask);
+			m_f.i32_const(0);
+			m_f.i32_ne();
+			m_f.i32_const(1);
+			m_f.i32_shl();
+			m_f.i32_or();
+			// underflow: 0 < |x| < 0x800000
+			m_f.local_get(m_aun);
+			Splat(0x007fffffu);
+			Simd(Simd::I32x4LtU);
+			Simd(Simd::V128AnyTrue);
+			m_f.i32_const(2);
+			m_f.i32_shl();
+			m_f.i32_or();
+			// overflow: an exponent 255
+			m_f.local_get(m_amax);
+			Splat(EXP);
+			Simd(Simd::I32x4Eq);
+			Simd(Simd::V128AnyTrue);
+			m_f.i32_const(3);
+			m_f.i32_shl();
+			m_f.i32_or();
+			m_f.local_get(m_axs);
+			m_f.i32_or();
+			m_f.i32_const(6);
+			m_f.i32_shl();
+			m_f.i32_or();
 		}
 
 		void Emitter::FmacWriteback(u32 slot, int flagreg)
 		{
-			// _vuFMACflush / _vuFlushAll for one entry (VUops.cpp:51-63), on the flags in locals.
+			// _vuFMACflush / _vuFlushAll for one entry (VUops.cpp:51-63), on the flags in locals (lazily, see m_pr).
 			const u32* e = m_snap[slot];
+			const u32 r = m_snapr[slot];
 			if (flagreg & (1 << REG_CLIP_FLAG))
 			{
 				m_f.local_get(e[2]);
 				m_f.local_set(m_vclip);
 			}
+			if (flagreg & (1 << REG_STATUS_FLAG))
 			{
+				// FSSET's entry: (status & 0x30) | (sf & 0xFC0) | (sf & 0xF), from here on the base of the sticky bits.
 				const u32 sf = m_dx;
-				m_f.local_get(e[1]);
+				PushStat(r, e[1]);
 				m_f.local_set(sf);
-				m_f.local_get(m_vstat);
-				if (flagreg & (1 << REG_STATUS_FLAG))
-				{
-					m_f.i32_const(0x30);
-					m_f.i32_and();
-					m_f.local_get(sf);
-					m_f.i32_const(0xFC0);
-					m_f.i32_and();
-					m_f.i32_or();
-					m_f.local_get(sf);
-					m_f.i32_const(0xF);
-					m_f.i32_and();
-					m_f.i32_or();
-				}
-				else
-				{
-					m_f.i32_const(0xFF0);
-					m_f.i32_and();
-					m_f.local_get(sf);
-					m_f.i32_const(0xF);
-					m_f.i32_and();
-					m_f.local_tee(sf);
-					m_f.i32_or();
-					m_f.local_get(sf);
-					m_f.i32_const(6);
-					m_f.i32_shl();
-					m_f.i32_or();
-				}
+				PushVstat();
+				m_f.i32_const(0x30);
+				m_f.i32_and();
+				m_f.local_get(sf);
+				m_f.i32_const(0xFC0);
+				m_f.i32_and();
+				m_f.i32_or();
+				m_f.local_get(sf);
+				m_f.i32_const(0xF);
+				m_f.i32_and();
+				m_f.i32_or();
 				m_f.local_set(m_vstat);
+				ResetSticky();
 			}
+			else
+			{
+				// (status & 0xFF0) | low4 | low4 << 6: the entry's flags go into the sticky accumulators.
+				m_f.local_get(r);
+				Splat(EXP);
+				Simd(Simd::V128And);
+				m_f.local_tee(m_v[4]);
+				m_f.local_get(m_amin);
+				Simd(Simd::I32x4MinU);
+				m_f.local_set(m_amin);
+				m_f.local_get(m_v[4]);
+				m_f.local_get(m_amax);
+				Simd(Simd::I32x4MaxU);
+				m_f.local_set(m_amax);
+				m_f.local_get(r);
+				m_f.local_get(m_aor);
+				Simd(Simd::V128Or);
+				m_f.local_set(m_aor);
+				m_f.local_get(r);
+				Splat(0x7fffffffu);
+				Simd(Simd::V128And);
+				Splat(1);
+				Simd(Simd::I32x4Sub);
+				m_f.local_get(m_aun);
+				Simd(Simd::I32x4MinU);
+				m_f.local_set(m_aun);
+				m_f.local_get(e[1]);
+				m_f.i32_const(0xF);
+				m_f.i32_and();
+				m_f.local_get(m_axs);
+				m_f.i32_or();
+				m_f.local_set(m_axs);
+			}
+			// The last entry written back: VI[MAC] and the low 4 bits of VI[STATUS].
+			m_f.local_get(r);
+			m_f.local_set(m_lr);
 			m_f.local_get(e[0]);
 			m_f.local_set(m_vmac);
+			m_f.local_get(e[1]);
+			m_f.local_set(m_lxstat);
 		}
 
 		void Emitter::Flushes(const Plan& p)
@@ -1665,6 +1804,70 @@ namespace VU1Jit
 					Simd(Simd::V128Bitselect);
 					m_f.local_set(r);
 					SetVF(fd, r, dest, clean);
+					m_out->native_ops++;
+					return true;
+				}
+				case U::OPMULA:
+				case U::OPMSUB:
+				{
+					// _vuOPMULA / _vuOPMSUB (VUops.cpp:844-873): x, y and z of fs.yzx * ft.zxy (subtracted from ACC for
+					// OPMSUB), whatever the dest field says. MAC's w bits stay as the previous op left them, and the
+					// status is taken from all four lanes (VU_STAT_UPDATE).
+					const bool sub = p.ins.up == U::OPMSUB;
+					const u32 a = m_v[0], b = m_v[1], c = m_v[2], r = m_v[3], w = m_i[0];
+					static constexpr u8 yzx[16] = {4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 12, 13, 14, 15};
+					static constexpr u8 zxy[16] = {8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15};
+					ClampedVF(fs, 0xE, a);
+					ClampedVF(ft, 0xE, b);
+					if (sub)
+					{
+						ClampedVF(ACC_INDEX, 0xE, c);
+						m_f.local_get(c);
+					}
+					m_f.local_get(a);
+					m_f.local_get(a);
+					m_f.shuffle(yzx);
+					m_f.local_get(b);
+					m_f.local_get(b);
+					m_f.shuffle(zxy);
+					Simd(Simd::F32x4Mul);
+					if (sub)
+						Simd(Simd::F32x4Sub);
+					m_f.local_set(r);
+					// Lazily (see m_pr): the raw x, y and z with the previous raw w, MAC's w bits and the bits above 16
+					// kept explicit, and the status of those w bits explicit.
+					m_f.local_get(r);
+					m_f.local_get(m_pr);
+					DestConst(0xE);
+					Simd(Simd::V128Bitselect);
+					m_f.local_set(m_pr);
+					m_f.local_get(m_pmac);
+					m_f.i32_const(static_cast<s32>(0xffff1111u));
+					m_f.i32_and();
+					m_f.local_tee(m_pmac);
+					m_f.i32_const(0x1111);
+					m_f.i32_and();
+					m_f.local_set(w);
+					// Z.w is bit 0, S.w bit 4, U.w bit 8, O.w bit 12
+					m_f.i32_const(0);
+					for (u32 g = 0; g < 4; g++)
+					{
+						m_f.local_get(w);
+						if (g)
+						{
+							m_f.i32_const(static_cast<s32>(3 * g));
+							m_f.i32_shr_u();
+						}
+						m_f.i32_const(1 << g);
+						m_f.i32_and();
+						m_f.i32_or();
+					}
+					m_f.local_set(m_pstat);
+					if (!sub || fd != 0) // fd 0 writes RDzero, which nothing reads
+					{
+						Clamp(r);
+						SetVF(sub ? fd : ACC_INDEX, r, 0xE, 0xf);
+					}
 					m_out->native_ops++;
 					return true;
 				}
@@ -2216,7 +2419,7 @@ namespace VU1Jit
 						return true;
 					const u32 imm = (((code >> 21) & 1) << 11) | (code & 0x7ff);
 					SetVI(it, [&] {
-						m_f.local_get(m_vstat);
+						PushVstat();
 						m_f.i32_const(0xFFF);
 						m_f.i32_and();
 						m_f.i32_const(static_cast<s32>(imm));
@@ -2250,7 +2453,7 @@ namespace VU1Jit
 					if (it == 0)
 						return true;
 					SetVI(it, [&] {
-						m_f.local_get(m_vmac);
+						PushMac(m_lr, m_vmac);
 						m_f.i32_const(0xFFFF);
 						m_f.i32_and();
 						VI(is);
@@ -2492,11 +2695,13 @@ namespace VU1Jit
 					m_f.local_get(from[j]);
 					m_f.local_set(e[j]);
 				}
+				m_f.local_get(m_pr);
+				m_f.local_set(m_snapr[p.pre.fmacwritepos]);
 			}
 			if (info.fdiv_added)
 			{
 				St32(A(R.fdiv.reg), [&] { Ld32(A(R.q)); });
-				St32(A(R.fdiv.statusflag), [&] { m_f.local_get(m_pstat); });
+				St32(A(R.fdiv.statusflag), [&] { PushStat(m_pr, m_pstat); });
 			}
 			if (info.efu_added)
 				St32(A(R.efu.reg), [&] { Ld32(A(R.p)); });
