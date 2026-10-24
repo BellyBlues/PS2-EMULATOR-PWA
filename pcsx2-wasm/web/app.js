@@ -58,6 +58,8 @@
 	const PREF_PICTURE = 'pcsx2web.picture';
 	// The Graphics menu's choice (UI-SPEC.md §12): 'auto', 'gpu' or 'sw'; ?gpu= and ?renderer= win over it.
 	const PREF_RENDERER = 'pcsx2web.renderer';
+	// The Graphics menu's resolution: '1' (native, as the PS2 draws) or '2' (twice the lines).
+	const PREF_UPSCALE = 'pcsx2web.upscale';
 	const PREF_KEEP_CHROME = 'pcsx2web.keepChrome';
 	// Which PS2 port the keyboard plays as, and which one the first gamepad does (1 or 2).
 	const PREF_PAD_KEYBOARD = 'pcsx2web.padKeyboard';
@@ -404,6 +406,7 @@
 
 	const page = {
 		picture: 'smooth', // the remote's picture mode (PICTURE_MODES)
+		upscale: 1, // the Graphics menu's resolution multiplier (1 or 2)
 		phase: 'loading', // loading | ready | unsupported | dead
 		runtimeRequested: false, // false while a touch-only device waits for a BIOS
 		vmState: STATE.WAITING,
@@ -881,6 +884,7 @@
 			frame: () => M._pcsx2web_frame() >>> 0,
 			surfaceSize: (w, h, scale) => M._pcsx2web_surface_size && M._pcsx2web_surface_size(w, h, scale),
 			setCrisp: (on) => M._pcsx2web_set_crisp && M._pcsx2web_set_crisp(on ? 1 : 0),
+			setUpscale: (n) => M._pcsx2web_set_upscale && M._pcsx2web_set_upscale(n),
 			setTvShader: (n) => M._pcsx2web_set_tv_shader && M._pcsx2web_set_tv_shader(n),
 		};
 	}
@@ -928,6 +932,7 @@
 		renderProgress();
 		feedSurfaceSize(0, 0, 0);
 		api.setCrisp(els.body.dataset.crisp === 'on');
+		api.setUpscale(page.upscale);
 		api.setTvShader(PICTURE_MODES[page.picture].shader);
 		audioStart(); // the context exists already when a boot was queued while the runtime loaded
 		frame.lastPollTime = performance.now();
@@ -8120,6 +8125,8 @@
 		check: $('gfx-check'),
 		result: $('gfx-result'),
 		radios: [...document.querySelectorAll('input[name="gfx-choice"]')],
+		scaleRadios: [...document.querySelectorAll('input[name="gfx-scale"]')],
+		scaleNote: $('gfx-scale-note'),
 	};
 	// The HW renderer's one hard requirement, then the features it uses when they are there
 	// (GSDeviceWebGPU::CreateInstanceAndDevice()).
@@ -8191,6 +8198,12 @@
 		const changed = currentChoice() !== RENDERER_CHOICE;
 		gfxEls.applies.textContent = URL_GRAPHICS ? 'The address’s ?gpu= or ?renderer= decides for this visit.' :
 			changed ? 'Applies when the page is reloaded.' : 'Remembered in this browser. A change applies after a reload.';
+		for (const r of gfxEls.scaleRadios)
+			r.checked = Number(r.value) === page.upscale;
+		// Only the GPU renderer draws above native; the software renderer ignores it.
+		gfxEls.scaleNote.textContent = gpu.mode && !gpu.mode.hw ?
+			'Only the GPU renderer draws at 2×; this picture is drawn in software. Remembered in this browser.' :
+			'Remembered in this browser. Applies at once.';
 	}
 
 	// Linux desktop Chromium ships WebGPU off for most GPUs; the flags page turns it on.
@@ -8276,6 +8289,19 @@
 					return;
 				writePref(PREF_RENDERER, r.value);
 				pageLog(`Graphics choice: ${r.value} (applies after a reload).`);
+				renderGfx();
+			});
+		}
+		page.upscale = readPref(PREF_UPSCALE) === '2' ? 2 : 1;
+		for (const r of gfxEls.scaleRadios) {
+			r.addEventListener('change', () => {
+				if (!r.checked)
+					return;
+				page.upscale = Number(r.value) === 2 ? 2 : 1;
+				writePref(PREF_UPSCALE, String(page.upscale));
+				if (api)
+					api.setUpscale(page.upscale);
+				pageLog(`Graphics resolution: ${page.upscale === 2 ? '2×' : 'native'}.`);
 				renderGfx();
 			});
 		}

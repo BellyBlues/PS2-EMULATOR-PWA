@@ -119,6 +119,12 @@ Together: Naruto's intro video, headless, 95.3 → 96.9 %.
 |---|---|---|---|
 | Underclock: PCSX2's EE cycle rate (0, -1, -2, -3: the EE at 100, 75, 60, 50 %), chosen per game in the page and remembered per serial; every boot starts at Off. The EE JIT used to leave wasm for every taken branch and turn the idle loop skip off with any rate but 0, so the hack made things slower; now the branch end stays in wasm (the interpreter's own `intUpdateCPUCycles()` for the cycle update) and the idle loop skip models the rate. The JIT is exact against the interpreter at -1 and -2 (state hashes over 600 GTA vsyncs), and unchanged at 0. | `pcsx2/wasm/EEJit.cpp`, `pcsx2-wasm/Main.cpp`, the page | GTA SA gameplay headless, unlimited, medians of 3 interleaved on a busy machine (from vsync 600 of 2400): Off 86.4 %, Light 81.3 % (slower), Medium 108.6 % but CJ falls through the ground there (the game renders almost nothing), Strong 95.9 % (+11 %). GTA's clock keeps the same time at Off, Light and Strong (no slow motion). So for GTA only Strong helps; each game needs trying. | `6d4587379`, `c202859c6` |
 
+### Options that cost speed (not optimizations; off unless chosen)
+
+| What | Where | Cost | Commit |
+|---|---|---|---|
+| Resolution 2×: the hardware renderer draws at twice the PS2's lines (`pcsx2web_set_upscale()`, the Graphics menu's Resolution; native by default). Switching mid-game gives frames identical to booting at that setting (checked at three points of the benchmark, native, 2×, native again). | `pcsx2-wasm/Main.cpp`, the page | None measurable on the crowd benchmark: Chrome, unlimited, 1792x1344 presented, medians of 3 interleaved runs on a busy machine (load about 19, no quiet window), VPS native / 2×: 100 figures 196.9 / 194.3, 200 figures 120.5 / 122.5, 300 figures 86.9 / 86.8 (the benchmark is EE and VU1 bound). An M1 Max has fill rate to spare; a game that is GS-bound or a weaker GPU will pay more, not yet measured | the Resolution 2× commit |
+
 ### Measuring tools (no speed of their own)
 
 - **The crowd benchmark** and its runners: `cfc473aed`, `2298389fb`, `f28aa05f8`, `df4d8a645`,

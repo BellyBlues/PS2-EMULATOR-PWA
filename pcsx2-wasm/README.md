@@ -552,6 +552,7 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_frame()` | address of the frame descriptor: `seq, width, height, pixels, vsync` (u32) |
 | `pcsx2web_surface_size(w, h, scale)` | the display canvas's backing size and device pixel ratio (WebGPU presents at it) |
 | `pcsx2web_set_crisp(on)` | nearest (1) or bilinear (0) presentation, applied at the next vsync |
+| `pcsx2web_set_upscale(n)` | the internal resolution (`EmuCore/GS/upscale_multiplier`): 1 (native, the default) or 2 (twice the PS2's lines), applied at the next vsync or boot; other values are ignored. The hardware renderer only (the software renderer ignores it); the GS clamps it to the adapter's largest texture. The page's Graphics menu offers Native and 2× |
 | `pcsx2web_set_tv_shader(n)` | PCSX2's TV shader (`EmuCore/GS/TVShader`: 0 none, 1 scanlines, 2 diagonal, 3 triangular, 4 wave, 5 Lottes CRT, 6 4xRGSS, 7 NxAGSS), applied at the next vsync; the WebGPU device only (the 2D path's device has none). The page's CRT picture mode is 5 |
 | `pcsx2web_set_ee_cycle_rate(rate)` | the Underclock (PCSX2's EE cycle rate): 0, or -1 to -3 for the EE at 75, 60 or 50 %, applied at the next vsync or boot; other values are ignored |
 | `pcsx2web_vsync_count()` | vsyncs emulated since the module started |
