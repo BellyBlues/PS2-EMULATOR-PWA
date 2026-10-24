@@ -5381,6 +5381,9 @@
 
 	// The disc library (library/player-library.js, UI-SPEC.md §15) chooses a disc from a folder and boots
 	// it while its insert plays over the page.
+	// Set by the library (onPad): where a gamepad's presses go while its dialog is open (libraryPadFrame).
+	let libraryPadHandler = null;
+
 	window.PCSX2WebLibrary = Object.freeze({
 		// Why a disc can't go in now, or '' when it can.
 		blocked() {
@@ -5444,6 +5447,8 @@
 		stop: () => stop(),
 		// A line in the subtitle, for a library button that can't open it now (Eject while the PS2 runs).
 		say: (text) => subtitle(text),
+		// The library's reader of gamepad presses (libraryPadFrame): { step: -1 | 1 } or { confirm: true }.
+		onPad: (fn) => { libraryPadHandler = fn; },
 	});
 
 	// Read-only hooks for automated tests, next to window.PCSX2Web.
@@ -6429,7 +6434,44 @@
 	// gamepad state from the browser anyway).
 	function gamepadsLive() {
 		return page.phase === 'ready' && page.vmState === STATE.RUNNING && page.frameSinceBoot &&
-			document.hasFocus() && document.visibilityState === 'visible';
+			document.hasFocus() && document.visibilityState === 'visible' && !libraryDialog.open;
+	}
+
+	// The disc library plays by gamepad (UI-SPEC.md §15): the D-pad or the left stick steps along the shelf and
+	// Cross puts the disc in front in, like the arrows and Enter. A held direction repeats. What was held when the
+	// library opened is ignored until it is let go, and nothing in the library reaches the PS2.
+	const LIBRARY_PAD_FIRST_MS = 400;
+	const LIBRARY_PAD_REPEAT_MS = 110;
+	const LIBRARY_PAD_PRESS = 0.5;
+	const libraryDialog = document.getElementById('library');
+
+	function libraryPadFrame(g, raw, now) {
+		const st = g.library || (g.library = { armed: false, dir: 0, next: 0, cross: false });
+		if (!libraryDialog.open || !libraryPadHandler || g.mapper) {
+			st.armed = false;
+			return;
+		}
+		const at = (name) => raw[PAD_INDEX[name]];
+		const back = Math.max(at('Left'), at('Up'), at('LLeft')) >= LIBRARY_PAD_PRESS;
+		const fwd = Math.max(at('Right'), at('Down'), at('LRight')) >= LIBRARY_PAD_PRESS;
+		const dir = back === fwd ? 0 : fwd ? 1 : -1;
+		const cross = at('Cross') >= LIBRARY_PAD_PRESS;
+		if (!st.armed) {
+			st.armed = !dir && !cross;
+			return;
+		}
+		if (cross && !st.cross)
+			libraryPadHandler({ confirm: true });
+		st.cross = cross;
+		if (dir !== st.dir) {
+			st.dir = dir;
+			st.next = now + LIBRARY_PAD_FIRST_MS;
+			if (dir)
+				libraryPadHandler({ step: dir });
+		} else if (dir && now >= st.next) {
+			st.next = now + LIBRARY_PAD_REPEAT_MS;
+			libraryPadHandler({ step: dir });
+		}
 	}
 
 	function stickValue(x, y) {
@@ -6582,9 +6624,12 @@
 				updateGamepadView(g);
 			updatePadLive(g);
 		}
+		libraryPadFrame(g, raw, now);
 		const idle = !raw.some((v) => v > 0);
 		if (idle)
 			g.needsNeutral = false;
+		else if (libraryDialog.open)
+			g.needsNeutral = true; // what is held in the library is not for the game
 		// After a change of player or a pause in play, the inputs held must be let go once.
 		if (live && !g.needsNeutral && !g.mapper)
 			g.state.set(raw);

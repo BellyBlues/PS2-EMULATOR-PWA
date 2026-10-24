@@ -380,6 +380,10 @@ picture, so the boot is never seen. The component is `library/disc-library.js` (
 `window.PCSX2WebLibrary`. `?clean=1` makes every insert play the Easter egg (a disc that has to be
 cleaned before it reads), which otherwise comes one time in ten.
 
+A gamepad plays the shelf: the D-pad or the left stick moves along it and Cross puts the disc in front in.
+`app.js` reads the gamepads (`libraryPadFrame()`) and hands the presses to the library through
+`PCSX2WebLibrary.onPad()`; nothing a gamepad does while the dialog is open reaches the PS2.
+
 - The console is a photo (`library/ps2.webp`, Evan-Amos, public domain; `library/ps2-photo.txt`).
   The tray is the photo's own front panel, cut out and slid along the console's depth; the plate
   and the disc behind it are drawn on the tray's plane with an affine transform measured from the

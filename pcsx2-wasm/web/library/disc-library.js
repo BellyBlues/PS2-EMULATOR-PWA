@@ -1150,6 +1150,18 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		},
 		reset,
 		rise,
+		// A gamepad's press, read by app.js: { step: -1 | 1 } moves along the shelf like the arrows, { confirm: true }
+		// puts the disc in front in like Enter, and counts as Enter for skipping while one goes in.
+		pad({ step = 0, confirm = false }) {
+			if (mode === 'shelf') {
+				if (step)
+					select(target + step);
+				else if (confirm)
+					insert();
+			} else if (confirm && (mode === 'inserting' || mode === 'inserted' || mode === 'ejecting')) {
+				pressToSkip();
+			}
+		},
 		// Whether the insert is under way: the dialog then stays until the boot is covered.
 		get busy() {
 			return mode === 'inserting' || mode === 'inserted' || mode === 'ejecting';
