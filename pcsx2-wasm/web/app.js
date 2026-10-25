@@ -80,6 +80,7 @@
 	const SLOW_HINT_AFTER_MS = 5000;
 	const STARTING_REASSURE_S = 10;
 	const STARTING_LOG_S = 15;
+	const STARTING_GZ_LOG_S = 180; // a .gz is indexed whole first (gzBoot())
 
 	// Frame descriptor (5 x u32) written by the GS thread; see pcsx2web_frame().
 	const FD_SEQ = 0;
@@ -194,6 +195,7 @@
 		starting: 'Starting the PS2…',
 		firstFrame: 'Waiting for the first frame…',
 		reassure: 'Still starting. The first screen can take a few seconds here.',
+		reassureGz: 'Still starting. A .gz image is read whole before the game starts: about a minute for a DVD.',
 		noAnswer: 'The emulator hasn’t answered. The log may say why.',
 		openLog: 'Open the log',
 		alreadyStarting: 'The emulator is already starting.',
@@ -2005,7 +2007,15 @@
 		[2048, 150 * 2048, 24], [2352, 150 * 2048, 0], [2448, 150 * 2048, 0]];
 	const DISC_HEADER_BYTES = 150 * 2048 + 17 * 2448;
 	const DISC_MIN_SIZE = 17 * 2048;
-	const DISC_UNSUPPORTED_RE = /\.(chd|cso|zso|gz|dump)$/i;
+	const DISC_UNSUPPORTED_RE = /\.dump$/i;
+	// Compressed images PCSX2's own readers open (through WebDisc::OpenCFile): the extension and the file's first
+	// bytes must agree.
+	const DISC_COMPRESSED = [
+		{ re: /\.chd$/i, magic: [0x4d, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x48, 0x44] }, // "MComprHD"
+		{ re: /\.cso$/i, magic: [0x43, 0x49, 0x53, 0x4f] }, // "CISO"
+		{ re: /\.zso$/i, magic: [0x5a, 0x49, 0x53, 0x4f] }, // "ZISO"
+		{ re: /\.gz$/i, magic: [0x1f, 0x8b] },
+	];
 	const DISC_BOOT_FULL = 1; // pcsx2web_boot_disc(): the BIOS intro instead of fast boot
 	const DISC_POLL_MS = 500;
 	const DISC_ERROR_MS = 8000;
@@ -2054,8 +2064,8 @@
 		blocked: 'Stop the PS2 first to change the disc.',
 		blockedAny: 'Stop the PS2 first to change the disc or BIOS.',
 		drop: 'Drop to use this disc or BIOS.',
-		notDisc: 'That file isn’t a disc image TabStationToo can read. Use an .iso, .bin or .img of a PS2 disc.',
-		compressed: 'Compressed images (.chd, .cso, .zso, .gz) and block dumps aren’t supported yet. Use an .iso.',
+		notDisc: 'That file isn’t a disc image TabStationToo can read. Use an .iso, .bin, .img, .chd or .cso of a PS2 disc.',
+		compressed: 'Block dumps (.dump) aren’t supported. Use an .iso, .chd or .cso.',
 		unreadable: 'Couldn’t read the disc file. It may have been moved, changed or deleted; choose it again.',
 		denied: (name) => `The browser didn’t allow reading ${name}. Choose it again.`,
 		fetchFailed: (path, why) => `Couldn’t open the disc at ${path} (${why}).`,
@@ -2188,11 +2198,18 @@
 		return null;
 	}
 
+	// A disc image TabStationToo can read, from its name and first bytes: a flat image with an ISO 9660 volume
+	// where PCSX2 looks, or a compressed image whose header matches its extension.
+	function isDiscBytes(name, bytes, size) {
+		const compressed = DISC_COMPRESSED.find((c) => c.re.test(name));
+		if (compressed)
+			return bytes.length >= compressed.magic.length && compressed.magic.every((b, i) => bytes[i] === b);
+		return size >= DISC_MIN_SIZE && discLayout(bytes) !== null;
+	}
+
 	async function isDiscImage(file) {
-		if (file.size < DISC_MIN_SIZE)
-			return false;
 		const bytes = new Uint8Array(await file.slice(0, Math.min(file.size, DISC_HEADER_BYTES)).arrayBuffer());
-		return discLayout(bytes) !== null;
+		return isDiscBytes(file.name, bytes, file.size);
 	}
 
 	function discError(text) {
@@ -2402,7 +2419,7 @@
 		try {
 			[handle] = await window.showOpenFilePicker({
 				id: 'tabstationtoo-disc',
-				types: [{ description: 'PS2 disc images', accept: { 'application/octet-stream': ['.iso', '.bin', '.img'] } }],
+				types: [{ description: 'PS2 disc images', accept: { 'application/octet-stream': ['.iso', '.bin', '.img', '.chd', '.cso', '.zso', '.gz'] } }],
 			});
 		} catch (err) {
 			if (err && err.name === 'AbortError')
@@ -2523,7 +2540,7 @@
 			clearTimeout(timer);
 		}
 		disc.urlPending = false;
-		if (size < DISC_MIN_SIZE || discLayout(bytes) === null) {
+		if (!isDiscBytes(base, bytes, size)) {
 			page.autoBoot = false;
 			discError(DISC_COPY.notDisc);
 			return;
@@ -10132,10 +10149,10 @@
 				? [COPY.firstFrame, ' ', { num: s, unit: 's' }]
 				: [{ name: b ? b.name : '' }, { sep: 1 }, { num: s, unit: 's' }];
 			m.meta = true;
-			if (s >= STARTING_LOG_S)
+			if (s >= startingLogSeconds())
 				m.fine = [[COPY.noAnswer, ' ', { logLink: COPY.openLog }]];
 			else if (s >= STARTING_REASSURE_S) {
-				m.fine = [[COPY.reassure]];
+				m.fine = [[gzBoot() ? COPY.reassureGz : COPY.reassure]];
 			}
 			break;
 		}
@@ -10348,13 +10365,22 @@
 	// newer one when both are due at once, as after a hidden tab).
 	function announceStartingNotice() {
 		const s = (performance.now() - page.bootAt) / 1000;
-		if (s >= STARTING_LOG_S && page.startNotice < 2) {
+		if (s >= startingLogSeconds() && page.startNotice < 2) {
 			page.startNotice = 2;
 			announce(COPY.noAnswer);
 		} else if (s >= STARTING_REASSURE_S && page.startNotice < 1) {
 			page.startNotice = 1;
-			announce(COPY.reassure);
+			announce(gzBoot() ? COPY.reassureGz : COPY.reassure);
 		}
+	}
+
+	// A .gz disc: PCSX2 reads the whole image to index it before the game starts (DISC-DESIGN.md 5.4).
+	function gzBoot() {
+		return !!(disc.runIsDisc && disc.current && /\.gz$/i.test(disc.current.name));
+	}
+
+	function startingLogSeconds() {
+		return gzBoot() ? STARTING_GZ_LOG_S : STARTING_LOG_S;
 	}
 
 	// Focus, announcements and timing that belong to entering a state.
