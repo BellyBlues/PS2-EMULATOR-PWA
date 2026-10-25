@@ -6,6 +6,10 @@
 #include "Host.h"
 #include "CDVD/zlib_indexed.h"
 
+#ifdef __EMSCRIPTEN__
+#include "CDVD/Emscripten/WebDisc.h"
+#endif
+
 #include "common/Console.h"
 #include "common/FileSystem.h"
 #include "common/Error.h"
@@ -183,7 +187,13 @@ bool GzippedFileReader::Open2(std::string filename, Error* error)
 	Close();
 
 	m_filename = std::move(filename);
-	if (!(m_src = FileSystem::OpenCFile(m_filename.c_str(), "rb", error)) || !LoadOrCreateIndex(error))
+#ifdef __EMSCRIPTEN__
+	if (WebDisc::IsDiscPath(m_filename))
+		m_src = WebDisc::OpenCFile(m_filename.c_str(), error);
+	else
+#endif
+		m_src = FileSystem::OpenCFile(m_filename.c_str(), "rb", error);
+	if (!m_src || !LoadOrCreateIndex(error))
 	{
 		Close();
 		return false;

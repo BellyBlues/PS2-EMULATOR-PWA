@@ -3,6 +3,10 @@
 
 #include "CDVD/CsoFileReader.h"
 
+#ifdef __EMSCRIPTEN__
+#include "CDVD/Emscripten/WebDisc.h"
+#endif
+
 #include "common/Assertions.h"
 #include "common/Console.h"
 #include "common/FileSystem.h"
@@ -68,7 +72,12 @@ bool CsoFileReader::Open2(std::string filename, Error* error)
 {
 	Close2();
 	m_filename = std::move(filename);
-	m_src = FileSystem::OpenCFile(m_filename.c_str(), "rb", error);
+#ifdef __EMSCRIPTEN__
+	if (WebDisc::IsDiscPath(m_filename))
+		m_src = WebDisc::OpenCFile(m_filename.c_str(), error);
+	else
+#endif
+		m_src = FileSystem::OpenCFile(m_filename.c_str(), "rb", error);
 
 	bool success = false;
 	if (m_src && ReadFileHeader(error) && InitializeBuffers(error))

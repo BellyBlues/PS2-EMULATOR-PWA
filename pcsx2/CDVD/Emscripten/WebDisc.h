@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <string_view>
 
 class Error;
@@ -132,4 +133,10 @@ namespace WebDisc
 
 	/// A short description of a Result code, for logs.
 	const char* ResultName(s32 result);
+
+	/// A read-only FILE* over the disc opened now (fopencookie), for the readers of compressed images (CHD,
+	/// CSO/ZSO, GZ), which do all their I/O through one. Reads go through a cache of aligned 128 KiB windows, as
+	/// those readers make many small reads and a small read costs about as much as a large one. Null, with an
+	/// error, when the page has no disc open. Close it with std::fclose.
+	std::FILE* OpenCFile(const char* path, Error* error);
 } // namespace WebDisc

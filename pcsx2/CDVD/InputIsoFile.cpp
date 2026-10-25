@@ -46,9 +46,12 @@ static std::unique_ptr<ThreadedFileReader> GetFileReader(const std::string& path
 	const std::string_view extension = Path::GetExtension(path);
 
 #ifdef __EMSCRIPTEN__
-	// A disc the page reads from the user's file through its disc worker. Flat images only: the page
-	// refuses compressed and blockdump images, whose readers open the file themselves.
-	if (WebDisc::IsDiscPath(path))
+	// A disc the page reads from the user's file through its disc worker. Compressed images keep their own
+	// readers, which open the disc through WebDisc::OpenCFile(); everything else (the page refuses blockdumps)
+	// is a flat image.
+	if (WebDisc::IsDiscPath(path) && !StringUtil::compareNoCase(extension, "chd") &&
+		!StringUtil::compareNoCase(extension, "cso") && !StringUtil::compareNoCase(extension, "zso") &&
+		!StringUtil::compareNoCase(extension, "gz"))
 		return std::make_unique<WebDiscFileReader>();
 #endif
 
