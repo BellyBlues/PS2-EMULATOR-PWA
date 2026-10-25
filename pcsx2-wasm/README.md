@@ -72,9 +72,12 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    the download waits until you pick a BIOS.
 2. Without the library (close it with Esc), the slate under it offers **Choose a disc…**; a disc image
    dropped on the page works too:
-   an uncompressed `.iso`, `.bin` or `.img` made from a disc you own. The page checks that the file
-   holds an ISO 9660 volume where PCSX2 looks for one and refuses anything else (compressed
-   `.chd`/`.cso`/`.zso`/`.gz` and `.dump` images get their own message). The file is not copied or
+   an `.iso`, `.bin` or `.img`, or a compressed `.chd`, `.cso`, `.zso` or `.gz`, made from a disc you own.
+   The page checks that a flat file holds an ISO 9660 volume where PCSX2 looks for one, and that a
+   compressed file starts with its format's header, and refuses anything else (`.dump` block dumps get
+   their own message). PCSX2's own readers decompress them, through `WebDisc::OpenCFile()` (a `FILE*`
+   over the disc worker with a cache of 128 KiB windows). A `.gz` is scanned whole at every boot to
+   build its index, so it starts slowly; CHD and CSO start at once. The file is not copied or
    uploaded: the disc worker reads the parts the game asks for, while it runs. In Chrome and Edge
    the picker (or a drop) also gives the page a handle to the file, kept in IndexedDB: after a
    reload the title card offers **Open it again**, which asks the browser for permission and opens
@@ -664,8 +667,9 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 - Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
   continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
   Safari is untested.
-- Discs: uncompressed single-file images only (no CHD, CSO/ZSO, GZ, blockdump or multi-file
-  BIN/CUE), and no disc swap or eject while a game runs.
+- Discs: single-file images only (no CHD with a parent, blockdump or multi-file BIN/CUE), and no
+  disc swap or eject while a game runs. In the disc library, CHD, ZSO and GZ discs are named after
+  their file (no serial, so no cover from ps2-covers); ISO and CSO discs are read for their serial.
 - Not every scene runs at full speed: the EE (main CPU) thread is the usual limit. Guitar Hero, GTA San Andreas
   and Final Fantasy XII's cutscenes run at or near 100 % in Chrome; heavy scenes such as a WWE
   SmackDown vs. Raw 2011 match run at about 50-60 % (`docs/web-port/PERFORMANCE.md`).

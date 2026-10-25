@@ -19,7 +19,7 @@ Please do not report TabStationToo problems to PCSX2.
 
 Early and experimental, but games play.
 
-- **Games** boot from disc images (uncompressed `.iso`, `.bin` or `.img`), read straight from your
+- **Games** boot from disc images (`.iso`, `.bin`, `.img`, or compressed `.chd`, `.cso`, `.zso`, `.gz`), read straight from your
   file. Tested so far: Dragon Ball Z: Budokai Tenkaichi 3, Guitar Hero, Naruto Shippuden: Ultimate
   Ninja 5, Grand Theft Auto: San Andreas, Final Fantasy XII and WWE SmackDown vs. Raw 2011. Saves on
   memory cards are kept in the browser (or in `.ps2` files on your disk in Chromium browsers).
@@ -45,7 +45,7 @@ Early and experimental, but games play.
   slow motion or glitches. Off unless chosen.
 - **Save states:** STATE on the remote (or F1 to save, F3 to load the newest) keeps up to 10 states
   per game in the browser, each with a picture of the moment; a copy can be saved to disk as a `.p2s`.
-- **Not there yet:** rumble, compressed disc images (CHD, CSO, GZ),
+- **Not there yet:** rumble, CHD images with a parent, multi-file BIN/CUE images,
   swapping discs while a game runs, and phones.
 - **Linux:** Chromium-based browsers keep WebGPU off for most GPUs, so the page falls back to
   software drawing. Graphics → Check WebGPU explains how to turn it on (chrome://flags, "Unsafe

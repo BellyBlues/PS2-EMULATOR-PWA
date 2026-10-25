@@ -253,6 +253,7 @@ With reduced motion, every duration is 0. The controls still hide.
   - "Starting the PS2…" / "SCPH-39001.bin · 4 s", then "Waiting for the first frame… 6 s"
   - At 10 s: "Still starting. The first screen can take a few seconds here."
   - At 15 s: "The emulator hasn't answered. The log may say why." with "Open the log"
+  - Booting a `.gz` disc, which PCSX2 reads whole to index it first: at 10 s "Still starting. A .gz image is read whole before the game starts: about a minute for a DVD.", and the 15 s line only at 180 s.
 - **Boot refused:** "The emulator is already starting." / "The emulator refused to boot. The log has details."
 - **Capture:** "Keys go to the PS2" / "Click the screen to play" / when the button has focus: "Press Enter to play"
 - **Hints:**
@@ -431,8 +432,8 @@ A disc is the second thing the page asks for, after the BIOS. It is optional: Bo
 **Removed.** "Remove the disc" (title card or disc menu) forgets the disc and its remembered handle; the BIOS title card comes back and focus goes to Boot. The subtitle confirms: "Disc removed. Boot opens the console's menus."
 
 **Errors** (the slate's coral line; while running, the slate is hidden, so a disc failure shows as a subtitle that stays 8 s, and again on the slate after Stop):
-- "That file isn't a disc image TabStationToo can read. Use an .iso, .bin or .img of a PS2 disc."
-- "Compressed images (.chd, .cso, .zso, .gz) and block dumps aren't supported yet. Use an .iso."
+- "That file isn't a disc image TabStationToo can read. Use an .iso, .bin, .img, .chd or .cso of a PS2 disc." (also a `.chd`, `.cso`, `.zso` or `.gz` whose first bytes are not that format's header)
+- "Block dumps (.dump) aren't supported. Use an .iso, .chd or .cso."
 - "Couldn't read the disc file. It may have been moved, changed or deleted; choose it again."
 - "The browser didn't allow reading <name>. Choose it again."
 - "Couldn't open the disc at /dev-disc/x.iso (HTTP 404)." (or "(network error)", "(no answer in time)", "(no byte ranges)", "(the disc changed)") · "?disc= only accepts addresses on this server." These are also the slate's line after Stop when a `?disc=` disc failed while running.
