@@ -324,6 +324,8 @@ static char s_boot_disc_path[512];
 static char s_boot_state_path[512];
 // Save state results for the page: (sequence << 1) | ok, the sequence counting finished saves and loads.
 static std::atomic<unsigned int> s_state_result{0};
+// (sequence << 1) | ok of the last finished pcsx2web_change_disc(), as s_state_result.
+static std::atomic<unsigned int> s_disc_change_result{0};
 static std::atomic<int> s_boot_disc_flags{0};
 static std::atomic<bool> s_boot_disc_requested{false};
 
@@ -646,6 +648,35 @@ EMSCRIPTEN_KEEPALIVE int pcsx2web_load_state(const char* path)
 EMSCRIPTEN_KEEPALIVE unsigned int pcsx2web_state_result(void)
 {
 	return s_state_result.load(std::memory_order_acquire);
+}
+
+/// Disc swap while the game runs, in two steps as on the console: "" ejects the disc (the tray opens and
+/// PCSX2 closes the old reader), then the page opens the new file in its disc worker and passes its path
+/// ("/disc/<name>") to insert it. Ejecting first means nothing reads the old disc once the worker has
+/// replaced it, and PCSX2's fallback when an insert fails is "no disc", never the old file. Runs on the CPU
+/// thread at its next pause point. 0 if queued, -1 otherwise; pcsx2web_disc_change_result() changes when it
+/// is done.
+EMSCRIPTEN_KEEPALIVE int pcsx2web_change_disc(const char* path)
+{
+	if (!path || (path[0] && (std::strlen(path) >= sizeof(s_boot_disc_path) || !WebDisc::IsDiscPath(path))) ||
+		s_state.load(std::memory_order_acquire) != WEB_STATE_RUNNING)
+		return -1;
+	Host::RunOnCPUThread([path = std::string(path)]() {
+		bool ok = VMManager::HasValidVM();
+		if (ok)
+			ok = VMManager::ChangeDisc(path.empty() ? CDVD_SourceType::NoDisc : CDVD_SourceType::Iso, path);
+		if (!ok)
+			Console.ErrorFmt("pcsx2-wasm: {} failed", path.empty() ? "ejecting the disc" : "inserting " + path);
+		const unsigned int seq = (s_disc_change_result.load(std::memory_order_relaxed) >> 1) + 1;
+		s_disc_change_result.store((seq << 1) | (ok ? 1u : 0u), std::memory_order_release);
+	});
+	return 0;
+}
+
+/// (sequence << 1) | ok of the last finished pcsx2web_change_disc().
+EMSCRIPTEN_KEEPALIVE unsigned int pcsx2web_disc_change_result(void)
+{
+	return s_disc_change_result.load(std::memory_order_acquire);
 }
 
 /// The disc request block the page's disc worker serves (docs/web-port/DISC-DESIGN.md, 4.1).
