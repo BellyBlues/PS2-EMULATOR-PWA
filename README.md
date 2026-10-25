@@ -47,7 +47,9 @@ Early and experimental, but games play.
   per game in the browser, each with a picture of the moment; a copy can be saved to disk as a `.p2s`.
 - **Discs change while a game runs** (the disc menu, or a disc dropped on the page), for games on
   several discs: the tray opens, the new disc goes in, the game goes on.
-- **Not there yet:** rumble, CHD images with a parent, multi-file BIN/CUE images, and phones.
+- **Rumble:** the game's vibration plays on Xbox, DualShock 4 and DualSense pads in Chrome and Edge
+  (a Rumble checkbox under each controller turns it off).
+- **Not there yet:** CHD images with a parent, multi-file BIN/CUE images, and phones.
 - **Linux:** Chromium-based browsers keep WebGPU off for most GPUs, so the page falls back to
   software drawing. Graphics → Check WebGPU explains how to turn it on (chrome://flags, "Unsafe
   WebGPU Support" and "Vulkan").
