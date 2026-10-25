@@ -459,7 +459,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		}, handles);
 		if (!result.discs.length) {
 			els.intakeAside.textContent = COPY.drop;
-			els.intakeError.textContent = noDiscsText(result.compressed);
+			els.intakeError.textContent = noDiscsText();
 			els.intakeError.hidden = false;
 			setMode(previous === 'shelf' ? 'shelf' : 'empty');
 			if (mode === 'empty')
@@ -467,10 +467,10 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 			return;
 		}
 		discs = result.discs;
-		showShelf(result.compressed);
+		showShelf();
 	}
 
-	function showShelf(compressed = 0) {
+	function showShelf() {
 		current = null;
 		buildDiscs();
 		els.intakeAside.textContent = COPY.drop;
@@ -478,7 +478,7 @@ export function createDiscLibrary(root, { host = null, onBooted = () => {}, clea
 		pos = -Math.min(discs.length, G.span); // they roll in from the left
 		select(Math.floor((discs.length - 1) / 2));
 		els.shelf.focus({ preventScroll: true });
-		announce(shelfAnnouncement(discs.length, compressed));
+		announce(shelfAnnouncement(discs.length));
 	}
 
 	async function readDirectory(dir) {

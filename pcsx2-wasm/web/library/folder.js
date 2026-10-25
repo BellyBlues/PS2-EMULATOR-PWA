@@ -19,14 +19,13 @@ let objectUrls = [];
 export const fontsReady = () =>
 	Promise.all([document.fonts.load('720 100px Archivo'), document.fonts.load('500 27px "Chivo Mono"')]).catch(() => {});
 
-// { discs, compressed } for the files of a folder: every disc image with an ISO 9660 volume, named
+// { discs } for the files of a folder: every disc image (with an ISO 9660 volume, or compressed), named
 // from its serial, with the folder's own image for it if there is one. onProgress(done, total).
 // handles: each file's FileSystemFileHandle when the folder came from showDirectoryPicker(), so the
 // player can remember the disc it boots.
 export async function readFolder(files, onProgress = () => {}, handles = null) {
 	const list = [...files].filter((f) => !/(^|\/)\._/.test(f.webkitRelativePath || f.name) && !f.name.startsWith('._'));
-	const candidates = list.filter((f) => DISC_RE.test(f.name));
-	const compressed = list.filter((f) => COMPRESSED_RE.test(f.name)).length;
+	const candidates = list.filter((f) => DISC_RE.test(f.name) || COMPRESSED_RE.test(f.name));
 	const images = new Map();
 	for (const f of list)
 		if (IMAGE_RE.test(f.name))
@@ -54,7 +53,7 @@ export async function readFolder(files, onProgress = () => {}, handles = null) {
 	const titles = await titlesReady;
 	await fontsReady(); // labels are measured in the page's own faces
 	if (!found.length)
-		return { discs: [], compressed };
+		return { discs: [] };
 
 	for (const u of objectUrls)
 		URL.revokeObjectURL(u);
@@ -76,7 +75,7 @@ export async function readFolder(files, onProgress = () => {}, handles = null) {
 		return d;
 	});
 	discs.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }) || a.fileName.localeCompare(b.fileName));
-	return { discs, compressed };
+	return { discs };
 }
 
 // Folders dropped on the page, read through the entries API (every browser has it).
@@ -210,13 +209,8 @@ export function discMeta(d) {
 	return [d.serial || 'No serial', d.region, d.platform === 'ps1' ? 'PS1 disc' : d.media, formatSize(d.size)].filter(Boolean).join(' · ');
 }
 
-export const noDiscsText = (compressed) => (compressed
-	? 'No disc images TabStationToo can read in that folder. Compressed images (.chd, .cso, .zso, .gz) aren’t supported yet.'
-	: 'No disc images in that folder. TabStationToo reads .iso, .bin and .img files.');
+export const noDiscsText = () => 'No disc images in that folder. TabStationToo reads .iso, .bin, .img, .chd, .cso, .zso and .gz files.';
 
-export function shelfAnnouncement(count, compressed) {
-	let text = `${count} ${count === 1 ? 'disc' : 'discs'} on the shelf.`;
-	if (compressed)
-		text += ` ${compressed} compressed ${compressed === 1 ? 'image was' : 'images were'} left out; they aren’t supported yet.`;
-	return text;
+export function shelfAnnouncement(count) {
+	return `${count} ${count === 1 ? 'disc' : 'discs'} on the shelf.`;
 }
