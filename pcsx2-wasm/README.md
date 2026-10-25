@@ -2,12 +2,15 @@
 
 TabStationToo is a browser frontend for the WebAssembly build of PCSX2 (the `pcsx2-wasm`
 target). It is built on PCSX2 (GPL-3.0) and is not affiliated with Sony or the PCSX2 project.
-You pick your own PS2 BIOS and, if you like, a disc image of one of your games, press Boot, and the
-game (or the BIOS menu) renders in a `<canvas>`, driven from the keyboard. Where the browser offers
-WebGPU, the GS draws with PCSX2's hardware renderer on the GPU and posts each frame to the page as an
-`ImageBitmap` (the WebGPU device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise it uses the software
-renderer and its output is copied to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio worklet.
-Memory cards plug into both slots from a library of named cards kept in the browser or in `.ps2` files on disk. There are no save states yet.
+You pick your own PS2 BIOS and a folder of disc images of your own games, put a disc into the PS2
+in the disc library, and the game (or the BIOS menu) renders in a `<canvas>`, driven from the
+keyboard or a gamepad. The EE, IOP, VU0 and VU1 run on WebAssembly JITs that compile the PS2's
+code at run time (`../pcsx2/wasm/`). Where the browser offers WebGPU, the GS draws with PCSX2's
+hardware renderer on the GPU and posts each frame to the page as an `ImageBitmap` (the WebGPU
+device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise it uses the software renderer and its output
+is copied to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio
+worklet. Memory cards plug into both slots from a library of named cards kept in the browser or in
+`.ps2` files on disk. Save states exist only for developers (the Recorder, `?threads=1`).
 
 - `Main.cpp`: the frontend (Host callbacks, settings, CPU thread loop, `pcsx2web_*` exports)
 - `web/`: the page (`index.html`, `app.js`, `disc-worker.js`, `audio-tap.js`, `style.css`,
@@ -62,10 +65,13 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
 
 ## Use
 
-1. Open the URL. The emulator (about 14 MB) starts downloading at once; the screen asks for your
-   BIOS. Press **Choose BIOS file…** or drop the file on the page (usually a 4 MB `.bin`, for
-   example `SCPH-39001.bin`). On touch-only devices the download waits until you pick a BIOS.
-2. To play a game, press **Choose a disc…** on the BIOS's title card, or drop the image on the page:
+1. Open the URL. The emulator (about 14 MB) starts downloading at once and the disc library opens
+   ([Disc library](#disc-library)). Its BIOS tile asks for your BIOS: press **Choose file** or drop
+   the file on the page (usually a 4 MB `.bin`, for example `SCPH-39001.bin`). Its Games tile then
+   takes a folder of disc images, and putting a disc into the PS2 boots it. On touch-only devices
+   the download waits until you pick a BIOS.
+2. Without the library (close it with Esc), the slate under it offers **Choose a disc…**; a disc image
+   dropped on the page works too:
    an uncompressed `.iso`, `.bin` or `.img` made from a disc you own. The page checks that the file
    holds an ISO 9660 volume where PCSX2 looks for one and refuses anything else (compressed
    `.chd`/`.cso`/`.zso`/`.gz` and `.dump` images get their own message). The file is not copied or
@@ -97,7 +103,7 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    the letters of your layout. **Escape** releases the keyboard (it never reaches the PS2); click
    the screen, or press Enter on "Click the screen to play", to take it back. Tab (which moves to
    that button and never reaches the PS2), opening the BIOS menu or About, leaving the window or
-   hiding the tab also release it. Clicking Stop, Crisp, Keys, Log or Fullscreen keeps the keyboard
+   hiding the tab also release it. Clicking Reset or the remote's buttons keeps the keyboard
    on the PS2. Browser shortcuts (Ctrl/Cmd/Alt combinations, F5, F11, F12) keep working. The controls fade after 2.5 s without
    pointer activity; **Keep controls visible** in the Keys drawer turns that off.
    **Gamepads** play too: a gamepad with the browser's standard layout (Xbox, DualShock, DualSense,
@@ -109,13 +115,17 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    gamepads can be swapped. The choices are remembered in this browser. A gamepad that the browser
    does not lay out in the standard way (an 8BitDo in D mode on a Mac, for one) shows **Map controls**
    in that tab: press each control when asked and the mapping is kept in this browser.
-5. Under the screen: **Stop** shuts the VM down (then **Boot again**); the BIOS menu shows where the
-   BIOS is stored and has **Choose another file…** and **Forget this BIOS**; **Sound** opens the
-   volume slider and **Mute** (M mutes and unmutes from the screen too; both are remembered in this
-   browser); **Crisp** switches
-   between sharp and smooth scaling; **Keys** (`?`) and **Log** (`` ` ``, ² on AZERTY) open the
-   drawers; **Fullscreen** (Alt+Enter, or a double-click on the picture) fills the display. The
-   single-key shortcuts only work while focus is on the screen or the controls under it.
+5. Under the screen, the console's front (UI-SPEC.md §16): **Reset** stops the VM (then **Boot
+   again**); **Eject** opens the disc library; the tray opens the disc menu and the plate beside
+   the memory card slots the BIOS menu (where the BIOS is stored, **Choose another file…** and
+   **Forget this BIOS**); the memory card slots open their cards' menus, and the controller ports
+   plug and unplug Player 1 and Player 2. The remote beside it has **VOL** − and + and **MUTE**
+   (M mutes and unmutes from the screen too; both are remembered in this browser), **WIDE**
+   (Fullscreen; Alt+Enter, or a double-click on the picture), **PICTURE** (Smooth, Crisp or CRT),
+   **MENU** (Graphics: renderer and resolution), **CLOCK** (Underclock, per game), **INFO** (the
+   Log, `` ` ``, ² on AZERTY) and, with `?threads=1`, **REC** (the Recorder). `?` opens the Keys
+   drawer. Under the console, the two controllers show what plays each control; click one to change
+   it. The single-key shortcuts only work while focus is on the screen or the controls under it.
 
 Use only a BIOS dumped from a console you own. The file never leaves the browser: it is written
 into the emulator's in-memory file system (`/bios/<name>`) and remembered in the site's IndexedDB
@@ -639,16 +649,17 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 
 ## Current limitations
 
-- No save states, rumble or touch controls yet; fixed key and gamepad layouts (no remapping). Two pads (ports 1 and 2, no multitap). Two memory card slots of 8 MB `.ps2` cards (no multitap, PS1 or folder cards).
+- No save states for players (only the developers' Recorder has them), rumble or touch controls yet. Two pads (ports 1 and 2, no multitap). Two memory card slots of 8 MB `.ps2` cards (no multitap, PS1 or folder cards).
 - Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
   continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
   Safari is untested.
 - Discs: uncompressed single-file images only (no CHD, CSO/ZSO, GZ, blockdump or multi-file
   BIN/CUE), and no disc swap or eject while a game runs.
-- Interpreters only, so most content runs below full speed: game menus mostly run at 60–100 %,
-  3D battles at 10–20 %.
+- Not every scene runs at full speed: the EE (main CPU) thread is the usual limit. Guitar Hero, GTA San Andreas
+  and Final Fantasy XII's cutscenes run at or near 100 % in Chrome; heavy scenes such as a WWE
+  SmackDown vs. Raw 2011 match run at about 50-60 % (`docs/web-port/PERFORMANCE.md`).
 - The hardware renderer on WebGPU needs dual-source blending (not in Safari) and does not have
-  upscaling, PrimID DATE, AA1, CAS or FXAA yet (`docs/web-port/WEBGPU-DESIGN.md`, step 3).
+  upscaling beyond 2×, PrimID DATE, AA1, CAS or FXAA yet (`docs/web-port/WEBGPU-DESIGN.md`, step 3).
 - Only the main BIOS file is loaded (no separate ROM1/ROM2/NVM/MEC files).
 - Needs a recent desktop browser with cross-origin isolation (Chrome, Edge or Firefox; Safari is
   untested). WebGPU presentation also needs JSPI (Chrome 137+, Firefox 157 has it); without it,
