@@ -82,8 +82,14 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    the picker (or a drop) also gives the page a handle to the file, kept in IndexedDB: after a
    reload the title card offers **Open it again**, which asks the browser for permission and opens
    the disc with one press. Other browsers need the file picked again. The disc menu under the
-   screen (the disc's title) has **Choose another disc…** and **Remove the disc**; neither works
-   while the PS2 runs, because there is no disc swap yet.
+   screen (the disc's title) has **Choose another disc…** and **Remove the disc**. While the PS2 runs
+   they swap or eject the disc without stopping it, for games on several discs: the page asks the
+   emulator to eject (`pcsx2web_change_disc("")`, PCSX2's `ChangeDisc` to no disc), opens the new file
+   in the disc worker, then inserts it (`pcsx2web_change_disc("/disc/<name>")`). Ejecting first means
+   nothing reads the old disc once the worker has replaced it; if the new file can't be opened, the
+   worker still serves the old one and it goes back in. A disc dropped on the page while a game runs,
+   and the console's empty tray, swap the same way. `window.PCSX2WebDisc.load(url)` and `.remove()` do
+   it from automated runs.
 3. Press **Boot** (or Enter while the screen has focus). If the emulator is still downloading, the
    boot is queued; press again to cancel. With a disc, PCSX2 fast-boots it as its desktop version
    does (the BIOS intro is skipped) and the game's title, from PCSX2's game database, appears in the
@@ -667,8 +673,8 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 - Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
   continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
   Safari is untested.
-- Discs: single-file images only (no CHD with a parent, blockdump or multi-file BIN/CUE), and no
-  disc swap or eject while a game runs. In the disc library, CHD, ZSO and GZ discs are named after
+- Discs: single-file images only (no CHD with a parent, blockdump or multi-file BIN/CUE). The disc
+  library is for booting: while a game runs, discs change through the disc menu. In the disc library, CHD, ZSO and GZ discs are named after
   their file (no serial, so no cover from ps2-covers); ISO and CSO discs are read for their serial.
 - Not every scene runs at full speed: the EE (main CPU) thread is the usual limit. Guitar Hero, GTA San Andreas
   and Final Fantasy XII's cutscenes run at or near 100 % in Chrome; heavy scenes such as a WWE

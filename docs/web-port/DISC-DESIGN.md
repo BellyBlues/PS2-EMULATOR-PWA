@@ -615,7 +615,11 @@ down.
 - *A failed disc swap keeps the old disc readable*: `open` no longer drops the current disc first
   (4.3). The page offers no swap while a game runs anyway, so PCSX2's own `ChangeDisc()` revert
   path is never asked to reopen a stale generation; that needs a source per generation (v2) before
-  swap can be offered.
+  swap can be offered. *Built differently (2026-10-25):* the swap ejects first
+  (`pcsx2web_change_disc("")`, PCSX2's `ChangeDisc` to no disc, which closes the old reader), then
+  the worker opens the new file, then the disc is inserted. Nothing reads the old generation after
+  the worker drops it, and `ChangeDisc`'s revert after a failed insert goes back to no disc. A
+  failed `open` keeps the old disc in the worker, so the page inserts it again.
 - *An open overtaken by a newer open or a close replies `ok: false` (`CANCELLED`)*, so the page
   never takes it for the current disc.
 - *Publishing is one synchronous step*: `STATE` = no disc, generation + 1, size, generation + 1,
@@ -653,12 +657,12 @@ down.
   was in flight: the read was handed back, the next worker took the disc over under the same
   generation, and the game went on from the language menu to the logos and the intro movie. After
   the third restart, reads failed at once and the slate said so; Stop took 62 ms.
-- Not done: a full-image hash through the C++ reader, disc swap, and measuring the time
+- Not done: a full-image hash through the C++ reader, and measuring the time
   the CPU thread waits in `FinishRead` during movies.
 
 **Open.**
 - CHD parents, blockdump images, and multi-file images.
-- Disc swap and eject while running (needs one source per generation, see above).
+- Disc swap and eject while running: built (eject first, see above); the revert after a failed open is untested.
 - A worker stuck inside a synchronous read (a hung network drive) still holds its requester; the
   page cannot tell it from a slow read. Reads time out only on the C++ side, which then waits for
   the worker to finish the busy slot, and a restart would wait for the stuck worker's lock.
