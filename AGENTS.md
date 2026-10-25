@@ -105,15 +105,18 @@ These notes come from PCSX2's own agent guidelines, kept word for word in
 - `3rdparty/` holds vendored dependencies. Avoid modifying them unless a task requires patching
   one.
 - PCSX2's layout: `pcsx2/` is the emulator core (EE, IOP, VUs, GS, SPU2, input, storage,
-  networking and devices), `pcsx2-qt/` the Qt desktop frontend, `common/` shared utilities and
-  platform abstraction, `pcsx2-gsrunner/` the GS dump runner used for graphics testing,
-  `tests/ctest/` unit tests, `cmake/` build configuration, `bin/` runtime resources, and `tools/`
-  and `updater/` auxiliary programs.
-- Desktop builds follow the [PCSX2 build guide](https://pcsx2.net/docs/advanced/building/). On
-  Linux, dependencies come from `.github/workflows/scripts/linux/build-dependencies-qt.sh deps`.
+  networking and devices), `common/` shared utilities and platform abstraction,
+  `pcsx2-gsrunner/` the GS dump runner used for graphics testing, `tests/ctest/` unit tests,
+  `cmake/` build configuration, `bin/` runtime resources, and `tools/` auxiliary programs.
+- PCSX2's desktop-only parts are removed from `wasm`: the Qt frontend (`pcsx2-qt/`), the Windows
+  updater (`updater/`), the Visual Studio solution and projects (`*.slnx`, `*.vcxproj*`,
+  `*.props`, `common/vsprops/`), PCSX2's CI scripts and GitHub templates, and its Crowdin and
+  Codacy configuration. Desktop builds of the core use CMake; for them, see the
+  [PCSX2 build guide](https://pcsx2.net/docs/advanced/building/) and upstream's own scripts.
 
 Their contribution and communication rules apply to anything proposed to PCSX2 itself (see Git
-and GitHub below). After merging a newer upstream `master`, keep this file on merge conflicts,
+and GitHub below). After merging a newer upstream `master`, resolve modify/delete conflicts on the
+removed desktop-only parts above by keeping them deleted (`git rm`), keep this file on merge conflicts,
 refresh the copy with `git show upstream/master:AGENTS.md > docs/upstream/PCSX2-AGENTS.md`, and
 bring any new engineering guidance over here.
 
