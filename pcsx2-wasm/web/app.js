@@ -2018,6 +2018,7 @@
 	];
 	const DISC_BOOT_FULL = 1; // pcsx2web_boot_disc(): the BIOS intro instead of fast boot
 	const DISC_POLL_MS = 500;
+	const DISC_CHANGE_TIMEOUT_MS = 30000; // pcsx2web_change_disc(): a .gz insert indexes the whole image
 	const DISC_ERROR_MS = 8000;
 	// The check before a boot usually takes milliseconds; the slate says it is reading the disc only after this.
 	const DISC_CHECK_SHOW_MS = 300;
@@ -2077,6 +2078,15 @@
 		checking: 'Reading the disc…',
 		readerFailed: 'The disc reader stopped working. Reload the page to read discs again.',
 		removed: 'Disc removed. Boot opens the console’s menus.',
+		swapping: 'Changing the disc…',
+		swapped: (name) => `Disc changed: ${name}.`,
+		ejected: 'Disc removed. The game goes on with the tray empty.',
+		swapFailed: 'Couldn’t change the disc. The game goes on with the one it had.',
+		swapReverted: 'Couldn’t open that disc, so the old one went back in.',
+		swapEmpty: 'Couldn’t open that disc. The tray is empty; choose a disc again.',
+		insertFailed: 'PCSX2 couldn’t read that disc. The tray is empty; choose another.',
+		menuReason: 'The disc can change once the PS2 runs.',
+		libraryWhileRunning: 'Stop the PS2 to use the disc library. Choose another disc… changes it while it runs.',
 		memcardFailed: 'Couldn’t keep the memory card in this browser. Saves last for this visit.',
 		announceReady: 'Disc ready.',
 		announceRemoved: 'Disc removed.',
@@ -2099,6 +2109,7 @@
 		menuLibrary: $('disc-menu-library'),
 		menuRemove: $('disc-menu-remove'),
 		menuReason: $('disc-menu-reason'),
+		tray: $('tray-library'),
 	};
 
 	const disc = {
@@ -2124,7 +2135,9 @@
 		op: 0, // generation token: a newer choice or Remove wins over an older, slower one
 		urlPending: false, // ?disc= is still being checked: a queued boot waits for it
 		remembered: null, // the last picked disc's handle (Chromium): { handle, name, size, lastModified, title }
-		runIsDisc: false, // the current or last boot booted a disc
+		runIsDisc: false, // the current or last boot booted a disc (false again once a running game's disc is ejected)
+		trayEmpty: false, // a running game's disc was ejected (until a disc goes in, or the next boot)
+		swapping: false, // swapDisc() or removeRunningDisc() is between its steps
 		runTitle: '', // the game's title as PCSX2 reported it during that boot
 		runSerial: '',
 		runGeneration: 0, // the request block's generation the current or last disc boot read
@@ -2222,7 +2235,7 @@
 	async function acceptFile(file, handlePromise) {
 		if (!file)
 			return;
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blockedAny);
 			return;
 		}
@@ -2240,6 +2253,8 @@
 		}
 		if (isDisc) {
 			chooseDisc({ kind: 'file', file, name: file.name, size: file.size }, await (handlePromise || null));
+		} else if (!canChangeBios()) {
+			subtitle(DISC_COPY.blockedAny);
 		} else if (file.size > BIOS_REJECT_ABOVE) {
 			discError(DISC_COPY.notDisc);
 		} else {
@@ -2251,7 +2266,7 @@
 	async function acceptDiscFile(file, handle) {
 		if (!file)
 			return;
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
 			return;
 		}
@@ -2287,12 +2302,7 @@
 		acceptFile(file, handle && handle.then((h) => (h && h.kind === 'file' ? h : null)));
 	}
 
-	function chooseDisc(desc, handle) {
-		if (!canChangeBios()) {
-			subtitle(DISC_COPY.blocked);
-			return;
-		}
-		const op = ++disc.op;
+	function newDiscRecord(desc, handle) {
 		const d = {
 			name: sanitizeDiscName(desc.name), path: '', size: desc.size, kind: handle ? 'handle' : desc.kind,
 			file: desc.file || null, url: desc.url || null, handle: handle || null, title: '', opened: false,
@@ -2302,6 +2312,20 @@
 		const r = disc.remembered;
 		if (r && r.name === desc.name && r.size === desc.size && r.title)
 			d.title = r.title;
+		return d;
+	}
+
+	function chooseDisc(desc, handle) {
+		if (!canChangeDisc()) {
+			subtitle(DISC_COPY.blocked);
+			return;
+		}
+		if (swapping()) {
+			swapDisc(desc, handle);
+			return;
+		}
+		const op = ++disc.op;
+		const d = newDiscRecord(desc, handle);
 		page.error = '';
 		disc.opening = d;
 		pageLog(`Disc chosen: ${desc.name} (${desc.size.toLocaleString('en-US')} bytes${desc.url ? `, ${desc.url}` : ''}).`);
@@ -2325,17 +2349,17 @@
 
 	async function openDiscInWorker(d, op) {
 		if (!disc.attached)
-			return; // opened once the worker is attached
+			return false; // opened once the worker is attached
 		const worker = disc.worker;
 		const msg = d.url ? { type: 'open', url: d.url, name: d.name } : { type: 'open', file: d.file, name: d.name };
 		const reply = await discCall(msg);
 		if (op !== disc.op || disc.opening !== d)
-			return; // a newer choice or Remove won
+			return false; // a newer choice or Remove won
 		if (!reply.ok && worker !== disc.worker) {
 			// The disc reader stopped during the open: nothing was learnt about the disc. It stays the one being
 			// opened, so the restarted reader opens it (startDiscWorker), and a reader that cannot restart says so.
 			pageLog(`The disc reader stopped while it opened ${d.name}; the next one opens it again.`, 'warn');
-			return;
+			return false;
 		}
 		disc.opening = null;
 		if (!reply.ok) {
@@ -2343,10 +2367,11 @@
 			pageLog(`Could not open the disc ${d.name}: ${reply.error ? reply.error.message : 'unknown error'}`, 'warn');
 			page.autoBoot = false;
 			discError(discFailureText(d, reply.error));
-			return;
+			return false;
 		}
 		const prev = disc.current;
 		d.size = (reply.status && reply.status.disc && reply.status.disc.size) || d.size;
+		d.generation = (reply.status && reply.status.disc && reply.status.disc.generation) || 0;
 		try {
 			const FS = window.Module.FS;
 			if (!FS.analyzePath(DISC_DIR).exists)
@@ -2357,7 +2382,7 @@
 		} catch (err) {
 			pageLog(`Could not write the disc placeholder ${d.path}: ${errorText(err)}`, 'warn');
 			discError(DISC_COPY.unreadable);
-			return;
+			return false;
 		}
 		d.opened = true;
 		disc.current = d;
@@ -2369,16 +2394,169 @@
 		pageLog(`Disc ready: ${d.path} (${formatDiscSize(d.size).replace(' ', ' ')}).`);
 		render();
 		if (vmLive())
-			return; // a restarted reader opened it again: the running game cannot use it (reviewRunningDisc)
+			return true; // a swap inserts it (swapDisc); a restarted reader's reopen leaves the game without it (reviewRunningDisc)
 		announce(DISC_COPY.announceReady);
 		if (focusIsFree())
 			focusPrimary();
 		maybeAutoBoot();
+		return true;
+	}
+
+	// ---- swapping the disc while the game runs (UI-SPEC.md §10)
+
+	// The disc can change before a boot, and while a game or the console's menus run (not while it starts, not for
+	// an ELF, not during another swap).
+	function canChangeDisc() {
+		if (canChangeBios())
+			return true;
+		return page.phase === 'ready' && page.vmState === STATE.RUNNING && !devElf.bytes && !disc.swapping;
+	}
+
+	const swapping = () => page.vmState === STATE.RUNNING && !canChangeBios();
+
+	// pcsx2web_change_disc(path): '' ejects, a /disc/ path inserts. Resolves to true or false.
+	function changeDiscInVm(path) {
+		const M = window.Module;
+		return new Promise((resolve) => {
+			if (!M || typeof M._pcsx2web_disc_change_result !== 'function') {
+				resolve(false);
+				return;
+			}
+			const before = M._pcsx2web_disc_change_result() >>> 0;
+			if (M.ccall('pcsx2web_change_disc', 'number', ['string'], [path]) !== 0) {
+				resolve(false);
+				return;
+			}
+			const started = performance.now();
+			const check = () => {
+				const result = M._pcsx2web_disc_change_result() >>> 0;
+				if (result !== before)
+					resolve((result & 1) === 1);
+				else if (performance.now() - started > DISC_CHANGE_TIMEOUT_MS || page.vmState !== STATE.RUNNING)
+					resolve(false);
+				else
+					setTimeout(check, 50);
+			};
+			setTimeout(check, 50);
+		});
+	}
+
+	// The game's disc goes out: PCSX2 closes it and the game sees the tray open.
+	async function ejectRunningDisc() {
+		if (!disc.runIsDisc)
+			return true;
+		const ok = await changeDiscInVm('');
+		if (ok) {
+			disc.runIsDisc = false;
+			disc.trayEmpty = true;
+			disc.runTitle = '';
+			disc.runSerial = '';
+			disc.errorShown = false;
+		}
+		return ok;
+	}
+
+	// The current disc goes into the running PS2. Its title comes back through pcsx2web_game() as at a boot.
+	async function insertRunningDisc(d) {
+		const ok = await changeDiscInVm(d.path);
+		if (ok) {
+			disc.runIsDisc = true;
+			disc.trayEmpty = false;
+			disc.runGeneration = d.generation || (disc.status && disc.status.disc ? disc.status.disc.generation : 0);
+			disc.runTitle = '';
+			disc.runSerial = '';
+			disc.errorShown = false;
+		}
+		return ok;
+	}
+
+	// Eject, open the new file in the worker (so nothing reads the old one any more), insert. If the new file
+	// cannot be opened, the worker still serves the old disc, which goes back in.
+	async function swapDisc(desc, handle) {
+		disc.swapping = true;
+		page.error = '';
+		hideDiscMenu();
+		subtitle(DISC_COPY.swapping);
+		render();
+		const prev = disc.current && disc.current.opened && disc.runIsDisc ? disc.current : null;
+		let line;
+		let swappedOk = false;
+		try {
+			if (!await ejectRunningDisc()) {
+				line = DISC_COPY.swapFailed;
+				return;
+			}
+			const op = ++disc.op;
+			const d = newDiscRecord(desc, handle);
+			disc.opening = d;
+			pageLog(`Disc swap: ${desc.name} (${desc.size.toLocaleString('en-US')} bytes).`);
+			if (!await openDiscInWorker(d, op)) {
+				if (prev && disc.current === prev && await insertRunningDisc(prev)) {
+					line = DISC_COPY.swapReverted;
+				} else {
+					line = DISC_COPY.swapEmpty;
+				}
+				return;
+			}
+			if (!await insertRunningDisc(d)) {
+				line = DISC_COPY.insertFailed;
+				return;
+			}
+			line = DISC_COPY.swapped(d.name);
+			swappedOk = true;
+		} finally {
+			disc.swapping = false;
+			if (line) {
+				subtitle(line, swappedOk ? undefined : DISC_ERROR_MS);
+				announce(line);
+			}
+			pageLog(line || 'Disc swap ended.');
+			statesGameChanged();
+			render();
+		}
+	}
+
+	// Remove the disc while the game runs: the tray stays open, empty.
+	async function removeRunningDisc() {
+		disc.swapping = true;
+		hideDiscMenu();
+		render();
+		let ok = false;
+		try {
+			ok = await ejectRunningDisc();
+			if (ok) {
+				disc.op++;
+				const d = disc.current;
+				disc.current = null;
+				disc.opening = null;
+				if (disc.attached)
+					discCall({ type: 'close' });
+				try {
+					if (d)
+						window.Module.FS.unlink(d.path);
+				} catch {
+					// already gone
+				}
+				forgetRememberedDisc();
+			}
+		} finally {
+			disc.swapping = false;
+			const line = ok ? DISC_COPY.ejected : DISC_COPY.swapFailed;
+			subtitle(line);
+			announce(line);
+			pageLog(line);
+			statesGameChanged();
+			render();
+		}
 	}
 
 	function removeDisc() {
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
+			return;
+		}
+		if (swapping()) {
+			removeRunningDisc();
 			return;
 		}
 		disc.op++;
@@ -2406,7 +2584,7 @@
 	}
 
 	async function openDiscPicker() {
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
 			return;
 		}
@@ -2444,7 +2622,7 @@
 		const rec = disc.remembered;
 		if (!rec)
 			return;
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
 			return;
 		}
@@ -2736,6 +2914,8 @@
 	function reviewRunningDisc() {
 		const status = disc.status;
 		const d = disc.current;
+		if (disc.swapping)
+			return; // the generation changes on purpose; insertRunningDisc() takes the new one
 		if (!status || !disc.runIsDisc || !vmLive() || !d) {
 			if (status && status.state === 'ready')
 				disc.errorShown = false;
@@ -3146,6 +3326,7 @@
 		}
 		const d = disc.current;
 		disc.runIsDisc = !!(d && d.opened && !disc.dead);
+		disc.trayEmpty = false;
 		disc.runTitle = '';
 		disc.runSerial = '';
 		disc.errorShown = false;
@@ -3675,6 +3856,17 @@
 	function renderDiscMenu() {
 		const d = disc.current;
 		setData('disc', d ? 'set' : 'none');
+		// The empty tray opens the library, or in a running game the disc picker (insertWhileRunning).
+		const tray = discEls.tray;
+		const pick = !d && swapping();
+		if (tray && tray.dataset.pick !== String(pick)) {
+			tray.dataset.pick = String(pick);
+			tray.setAttribute('aria-label', pick ? 'Insert a disc' : 'Disc library');
+			if (pick)
+				tray.removeAttribute('aria-haspopup');
+			else
+				tray.setAttribute('aria-haspopup', 'dialog');
+		}
 		if (!d || page.phase === 'dead' || page.phase === 'unsupported') {
 			hideDiscMenu();
 			return;
@@ -3682,9 +3874,11 @@
 		setText(discEls.btnName, discDisplayTitle(d));
 		setText(discEls.menuName, d.name);
 		rich(discEls.menuWhere, [...discSizeParts(d.size), { sep: 1 }, discWhere(d)]);
-		const locked = !canChangeBios();
+		// While a game runs the disc can change (swapDisc) but the library, which boots, waits for Stop.
+		const locked = !canChangeDisc();
+		const libraryLocked = !canChangeBios();
 		for (const item of [discEls.menuChoose, discEls.menuLibrary, discEls.menuRemove]) {
-			if (locked) {
+			if (item === discEls.menuLibrary ? libraryLocked : locked) {
 				item.setAttribute('aria-disabled', 'true');
 				item.setAttribute('aria-describedby', 'disc-menu-reason');
 			} else {
@@ -3692,7 +3886,8 @@
 				item.removeAttribute('aria-describedby');
 			}
 		}
-		discEls.menuReason.hidden = !locked;
+		setText(discEls.menuReason, locked ? DISC_COPY.menuReason : DISC_COPY.libraryWhileRunning);
+		discEls.menuReason.hidden = !libraryLocked;
 	}
 
 	// ---- remembering the disc (File System Access handles, Chromium)
@@ -5407,6 +5602,13 @@
 	let libraryPadHandler = null;
 
 	window.PCSX2WebLibrary = Object.freeze({
+		// The empty tray of a running game: a disc goes in without stopping it (swapDisc). True if handled.
+		insertWhileRunning() {
+			if (!swapping() || !canChangeDisc() || disc.current)
+				return false;
+			openDiscPicker();
+			return true;
+		},
 		// Why a disc can't go in now, or '' when it can.
 		blocked() {
 			if (page.phase === 'dead' || page.phase === 'unsupported' || disc.dead)
@@ -5475,6 +5677,14 @@
 
 	// Read-only hooks for automated tests, next to window.PCSX2Web.
 	window.PCSX2WebDisc = Object.freeze({
+		// Automated runs: a same-origin disc URL, opened as ?disc= opens one (while a game runs, it is swapped in),
+		// and Remove the disc. Both are what the disc menu does.
+		load(url) {
+			if (canChangeDisc())
+				loadDiscFromUrl(url);
+		},
+		remove: () => removeDisc(),
+		swapping: () => disc.swapping,
 		stats: () => ({
 			disc: disc.current ? { name: disc.current.name, path: disc.current.path, size: disc.current.size,
 				kind: disc.current.kind, opened: disc.current.opened, title: disc.current.title,
@@ -5487,7 +5697,7 @@
 			restarts: disc.restarts,
 			runGeneration: disc.runGeneration,
 			readerStats: disc.status ? { ...disc.status.stats } : null,
-			game: { title: disc.runTitle, serial: disc.runSerial, disc: disc.runIsDisc },
+			game: { title: disc.runTitle, serial: disc.runSerial, disc: disc.runIsDisc, trayEmpty: disc.trayEmpty },
 			lastDisc: disc.remembered ? disc.remembered.name : null,
 			memcards: { persistent: memcards.persistent, owner: memcards.owner, otherTab: memcards.otherTab, failed: memcards.failed,
 				loaded: cards.loaded, syncing: memcards.syncing, unloadGuard: memcards.guarded, writes: memcards.writes,
@@ -8691,7 +8901,7 @@
 	function stateKeyNow() {
 		if (page.vmState !== STATE.RUNNING && page.vmState !== STATE.STARTING)
 			return '';
-		if (devElf.bytes)
+		if (devElf.bytes || disc.trayEmpty || disc.swapping)
 			return '';
 		if (!disc.runIsDisc)
 			return STATE_BIOS_KEY;
