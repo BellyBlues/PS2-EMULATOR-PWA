@@ -64,6 +64,7 @@
 	// Which PS2 port the keyboard plays as, and which one the first gamepad does (1 or 2).
 	const PREF_PAD_KEYBOARD = 'pcsx2web.padKeyboard';
 	const PREF_PAD_FIRST = 'pcsx2web.padFirst';
+	const PREF_RUMBLE = 'pcsx2web.rumble.'; // + port: '0' turns that player's rumble off
 	const PREF_HINTED = 'pcsx2web.firstBootHint';
 
 	const SOURCE_URL = 'https://github.com/TabStationToo/TabStationToo';
@@ -6832,8 +6833,68 @@
 		}
 		if (changed)
 			syncPads();
+		rumbleFrame(list, live);
 		if (!any)
 			stopGamepadLoop(); // the next gamepadconnected event starts it again
+	}
+
+	// ---- rumble (UI-SPEC.md §17): the game's motors on its players' gamepads
+
+	// PCSX2 keeps each port's motors in two words (pcsx2web_pad_vibration(): large << 8 | small, 0-255). Each frame
+	// a gamepad that can vibrate (Chromium's vibrationActuator) plays its port's: an effect of RUMBLE_EFFECT_MS,
+	// renewed every RUMBLE_RENEW_MS while it runs, so that a hidden tab or a stopped game never leaves it buzzing.
+	const RUMBLE_EFFECT_MS = 1000;
+	const RUMBLE_RENEW_MS = 700;
+	const rumble = {
+		on: [readPref(PREF_RUMBLE + 1) !== '0', readPref(PREF_RUMBLE + 2) !== '0'],
+		buf: null, words: null,
+		playing: new Map(), // Gamepad.index -> { value, at }
+	};
+
+	function canRumble(g) {
+		const gp = navigator.getGamepads && navigator.getGamepads()[g.index];
+		return !!(gp && gp.vibrationActuator && typeof gp.vibrationActuator.playEffect === 'function');
+	}
+
+	function rumbleWords() {
+		const M = window.Module;
+		if (!M || typeof M._pcsx2web_pad_vibration !== 'function')
+			return null;
+		const buf = heapBuffer();
+		if (rumble.buf !== buf) {
+			rumble.buf = buf;
+			rumble.words = new Uint32Array(buf, M._pcsx2web_pad_vibration() >>> 0, 2);
+		}
+		return rumble.words;
+	}
+
+	function rumbleFrame(list, live) {
+		const words = live ? rumbleWords() : null;
+		const now = performance.now();
+		for (const g of gamepads.values()) {
+			const gp = g.connected ? list[g.index] : null;
+			const act = gp && gp.vibrationActuator;
+			if (!act || typeof act.playEffect !== 'function')
+				continue;
+			const port = g.port;
+			const value = words && port && rumble.on[port - 1] && !g.mapper ? Atomics.load(words, port - 1) : 0;
+			const p = rumble.playing.get(g.index) || { value: 0, at: 0 };
+			if (value === p.value && (value === 0 || now - p.at < RUMBLE_RENEW_MS))
+				continue;
+			p.value = value;
+			p.at = now;
+			rumble.playing.set(g.index, p);
+			try {
+				const done = value
+					? act.playEffect('dual-rumble', { duration: RUMBLE_EFFECT_MS, strongMagnitude: (value >>> 8) / 255,
+						weakMagnitude: (value & 255) / 255 })
+					: typeof act.reset === 'function' ? act.reset() : null;
+				if (done && typeof done.catch === 'function')
+					done.catch(() => {}); // a newer effect replaced it, or the gamepad went away
+			} catch {
+				// the gamepad cannot play it
+			}
+		}
 	}
 
 	// Plays one state of a gamepad: what the PS2 gets (sent by the caller's syncPads), the Gamepad tab's
@@ -7289,6 +7350,8 @@
 				also: el.querySelector('.pad-also'),
 				map: el.querySelector('.pad-map'),
 				reset: el.querySelector('.pad-reset'),
+				rumble: el.querySelector('.pad-rumble'),
+				rumbleInput: el.querySelector('.pad-rumble-input'),
 				cable: [$(`cable-${port}-wall`), $(`cable-${port}`), $(`cable-${port}-front-wall`), $(`cable-${port}-front`)],
 				lit: false,
 			};
@@ -7306,6 +7369,12 @@
 			}
 			for (const c of el.querySelectorAll('.p-stick'))
 				u.sticks[c.dataset.stick] = c;
+			u.rumbleInput.checked = rumble.on[port - 1];
+			u.rumbleInput.addEventListener('change', () => {
+				rumble.on[port - 1] = u.rumbleInput.checked;
+				writePref(PREF_RUMBLE + port, u.rumbleInput.checked ? '1' : '0');
+				pageLog(`Rumble for Player ${port}: ${u.rumbleInput.checked ? 'on' : 'off'}.`);
+			});
 			u.map.addEventListener('click', () => {
 				const g = gamepads.get(padShown(port));
 				if (!g || g.mapper)
@@ -7511,6 +7580,7 @@
 				others.push(o.name);
 		setText(u.also, others.length ? `${others.join(' and ')} also ${others.length > 1 ? 'play' : 'plays'} as Player ${port}.` : '');
 		u.map.hidden = !g || !g.custom;
+		u.rumble.hidden = !g || !canRumble(g);
 		setText(u.map, g && g.map ? 'Map again' : 'Map all controls');
 		u.reset.hidden = id === null || (id === 'keyboard' ? !keyBindsChanged() : !g || !g.map);
 		setText(u.reset, id === 'keyboard' ? 'Reset the keys' : g && g.custom ? 'Clear the mapping' : 'Reset the controls');
@@ -11021,6 +11091,7 @@
 			gpuMode: gpu.mode,
 			latency: latencySummary(),
 			surface: surfaceFeed.width ? `${surfaceFeed.width}x${surfaceFeed.height}@${surfaceFeed.scale}` : null,
+			rumble: page.phase === 'ready' && rumbleWords() ? [0, 1].map((i) => Atomics.load(rumble.words, i)) : null,
 		}),
 		logText: () => logLines.map((l) => l.text).join('\n'),
 		// Tests: the copy asked for with ?capture= of the first frame presented at vsync n or later

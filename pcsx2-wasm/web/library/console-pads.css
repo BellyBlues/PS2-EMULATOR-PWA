@@ -321,6 +321,15 @@ body[data-chrome="hidden"] .cables {
   outline-offset: 2px;
 }
 
+.pad-rumble input:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.pad-rumble[hidden] {
+  display: none;
+}
+
 .pad-dev-hint {
   font-size: 13px;
   color: var(--ink-3);
