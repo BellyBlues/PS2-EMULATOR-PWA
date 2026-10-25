@@ -7,7 +7,8 @@ TabStationToo runs PlayStation 2 emulation in a browser tab. It is the
 around it. You bring the BIOS from your own console and disc images of your own games; nothing is
 uploaded anywhere.
 
-**Try it:** https://tabstationtoo.github.io/TabStationToo/ (desktop Chrome or Edge).
+**Try it:** https://tabstationtoo.github.io/TabStationToo/ (desktop Chrome or Edge; Firefox works
+too).
 
 TabStationToo is built on PCSX2 and would not exist without the PCSX2 team and its contributors,
 who have developed it for more than twenty years. It is an independent project: it is not
@@ -16,42 +17,55 @@ Please do not report TabStationToo problems to PCSX2.
 
 ## Status
 
-Early and experimental.
+Early and experimental, but games play.
 
-- Games boot from disc images (uncompressed `.iso`, `.bin` or `.img`), read straight from your
-  file. One game has been tested so far, Dragon Ball Z: Budokai Tenkaichi 3 (PAL): it runs from
-  its language menu through the title and menus into a battle, driven from the keyboard, and its
-  save on a memory card is kept in the browser and loaded again after a reload.
-- The BIOS still boots on its own: the start-up animation, the console's menus and its settings.
-- Sound plays: PCSX2's sound chip emulation (SPU2) through a Web Audio worklet, with a Sound control
-  for volume and mute (M). Below full speed the sound is time-stretched, as in PCSX2 on the desktop:
-  continuous and at the right pitch, but slowed down with the picture, so a battle at 10–20 % sounds
-  smeared. Browsers only start sound after a key press or click on the page; pressing Boot counts.
-- Speed: the emulated CPU is the limit, because a browser cannot run PCSX2's faster recompilers
-  (see below). Measured in that game in Chrome on a Ryzen 7 PRO 7840U laptop, with other jobs
-  running: title screen and logos 100 % of full speed, menus 60–100 %, character select 60–95 %,
-  movies 20–70 %, and battles 10–16 % (5–8 of the PS2's 50 frames per second), which is not
-  playable yet. Drawing is not what slows it down.
-- Gamepads play too (the standard layout of Xbox, DualShock, DualSense and Switch Pro pads; any other
-  gamepad can be mapped by its owner), and the
-  keyboard and each gamepad can be Player 1 or Player 2 (Keys, then Gamepad). In Firefox and Zen, set
+- **Games** boot from disc images (uncompressed `.iso`, `.bin` or `.img`), read straight from your
+  file. Tested so far: Dragon Ball Z: Budokai Tenkaichi 3, Guitar Hero, Naruto Shippuden: Ultimate
+  Ninja 5, Grand Theft Auto: San Andreas, Final Fantasy XII and WWE SmackDown vs. Raw 2011. Saves on
+  memory cards are kept in the browser (or in `.ps2` files on your disk in Chromium browsers).
+- **Speed:** many scenes now run at or near full speed in Chrome. Guitar Hero plays a song at
+  100 % with rare dips, GTA San Andreas averages about 99 % on foot, and Final Fantasy XII's
+  cutscenes run at 100 %. The heaviest scenes are still slower: a WWE SmackDown vs. Raw 2011 match
+  runs at about 50-60 %. Every measurement is in
+  [docs/web-port/PERFORMANCE.md](docs/web-port/PERFORMANCE.md).
+- **The disc library** is the home page: choose your BIOS and a folder of disc images, pick a disc
+  from the shelf (mouse, keyboard or gamepad) and put it in a PS2 whose tray opens. One insert in
+  ten, the disc needs a clean first. With "reduce motion" set in your system (on Linux, GNOME's
+  animations switched off), the animations are skipped.
+- **Graphics:** PCSX2's hardware renderer on WebGPU, with the software renderer as a fallback;
+  native or 2× internal resolution, and Smooth, Crisp or CRT (PCSX2's Lottes shader) pictures. The
+  picture sits in a drawn CRT television, above a drawing of the console's front.
+- **Sound:** PCSX2's sound chip emulation (SPU2) through a Web Audio worklet. Below full speed it is
+  time-stretched, as in PCSX2 on the desktop. Browsers only start sound after a key press or click.
+- **Controls:** the keyboard and gamepads (Xbox, DualShock, DualSense, Switch Pro and other standard
+  pads; any other gamepad can be mapped), each as Player 1 or Player 2. Every key and button can be
+  changed by clicking it on the controller drawn under the console. In Firefox and Zen, set
   `dom.gamepad.non_standard_events.enabled` to true in `about:config`, or quick taps can be lost.
-- Not there yet: save states, rumble, remapping keys and buttons, compressed disc images (CHD, CSO, GZ), and swapping discs
-  while a game runs.
-- Desktop Chrome and Edge are the targets. Other browsers may work; phones are not supported yet.
+- **Underclock:** PCSX2's EE cycle rate, chosen per game, makes heavy scenes faster at the risk of
+  slow motion or glitches. Off unless chosen.
+- **Not there yet:** save states for players, rumble, compressed disc images (CHD, CSO, GZ),
+  swapping discs while a game runs, and phones.
+- **Linux:** Chromium-based browsers keep WebGPU off for most GPUs, so the page falls back to
+  software drawing. Graphics → Check WebGPU explains how to turn it on (chrome://flags, "Unsafe
+  WebGPU Support" and "Vulkan").
 
 ## How it works
 
-- PCSX2's core is compiled with [Emscripten](https://emscripten.org) to WebAssembly. The
-  emulated PS2 processors run on PCSX2's interpreters (its recompilers emit x86 or ARM code,
-  which a browser cannot run), on threads backed by `SharedArrayBuffer`.
-- The PS2's graphics are drawn by PCSX2's software renderer and shown in a `<canvas>`. A WebGPU
-  renderer is planned.
+- PCSX2's core is compiled with [Emscripten](https://emscripten.org) to WebAssembly, on threads
+  backed by `SharedArrayBuffer`.
+- A browser cannot run PCSX2's recompilers, which write x86 or ARM code. TabStationToo has its own
+  JITs instead: the EE (main CPU), IOP (I/O CPU), VU0 and VU1 (vector units) are compiled to
+  WebAssembly modules at run time, and checked bit for bit against PCSX2's interpreters
+  ([docs/web-port/VU1-JIT-DESIGN.md](docs/web-port/VU1-JIT-DESIGN.md)).
+- The PS2's graphics are drawn by PCSX2's hardware renderer ported to WebGPU
+  ([docs/web-port/WEBGPU-DESIGN.md](docs/web-port/WEBGPU-DESIGN.md)). Without WebGPU, PCSX2's
+  software renderer draws on a 2D canvas.
 - The PS2's sound is mixed by PCSX2 on the emulated CPU's thread and played by an Emscripten Wasm
-  Audio Worklet, which reads PCSX2's audio stream on the browser's audio thread
-  ([docs/web-port/AUDIO-DESIGN.md](docs/web-port/AUDIO-DESIGN.md)).
-- The page (`pcsx2-wasm/web/`) is plain HTML, CSS and JavaScript with no build step and no
-  third-party requests. The BIOS you pick stays in your browser (IndexedDB).
+  Audio Worklet ([docs/web-port/AUDIO-DESIGN.md](docs/web-port/AUDIO-DESIGN.md)).
+- The page (`pcsx2-wasm/web/`) is plain HTML, CSS and JavaScript with no build step. It makes no
+  third-party requests except disc covers from the
+  [ps2-covers](https://github.com/xlenore/ps2-covers) collection, fetched by serial. The BIOS you
+  pick stays in your browser (IndexedDB).
 - A disc image is never copied: a worker reads the parts the game asks for from your file and
   hands them to the emulator through shared memory
   ([docs/web-port/DISC-DESIGN.md](docs/web-port/DISC-DESIGN.md)). Memory cards come from a
@@ -94,9 +108,10 @@ required headers and listens on localhost only:
 python3 tools/wasm/serve.py
 ```
 
-Open http://127.0.0.1:8080/ and choose your BIOS file. Then press **Choose a disc…** (or drop a
-disc image on the page) and press Boot; without a disc, Boot opens the console's own menus. Click
-the screen to give it the keyboard, and press Esc to take the keyboard back. The Keys panel shows
+Open http://127.0.0.1:8080/. The disc library opens: choose your BIOS file and the folder with
+your disc images (or drop them on the page), then put a disc in. To start without a disc, close the
+library (Esc) and press Boot: the console's own menus appear. Click the screen to give it the keyboard,
+and press Esc to take the keyboard back. The controllers drawn under the console show and change
 the controls.
 
 More detail, including the frontend's API and testing options, is in
@@ -115,11 +130,13 @@ anywhere else in this repository.
 
 | Path | What it is |
 |---|---|
-| `pcsx2-wasm/` | The browser frontend: `Main.cpp` (the emulator's entry point and the API the page uses) and `web/` (the page) |
+| `pcsx2-wasm/` | The browser frontend: `Main.cpp` (the emulator's entry point and the API the page uses) and `web/` (the page; `web/library/` is the disc library, console, TV and controllers) |
 | `pcsx2-headless/` | A windowless runner for Node.js, used to test and benchmark without a browser |
-| `common/Emscripten/`, `pcsx2/wasm/`, `pcsx2/CDVD/Emscripten/` | WebAssembly platform code for PCSX2's core (`CDVD/Emscripten/` reads discs through the page's disc worker) |
-| `tools/wasm/` | Dependency build script, the dev server, and the scripts that assemble and smoke-test the deployed site |
-| `docs/web-port/` | Porting plan and interface design |
+| `pcsx2/wasm/` | The WebAssembly JITs (EE, IOP, VU0, VU1) and their fuzzers and lockstep checks |
+| `pcsx2/GS/Renderers/WebGPU/` | The WebGPU renderer; its shaders are in `bin/resources/shaders/webgpu/` |
+| `common/Emscripten/`, `pcsx2/CDVD/Emscripten/`, `pcsx2/DEV9/Emscripten/` | WebAssembly platform code for PCSX2's core (`CDVD/Emscripten/` reads discs through the page's disc worker) |
+| `tools/wasm/` | Dependency build script, the dev server, the crowd benchmark (`bench/`), and the scripts that assemble and smoke-test the deployed site |
+| `docs/web-port/` | Porting plan, interface design, the design of each part, and the performance record |
 | `docs/upstream/` | PCSX2's own guidance kept for reference (its agent guidelines) |
 | everything else | PCSX2, with changes for WebAssembly where needed |
 
