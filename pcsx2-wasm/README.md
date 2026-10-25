@@ -10,7 +10,7 @@ hardware renderer on the GPU and posts each frame to the page as an `ImageBitmap
 device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise it uses the software renderer and its output
 is copied to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio
 worklet. Memory cards plug into both slots from a library of named cards kept in the browser or in
-`.ps2` files on disk. Save states exist only for developers (the Recorder, `?threads=1`).
+`.ps2` files on disk. Save states (STATE on the remote, F1 and F3) are kept per game in the browser.
 
 - `Main.cpp`: the frontend (Host callbacks, settings, CPU thread loop, `pcsx2web_*` exports)
 - `web/`: the page (`index.html`, `app.js`, `disc-worker.js`, `audio-tap.js`, `style.css`,
@@ -379,6 +379,17 @@ compile a block once it has run 128 times, within 4 ms of compiling per vsync (`
 `-eejit-hot N[,M[,B]]`, `-iopjit-hot N[,M[,B]]` and `-jit-budget US` change that, and
 `-jit-compile-stats VSYNCS` prints their compile time, total and worst vsync, every VSYNCS vsyncs.
 
+### Save states
+
+STATE on the remote (UI-SPEC.md §19) saves and loads PCSX2 save states (`.p2s`) of the running game, with
+F1 (save) and F3 (load the newest) while the screen or its controls have focus. They are kept per game serial
+(the console's menus have their own key) in IndexedDB, `pcsx2-web-states`, at most 10 per game, each with a
+128 × 96 JPEG of the picture at that moment (the next WebGPU frame, or the 2D canvas). The emulator writes and
+reads them in `/states` through `pcsx2web_save_state()` and `pcsx2web_load_state()`, the calls the Recorder's
+developer states use; the two share one busy lock. PCSX2 refuses to load while a memory card was written in
+the last few seconds, so the page checks the cards first and says so. "Open a state file…" loads a `.p2s`
+into the running game and keeps it with that game's states (a file does not say which game it is from).
+
 ### Disc library
 
 The page's home is a dialog with a shelf of the discs in a folder and a PS2 to put them in
@@ -649,7 +660,7 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 
 ## Current limitations
 
-- No save states for players (only the developers' Recorder has them), rumble or touch controls yet. Two pads (ports 1 and 2, no multitap). Two memory card slots of 8 MB `.ps2` cards (no multitap, PS1 or folder cards).
+- No rumble or touch controls yet. Two pads (ports 1 and 2, no multitap). Two memory card slots of 8 MB `.ps2` cards (no multitap, PS1 or folder cards).
 - Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
   continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
   Safari is untested.

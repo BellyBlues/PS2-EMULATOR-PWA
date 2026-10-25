@@ -43,7 +43,9 @@ Early and experimental, but games play.
   `dom.gamepad.non_standard_events.enabled` to true in `about:config`, or quick taps can be lost.
 - **Underclock:** PCSX2's EE cycle rate, chosen per game, makes heavy scenes faster at the risk of
   slow motion or glitches. Off unless chosen.
-- **Not there yet:** save states for players, rumble, compressed disc images (CHD, CSO, GZ),
+- **Save states:** STATE on the remote (or F1 to save, F3 to load the newest) keeps up to 10 states
+  per game in the browser, each with a picture of the moment; a copy can be saved to disk as a `.p2s`.
+- **Not there yet:** rumble, compressed disc images (CHD, CSO, GZ),
   swapping discs while a game runs, and phones.
 - **Linux:** Chromium-based browsers keep WebGPU off for most GPUs, so the page falls back to
   software drawing. Graphics → Check WebGPU explains how to turn it on (chrome://flags, "Unsafe
