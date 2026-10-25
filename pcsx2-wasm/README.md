@@ -30,7 +30,7 @@ tools/wasm/build-dependencies-wasm.sh deps-wasm        # once; output in deps-wa
 
 emcmake cmake -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$PWD/deps-wasm" \
-  -DENABLE_QT_UI=OFF -DENABLE_GSRUNNER=OFF -DENABLE_TESTS=OFF
+  -DENABLE_GSRUNNER=OFF -DENABLE_TESTS=OFF
 ninja -C build-wasm pcsx2-wasm
 ```
 

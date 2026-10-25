@@ -110,7 +110,7 @@ jobs:
           source ~/emsdk/emsdk_env.sh > /dev/null
           ccache --zero-stats > /dev/null
           emcmake cmake -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_QT_UI=OFF -DENABLE_TESTS=OFF \
+            -DENABLE_TESTS=OFF \
             -DCMAKE_PREFIX_PATH="$PWD/deps-wasm" -DCMAKE_FIND_ROOT_PATH="$PWD/deps-wasm" \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           ninja -C build-wasm pcsx2-wasm 2>&1 | tee build.log

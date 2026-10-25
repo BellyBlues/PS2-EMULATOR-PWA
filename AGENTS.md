@@ -37,7 +37,7 @@ Emscripten 6.0.12 (emsdk), CMake, Ninja and Python 3:
 source ~/emsdk/emsdk_env.sh
 tools/wasm/build-dependencies-wasm.sh deps-wasm      # once
 emcmake cmake -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_QT_UI=OFF -DENABLE_TESTS=OFF \
+  -DENABLE_TESTS=OFF \
   -DCMAKE_PREFIX_PATH="$PWD/deps-wasm" -DCMAKE_FIND_ROOT_PATH="$PWD/deps-wasm" \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ninja -C build-wasm pcsx2-wasm pcsx2-headless
