@@ -292,7 +292,7 @@ With reduced motion, every duration is 0. The controls still hide.
   - "About TabStationToo."
   - "PCSX2, compiled to WebAssembly, running entirely in this tab."
   - "Use only a BIOS dumped from a console you own. It's kept in this browser (IndexedDB), never sent anywhere, and you can forget it from the BIOS menu."
-  - "Works today: the BIOS menus and games from disc images, with sound, a keyboard and gamepads, and memory cards kept in this browser or in files on your disk. Most games run well below full speed for now. Not yet: save states."
+  - "Works today: the BIOS menus and games from disc images, with sound, a keyboard and gamepads, and memory cards kept in this browser or in files on your disk. Many games run at or near full speed, the heaviest scenes still below. Save states are kept in this browser."
   - "Built from PCSX2, GPL-3.0-or-later. Source"
   - "PlayStation and PS2 are trademarks of Sony Interactive Entertainment. This project isn't affiliated with or endorsed by Sony."
   - "Type: Archivo and Chivo Mono by Omnibus-Type (OFL 1.1). Icons: Phosphor (MIT)." Each name links to its licence file.
@@ -633,3 +633,27 @@ Below the first screen (the room: marquee and theatre, as tall as the window) li
 ## 18. The television
 
 The screen sits in an old CRT television, drawn as a wireframe in the console's style (the SVG in `index.html`, 1080 × 952 units with the screen 1000 × 750 at 40, 64: a slim set, so that the picture keeps as much of the room as it can; `library/console-tv.css`): a deep cabinet with a sliver of its top, the tube's dark surround, and under the screen a speaker grille, a blank plate (no maker's name), a power button with its light (green while the PS2 starts or runs, like the console's), a channel dial with its ticks and a volume knob, on two feet. The screen and the slate shrink to leave the set room (the screen's width is the largest that lets the whole set fit the stage) and move up so that the set is centred; their corners round like a tube's glass. In the set the screen has no frame line (the amber one of §5 is gone: the tally and "Keys go to the PS2" under it say where keys go); keyboard focus on the screen lights the tube's surround in light grey instead. The set is decoration only (`aria-hidden`, no controls). It is not shown in fullscreen, where the picture fills the screen as before, nor under 640 px, where the screen takes the width.
+
+## 19. Save states
+
+A save state is a snapshot of the whole PS2 at one moment, PCSX2's `.p2s` format, so states move between TabStationToo and desktop PCSX2 of the same version. It is not a memory card save: the game never sees it, and loading one puts the console back to that moment (the memory cards stay as they are, as in PCSX2). Plain words: "save state", "state".
+
+**STATE** (`#btn-state`, `.rm-small` on the remote, `popovertarget="state-menu"`), at the top of the remote's right column, over CLOCK and INFO (the three 27 px apart). With the Recorder shown, the remote grows a fourth column (42 px wider) and REC moves there, centred. Accessible name "Save states"; with states for the running game, "Save states, 3 for this game". Never disabled. Shortcuts as on the desktop: **F1** saves a state, **F3** loads the newest state of the running game; both only while focus is on the screen or the controls under it, and the Keys drawer lists them.
+
+**The menu** (`#state-menu`, popover, `role="group"`, 320 px, placed like the Underclock menu, focuses its first enabled item).
+- **This game:** the running game's title (or its serial), "The console's menus" while the BIOS runs alone, or "No game running".
+- **Save state** (Phosphor `camera`, "F1" on the right in mono): saves at the CPU thread's next pause, then lists it first. "Saving…" while it runs (about a second; the picture pauses). Disabled while nothing runs, described by "Start a game to save its state."
+- **The states** of the running game (by serial; the console's menus have their own), newest first, at most 10: a game with 10 replaces its oldest on Save state, and the fine print says so once there are 10 ("10 states: saving replaces the oldest."). Each row is a button: a thumbnail of the picture at that moment (64 × 48, 4:3, 1 px line), the time ("Today 19:42", "Yesterday 08:10", "12 Oct 21:03"), and under it "Newest · F3" for the first, otherwise the size ("14.2 MB"). Choosing a row loads it into the running game ("Loading…" on the row). A **More** button (`dots-three`, "More for the state of today 19:42") opens a view with the time, then **Save a copy to disk…** (a download, `<serial> <date> <time>.p2s`), **Delete** (no question: the copy to disk is the backup) and **Back to the states**.
+- **Open a state file…** (`folder-open`): loads a `.p2s` into the running game and adds it to this game's states. Disabled while nothing runs.
+- With no states for the game: "No states for this game yet." in ink-2 above Open.
+- Fine print: "Kept in this browser." · "States only load into the game they were saved from, in this version of TabStationToo or one close to it."
+
+**Storage.** IndexedDB (`pcsx2-web-states`): one record per state with the serial, the game's title, the time, the size, the thumbnail (JPEG) and the `.p2s` bytes. The page asks for persistent storage as for memory cards. A state saved while another TabStationToo tab is open still saves (states are written once, never shared live).
+
+**Loading.** Only into a running game. The list only holds the running game's states; a file from Open a state file… says nothing of its game (as in PCSX2, a state from another game loads that game's moment over the disc, and the game usually crashes), so the picker is for this game's own copies. While the game wrote to a memory card in the last 5 s (PCSX2's busy time) PCSX2 refuses to load, to protect the card: "The game is saving to a memory card. Try again in a few seconds." A state PCSX2 cannot load (another version, a damaged file) leaves the game running as it was: "That state didn't load. It may be from another version of TabStationToo." The Log has PCSX2's reason.
+
+**Errors** (a coral line in the menu): "Couldn't save the state. The log may say why." · "The browser has no room for another state. Delete one or save a copy to disk." · "Couldn't read that file. Try choosing it again." · "That file isn't a PS2 save state (.p2s)."
+
+**Subtitles and announcer:** "State saved." · "State loaded: today 19:42." · "State deleted." · "No state for this game yet. F1 saves one." (F3 with none).
+
+**Not here:** loading a state before a game boots (resume from the library), states of games without a serial in the library, and sharing states between browsers other than by file.
