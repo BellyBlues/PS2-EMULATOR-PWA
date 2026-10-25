@@ -679,6 +679,13 @@ EMSCRIPTEN_KEEPALIVE unsigned int pcsx2web_disc_change_result(void)
 	return s_disc_change_result.load(std::memory_order_acquire);
 }
 
+/// Each pad port's vibration, two words (large motor << 8 | small motor, 0-255 each) that PCSX2 updates on every pad
+/// poll; the page plays them on that player's gamepads (UI-SPEC.md §17). Read with Atomics; never blocks.
+EMSCRIPTEN_KEEPALIVE const void* pcsx2web_pad_vibration(void)
+{
+	return InputManager::GetWebPadVibration();
+}
+
 /// The disc request block the page's disc worker serves (docs/web-port/DISC-DESIGN.md, 4.1).
 EMSCRIPTEN_KEEPALIVE const void* pcsx2web_disc_block(void)
 {

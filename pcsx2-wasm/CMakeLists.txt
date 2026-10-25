@@ -90,6 +90,7 @@ list(APPEND PCSX2_WASM_EXPORTS
 	_pcsx2web_state_result
 	_pcsx2web_change_disc
 	_pcsx2web_disc_change_result
+	_pcsx2web_pad_vibration
 )
 # Per-game TFX pipeline lists (Main.cpp, WebGPUHost.h).
 list(APPEND PCSX2_WASM_EXPORTS

@@ -1463,8 +1463,25 @@ void InputManager::SetUSBVibrationIntensity(u32 port, float large_or_single_moto
 	SetPadVibrationIntensity(Pad::NUM_CONTROLLER_PORTS + port, large_or_single_motor_intensity, small_motor_intensity);
 }
 
+#ifdef __EMSCRIPTEN__
+static std::atomic<u32> s_web_pad_vibration[2] = {};
+
+const std::atomic<u32>* InputManager::GetWebPadVibration()
+{
+	return s_web_pad_vibration;
+}
+#endif
+
 void InputManager::SetPadVibrationIntensity(u32 pad_index, float large_or_single_motor_intensity, float small_motor_intensity)
 {
+#ifdef __EMSCRIPTEN__
+	if (pad_index < std::size(s_web_pad_vibration))
+	{
+		const u32 large = static_cast<u32>(std::clamp(large_or_single_motor_intensity, 0.0f, 1.0f) * 255.0f + 0.5f);
+		const u32 small = static_cast<u32>(std::clamp(small_motor_intensity, 0.0f, 1.0f) * 255.0f + 0.5f);
+		s_web_pad_vibration[pad_index].store((large << 8) | small, std::memory_order_relaxed);
+	}
+#endif
 	for (PadVibrationBinding& pad : s_pad_vibration_array)
 	{
 		if (pad.pad_index != pad_index)
@@ -1514,6 +1531,11 @@ void InputManager::SetPadVibrationIntensity(u32 pad_index, float large_or_single
 
 void InputManager::PauseVibration()
 {
+#ifdef __EMSCRIPTEN__
+	// The game sets the motors again on its next pad poll after the pause.
+	for (std::atomic<u32>& word : s_web_pad_vibration)
+		word.store(0, std::memory_order_relaxed);
+#endif
 	for (PadVibrationBinding& binding : s_pad_vibration_array)
 	{
 		for (u32 motor_index = 0; motor_index < MAX_MOTORS_PER_PAD; motor_index++)
