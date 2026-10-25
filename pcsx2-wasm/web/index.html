@@ -189,6 +189,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       <span class="rm-cap rm-cap-vol" aria-hidden="true">VOL</span>
       <button type="button" class="rm-btn rm-pill rm-picture" id="btn-crisp" aria-label="Picture: Smooth">PICTURE</button>
       <button type="button" class="rm-btn rm-pill rm-menu" id="btn-gfx" popovertarget="gfx-menu" aria-controls="gfx-menu" aria-expanded="false" aria-label="Graphics">MENU</button>
+      <button type="button" class="rm-btn rm-small rm-state" id="btn-state" popovertarget="state-menu" aria-controls="state-menu" aria-expanded="false" aria-keyshortcuts="F1 F3" aria-label="Save states">STATE</button>
       <button type="button" class="rm-btn rm-small rm-clock" id="btn-ee" popovertarget="ee-menu" aria-controls="ee-menu" aria-expanded="false" aria-label="Underclock, off">CLOCK</button>
       <button type="button" class="rm-btn rm-small rm-info" id="btn-log" aria-expanded="false" aria-controls="log-drawer" aria-keyshortcuts="`" aria-label="Log">INFO</button>
       <button type="button" class="rm-btn rm-small rm-rec" id="btn-rec" aria-expanded="false" aria-controls="rec-drawer" aria-label="Recorder" hidden><span class="rm-dot" aria-hidden="true"></span>REC</button>
@@ -270,7 +271,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
       </div>
     </div>
     <div class="drawer-foot">
-      <p class="shortcuts"><span class="shortcut"><kbd>?</kbd> Keys</span><span class="vh">, </span><span class="shortcut"><kbd data-code="Backquote">`</kbd> Log</span><span class="vh">, </span><span class="shortcut"><kbd>M</kbd> Mute</span><span class="vh">, </span><span class="shortcut"><kbd>Alt</kbd><span class="vh">+</span><kbd>Enter</kbd> Fullscreen</span><span class="vh">, </span><span class="shortcut"><kbd>Esc</kbd> Release the keyboard</span></p>
+      <p class="shortcuts"><span class="shortcut"><kbd>?</kbd> Keys</span><span class="vh">, </span><span class="shortcut"><kbd data-code="Backquote">`</kbd> Log</span><span class="vh">, </span><span class="shortcut"><kbd>M</kbd> Mute</span><span class="vh">, </span><span class="shortcut"><kbd>F1</kbd> Save state</span><span class="vh">, </span><span class="shortcut"><kbd>F3</kbd> Load the newest</span><span class="vh">, </span><span class="shortcut"><kbd>Alt</kbd><span class="vh">+</span><kbd>Enter</kbd> Fullscreen</span><span class="vh">, </span><span class="shortcut"><kbd>Esc</kbd> Release the keyboard</span></p>
       <label class="check"><input type="checkbox" id="keep-chrome"><span>Keep controls visible</span></label>
       <button type="button" class="btn-icon" id="keys-close" aria-label="Close Keys"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-x"/></svg></button>
     </div>
@@ -503,6 +504,28 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
     </fieldset>
   </div>
 
+  <div class="menu gfx-menu state-menu" id="state-menu" popover role="group" aria-label="Save states">
+    <div class="state-view" data-view="list">
+      <p class="menu-file"><span class="menu-where">This game</span><span class="gfx-mode" id="state-game">No game running</span></p>
+      <div class="menu-items">
+        <button type="button" class="menu-item" id="state-new" aria-keyshortcuts="F1"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-camera"/></svg><span class="label" id="state-new-label">Save state</span><kbd class="cap-key" aria-hidden="true">F1</kbd></button>
+        <div class="state-list" id="state-list" role="group" aria-label="States of this game"></div>
+        <p class="state-none" id="state-none" hidden>No states for this game yet.</p>
+        <button type="button" class="menu-item" id="state-open"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-folder-open"/></svg>Open a state file…</button>
+        <p class="menu-reason" id="state-reason">Start a game to save its state.</p>
+      </div>
+    </div>
+    <div class="state-view" data-view="more" hidden>
+      <p class="menu-file"><span class="menu-name" id="state-more-name"></span><span class="menu-where" id="state-more-where"></span></p>
+      <div class="menu-items">
+        <button type="button" class="menu-item" id="state-copy"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-download-simple"/></svg>Save a copy to disk…</button>
+        <button type="button" class="menu-item" id="state-delete"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-trash"/></svg>Delete</button>
+        <button type="button" class="menu-item" id="state-back"><svg class="icon" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-left"/></svg>Back to the states</button>
+      </div>
+    </div>
+    <p class="card-error" id="state-error" role="alert" hidden></p>
+  </div>
+
   <div class="menu" id="bios-menu" popover role="group" aria-label="BIOS">
     <p class="menu-file"><span class="menu-name" id="menu-name"></span><span class="menu-where" id="menu-where"></span></p>
     <div class="menu-items" id="menu-items">
@@ -622,7 +645,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
   <h2 id="about-title" tabindex="-1" autofocus>About TabStationToo.</h2>
   <p>TabStationToo runs PCSX2, the PlayStation&nbsp;2 emulator, compiled to WebAssembly, entirely in this tab.</p>
   <p>Use only a BIOS dumped from a console you own, and disc images of games you own. The BIOS is kept in this browser (IndexedDB), never sent anywhere, and you can forget it from the BIOS menu. A disc image is read from your file as the game needs it; nothing is copied or uploaded.</p>
-  <p>Works today: the BIOS menus and games from disc images, with sound, a keyboard and gamepads, and memory cards kept in this browser or in files on your disk. Most games run well below full speed for now. Not yet: save states.</p>
+  <p>Works today: the BIOS menus and games from disc images, with sound, a keyboard and gamepads, and memory cards kept in this browser or in files on your disk. Many games run at or near full speed, the heaviest scenes still below. Save states are kept in this browser.</p>
   <p>Built on <a href="https://github.com/PCSX2/pcsx2" target="_blank" rel="noopener noreferrer">PCSX2<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a>, GPL-3.0-or-later. <a class="source-link" href="https://github.com/TabStationToo/TabStationToo" target="_blank" rel="noopener noreferrer">Source<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> (opens in a new tab)</span></a></p>
   <p class="fine">PlayStation and PS2 are trademarks of Sony Interactive Entertainment. TabStationToo isn’t affiliated with or endorsed by Sony or the PCSX2 project.</p>
   <p class="fine">Type: <a href="fonts/Archivo-OFL.txt" target="_blank" rel="noopener noreferrer">Archivo<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> licence (opens in a new tab)</span></a> and <a href="fonts/ChivoMono-OFL.txt" target="_blank" rel="noopener noreferrer">Chivo Mono<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> licence (opens in a new tab)</span></a> by Omnibus-Type (OFL 1.1). Icons: <a href="icons/Phosphor-LICENSE.txt" target="_blank" rel="noopener noreferrer">Phosphor<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> licence (opens in a new tab)</span></a> (MIT). Service worker: <a href="coi-serviceworker-LICENSE.txt" target="_blank" rel="noopener noreferrer">coi-serviceworker<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> licence (opens in a new tab)</span></a> by Guido Zuidhof (MIT). Cable physics: <a href="vendor/matter-js-LICENSE.txt" target="_blank" rel="noopener noreferrer">matter-js<svg class="icon-ext" aria-hidden="true" focusable="false"><use href="icons.svg#i-arrow-up-right"/></svg><span class="vh"> licence (opens in a new tab)</span></a> by Liam Brummitt and contributors (MIT).</p>
@@ -634,6 +657,7 @@ Cross-Origin-Embedder-Policy: require-corp</pre>
 <input type="file" id="disc-input" hidden accept=".iso,.ISO,.bin,.BIN,.img,.IMG">
 <input type="file" id="card-input" hidden accept=".ps2,.PS2">
 <input type="file" id="state-input" hidden accept=".p2s,.P2S">
+<input type="file" id="player-state-input" hidden accept=".p2s,.P2S">
 <noscript><p class="noscript">TabStationToo needs JavaScript and WebAssembly to run.</p></noscript>
 </body>
 </html>

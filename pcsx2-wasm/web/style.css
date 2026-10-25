@@ -1735,6 +1735,54 @@ p.fine {
   outline-offset: -2px;
 }
 
+.state-list {
+  display: grid;
+}
+
+.state-list:empty {
+  display: none;
+}
+
+.state-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.state-row .state-pick {
+  flex: 1;
+  min-width: 0;
+  gap: 12px;
+  padding-right: 4px;
+}
+
+.state-thumb {
+  flex: none;
+  width: 64px;
+  height: 48px;
+  margin: 6px 0;
+  border: 1px solid var(--line-2);
+  background: #000;
+  object-fit: cover;
+}
+
+.state-pick .state-thumb + .state-pick-text {
+  padding: 6px 0;
+}
+
+.state-row .card-more {
+  flex: none;
+  align-self: center;
+  margin-right: 8px;
+}
+
+.state-none {
+  margin: 0;
+  padding: 6px 16px;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--ink-2);
+}
+
 .card-form {
   display: grid;
   gap: 6px;
