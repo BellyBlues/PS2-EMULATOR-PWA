@@ -326,6 +326,13 @@ body[data-chrome="hidden"] .cables {
   outline-offset: 2px;
 }
 
+.pad-rumble {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 12px;
+}
+
 .pad-rumble[hidden] {
   display: none;
 }

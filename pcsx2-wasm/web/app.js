@@ -6851,6 +6851,35 @@
 		playing: new Map(), // Gamepad.index -> { value, at }
 	};
 
+	// The Test button: the strong motor, then the weak one, on every gamepad that plays as this player, whether the
+	// game's rumble is on or off (it tests the gamepad). The game's own motors take over at their next change.
+	const RUMBLE_TEST_MS = 400;
+	function testRumble(port) {
+		const list = navigator.getGamepads ? navigator.getGamepads() : [];
+		const acts = [];
+		for (const g of connectedGamepads()) {
+			const gp = g.port === port ? list[g.index] : null;
+			if (gp && gp.vibrationActuator && typeof gp.vibrationActuator.playEffect === 'function')
+				acts.push(gp.vibrationActuator);
+		}
+		const play = (strong, weak, delay) => {
+			for (const act of acts) {
+				try {
+					const done = act.playEffect('dual-rumble', { startDelay: delay, duration: RUMBLE_TEST_MS, strongMagnitude: strong, weakMagnitude: weak });
+					if (done && typeof done.catch === 'function')
+						done.catch(() => {});
+				} catch {
+					// the gamepad cannot play it
+				}
+			}
+		};
+		play(1, 0, 0);
+		setTimeout(() => play(0, 1, 0), RUMBLE_TEST_MS + 150);
+		pads.note[port - 1] = acts.length ? 'Rumble test: the strong motor, then the weak one.' : 'No gamepad playing as this player can rumble.';
+		pageLog(`Rumble test for Player ${port} on ${acts.length} gamepad${acts.length === 1 ? '' : 's'}.`);
+		renderPads();
+	}
+
 	function canRumble(g) {
 		const gp = navigator.getGamepads && navigator.getGamepads()[g.index];
 		return !!(gp && gp.vibrationActuator && typeof gp.vibrationActuator.playEffect === 'function');
@@ -7352,6 +7381,7 @@
 				reset: el.querySelector('.pad-reset'),
 				rumble: el.querySelector('.pad-rumble'),
 				rumbleInput: el.querySelector('.pad-rumble-input'),
+				rumbleTest: el.querySelector('.pad-rumble-test'),
 				cable: [$(`cable-${port}-wall`), $(`cable-${port}`), $(`cable-${port}-front-wall`), $(`cable-${port}-front`)],
 				lit: false,
 			};
@@ -7375,6 +7405,8 @@
 				writePref(PREF_RUMBLE + port, u.rumbleInput.checked ? '1' : '0');
 				pageLog(`Rumble for Player ${port}: ${u.rumbleInput.checked ? 'on' : 'off'}.`);
 			});
+			u.rumbleTest.setAttribute('aria-label', `Test rumble for Player ${port}`);
+			u.rumbleTest.addEventListener('click', () => testRumble(port));
 			u.map.addEventListener('click', () => {
 				const g = gamepads.get(padShown(port));
 				if (!g || g.mapper)
