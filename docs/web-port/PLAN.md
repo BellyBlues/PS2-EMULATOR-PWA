@@ -473,13 +473,13 @@ Done: `ARCH_WASM`/`SIMD_SSE` (`common/Pcsx2Defs.h`, `cmake/BuildParameters.cmake
 
 ## 9. Week-1 starter checklist
 
-Builds on the existing worktree. Run from `/home/nassim/Desktop/Startups/pcsx2-web-wasm`. Another session owns uncommitted work there (`pcsx2-wasm/`, `tools/wasm/serve.py`, `GSDeviceNull`, root `CMakeLists.txt`): coordinate before editing, and stage only your own files.
+Builds on the existing worktree. Run from the repository root (`/home/nassim/Desktop/Startups/tabstationtoo` on the owner's machine). Another session owns uncommitted work there (`pcsx2-wasm/`, `tools/wasm/serve.py`, `GSDeviceNull`, root `CMakeLists.txt`): coordinate before editing, and stage only your own files.
 
 **Day 1: reproduce the toolchain, the Node boot and the browser build.**
 ```bash
 cd ~/emsdk && ./emsdk install 6.0.12 && ./emsdk activate 6.0.12
 source ~/emsdk/emsdk_env.sh && emcc --version          # expect 6.0.12
-cd /home/nassim/Desktop/Startups/pcsx2-web-wasm
+cd /home/nassim/Desktop/Startups/tabstationtoo
 tools/wasm/build-dependencies-wasm.sh deps-wasm        # static, -pthread, -sSUPPORT_LONGJMP=wasm
 emcmake cmake -S . -B build-wasm -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
