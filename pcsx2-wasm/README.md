@@ -677,9 +677,10 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 - Discs: single-file images only (no CHD with a parent, blockdump or multi-file BIN/CUE). The disc
   library is for booting: while a game runs, discs change through the disc menu. In the disc library, CHD, ZSO and GZ discs are named after
   their file (no serial, so no cover from ps2-covers); ISO and CSO discs are read for their serial.
-- Not every scene runs at full speed: the EE (main CPU) thread is the usual limit. Guitar Hero, GTA San Andreas
-  and Final Fantasy XII's cutscenes run at or near 100 % in Chrome; heavy scenes such as a WWE
-  SmackDown vs. Raw 2011 match run at about 50-60 % (`docs/web-port/PERFORMANCE.md`).
+- Not every scene runs at full speed on every machine: the EE (main CPU) thread is the usual limit. Guitar
+  Hero, GTA San Andreas and Final Fantasy XII's cutscenes run at or near 100 % in Chrome, and a WWE SmackDown
+  vs. Raw 2011 match runs smoothly on a Ryzen 7 7840U at full power. A power manager capping the CPU (TLP on
+  Linux, even on mains) costs a lot: under such a cap that match read 50-60 % (`docs/web-port/PERFORMANCE.md`).
 - The hardware renderer on WebGPU needs dual-source blending (not in Safari) and does not have
   upscaling beyond 2×, PrimID DATE, AA1, CAS or FXAA yet (`docs/web-port/WEBGPU-DESIGN.md`, step 3).
 - Only the main BIOS file is loaded (no separate ROM1/ROM2/NVM/MEC files).

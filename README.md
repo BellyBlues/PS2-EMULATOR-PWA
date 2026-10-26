@@ -25,8 +25,10 @@ Early and experimental, but games play.
   memory cards are kept in the browser (or in `.ps2` files on your disk in Chromium browsers).
 - **Speed:** many scenes now run at or near full speed in Chrome. Guitar Hero plays a song at
   100 % with rare dips, GTA San Andreas averages about 99 % on foot, and Final Fantasy XII's
-  cutscenes run at 100 %. The heaviest scenes are still slower: a WWE SmackDown vs. Raw 2011 match
-  runs at about 50-60 %. Every measurement is in
+  cutscenes run at 100 %. Heavy scenes need a fast CPU: a WWE SmackDown vs. Raw 2011 match runs
+  smoothly on a Ryzen 7 7840U laptop at full power. (On Linux, check that a power manager such as
+  TLP is not capping the CPU on mains power: an earlier 50-60 % reading of that match came from
+  exactly that.) Every measurement is in
   [docs/web-port/PERFORMANCE.md](docs/web-port/PERFORMANCE.md).
 - **The disc library** is the home page: choose your BIOS and a folder of disc images, pick a disc
   from the shelf (mouse, keyboard or gamepad) and put it in a PS2 whose tray opens. One insert in

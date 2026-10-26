@@ -145,7 +145,7 @@ earlier items above.
 **How to read this.** "Verified" means read in this tree at `a65e4ea5cd`; paths are relative to the
 repository root and line numbers are those of that commit. "Measured" means observed by the spike (Node
 24.19.0 with V8 13.6, and Chrome 155, on a Ryzen 7 PRO 7840U shared with other jobs, so ±30% between
-runs), by the phase-1 workload instrumentation (BT3, 1500 PAL vsyncs from a savestate at the start of a
+runs, and with its CPU capped by TLP, so absolute times are slow; see `PERFORMANCE.md`), by the phase-1 workload instrumentation (BT3, 1500 PAL vsyncs from a savestate at the start of a
 fight, MTVU on), or by the reviews' analyses of that data. "Estimate" means a judgement nobody has
 measured. Game data (microprograms, dumps, screenshots, savestates) stays outside the repository; only
 statistics appear here.

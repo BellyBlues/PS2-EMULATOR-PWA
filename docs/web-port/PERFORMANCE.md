@@ -6,6 +6,15 @@ Update it with every optimization (newest entries at the bottom of each list). N
 Apple M1 Max unless noted; "speed" is the emulator's speed in percent of a real PS2, with the frame
 limiter off when it is above 100 %.
 
+**Numbers from the Ryzen 7 PRO 7840U before 2026-10-26 were taken with its CPU capped.** On that laptop
+TLP (Linux power management) held the CPU back on mains power as well as on battery; fixed on 2026-10-26
+(`CPU_SCALING_MAX_FREQ_ON_AC=5132000`, energy preference `performance`). Their absolute speeds are too low.
+Comparisons made there stay valid (both sides ran interleaved under the same cap), and so do the shares of
+a thread's time, which are ratios. The SVR 2011 numbers below are the ones most affected: with the cap
+removed the owner reports that the game runs smoothly (not measured again yet). Before measuring on Linux,
+check that `/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq` equals `cpuinfo_max_freq` and that
+`tlp-stat -p` (or `powerprofilesctl`) shows no power-saving profile on mains.
+
 ## How speed is measured
 
 - **Crowd benchmark** (`tools/wasm/bench/`): a PS2 program with no menu that draws 1, 100, 200 and
@@ -335,7 +344,8 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   - flag computation costs about 10 instructions per flag;
   - a few rare delay-slot cases still go to the interpreter.
 - **WWE SmackDown vs. Raw 2011** (NTSC-U, SLUS-21939; a 6-man Hell in a Cell fight from the owner's save
-  state, which sits on the pause menu with the whole scene still drawn; Ryzen 7 7840U). 92 % headless with the
+  state, which sits on the pause menu with the whole scene still drawn; Ryzen 7 7840U, under the TLP CPU cap
+  noted at the top: the percentages are too low, the shares stand). 92 % headless with the
   null renderer, 93 % in Chromium on the 780M (WebGPU): the GPU is not the limit. VU1 is at 100 %: 15,800
   programs and 2.6 M instructions a vsync, 3.6 MB of PATH1 packets. Share of the VU thread (after `9cf1444b2`):
 
@@ -355,7 +365,9 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   6 %, `VIF1transfer` 4 %, `vu1ExecMicro` 3 %). A state taken in live action, not on the pause menu, is still to be
   measured.
 - **SVR 2011 in live action** (the same fight unpaused with a scripted Cross, then a state saved 1,800 vsyncs
-  later; the owner's page recording of a match agrees: 50-60 % with the EE at 100 % and VU1 at 55-65 %). About 61 %
+  later; the owner's page recording of a match agrees: 50-60 % with the EE at 100 % and VU1 at 55-65 %). All of
+  this was under the TLP CPU cap noted at the top: with the cap removed (2026-10-26) the owner reports the game
+  running smoothly, so the "1.65 times" below overstates what the EE lacks; measure again before planning on it. About 61 %
   headless with the null renderer on a quiet machine (50 % while the browser ran too): the EE needs about 1.65 times
   its speed. Share of the EE thread: generated EE, IOP
   and VU0 code 56 % (thin: no block above 1.2 %), VIF 10 % (`vifCode_Unpack` 5.6 %), `intExecute` 6 %, GIF and
@@ -363,5 +375,5 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   The idle loop skip finds 473 sites and skips none: the hottest (`0x1b51b0`, about 3,600 entries a vsync) polls
   bit 8 of a DMA channel's CHCR with a timeout counter in s1, which changes every iteration, so the skip refuses it;
   it is only some 15,000 instructions a vsync. Interpreter calls are about 10,000 a vsync (CACHE 3,900, COP2 2,300).
-  So this game is the case for the faster EE compiler (`EE-JIT-REGIONS.md` on `Yousri-v2`).
+  So this game was the case for the faster EE compiler (`EE-JIT-REGIONS.md` on `Yousri-v2`), on a capped CPU.
 - **SPU2 mixing**: 5-10 % of the EE thread. It processes all 48 voices every sample by design.

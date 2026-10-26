@@ -59,7 +59,10 @@ Every change must be verified, not assumed.
   `source ~/emsdk/emsdk_env.sh`): Node 22's V8 copies the function table into every module the JITs
   generate, and a game then exhausts the heap within minutes.
 - Performance: measure with the crowd benchmark (`tools/wasm/bench/README.md`); `?threads=1` on the
-  page shows which emulator thread limits a game.
+  page shows which emulator thread limits a game. First check that the CPU runs at full power: on the
+  owner's laptop TLP capped it even on mains until 2026-10-26, and every 7840U number before then is too
+  low (`docs/web-port/PERFORMANCE.md`, top). `scaling_max_freq` must equal `cpuinfo_max_freq` in
+  `/sys/devices/system/cpu/cpu0/cpufreq/`.
 - Browser: `python3 tools/wasm/serve.py [--port N] [--bios-dir DIR] [web root]`, then open
   `index.html` (or `index.html?bios=dev-bios/<file>` with `--bios-dir`). Test UI changes in a
   real browser at desktop and phone widths, with the keyboard.
