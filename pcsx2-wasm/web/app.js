@@ -6875,10 +6875,50 @@
 		};
 		play(1, 0, 0);
 		setTimeout(() => play(0, 1, 0), RUMBLE_TEST_MS + 150);
+		// Not left to the effect's duration, which some gamepads ignore in Chromium (stopAllRumble()).
+		setTimeout(() => {
+			for (const act of acts) {
+				try {
+					const done = typeof act.reset === 'function' ? act.reset() : null;
+					if (done && typeof done.catch === 'function')
+						done.catch(() => {});
+				} catch {
+					// gone
+				}
+			}
+		}, 2 * RUMBLE_TEST_MS + 150);
 		pads.note[port - 1] = acts.length ? 'Rumble test: the strong motor, then the weak one.' : 'No gamepad playing as this player can rumble.';
 		pageLog(`Rumble test for Player ${port} on ${acts.length} gamepad${acts.length === 1 ? '' : 's'}.`);
 		renderPads();
 	}
+
+	// Every gamepad's motors off now. Chromium does not always end an effect after its duration (a DualShock or
+	// DualSense kept rumbling after its tab was closed, until the browser quit), so the page stops them itself when it
+	// goes away, is hidden or loses focus: then rumbleFrame() no longer runs to send the zero.
+	function stopAllRumble() {
+		const list = navigator.getGamepads ? navigator.getGamepads() : [];
+		for (const gp of list) {
+			const act = gp && gp.vibrationActuator;
+			if (!act || typeof act.reset !== 'function')
+				continue;
+			try {
+				const done = act.reset();
+				if (done && typeof done.catch === 'function')
+					done.catch(() => {});
+			} catch {
+				// gone
+			}
+		}
+		for (const p of rumble.playing.values())
+			p.value = 0;
+	}
+
+	for (const [target, type] of [[window, 'pagehide'], [window, 'beforeunload'], [window, 'blur'], [document, 'freeze']])
+		target.addEventListener(type, stopAllRumble);
+	document.addEventListener('visibilitychange', () => {
+		if (document.visibilityState === 'hidden')
+			stopAllRumble();
+	});
 
 	function canRumble(g) {
 		const gp = navigator.getGamepads && navigator.getGamepads()[g.index];
