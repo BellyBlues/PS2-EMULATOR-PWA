@@ -1,0 +1,13 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="90" fill="#11111b"/>
+  <rect x="70" y="110" width="372" height="230" rx="24"
+        fill="#292943" stroke="#8585ff" stroke-width="12"/>
+  <text x="256" y="252" font-family="Arial,sans-serif"
+        font-size="100" font-weight="bold" fill="#ffffff"
+        text-anchor="middle">PS2</text>
+  <path d="M150 390h212" stroke="#8585ff" stroke-width="16"
+        stroke-linecap="round"/>
+  <circle cx="180" cy="390" r="22" fill="#8585ff"/>
+  <circle cx="332" cy="390" r="22" fill="#8585ff"/>
+</svg>
