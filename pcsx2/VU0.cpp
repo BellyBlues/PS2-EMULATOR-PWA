@@ -17,6 +17,9 @@
 #include "VUmicro.h"
 #include "Vif_Dma.h"
 #include "MTVU.h"
+#ifdef ARCH_WASM
+#include "wasm/VU0Jit.h"
+#endif
 
 #define _Ft_ _Rt_
 #define _Fs_ _Rd_
@@ -87,6 +90,52 @@ void _vu0FinishMicro() { _vu0run(0, 1, 0); } // Runs VU0 Micro Until E-Bit End
 void vu0Finish()	   { _vu0run(0, 0, 0); } // Runs VU0 Micro Until E-Bit End (doesn't stall EE)
 void vu0Sync()		   { _vu0run(0, 0, 1); } // Runs VU0 until it catches up
 
+// vu0Sync(), then _vu0FinishMicro() if the move is interlocked (QMFC2, CFC2).
+static __fi void _vu0SyncFinish(bool interlocked)
+{
+#ifdef ARCH_WASM
+	// The same in one run of VU0 to its end instead of two (Tekken Tag Tournament reads every vertex it skins on VU0
+	// back with QMFC2.I: one Execute fewer per program). Execute() stops between instructions and the next one goes
+	// on from there, so both end on the same VU0 state; what differs is _vu0FinishMicro()'s own work, which it skips
+	// when vu0Sync() already ended the program: the JIT tells whether it would have (VU0Jit::EndWindow). The rest of
+	// _vu0FinishMicro() then follows in its order, after the run instead of around it: VU0 reads no EE state, except
+	// for raising the D/T bits' interrupt (left to the usual path, as the cycle rate, which scales each Execute).
+	if (interlocked && (VU0.VI[REG_VPU_STAT].UL & 1) && EmuConfig.Speedhacks.EECycleRate == 0 &&
+		!(VU0.VI[REG_FBRST].UL & 0xc) && VU0Jit::CanTrackWindow())
+	{
+		// vu0Sync()
+		if (!EmuConfig.Cpu.Recompiler.EnableEE)
+			intUpdateCPUCycles();
+		const s32 runCycles = (s64)(cpuRegs.cycle - VU0.cycle);
+		if (runCycles >= 0)
+		{
+			VU0Jit::BeginWindow(VU0.cycle + runCycles);
+			do
+			{
+				CpuVU0->Execute(0x7fffffff);
+			} while (VU0.VI[REG_VPU_STAT].UL & 1);
+			if (VU0Jit::EndWindow())
+				return; // _vu0FinishMicro() finds VU0 stopped
+
+			// _vu0FinishMicro(): its Execute() would have left nextBlockCycles from this cpuRegs.cycle.
+			if (!EmuConfig.Cpu.Recompiler.EnableEE)
+				intUpdateCPUCycles();
+			const u64 startcycle = cpuRegs.cycle;
+			VU0.nextBlockCycles = (VU0.cycle - cpuRegs.cycle) + 1;
+			cpuRegs.cycle += (VU0.cycle - startcycle);
+			CpuVU1->ExecuteBlock(0);
+			return;
+		}
+		// vu0Sync() returned at once; _vu0FinishMicro() as usual (its own cycle update follows).
+		_vu0FinishMicro();
+		return;
+	}
+#endif
+	vu0Sync();
+	if (interlocked)
+		_vu0FinishMicro();
+}
+
 namespace R5900 {
 namespace Interpreter{
 namespace OpcodeImpl
@@ -114,11 +163,7 @@ namespace OpcodeImpl
 
 
 void QMFC2() {
-	vu0Sync();
-
-	if (cpuRegs.code & 1) {
-		_vu0FinishMicro();
-	}
+	_vu0SyncFinish(cpuRegs.code & 1);
 
 	if (_Rt_ == 0) return;
 	cpuRegs.GPR.r[_Rt_].UD[0] = VU0.VF[_Fs_].UD[0];
@@ -138,11 +183,7 @@ void QMTC2() {
 }
 
 void CFC2() {
-	vu0Sync();
-
-	if (cpuRegs.code & 1) {
-		_vu0FinishMicro();
-	}
+	_vu0SyncFinish(cpuRegs.code & 1);
 
 	if (_Rt_ == 0) return;
 

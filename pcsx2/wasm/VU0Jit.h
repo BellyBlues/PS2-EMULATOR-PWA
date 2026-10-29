@@ -35,4 +35,11 @@ namespace VU0Jit
 {
 	void SetLockstep(bool enabled); // every VU0 Execute on the JIT and on the interpreter, compared
 	void LogReport();
+
+	// Whether WasmVU0::Execute runs VU0 on its own dispatcher (not the interpreter, not lockstep): it can then tell, of
+	// a run to the program's end, whether one Execute up to cycle `end` would have ended it (BeginWindow, EndWindow):
+	// the program's last instruction started before `end` and no M bit stopped it before. _vu0SyncFinish (VU0.cpp).
+	bool CanTrackWindow();
+	void BeginWindow(u64 end);
+	bool EndWindow();
 } // namespace VU0Jit

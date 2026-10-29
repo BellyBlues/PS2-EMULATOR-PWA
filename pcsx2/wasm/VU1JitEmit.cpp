@@ -2919,6 +2919,7 @@ namespace VU1Jit
 			x.kind = kind;
 			x.reason = reason;
 			x.instrs = instrs;
+			x.last_cyc = instrs > 0 ? b.plans[instrs - 1].cyc : 0;
 			x.tpc = tpc;
 			x.ebit = ctl.ebit;
 			x.pipes = img;

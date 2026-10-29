@@ -62,6 +62,7 @@ namespace VU1Jit
 		ExitKind kind = ExitKind::Boundary;
 		ExitReason reason = ExitReason::Block;
 		u32 instrs = 0; // instructions generated code ran before it
+		u32 last_cyc = 0; // cycles from the block's entry to the start of the last of them (VU0: VU0Jit's tracking)
 		u32 tpc = 0; // TPC as the interpreter leaves it (unmasked), unless dynamic_tpc
 		bool dynamic_tpc = false; // JR/JALR: generated code stored TPC
 		u32 ebit = 0;

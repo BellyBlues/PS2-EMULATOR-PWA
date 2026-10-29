@@ -28,6 +28,13 @@ namespace VU0Jit
 
 	static bool s_lockstep = false;
 
+	// BeginWindow()/EndWindow(): the start cycle of the instruction that ended the program, and whether an M bit
+	// stopped an Execute before.
+	static bool s_window = false;
+	static bool s_window_mbit = false;
+	static u64 s_window_end = 0;
+	static u64 s_window_last = ~0ull;
+
 	void SetLockstep(bool enabled)
 	{
 		s_lockstep = enabled;
@@ -86,6 +93,7 @@ namespace VU0Jit
 			void ExecuteLockstep(u32 cycles);
 			void Flush();
 			void Dirty() { m_dirty = true; }
+			bool Usable() const { return m_usable; }
 			void LogSummary() const;
 
 		private:
@@ -303,8 +311,16 @@ namespace VU0Jit
 					why = 3;
 				m_why[why]++;
 				force_step = false;
+				const u64 before = VU0.cycle;
 				CpuIntVU0.Step();
 				m_steps++;
+				if (s_window)
+				{
+					if (!(VU0.VI[REG_VPU_STAT].UL & 0x1))
+						s_window_last = before;
+					else if (VU0.flags & VUFLAG_MFLAGSET)
+						s_window_mbit = true;
+				}
 				continue;
 			}
 
@@ -319,6 +335,13 @@ namespace VU0Jit
 			ApplyExit(VU0, x, g_block_base0); // the base of the block that exited
 			m_jit_instrs += x.instrs + g_chain_instrs0;
 			m_edges += g_chain_edges0;
+			if (s_window)
+			{
+				if (x.kind == ExitKind::End)
+					s_window_last = g_block_base0 + x.last_cyc;
+				else if (x.mbit)
+					s_window_mbit = true;
+			}
 			if (x.kind == ExitKind::End)
 				continue;
 			// A slice's end (ExitReason::Budget): the loop's test stops it, or the interpreter takes the one instruction
@@ -451,6 +474,26 @@ namespace VU0Jit
 	void LogReport()
 	{
 		GetState().LogSummary();
+	}
+
+	bool CanTrackWindow()
+	{
+		return CpuVU0 == &CpuWasmVU0 && EmuConfig.Cpu.Recompiler.vu0Overflow && EmuConfig.Cpu.Recompiler.vu1Overflow &&
+		       GetState().Usable() && !s_lockstep;
+	}
+
+	void BeginWindow(u64 end)
+	{
+		s_window = true;
+		s_window_mbit = false;
+		s_window_end = end;
+		s_window_last = ~0ull;
+	}
+
+	bool EndWindow()
+	{
+		s_window = false;
+		return !s_window_mbit && s_window_last < s_window_end;
 	}
 } // namespace VU0Jit
 
