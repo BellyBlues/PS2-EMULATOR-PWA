@@ -27,6 +27,8 @@ namespace VU1Jit
 	bool g_vu0_slices = true;
 	u32 g_chain_instrs = 0;
 	u32 g_chain_edges = 0;
+	u32 g_chain_instrs0 = 0;
+	u32 g_chain_edges0 = 0;
 	bool g_trace = false;
 }
 
@@ -250,6 +252,46 @@ namespace VU1Jit
 			return true;
 		}
 
+		// A VU0 memory op that reaches memory: its address may be VU0's 0x4000 mapping of VU1's registers (GET_VU_MEM),
+		// where the interpreter takes the instruction (an exit before it, EmitInstruction). The others (no lane in
+		// dest, or a load to register 0 that returns before its access) read and write nothing.
+		bool IsVu0Memory(const Plan& p)
+		{
+			return !p.ins.IBit() && ((GetLowerFlags(p.ins.lo) & LOWER_STORE) || p.ins.lo == L::LQ || p.ins.lo == L::LQI ||
+										p.ins.lo == L::LQD || p.ins.lo == L::ILW || p.ins.lo == L::ILWR);
+		}
+		// In a branch's or an E bit's delay slot (where VU0 exits are not made either, SliceExitable) a VU0 memory op
+		// calls its op body instead.
+		bool Vu0MemoryNative(const Plan& p)
+		{
+			return p.pre_ctl.branch == 0 && p.pre_ctl.ebit == 0;
+		}
+		bool Vu0MemoryCheck(const Plan& p)
+		{
+			if (!IsVu0Memory(p) || !Vu0MemoryNative(p))
+				return false;
+			const u32 code = p.ins.lower;
+			const u32 ft = (code >> 16) & 0x1f, dest = (code >> 21) & 0xf;
+			switch (p.ins.lo)
+			{
+				case L::LQ:
+				case L::LQI:
+				case L::LQD:
+					return ft != 0 && dest != 0;
+				case L::ILW:
+				case L::ILWR:
+					return (ft & 0xf) != 0 && dest != 0;
+				case L::SQ:
+				case L::SQI:
+				case L::SQD:
+				case L::ISW:
+				case L::ISWR:
+					return dest != 0;
+				default:
+					return false;
+			}
+		}
+
 		// The VU registers a block's native code reads or writes (Emitter::VF and Emitter::VI): they live in locals
 		// while it runs (VF0 to VF31 and ACC as index 32, VI0 to VI15).
 		struct RegUse
@@ -363,14 +405,14 @@ namespace VU1Jit
 					m_f.i64_load(A(g_budget_end));
 					m_f.local_set(m_budget);
 				}
-				else if (g_vu0_slices)
+				else
 				{
-					// VU0: the cycles left in the dispatcher's slice at the entry (EmitBudgetExit).
-					m_f.i32_const(0);
-					m_f.i64_load(A(g_budget_end0));
+					// VU0: VU0.cycle at the entry and the end of the dispatcher's slice (EmitBudgetExit, EmitEdge).
 					m_f.i32_const(0);
 					m_f.i64_load(A(g_block_base0));
-					m_f.i64_sub();
+					m_f.local_set(m_base);
+					m_f.i32_const(0);
+					m_f.i64_load(A(g_budget_end0));
 					m_f.local_set(m_budget);
 				}
 			}
@@ -426,11 +468,8 @@ namespace VU1Jit
 					St32(A(R.fmac[s].statusflag), [&] { PushStat(m_snapr[s], m_snap[s][1]); });
 					St32(A(R.fmac[s].clipflag), [&] { m_f.local_get(m_snap[s][2]); });
 				}
-				if (m_vu)
-				{
-					St32(A(g_chain_instrs), [&] { m_f.local_get(m_acc); });
-					St32(A(g_chain_edges), [&] { m_f.local_get(m_edges); });
-				}
+				St32(A(m_vu ? g_chain_instrs : g_chain_instrs0), [&] { m_f.local_get(m_acc); });
+				St32(A(m_vu ? g_chain_edges : g_chain_edges0), [&] { m_f.local_get(m_edges); });
 				m_f.local_get(m_exit);
 				m_f.return_();
 			}
@@ -457,13 +496,18 @@ namespace VU1Jit
 			}
 			void EndLoop() { m_f.end(); }
 
+			// busy_kick_exit, busy_kick_untaken: exits before the instruction (VU1: an XGKICK while a kick runs; VU0: a
+			// memory op at VU0's 0x4000 mapping, Vu0MemoryCheck), the second for the untaken branch of a delay slot.
 			void EmitInstruction(const Plan& p, s32 busy_kick_exit, s32 busy_kick_untaken, bool last);
-			// VU0: leaves by exit_id when the slice has threshold cycles or fewer left at the entry (m_budget).
+			void EmitVu0MappingTest(const Plan& p); // pushes whether the memory op's address is VU0's 0x4000 mapping
+			// VU0: leaves by exit_id when the slice has threshold cycles or fewer left at the block's entry (m_base).
 			void EmitBudgetExit(u32 threshold, u32 exit_id)
 			{
-				m_f.local_get(m_budget);
+				m_f.local_get(m_base);
 				m_f.i64_const(static_cast<s64>(threshold));
-				m_f.i64_le_s();
+				m_f.i64_add();
+				m_f.local_get(m_budget);
+				m_f.i64_ge_u();
 				m_f.if_unlikely();
 				EmitExit(exit_id);
 				m_f.end();
@@ -1014,7 +1058,7 @@ namespace VU1Jit
 			m_f.local_set(m_base);
 			m_f.i32_const(0);
 			m_f.local_get(m_base);
-			m_f.i64_store(A(g_block_base));
+			m_f.i64_store(A(m_vu ? g_block_base : g_block_base0));
 			m_f.i32_const(1);
 			m_f.local_set(m_looped);
 			CountPass();
@@ -1088,7 +1132,7 @@ namespace VU1Jit
 			m_f.local_set(m_base);
 			m_f.i32_const(0);
 			m_f.local_get(m_base);
-			m_f.i64_store(A(g_block_base));
+			m_f.i64_store(A(m_vu ? g_block_base : g_block_base0));
 			CountPass();
 			if (next > m_k)
 				m_f.br(m_f.depth() - BlockLevel(next));
@@ -1942,12 +1986,12 @@ namespace VU1Jit
 				SetVI(dst, value);
 				m_out->native_ops++;
 			};
-			// VU memory address of a qword index on the stack (GET_VU_MEM for VU1: & 0x3fff after * 16), from the
-			// data memory's base in a local (Addr).
+			// VU memory address of a qword index on the stack (GET_VU_MEM: & 0x3fff after * 16 for VU1, & 0xfff for VU0,
+			// whose 0x4000 mapping EmitInstruction left to the interpreter), from the data memory's base in a local (Addr).
 			const auto qaddr = [&] {
 				m_f.i32_const(4);
 				m_f.i32_shl();
-				m_f.i32_const(0x3ff0);
+				m_f.i32_const(m_vu ? 0x3ff0 : 0xff0);
 				m_f.i32_and();
 				m_f.local_get(m_mb);
 				m_f.i32_add();
@@ -1972,9 +2016,7 @@ namespace VU1Jit
 				m_f.v128_store(0);
 			};
 
-			const bool vu0_memory = m_vu == 0 && ((GetLowerFlags(p.ins.lo) & LOWER_STORE) || p.ins.lo == L::LQ ||
-				p.ins.lo == L::LQI || p.ins.lo == L::LQD || p.ins.lo == L::ILW || p.ins.lo == L::ILWR);
-			if (((DebugMask() & 2) && !IsBranch(p.ins.lo)) || vu0_memory) // VU0's 0x4000 mapping: GET_VU_MEM
+			if (((DebugMask() & 2) && !IsBranch(p.ins.lo)) || (m_vu == 0 && IsVu0Memory(p) && !Vu0MemoryNative(p))) // GET_VU_MEM
 			{
 				HelperLower(p, delta);
 				return true;
@@ -2594,6 +2636,59 @@ namespace VU1Jit
 			}
 		}
 
+		void Emitter::EmitVu0MappingTest(const Plan& p)
+		{
+			// The address is the qword index times 16 (_vuLQ to _vuISWR, VUops.cpp:1156-1290): bit 14 is bit 10 of the
+			// index, before the op changes its register (LQD and SQD decrement it first).
+			const u32 code = p.ins.lower;
+			const u32 ft = (code >> 16) & 0x1f, fs = (code >> 11) & 0x1f;
+			const u32 it = ft & 0xf, is = fs & 0xf;
+			const s32 imm11 = (code & 0x400) ? static_cast<s32>(0xfffffc00u | (code & 0x3ff)) : static_cast<s32>(code & 0x3ff);
+			switch (p.ins.lo)
+			{
+				case L::LQ:
+				case L::ILW:
+				case L::ISW:
+					VI(is);
+					m_f.i32_const(imm11);
+					m_f.i32_add();
+					break;
+				case L::SQ:
+					VI(it);
+					m_f.i32_const(imm11);
+					m_f.i32_add();
+					break;
+				case L::LQI:
+				case L::ILWR:
+				case L::ISWR:
+					VI(is);
+					break;
+				case L::SQI:
+					VI(it);
+					break;
+				case L::LQD:
+					VI(is);
+					if (is != 0)
+					{
+						m_f.i32_const(1);
+						m_f.i32_sub();
+					}
+					break;
+				case L::SQD:
+					VI(it);
+					if (ft != 0)
+					{
+						m_f.i32_const(1);
+						m_f.i32_sub();
+					}
+					break;
+				default:
+					pxFailRel("VU0 JIT: not a memory op");
+			}
+			m_f.i32_const(0x400);
+			m_f.i32_and();
+		}
+
 		void Emitter::EmitInstruction(const Plan& p, s32 busy_kick_exit, s32 busy_kick_untaken, bool last)
 		{
 			const StepInfo& info = p.info;
@@ -2623,6 +2718,15 @@ namespace VU1Jit
 				}
 				else
 					EmitExit(static_cast<u32>(busy_kick_exit));
+				m_f.end();
+			}
+			if (!m_vu && busy_kick_exit >= 0)
+			{
+				// VU1's registers through VU0's 0x4000 mapping: the interpreter takes the instruction (GET_VU_MEM waits
+				// for the VU thread there).
+				EmitVu0MappingTest(p);
+				m_f.if_unlikely();
+				EmitExit(static_cast<u32>(busy_kick_exit)); // never in a delay slot (Vu0MemoryNative)
 				m_f.end();
 			}
 
@@ -2755,6 +2859,10 @@ namespace VU1Jit
 		// Caps per module (section 4.3): its compile time grows with its size.
 		static constexpr u32 MODULE_BLOCKS = 1024;
 		static constexpr u32 MODULE_INSTRS = 8192;
+		// VU0: a module from every entry, each holding all it reaches (no ModuleSource::known), so smaller ones. Its micro
+		// memory holds 512 instructions; random code (the fuzzer) reaches the same blocks under many signatures.
+		static constexpr u32 MODULE_BLOCKS0 = 64;
+		static constexpr u32 MODULE_INSTRS0 = 1024;
 
 		// One block: the timing model's plan for its instructions, and how it ends.
 		struct BlockPlan
@@ -2843,10 +2951,10 @@ namespace VU1Jit
 		// Whether generated code may go from exit x to the block at its TPC itself: the dispatcher would enter that
 		// block next with x's signature and no branch or E bit pending. A TPC past the end of micro memory is left to
 		// the dispatcher, which masks it (the interpreter keeps it unmasked until the next fetch).
-		bool CanChain(const BlockExit& x)
+		bool CanChain(int vu, const BlockExit& x)
 		{
 			return x.kind == ExitKind::Boundary && (x.reason == ExitReason::Block || x.reason == ExitReason::Cap) && x.chain &&
-			       !x.dynamic_tpc && x.ebit == 0 && x.tpc < VU1_PROGSIZE;
+			       !x.dynamic_tpc && x.ebit == 0 && x.tpc < (vu ? VU1_PROGSIZE : VU0_PROGSIZE) && !(vu == 0 && x.mbit);
 		}
 
 		// A static branch in the delay slot of a static branch compiled (VU1). Off with VU1JIT_NOBDS, to bisect.
@@ -3084,11 +3192,13 @@ namespace VU1Jit
 					em.EmitBudgetExit(SliceThreshold(b, i),
 						add(MakeExit(vu, b, ExitKind::Boundary, ExitReason::Budget, i, p.pre, p.pre_ctl, p.pc)));
 				s32 busy = -1, busy_untaken = -1;
-				if (vu && !p.ins.IBit() && p.ins.lo == L::XGKICK && !p.info.discarded)
+				const bool vu0_check = vu == 0 && Vu0MemoryCheck(p);
+				if ((vu && !p.ins.IBit() && p.ins.lo == L::XGKICK && !p.info.discarded) || vu0_check)
 				{
 					// The interpreter's state before this instruction: TPC is its own address. In a branch's delay slot
 					// the branch is pending if it was taken (busy), not if a conditional one was not (busy_untaken).
-					BlockExit x = MakeExit(vu, b, ExitKind::Boundary, ExitReason::BusyKick, i, p.pre, p.pre_ctl, p.pc);
+					BlockExit x = MakeExit(vu, b, ExitKind::Boundary, vu0_check ? ExitReason::Fallback : ExitReason::BusyKick, i,
+						p.pre, p.pre_ctl, p.pc);
 					if (p.pre_ctl.branch == 1)
 					{
 						x.branch = 1;
@@ -3191,11 +3301,13 @@ namespace VU1Jit
 		return true;
 	}
 
-	bool CompileModule(u32 pc, const Signature& sig, const ModuleSource& source, CompiledModule* out)
+	bool CompileModule(int vu, u32 pc, const Signature& sig, const ModuleSource& source, CompiledModule* out)
 	{
 		*out = {};
+		const u32 max_blocks = vu ? MODULE_BLOCKS : MODULE_BLOCKS0;
+		const u32 max_instrs = vu ? MODULE_INSTRS : MODULE_INSTRS0;
 		std::vector<BlockPlan> blocks(1);
-		if (!PlanBlock(1, pc, sig, &blocks[0]))
+		if (!PlanBlock(vu, pc, sig, &blocks[0]))
 			return false;
 		u32 total = blocks[0].Instrs();
 		for (const auto& [rpc, rsig] : source.roots)
@@ -3204,7 +3316,7 @@ namespace VU1Jit
 			for (const BlockPlan& b : blocks)
 				have |= !b.ds && b.pc == rpc && b.sig == rsig;
 			BlockPlan nb;
-			if (have || blocks.size() >= MODULE_BLOCKS || !PlanBlock(1, rpc, rsig, &nb) || total + nb.Instrs() > MODULE_INSTRS)
+			if (have || blocks.size() >= max_blocks || !PlanBlock(vu, rpc, rsig, &nb) || total + nb.Instrs() > max_instrs)
 				continue;
 			total += nb.Instrs();
 			blocks.push_back(std::move(nb));
@@ -3225,11 +3337,11 @@ namespace VU1Jit
 		const bool chain = ChainEnabled();
 		const auto successor = [&](const BlockExit& x) -> s32 {
 			const bool ds = x.branch != 0;
-			if (!chain)
+			if (!chain || (ds && vu == 0))
 				return -1;
 			if (ds ? !(x.kind == ExitKind::Boundary && x.reason == ExitReason::Block && x.sig_valid && x.ebit == 0 &&
 						 x.tpc < VU1_PROGSIZE) :
-					 !CanChain(x))
+					 !CanChain(vu, x))
 				return -1;
 			const u32 ds_target = ds ? x.branchpc : 0;
 			for (size_t i = 0; i < blocks.size(); i++)
@@ -3242,13 +3354,13 @@ namespace VU1Jit
 				if (r.pc == x.tpc && r.sig == x.sig && r.ds == ds && r.ds_target == ds_target)
 					return -1;
 			}
-			if (blocks.size() >= MODULE_BLOCKS || (!ds && source.known && source.known(source.ctx, x.tpc, x.sig)))
+			if (blocks.size() >= max_blocks || (!ds && source.known && source.known(source.ctx, x.tpc, x.sig)))
 				return -1;
 			Control delay_slot;
 			delay_slot.branch = 1;
 			delay_slot.branchpc = ds_target;
 			BlockPlan nb;
-			if (!PlanBlock(1, x.tpc, x.sig, &nb, ds ? &delay_slot : nullptr) || total + nb.Instrs() > MODULE_INSTRS)
+			if (!PlanBlock(vu, x.tpc, x.sig, &nb, ds ? &delay_slot : nullptr) || total + nb.Instrs() > max_instrs)
 			{
 				refused.push_back(Key{x.tpc, x.sig, ds, ds_target});
 				return -1;
@@ -3336,12 +3448,15 @@ namespace VU1Jit
 			}
 		}
 		pxAssert(order.size() == nb);
+		// What the dispatcher tests before it enters each block, and so EmitEdge before it goes there (VU0 with slices:
+		// the cycles its first instructions need, as the dispatcher's first_need).
+		const auto need = [&](const BlockPlan& b) { return (vu == 0 && g_vu0_slices) ? SliceThreshold(b, 0) : b.LastStart(); };
 		std::vector<s32> pos(nb);
 		std::vector<u32> last_starts(nb);
 		for (u32 k = 0; k < nb; k++)
 		{
 			pos[order[k]] = static_cast<s32>(k);
-			last_starts[k] = blocks[order[k]].LastStart();
+			last_starts[k] = need(blocks[order[k]]);
 		}
 
 		CompiledBlock scratch;
@@ -3350,18 +3465,18 @@ namespace VU1Jit
 			em.EmitPrologue();
 			em.BeginModule(last_starts);
 			for (u32 k = 0; k < nb; k++)
-				EmitBlock(em, 1, blocks[order[k]], k, pos, scratch.exits);
+				EmitBlock(em, vu, blocks[order[k]], k, pos, scratch.exits);
 			em.EndModule();
 		};
 		RegUse use;
 		{
-			Emitter first(&scratch, 1, nullptr);
+			Emitter first(&scratch, vu, nullptr);
 			emit(first);
 			use = first.Use();
 		}
 		scratch.native_ops = 0;
 		scratch.helper_ops = 0;
-		Emitter em(&scratch, 1, &use);
+		Emitter em(&scratch, vu, &use);
 		emit(em);
 		em.Finish();
 
@@ -3373,7 +3488,7 @@ namespace VU1Jit
 		for (u32 k = 0; k < nb; k++)
 		{
 			const BlockPlan& b = blocks[order[k]];
-			out->blocks.push_back(CompiledModule::Block{b.pc, b.sig, b.Instrs(), b.LastStart(), !b.ds});
+			out->blocks.push_back(CompiledModule::Block{b.pc, b.sig, b.Instrs(), need(b), !b.ds});
 			out->edges += (b.next_taken >= 0) + (b.next_fall >= 0) + static_cast<u32>(b.jumps.size());
 			for (const s32 s : b.bds_next)
 				out->edges += s >= 0;

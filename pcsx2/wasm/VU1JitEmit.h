@@ -98,7 +98,7 @@ namespace VU1Jit
 	// reading the VU's micro memory (vu: 0 or 1). False when there is nothing to compile: the first instruction must run on the interpreter.
 	bool CompileBlock(int vu, u32 pc, const Signature& sig, CompiledBlock* out);
 
-	// A VU1 module: blocks that branch to each other inside generated code. Its function's argument is the index of
+	// A module: blocks that branch to each other inside generated code. Its function's argument is the index of
 	// the block to start at; exits are numbered across the module.
 	struct CompiledModule
 	{
@@ -131,9 +131,12 @@ namespace VU1Jit
 		std::vector<std::pair<u32, Signature>> roots;
 	};
 
-	// Compiles the VU1 block at pc for sig and the blocks reachable from it, through static branches, fall-throughs
+	// Compiles the block at pc for sig and the blocks reachable from it, through static branches, fall-throughs
 	// and learned jump targets, up to the module's caps. False when there is nothing to compile (as CompileBlock).
-	bool CompileModule(u32 pc, const Signature& sig, const ModuleSource& source, CompiledModule* out);
+	// VU0 (vu 0): no block entered in a delay slot, and no edge after an M bit, which ends InterpVU0::Execute's loop.
+	// CompiledModule::Block::last_start is then what the dispatcher tests before it enters the block: first_need
+	// with g_vu0_slices, as CompiledBlock.
+	bool CompileModule(int vu, u32 pc, const Signature& sig, const ModuleSource& source, CompiledModule* out);
 
 	// After generated code returned exit x: writes the timing state, TPC and the control state. base is VU1.cycle at
 	// the entry.
@@ -161,6 +164,8 @@ namespace VU1Jit
 	// block that exited, and how many times it went from a block to the next (or back to its start) without leaving.
 	extern u32 g_chain_instrs;
 	extern u32 g_chain_edges;
+	extern u32 g_chain_instrs0; // the same for VU0 modules (EE thread)
+	extern u32 g_chain_edges0;
 
 	// Debugging: log every block and interpreter step of the dispatcher.
 	extern bool g_trace;
