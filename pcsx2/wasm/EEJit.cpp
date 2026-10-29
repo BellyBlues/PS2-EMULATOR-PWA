@@ -458,7 +458,6 @@ namespace
 		std::vector<SpinWord> words; // target .. branch + 4
 		std::vector<u32> codes; // their instruction words
 		u32 fails = 0;
-		u32 wait = 0;
 		// The last iteration found to change nothing: its registers, tests, the states at its tests (with -eejit-trace)
 		// and loads.
 		bool memo = false;
@@ -476,6 +475,10 @@ namespace
 	};
 
 	constexpr size_t kMaxSpinSites = 1u << 16;
+	// Per site: the calls to let pass after a failed try. Generated code counts them down itself and calls SpinTry() at
+	// 0, so that a site that keeps failing (GTA's, Tekken Tag Tournament's random number loop at a vsync wait: 133,000
+	// calls a vsync) costs no call into C++ while it waits.
+	u32 s_spin_wait[kMaxSpinSites] = {};
 	std::vector<std::unique_ptr<SpinSite>> s_spin_sites = [] {
 		std::vector<std::unique_ptr<SpinSite>> v;
 		v.reserve(kMaxSpinSites);
@@ -751,18 +754,13 @@ namespace
 			SpinSkip(site);
 			return;
 		}
-		if (site.wait)
-		{
-			site.wait--;
-			return;
-		}
 		s_spin_tries++;
 		site.tries++;
 		site.memo = false;
 		auto fail = [&](int why) {
 			s_spin_why[why]++;
 			site.fails = std::min<u32>(site.fails + 1, 8);
-			site.wait = 1u << site.fails;
+			s_spin_wait[index] = 1u << site.fails;
 		};
 
 		std::memcpy(site.start.data(), &cpuRegs, kSpinSnap);
@@ -3236,9 +3234,22 @@ namespace
 				if (const s32 site = target == btarget && SpinClassOf(d.kind) == SpinClass::Branch ? AddSpinSite(pc, btarget) : -1;
 					site >= 0)
 				{
+					// The site's wait (s_spin_wait) counted down here; SpinTry() when it is 0.
+					const u32 wait = static_cast<u32>(reinterpret_cast<uptr>(&s_spin_wait[site]));
+					f.i32_const(0);
+					f.i32_load(wait);
+					f.if_();
+					f.i32_const(0);
+					f.i32_const(0);
+					f.i32_load(wait);
+					f.i32_const(1);
+					f.i32_sub();
+					f.i32_store(wait);
+					f.else_();
 					f.i32_const(site);
 					f.i32_const(static_cast<s32>(FnIndex(&SpinTry)));
 					f.call_indirect(m_tiv, 0);
+					f.end();
 				}
 				Leave(target, false);
 				m_pending = saved_pending;
