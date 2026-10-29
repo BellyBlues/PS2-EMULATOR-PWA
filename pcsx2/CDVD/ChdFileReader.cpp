@@ -3,6 +3,10 @@
 
 #include "ChdFileReader.h"
 
+#ifdef __EMSCRIPTEN__
+#include "CDVD/Emscripten/WebDisc.h"
+#endif
+
 #include "common/Assertions.h"
 #include "common/Console.h"
 #include "common/Error.h"
@@ -370,7 +374,12 @@ bool ChdFileReader::Open2(std::string filename, Error* error)
 
 	m_filename = std::move(filename);
 
+#ifdef __EMSCRIPTEN__
+	FileSystem::ManagedCFilePtr fp(WebDisc::IsDiscPath(m_filename) ? WebDisc::OpenCFile(m_filename.c_str(), error) :
+		FileSystem::OpenSharedCFile(m_filename.c_str(), "rb", FileSystem::FileShareMode::DenyWrite, error));
+#else
 	auto fp = FileSystem::OpenManagedSharedCFile(m_filename.c_str(), "rb", FileSystem::FileShareMode::DenyWrite, error);
+#endif
 	if (!fp)
 		return false;
 

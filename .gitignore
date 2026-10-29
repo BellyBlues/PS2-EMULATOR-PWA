@@ -2,16 +2,8 @@
 .*.swn
 .*.swo
 
-*.suo
-*.ncb
-*.sdf
-*.opensdf
 *.user
 *.log
-*.dsp
-*.dsw
-*.bsc
-*.aps
 *.exe
 *.wav
 
@@ -20,10 +12,6 @@
 
 *.asm
 
-*.VC.db
-*.VC.VC.opendb
-
-_ReSharper.*
 pcsx2.snapshot_*
 svnrev.h
 
@@ -51,9 +39,6 @@ oprofile_data/
 *.p2m2_backup
 *.p2m2_SaveState.p2s
 
-# Visual Studio upgrades
-/Backup*
-/UpgradeLog*.htm
 /.vscode*
 
 # Jetbrains Rider
@@ -67,14 +52,7 @@ oprofile_data/
 .kateproject*
 
 # Resources and docs in /bin are tracked
-/bin/**/*.dll
-/bin/**/*.dmp
-/bin/**/*.exp
-/bin/**/*.ilk
-/bin/**/*.lib
-/bin/**/*.pdb
 /bin/pcsx2*
-/bin/qt.conf
 /bin/bios
 /bin/cache
 /bin/cheats
@@ -91,14 +69,10 @@ oprofile_data/
 /bin/snaps
 /bin/sstates
 /bin/textures
-/bin/translations
 /bin/inputprofiles
 /bin/videos
 /bin/portable.ini
 /bin/portable.txt
-
-# Resources and docs copied from /bin
-/bin-arm64
 
 # Manually added by user.
 /bin/resources/patches.zip
@@ -111,23 +85,15 @@ oprofile_data/
 
 /deps-build
 /deps
-/deps-arm64
 /deps-wasm
 /deps-build-wasm
 /build-wasm*
 /_site
 /pcsx2-wasm/assets/node_modules
 __pycache__/
-/gammaray-build
-/gammaray
-/ipch
 
 !/3rdparty/libjpeg/change.log
 /tools/bin
-.vs
 
-/out/build/x64-Debug (default)
-CMakeSettings.json
-/ci-artifacts/
 /out/
 /.cache/

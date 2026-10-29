@@ -558,12 +558,20 @@ down.
 
 **Built.**
 - `pcsx2/CDVD/Emscripten/WebDisc.{h,cpp}`: the block, `IsDiscPath`, `Query`, `Read`, plus
-  `AbortReads`/`ResumeReads` and `ResultName`. No `OpenCFile` (5.4 is not built).
+  `AbortReads`/`ResumeReads` and `ResultName`, and `OpenCFile` (5.4, built 2026-10-25).
 - `pcsx2/CDVD/Emscripten/WebDiscFileReader.{h,cpp}`: as 5.2.
-- `GetFileReader()` (`InputIsoFile.cpp`): `/disc/` paths get a `WebDiscFileReader` before the
-  extension checks, so every disc path is read as a flat image. The page refuses `.chd`, `.cso`,
-  `.zso`, `.gz` and `.dump` files with their own message, and any file without an ISO 9660 volume
-  at one of the layouts `InputIsoFile::Detect()` tries.
+- `GetFileReader()` (`InputIsoFile.cpp`): `/disc/` paths get a `WebDiscFileReader`, except `.chd`,
+  `.cso`, `.zso` and `.gz`, which keep PCSX2's own readers; their open calls take
+  `WebDisc::OpenCFile()` for disc paths (5.4). The page refuses `.dump` files with their own message,
+  a compressed file whose first bytes are not its format's header, and any other file without an
+  ISO 9660 volume at one of the layouts `InputIsoFile::Detect()` tries.
+- `OpenCFile` as 5.4, with the read-through cache built from the start: four aligned 128 KiB windows
+  per FILE, least recently used replaced; reads of a window or more go straight to the worker. A
+  GZ's index is written next to the placeholder (`/disc/<name>.pindex.tmp`, in memory), so it is
+  built again at every boot.
+- The disc library reads a CSO's first sectors in JavaScript (raw deflate per block, through
+  `DecompressionStream`), so CSO discs get their serial; CHD, ZSO and GZ discs are named after their
+  file.
 - `pcsx2-wasm/Main.cpp`: `pcsx2web_disc_block()`, `pcsx2web_boot_disc(bios, path, flags)` (fast
   boot unless `flags` is 1) and `pcsx2web_game()` (title and serial from `Host::OnGameChanged`, as
   a seqlock). `pcsx2web_stop()` calls `WebDisc::AbortReads()`.
@@ -607,7 +615,11 @@ down.
 - *A failed disc swap keeps the old disc readable*: `open` no longer drops the current disc first
   (4.3). The page offers no swap while a game runs anyway, so PCSX2's own `ChangeDisc()` revert
   path is never asked to reopen a stale generation; that needs a source per generation (v2) before
-  swap can be offered.
+  swap can be offered. *Built differently (2026-10-25):* the swap ejects first
+  (`pcsx2web_change_disc("")`, PCSX2's `ChangeDisc` to no disc, which closes the old reader), then
+  the worker opens the new file, then the disc is inserted. Nothing reads the old generation after
+  the worker drops it, and `ChangeDisc`'s revert after a failed insert goes back to no disc. A
+  failed `open` keeps the old disc in the worker, so the page inserts it again.
 - *An open overtaken by a newer open or a close replies `ok: false` (`CANCELLED`)*, so the page
   never takes it for the current disc.
 - *Publishing is one synchronous step*: `STATE` = no disc, generation + 1, size, generation + 1,
@@ -645,12 +657,12 @@ down.
   was in flight: the read was handed back, the next worker took the disc over under the same
   generation, and the game went on from the language menu to the logos and the intro movie. After
   the third restart, reads failed at once and the slate said so; Stop took 62 ms.
-- Not done: a full-image hash through the C++ reader, CSO and CHD, disc swap, and measuring the time
+- Not done: a full-image hash through the C++ reader, and measuring the time
   the CPU thread waits in `FinishRead` during movies.
 
 **Open.**
-- 5.4 (CHD, CSO/ZSO, GZ through a cookie `FILE*`), blockdump images, and multi-file images.
-- Disc swap and eject while running (needs one source per generation, see above).
+- CHD parents, blockdump images, and multi-file images.
+- Disc swap and eject while running: built (eject first, see above); the revert after a failed open is untested.
 - A worker stuck inside a synchronous read (a hung network drive) still holds its requester; the
   page cannot tell it from a slow read. Reads time out only on the C++ side, which then waits for
   the worker to finish the busy slot, and a restart would wait for the stuck worker's lock.

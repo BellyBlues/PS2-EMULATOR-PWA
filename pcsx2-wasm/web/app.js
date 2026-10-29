@@ -64,6 +64,7 @@
 	// Which PS2 port the keyboard plays as, and which one the first gamepad does (1 or 2).
 	const PREF_PAD_KEYBOARD = 'pcsx2web.padKeyboard';
 	const PREF_PAD_FIRST = 'pcsx2web.padFirst';
+	const PREF_RUMBLE = 'pcsx2web.rumble.'; // + port: '0' turns that player's rumble off
 	const PREF_HINTED = 'pcsx2web.firstBootHint';
 
 	const SOURCE_URL = 'https://github.com/TabStationToo/TabStationToo';
@@ -80,6 +81,7 @@
 	const SLOW_HINT_AFTER_MS = 5000;
 	const STARTING_REASSURE_S = 10;
 	const STARTING_LOG_S = 15;
+	const STARTING_GZ_LOG_S = 180; // a .gz is indexed whole first (gzBoot())
 
 	// Frame descriptor (5 x u32) written by the GS thread; see pcsx2web_frame().
 	const FD_SEQ = 0;
@@ -194,6 +196,7 @@
 		starting: 'Starting the PS2…',
 		firstFrame: 'Waiting for the first frame…',
 		reassure: 'Still starting. The first screen can take a few seconds here.',
+		reassureGz: 'Still starting. A .gz image is read whole before the game starts: about a minute for a DVD.',
 		noAnswer: 'The emulator hasn’t answered. The log may say why.',
 		openLog: 'Open the log',
 		alreadyStarting: 'The emulator is already starting.',
@@ -1304,6 +1307,8 @@
 		const width = bitmap.width, height = bitmap.height;
 		if (page.litWait && !page.lit)
 			probeLit(bitmap);
+		if (savestates.thumbWait)
+			stateThumbFrom(bitmap);
 		ctx.transferFromImageBitmap(bitmap);
 		gpu.latencies.push(performance.timeOrigin + performance.now() - m.postedAt);
 		if (gpu.latencies.length > LATENCY_SAMPLES)
@@ -1476,6 +1481,8 @@
 		page.vmState = state;
 		stateRender();
 		renderEe();
+		statesGameChanged();
+		renderStates();
 		pageLog(`VM state: ${STATE_NAMES[prev] || prev} -> ${STATE_NAMES[state] || state}`);
 		if (state !== STATE.RUNNING)
 			releaseAllKeys(true);
@@ -2001,9 +2008,18 @@
 		[2048, 150 * 2048, 24], [2352, 150 * 2048, 0], [2448, 150 * 2048, 0]];
 	const DISC_HEADER_BYTES = 150 * 2048 + 17 * 2448;
 	const DISC_MIN_SIZE = 17 * 2048;
-	const DISC_UNSUPPORTED_RE = /\.(chd|cso|zso|gz|dump)$/i;
+	const DISC_UNSUPPORTED_RE = /\.dump$/i;
+	// Compressed images PCSX2's own readers open (through WebDisc::OpenCFile): the extension and the file's first
+	// bytes must agree.
+	const DISC_COMPRESSED = [
+		{ re: /\.chd$/i, magic: [0x4d, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x48, 0x44] }, // "MComprHD"
+		{ re: /\.cso$/i, magic: [0x43, 0x49, 0x53, 0x4f] }, // "CISO"
+		{ re: /\.zso$/i, magic: [0x5a, 0x49, 0x53, 0x4f] }, // "ZISO"
+		{ re: /\.gz$/i, magic: [0x1f, 0x8b] },
+	];
 	const DISC_BOOT_FULL = 1; // pcsx2web_boot_disc(): the BIOS intro instead of fast boot
 	const DISC_POLL_MS = 500;
+	const DISC_CHANGE_TIMEOUT_MS = 30000; // pcsx2web_change_disc(): a .gz insert indexes the whole image
 	const DISC_ERROR_MS = 8000;
 	// The check before a boot usually takes milliseconds; the slate says it is reading the disc only after this.
 	const DISC_CHECK_SHOW_MS = 300;
@@ -2050,8 +2066,8 @@
 		blocked: 'Stop the PS2 first to change the disc.',
 		blockedAny: 'Stop the PS2 first to change the disc or BIOS.',
 		drop: 'Drop to use this disc or BIOS.',
-		notDisc: 'That file isn’t a disc image TabStationToo can read. Use an .iso, .bin or .img of a PS2 disc.',
-		compressed: 'Compressed images (.chd, .cso, .zso, .gz) and block dumps aren’t supported yet. Use an .iso.',
+		notDisc: 'That file isn’t a disc image TabStationToo can read. Use an .iso, .bin, .img, .chd or .cso of a PS2 disc.',
+		compressed: 'Block dumps (.dump) aren’t supported. Use an .iso, .chd or .cso.',
 		unreadable: 'Couldn’t read the disc file. It may have been moved, changed or deleted; choose it again.',
 		denied: (name) => `The browser didn’t allow reading ${name}. Choose it again.`,
 		fetchFailed: (path, why) => `Couldn’t open the disc at ${path} (${why}).`,
@@ -2063,6 +2079,15 @@
 		checking: 'Reading the disc…',
 		readerFailed: 'The disc reader stopped working. Reload the page to read discs again.',
 		removed: 'Disc removed. Boot opens the console’s menus.',
+		swapping: 'Changing the disc…',
+		swapped: (name) => `Disc changed: ${name}.`,
+		ejected: 'Disc removed. The game goes on with the tray empty.',
+		swapFailed: 'Couldn’t change the disc. The game goes on with the one it had.',
+		swapReverted: 'Couldn’t open that disc, so the old one went back in.',
+		swapEmpty: 'Couldn’t open that disc. The tray is empty; choose a disc again.',
+		insertFailed: 'PCSX2 couldn’t read that disc. The tray is empty; choose another.',
+		menuReason: 'The disc can change once the PS2 runs.',
+		libraryWhileRunning: 'Stop the PS2 to use the disc library. Choose another disc… changes it while it runs.',
 		memcardFailed: 'Couldn’t keep the memory card in this browser. Saves last for this visit.',
 		announceReady: 'Disc ready.',
 		announceRemoved: 'Disc removed.',
@@ -2085,6 +2110,7 @@
 		menuLibrary: $('disc-menu-library'),
 		menuRemove: $('disc-menu-remove'),
 		menuReason: $('disc-menu-reason'),
+		tray: $('tray-library'),
 	};
 
 	const disc = {
@@ -2110,7 +2136,9 @@
 		op: 0, // generation token: a newer choice or Remove wins over an older, slower one
 		urlPending: false, // ?disc= is still being checked: a queued boot waits for it
 		remembered: null, // the last picked disc's handle (Chromium): { handle, name, size, lastModified, title }
-		runIsDisc: false, // the current or last boot booted a disc
+		runIsDisc: false, // the current or last boot booted a disc (false again once a running game's disc is ejected)
+		trayEmpty: false, // a running game's disc was ejected (until a disc goes in, or the next boot)
+		swapping: false, // swapDisc() or removeRunningDisc() is between its steps
 		runTitle: '', // the game's title as PCSX2 reported it during that boot
 		runSerial: '',
 		runGeneration: 0, // the request block's generation the current or last disc boot read
@@ -2184,11 +2212,18 @@
 		return null;
 	}
 
+	// A disc image TabStationToo can read, from its name and first bytes: a flat image with an ISO 9660 volume
+	// where PCSX2 looks, or a compressed image whose header matches its extension.
+	function isDiscBytes(name, bytes, size) {
+		const compressed = DISC_COMPRESSED.find((c) => c.re.test(name));
+		if (compressed)
+			return bytes.length >= compressed.magic.length && compressed.magic.every((b, i) => bytes[i] === b);
+		return size >= DISC_MIN_SIZE && discLayout(bytes) !== null;
+	}
+
 	async function isDiscImage(file) {
-		if (file.size < DISC_MIN_SIZE)
-			return false;
 		const bytes = new Uint8Array(await file.slice(0, Math.min(file.size, DISC_HEADER_BYTES)).arrayBuffer());
-		return discLayout(bytes) !== null;
+		return isDiscBytes(file.name, bytes, file.size);
 	}
 
 	function discError(text) {
@@ -2201,7 +2236,7 @@
 	async function acceptFile(file, handlePromise) {
 		if (!file)
 			return;
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blockedAny);
 			return;
 		}
@@ -2219,6 +2254,8 @@
 		}
 		if (isDisc) {
 			chooseDisc({ kind: 'file', file, name: file.name, size: file.size }, await (handlePromise || null));
+		} else if (!canChangeBios()) {
+			subtitle(DISC_COPY.blockedAny);
 		} else if (file.size > BIOS_REJECT_ABOVE) {
 			discError(DISC_COPY.notDisc);
 		} else {
@@ -2230,7 +2267,7 @@
 	async function acceptDiscFile(file, handle) {
 		if (!file)
 			return;
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
 			return;
 		}
@@ -2266,12 +2303,7 @@
 		acceptFile(file, handle && handle.then((h) => (h && h.kind === 'file' ? h : null)));
 	}
 
-	function chooseDisc(desc, handle) {
-		if (!canChangeBios()) {
-			subtitle(DISC_COPY.blocked);
-			return;
-		}
-		const op = ++disc.op;
+	function newDiscRecord(desc, handle) {
 		const d = {
 			name: sanitizeDiscName(desc.name), path: '', size: desc.size, kind: handle ? 'handle' : desc.kind,
 			file: desc.file || null, url: desc.url || null, handle: handle || null, title: '', opened: false,
@@ -2281,6 +2313,20 @@
 		const r = disc.remembered;
 		if (r && r.name === desc.name && r.size === desc.size && r.title)
 			d.title = r.title;
+		return d;
+	}
+
+	function chooseDisc(desc, handle) {
+		if (!canChangeDisc()) {
+			subtitle(DISC_COPY.blocked);
+			return;
+		}
+		if (swapping()) {
+			swapDisc(desc, handle);
+			return;
+		}
+		const op = ++disc.op;
+		const d = newDiscRecord(desc, handle);
 		page.error = '';
 		disc.opening = d;
 		pageLog(`Disc chosen: ${desc.name} (${desc.size.toLocaleString('en-US')} bytes${desc.url ? `, ${desc.url}` : ''}).`);
@@ -2304,17 +2350,17 @@
 
 	async function openDiscInWorker(d, op) {
 		if (!disc.attached)
-			return; // opened once the worker is attached
+			return false; // opened once the worker is attached
 		const worker = disc.worker;
 		const msg = d.url ? { type: 'open', url: d.url, name: d.name } : { type: 'open', file: d.file, name: d.name };
 		const reply = await discCall(msg);
 		if (op !== disc.op || disc.opening !== d)
-			return; // a newer choice or Remove won
+			return false; // a newer choice or Remove won
 		if (!reply.ok && worker !== disc.worker) {
 			// The disc reader stopped during the open: nothing was learnt about the disc. It stays the one being
 			// opened, so the restarted reader opens it (startDiscWorker), and a reader that cannot restart says so.
 			pageLog(`The disc reader stopped while it opened ${d.name}; the next one opens it again.`, 'warn');
-			return;
+			return false;
 		}
 		disc.opening = null;
 		if (!reply.ok) {
@@ -2322,10 +2368,11 @@
 			pageLog(`Could not open the disc ${d.name}: ${reply.error ? reply.error.message : 'unknown error'}`, 'warn');
 			page.autoBoot = false;
 			discError(discFailureText(d, reply.error));
-			return;
+			return false;
 		}
 		const prev = disc.current;
 		d.size = (reply.status && reply.status.disc && reply.status.disc.size) || d.size;
+		d.generation = (reply.status && reply.status.disc && reply.status.disc.generation) || 0;
 		try {
 			const FS = window.Module.FS;
 			if (!FS.analyzePath(DISC_DIR).exists)
@@ -2336,7 +2383,7 @@
 		} catch (err) {
 			pageLog(`Could not write the disc placeholder ${d.path}: ${errorText(err)}`, 'warn');
 			discError(DISC_COPY.unreadable);
-			return;
+			return false;
 		}
 		d.opened = true;
 		disc.current = d;
@@ -2348,16 +2395,169 @@
 		pageLog(`Disc ready: ${d.path} (${formatDiscSize(d.size).replace(' ', ' ')}).`);
 		render();
 		if (vmLive())
-			return; // a restarted reader opened it again: the running game cannot use it (reviewRunningDisc)
+			return true; // a swap inserts it (swapDisc); a restarted reader's reopen leaves the game without it (reviewRunningDisc)
 		announce(DISC_COPY.announceReady);
 		if (focusIsFree())
 			focusPrimary();
 		maybeAutoBoot();
+		return true;
+	}
+
+	// ---- swapping the disc while the game runs (UI-SPEC.md §10)
+
+	// The disc can change before a boot, and while a game or the console's menus run (not while it starts, not for
+	// an ELF, not during another swap).
+	function canChangeDisc() {
+		if (canChangeBios())
+			return true;
+		return page.phase === 'ready' && page.vmState === STATE.RUNNING && !devElf.bytes && !disc.swapping;
+	}
+
+	const swapping = () => page.vmState === STATE.RUNNING && !canChangeBios();
+
+	// pcsx2web_change_disc(path): '' ejects, a /disc/ path inserts. Resolves to true or false.
+	function changeDiscInVm(path) {
+		const M = window.Module;
+		return new Promise((resolve) => {
+			if (!M || typeof M._pcsx2web_disc_change_result !== 'function') {
+				resolve(false);
+				return;
+			}
+			const before = M._pcsx2web_disc_change_result() >>> 0;
+			if (M.ccall('pcsx2web_change_disc', 'number', ['string'], [path]) !== 0) {
+				resolve(false);
+				return;
+			}
+			const started = performance.now();
+			const check = () => {
+				const result = M._pcsx2web_disc_change_result() >>> 0;
+				if (result !== before)
+					resolve((result & 1) === 1);
+				else if (performance.now() - started > DISC_CHANGE_TIMEOUT_MS || page.vmState !== STATE.RUNNING)
+					resolve(false);
+				else
+					setTimeout(check, 50);
+			};
+			setTimeout(check, 50);
+		});
+	}
+
+	// The game's disc goes out: PCSX2 closes it and the game sees the tray open.
+	async function ejectRunningDisc() {
+		if (!disc.runIsDisc)
+			return true;
+		const ok = await changeDiscInVm('');
+		if (ok) {
+			disc.runIsDisc = false;
+			disc.trayEmpty = true;
+			disc.runTitle = '';
+			disc.runSerial = '';
+			disc.errorShown = false;
+		}
+		return ok;
+	}
+
+	// The current disc goes into the running PS2. Its title comes back through pcsx2web_game() as at a boot.
+	async function insertRunningDisc(d) {
+		const ok = await changeDiscInVm(d.path);
+		if (ok) {
+			disc.runIsDisc = true;
+			disc.trayEmpty = false;
+			disc.runGeneration = d.generation || (disc.status && disc.status.disc ? disc.status.disc.generation : 0);
+			disc.runTitle = '';
+			disc.runSerial = '';
+			disc.errorShown = false;
+		}
+		return ok;
+	}
+
+	// Eject, open the new file in the worker (so nothing reads the old one any more), insert. If the new file
+	// cannot be opened, the worker still serves the old disc, which goes back in.
+	async function swapDisc(desc, handle) {
+		disc.swapping = true;
+		page.error = '';
+		hideDiscMenu();
+		subtitle(DISC_COPY.swapping);
+		render();
+		const prev = disc.current && disc.current.opened && disc.runIsDisc ? disc.current : null;
+		let line;
+		let swappedOk = false;
+		try {
+			if (!await ejectRunningDisc()) {
+				line = DISC_COPY.swapFailed;
+				return;
+			}
+			const op = ++disc.op;
+			const d = newDiscRecord(desc, handle);
+			disc.opening = d;
+			pageLog(`Disc swap: ${desc.name} (${desc.size.toLocaleString('en-US')} bytes).`);
+			if (!await openDiscInWorker(d, op)) {
+				if (prev && disc.current === prev && await insertRunningDisc(prev)) {
+					line = DISC_COPY.swapReverted;
+				} else {
+					line = DISC_COPY.swapEmpty;
+				}
+				return;
+			}
+			if (!await insertRunningDisc(d)) {
+				line = DISC_COPY.insertFailed;
+				return;
+			}
+			line = DISC_COPY.swapped(d.name);
+			swappedOk = true;
+		} finally {
+			disc.swapping = false;
+			if (line) {
+				subtitle(line, swappedOk ? undefined : DISC_ERROR_MS);
+				announce(line);
+			}
+			pageLog(line || 'Disc swap ended.');
+			statesGameChanged();
+			render();
+		}
+	}
+
+	// Remove the disc while the game runs: the tray stays open, empty.
+	async function removeRunningDisc() {
+		disc.swapping = true;
+		hideDiscMenu();
+		render();
+		let ok = false;
+		try {
+			ok = await ejectRunningDisc();
+			if (ok) {
+				disc.op++;
+				const d = disc.current;
+				disc.current = null;
+				disc.opening = null;
+				if (disc.attached)
+					discCall({ type: 'close' });
+				try {
+					if (d)
+						window.Module.FS.unlink(d.path);
+				} catch {
+					// already gone
+				}
+				forgetRememberedDisc();
+			}
+		} finally {
+			disc.swapping = false;
+			const line = ok ? DISC_COPY.ejected : DISC_COPY.swapFailed;
+			subtitle(line);
+			announce(line);
+			pageLog(line);
+			statesGameChanged();
+			render();
+		}
 	}
 
 	function removeDisc() {
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
+			return;
+		}
+		if (swapping()) {
+			removeRunningDisc();
 			return;
 		}
 		disc.op++;
@@ -2385,7 +2585,7 @@
 	}
 
 	async function openDiscPicker() {
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
 			return;
 		}
@@ -2398,7 +2598,7 @@
 		try {
 			[handle] = await window.showOpenFilePicker({
 				id: 'tabstationtoo-disc',
-				types: [{ description: 'PS2 disc images', accept: { 'application/octet-stream': ['.iso', '.bin', '.img'] } }],
+				types: [{ description: 'PS2 disc images', accept: { 'application/octet-stream': ['.iso', '.bin', '.img', '.chd', '.cso', '.zso', '.gz'] } }],
 			});
 		} catch (err) {
 			if (err && err.name === 'AbortError')
@@ -2423,7 +2623,7 @@
 		const rec = disc.remembered;
 		if (!rec)
 			return;
-		if (!canChangeBios()) {
+		if (!canChangeDisc()) {
 			subtitle(DISC_COPY.blocked);
 			return;
 		}
@@ -2519,7 +2719,7 @@
 			clearTimeout(timer);
 		}
 		disc.urlPending = false;
-		if (size < DISC_MIN_SIZE || discLayout(bytes) === null) {
+		if (!isDiscBytes(base, bytes, size)) {
 			page.autoBoot = false;
 			discError(DISC_COPY.notDisc);
 			return;
@@ -2715,6 +2915,8 @@
 	function reviewRunningDisc() {
 		const status = disc.status;
 		const d = disc.current;
+		if (disc.swapping)
+			return; // the generation changes on purpose; insertRunningDisc() takes the new one
 		if (!status || !disc.runIsDisc || !vmLive() || !d) {
 			if (status && status.state === 'ready')
 				disc.errorShown = false;
@@ -3023,7 +3225,7 @@
 
 	function stateOperation(kind) {
 		const M = window.Module;
-		if (devState.busy || page.vmState !== STATE.RUNNING || !M || typeof M._pcsx2web_state_result !== 'function')
+		if (devState.busy || savestates.busy || page.vmState !== STATE.RUNNING || !M || typeof M._pcsx2web_state_result !== 'function')
 			return;
 		if (kind === 'load' && !devState.bytes)
 			return;
@@ -3125,6 +3327,7 @@
 		}
 		const d = disc.current;
 		disc.runIsDisc = !!(d && d.opened && !disc.dead);
+		disc.trayEmpty = false;
 		disc.runTitle = '';
 		disc.runSerial = '';
 		disc.errorShown = false;
@@ -3170,6 +3373,7 @@
 			codeGameKnown(serial);
 			eeGameKnown(serial);
 		}
+		statesGameChanged();
 		const d = disc.current;
 		if (title && d && d.title !== title) {
 			d.title = title;
@@ -3653,6 +3857,17 @@
 	function renderDiscMenu() {
 		const d = disc.current;
 		setData('disc', d ? 'set' : 'none');
+		// The empty tray opens the library, or in a running game the disc picker (insertWhileRunning).
+		const tray = discEls.tray;
+		const pick = !d && swapping();
+		if (tray && tray.dataset.pick !== String(pick)) {
+			tray.dataset.pick = String(pick);
+			tray.setAttribute('aria-label', pick ? 'Insert a disc' : 'Disc library');
+			if (pick)
+				tray.removeAttribute('aria-haspopup');
+			else
+				tray.setAttribute('aria-haspopup', 'dialog');
+		}
 		if (!d || page.phase === 'dead' || page.phase === 'unsupported') {
 			hideDiscMenu();
 			return;
@@ -3660,9 +3875,11 @@
 		setText(discEls.btnName, discDisplayTitle(d));
 		setText(discEls.menuName, d.name);
 		rich(discEls.menuWhere, [...discSizeParts(d.size), { sep: 1 }, discWhere(d)]);
-		const locked = !canChangeBios();
+		// While a game runs the disc can change (swapDisc) but the library, which boots, waits for Stop.
+		const locked = !canChangeDisc();
+		const libraryLocked = !canChangeBios();
 		for (const item of [discEls.menuChoose, discEls.menuLibrary, discEls.menuRemove]) {
-			if (locked) {
+			if (item === discEls.menuLibrary ? libraryLocked : locked) {
 				item.setAttribute('aria-disabled', 'true');
 				item.setAttribute('aria-describedby', 'disc-menu-reason');
 			} else {
@@ -3670,7 +3887,8 @@
 				item.removeAttribute('aria-describedby');
 			}
 		}
-		discEls.menuReason.hidden = !locked;
+		setText(discEls.menuReason, locked ? DISC_COPY.menuReason : DISC_COPY.libraryWhileRunning);
+		discEls.menuReason.hidden = !libraryLocked;
 	}
 
 	// ---- remembering the disc (File System Access handles, Chromium)
@@ -5385,6 +5603,13 @@
 	let libraryPadHandler = null;
 
 	window.PCSX2WebLibrary = Object.freeze({
+		// The empty tray of a running game: a disc goes in without stopping it (swapDisc). True if handled.
+		insertWhileRunning() {
+			if (!swapping() || !canChangeDisc() || disc.current)
+				return false;
+			openDiscPicker();
+			return true;
+		},
 		// Why a disc can't go in now, or '' when it can.
 		blocked() {
 			if (page.phase === 'dead' || page.phase === 'unsupported' || disc.dead)
@@ -5453,6 +5678,14 @@
 
 	// Read-only hooks for automated tests, next to window.PCSX2Web.
 	window.PCSX2WebDisc = Object.freeze({
+		// Automated runs: a same-origin disc URL, opened as ?disc= opens one (while a game runs, it is swapped in),
+		// and Remove the disc. Both are what the disc menu does.
+		load(url) {
+			if (canChangeDisc())
+				loadDiscFromUrl(url);
+		},
+		remove: () => removeDisc(),
+		swapping: () => disc.swapping,
 		stats: () => ({
 			disc: disc.current ? { name: disc.current.name, path: disc.current.path, size: disc.current.size,
 				kind: disc.current.kind, opened: disc.current.opened, title: disc.current.title,
@@ -5465,7 +5698,7 @@
 			restarts: disc.restarts,
 			runGeneration: disc.runGeneration,
 			readerStats: disc.status ? { ...disc.status.stats } : null,
-			game: { title: disc.runTitle, serial: disc.runSerial, disc: disc.runIsDisc },
+			game: { title: disc.runTitle, serial: disc.runSerial, disc: disc.runIsDisc, trayEmpty: disc.trayEmpty },
 			lastDisc: disc.remembered ? disc.remembered.name : null,
 			memcards: { persistent: memcards.persistent, owner: memcards.owner, otherTab: memcards.otherTab, failed: memcards.failed,
 				loaded: cards.loaded, syncing: memcards.syncing, unloadGuard: memcards.guarded, writes: memcards.writes,
@@ -6093,6 +6326,9 @@
 				}
 				toggleDrawer('keys');
 			};
+		} else if ((e.code === 'F1' || e.code === 'F3') && !e.shiftKey && inShortcutScope() && page.vmState === STATE.RUNNING) {
+			const load = e.code === 'F3';
+			action = () => stateShortcut(load);
 		} else if (e.code === 'Backquote' && !e.shiftKey && inShortcutScope()) {
 			action = () => toggleDrawer('log');
 		} else if (isMuteKey(e) && (inShortcutScope() || soundEls.menu.contains(document.activeElement))) {
@@ -6116,7 +6352,7 @@
 
 	// Esc: native dialog/popover close first, then a drawer, then the keyboard.
 	function onEscape(e) {
-		if (els.about.open || menuOpen() || discMenuOpen() || cardMenuOpen() || soundMenuOpen() || gfxMenuOpen() || eeMenuOpen())
+		if (els.about.open || menuOpen() || discMenuOpen() || cardMenuOpen() || soundMenuOpen() || gfxMenuOpen() || eeMenuOpen() || stateMenuOpen())
 			return;
 		dismissTips();
 		const a = document.activeElement;
@@ -6597,8 +6833,137 @@
 		}
 		if (changed)
 			syncPads();
+		rumbleFrame(list, live);
 		if (!any)
 			stopGamepadLoop(); // the next gamepadconnected event starts it again
+	}
+
+	// ---- rumble (UI-SPEC.md §17): the game's motors on its players' gamepads
+
+	// PCSX2 keeps each port's motors in two words (pcsx2web_pad_vibration(): large << 8 | small, 0-255). Each frame
+	// a gamepad that can vibrate (Chromium's vibrationActuator) plays its port's: an effect of RUMBLE_EFFECT_MS,
+	// renewed every RUMBLE_RENEW_MS while it runs, so that a hidden tab or a stopped game never leaves it buzzing.
+	const RUMBLE_EFFECT_MS = 1000;
+	const RUMBLE_RENEW_MS = 700;
+	const rumble = {
+		on: [readPref(PREF_RUMBLE + 1) !== '0', readPref(PREF_RUMBLE + 2) !== '0'],
+		buf: null, words: null,
+		playing: new Map(), // Gamepad.index -> { value, at }
+	};
+
+	// The Test button: the strong motor, then the weak one, on every gamepad that plays as this player, whether the
+	// game's rumble is on or off (it tests the gamepad). The game's own motors take over at their next change.
+	const RUMBLE_TEST_MS = 400;
+	function testRumble(port) {
+		const list = navigator.getGamepads ? navigator.getGamepads() : [];
+		const acts = [];
+		for (const g of connectedGamepads()) {
+			const gp = g.port === port ? list[g.index] : null;
+			if (gp && gp.vibrationActuator && typeof gp.vibrationActuator.playEffect === 'function')
+				acts.push(gp.vibrationActuator);
+		}
+		const play = (strong, weak, delay) => {
+			for (const act of acts) {
+				try {
+					const done = act.playEffect('dual-rumble', { startDelay: delay, duration: RUMBLE_TEST_MS, strongMagnitude: strong, weakMagnitude: weak });
+					if (done && typeof done.catch === 'function')
+						done.catch(() => {});
+				} catch {
+					// the gamepad cannot play it
+				}
+			}
+		};
+		play(1, 0, 0);
+		setTimeout(() => play(0, 1, 0), RUMBLE_TEST_MS + 150);
+		// Not left to the effect's duration, which some gamepads ignore in Chromium (stopAllRumble()).
+		setTimeout(() => {
+			for (const act of acts) {
+				try {
+					const done = typeof act.reset === 'function' ? act.reset() : null;
+					if (done && typeof done.catch === 'function')
+						done.catch(() => {});
+				} catch {
+					// gone
+				}
+			}
+		}, 2 * RUMBLE_TEST_MS + 150);
+		pads.note[port - 1] = acts.length ? 'Rumble test: the strong motor, then the weak one.' : 'No gamepad playing as this player can rumble.';
+		pageLog(`Rumble test for Player ${port} on ${acts.length} gamepad${acts.length === 1 ? '' : 's'}.`);
+		renderPads();
+	}
+
+	// Every gamepad's motors off now. Chromium does not always end an effect after its duration (a DualShock or
+	// DualSense kept rumbling after its tab was closed, until the browser quit), so the page stops them itself when it
+	// goes away, is hidden or loses focus: then rumbleFrame() no longer runs to send the zero.
+	function stopAllRumble() {
+		const list = navigator.getGamepads ? navigator.getGamepads() : [];
+		for (const gp of list) {
+			const act = gp && gp.vibrationActuator;
+			if (!act || typeof act.reset !== 'function')
+				continue;
+			try {
+				const done = act.reset();
+				if (done && typeof done.catch === 'function')
+					done.catch(() => {});
+			} catch {
+				// gone
+			}
+		}
+		for (const p of rumble.playing.values())
+			p.value = 0;
+	}
+
+	for (const [target, type] of [[window, 'pagehide'], [window, 'beforeunload'], [window, 'blur'], [document, 'freeze']])
+		target.addEventListener(type, stopAllRumble);
+	document.addEventListener('visibilitychange', () => {
+		if (document.visibilityState === 'hidden')
+			stopAllRumble();
+	});
+
+	function canRumble(g) {
+		const gp = navigator.getGamepads && navigator.getGamepads()[g.index];
+		return !!(gp && gp.vibrationActuator && typeof gp.vibrationActuator.playEffect === 'function');
+	}
+
+	function rumbleWords() {
+		const M = window.Module;
+		if (!M || typeof M._pcsx2web_pad_vibration !== 'function')
+			return null;
+		const buf = heapBuffer();
+		if (rumble.buf !== buf) {
+			rumble.buf = buf;
+			rumble.words = new Uint32Array(buf, M._pcsx2web_pad_vibration() >>> 0, 2);
+		}
+		return rumble.words;
+	}
+
+	function rumbleFrame(list, live) {
+		const words = live ? rumbleWords() : null;
+		const now = performance.now();
+		for (const g of gamepads.values()) {
+			const gp = g.connected ? list[g.index] : null;
+			const act = gp && gp.vibrationActuator;
+			if (!act || typeof act.playEffect !== 'function')
+				continue;
+			const port = g.port;
+			const value = words && port && rumble.on[port - 1] && !g.mapper ? Atomics.load(words, port - 1) : 0;
+			const p = rumble.playing.get(g.index) || { value: 0, at: 0 };
+			if (value === p.value && (value === 0 || now - p.at < RUMBLE_RENEW_MS))
+				continue;
+			p.value = value;
+			p.at = now;
+			rumble.playing.set(g.index, p);
+			try {
+				const done = value
+					? act.playEffect('dual-rumble', { duration: RUMBLE_EFFECT_MS, strongMagnitude: (value >>> 8) / 255,
+						weakMagnitude: (value & 255) / 255 })
+					: typeof act.reset === 'function' ? act.reset() : null;
+				if (done && typeof done.catch === 'function')
+					done.catch(() => {}); // a newer effect replaced it, or the gamepad went away
+			} catch {
+				// the gamepad cannot play it
+			}
+		}
 	}
 
 	// Plays one state of a gamepad: what the PS2 gets (sent by the caller's syncPads), the Gamepad tab's
@@ -7054,6 +7419,9 @@
 				also: el.querySelector('.pad-also'),
 				map: el.querySelector('.pad-map'),
 				reset: el.querySelector('.pad-reset'),
+				rumble: el.querySelector('.pad-rumble'),
+				rumbleInput: el.querySelector('.pad-rumble-input'),
+				rumbleTest: el.querySelector('.pad-rumble-test'),
 				cable: [$(`cable-${port}-wall`), $(`cable-${port}`), $(`cable-${port}-front-wall`), $(`cable-${port}-front`)],
 				lit: false,
 			};
@@ -7071,6 +7439,14 @@
 			}
 			for (const c of el.querySelectorAll('.p-stick'))
 				u.sticks[c.dataset.stick] = c;
+			u.rumbleInput.checked = rumble.on[port - 1];
+			u.rumbleInput.addEventListener('change', () => {
+				rumble.on[port - 1] = u.rumbleInput.checked;
+				writePref(PREF_RUMBLE + port, u.rumbleInput.checked ? '1' : '0');
+				pageLog(`Rumble for Player ${port}: ${u.rumbleInput.checked ? 'on' : 'off'}.`);
+			});
+			u.rumbleTest.setAttribute('aria-label', `Test rumble for Player ${port}`);
+			u.rumbleTest.addEventListener('click', () => testRumble(port));
 			u.map.addEventListener('click', () => {
 				const g = gamepads.get(padShown(port));
 				if (!g || g.mapper)
@@ -7276,6 +7652,7 @@
 				others.push(o.name);
 		setText(u.also, others.length ? `${others.join(' and ')} also ${others.length > 1 ? 'play' : 'plays'} as Player ${port}.` : '');
 		u.map.hidden = !g || !g.custom;
+		u.rumble.hidden = !g || !canRumble(g);
 		setText(u.map, g && g.map ? 'Map again' : 'Map all controls');
 		u.reset.hidden = id === null || (id === 'keyboard' ? !keyBindsChanged() : !g || !g.map);
 		setText(u.reset, id === 'keyboard' ? 'Reset the keys' : g && g.custom ? 'Clear the mapping' : 'Reset the controls');
@@ -8504,6 +8881,646 @@
 		renderEe();
 	}
 
+	// ------------------------------------------------------------------ save states (UI-SPEC.md §19)
+
+	// Snapshots of the whole PS2 (PCSX2's .p2s), kept per game serial in IndexedDB, at most STATES_PER_GAME each. The
+	// emulator writes and reads them in /states through pcsx2web_save_state() and pcsx2web_load_state(), the same
+	// calls as the Recorder's developer states (devState), which share their busy lock.
+	const STATES_IDB_NAME = 'pcsx2-web-states';
+	const STATES_STORE = 'states';
+	const STATES_PER_GAME = 10;
+	const STATE_BIOS_KEY = '(console)';
+	const STATE_THUMB_W = 128, STATE_THUMB_H = 96;
+	const STATE_THUMB_WAIT_MS = 400;
+	const P2S_MAGIC = [0x50, 0x4b, 0x03, 0x04]; // a .p2s is a zip archive
+	const STATE_COPY = {
+		noGame: 'No game running',
+		consoleMenus: 'The console’s menus',
+		startFirst: 'Start a game to save its state.',
+		unknownYet: 'Saving waits until the game is known.',
+		kept: 'Kept in this browser.',
+		full: `${STATES_PER_GAME} states: saving replaces the oldest.`,
+		versions: 'States only load into the game they were saved from, in this version of TabStationToo or one close to it.',
+		saving: 'Saving…',
+		loading: 'Loading…',
+		newest: 'Newest · F3',
+		btnName: (n) => n ? `Save states, ${n} for this game` : 'Save states',
+		moreFor: (when) => `More for the state of ${when}`,
+		saved: 'State saved.',
+		loaded: (when) => `State loaded: ${when}.`,
+		deleted: 'State deleted.',
+		noneYet: 'No state for this game yet. F1 saves one.',
+		saveFailed: 'Couldn’t save the state. The log may say why.',
+		loadFailed: 'That state didn’t load. It may be from another version of TabStationToo.',
+		cardBusy: 'The game is saving to a memory card. Try again in a few seconds.',
+		noRoom: 'The browser has no room for another state. Delete one or save a copy to disk.',
+		unreadable: 'Couldn’t read that file. Try choosing it again.',
+		notState: 'That file isn’t a PS2 save state (.p2s).',
+	};
+	const stEls = {
+		btn: $('btn-state'),
+		menu: $('state-menu'),
+		game: $('state-game'),
+		save: $('state-new'),
+		saveLabel: $('state-new-label'),
+		list: $('state-list'),
+		none: $('state-none'),
+		open: $('state-open'),
+		reason: $('state-reason'),
+		views: [...document.querySelectorAll('#state-menu .state-view')],
+		moreName: $('state-more-name'),
+		moreWhere: $('state-more-where'),
+		copy: $('state-copy'),
+		del: $('state-delete'),
+		back: $('state-back'),
+		error: $('state-error'),
+		input: $('player-state-input'),
+	};
+	// key: the running game's states key (its serial, STATE_BIOS_KEY, or '' while unknown or stopped); list: its
+	// records without their bytes, newest first; busy: 'save', or the id of the state being loaded ('file' for one
+	// opened from disk); thumbWait: resolves with the next WebGPU frame's thumbnail.
+	const savestates = { db: null, key: '', list: [], busy: null, view: 'list', target: null, thumbWait: null,
+		listKey: '', loadSeq: 0 };
+
+	function stateMenuOpen() {
+		try {
+			return stEls.menu.matches(':popover-open');
+		} catch {
+			return false;
+		}
+	}
+
+	function placeStateMenu() {
+		const r = stEls.btn.getBoundingClientRect();
+		const width = Math.min(320, window.innerWidth - 32);
+		const right = Math.max(16, Math.min(window.innerWidth - r.right, window.innerWidth - width - 16));
+		stEls.menu.style.right = `${Math.round(right)}px`;
+		stEls.menu.style.bottom = `${Math.round(Math.max(8, window.innerHeight - r.top + 8))}px`;
+	}
+
+	// ---- storage
+
+	function statesDb() {
+		if (!savestates.db) {
+			savestates.db = new Promise((resolve, reject) => {
+				if (typeof indexedDB === 'undefined') {
+					reject(new Error('no IndexedDB'));
+					return;
+				}
+				const req = indexedDB.open(STATES_IDB_NAME, 1);
+				req.onupgradeneeded = () => {
+					const store = req.result.createObjectStore(STATES_STORE, { keyPath: 'id' });
+					store.createIndex('key', 'key');
+				};
+				req.onsuccess = () => resolve(req.result);
+				req.onerror = () => reject(req.error);
+			});
+			savestates.db.catch(() => {
+				savestates.db = null;
+			});
+		}
+		return savestates.db;
+	}
+
+	async function statesTx(mode, fn) {
+		const db = await statesDb();
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction(STATES_STORE, mode);
+			let result;
+			Promise.resolve(fn(tx.objectStore(STATES_STORE))).then((r) => (result = r));
+			tx.oncomplete = () => resolve(result);
+			tx.onerror = () => reject(tx.error);
+			tx.onabort = () => reject(tx.error || new Error('aborted'));
+		});
+	}
+
+	const reqValue = (req) => new Promise((resolve, reject) => {
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => reject(req.error);
+	});
+
+	// The states of one game, newest first, without their bytes.
+	async function readStates(key) {
+		const all = await statesTx('readonly', (store) => reqValue(store.index('key').getAll(key)));
+		return (all || []).map(({ bytes, ...meta }) => meta).sort((a, b) => b.at - a.at);
+	}
+
+	async function readStateBytes(id) {
+		const rec = await statesTx('readonly', (store) => reqValue(store.get(id)));
+		return rec ? new Uint8Array(await rec.bytes.arrayBuffer()) : null;
+	}
+
+	// Adds a state and drops the oldest beyond STATES_PER_GAME, in one transaction.
+	async function putState(rec) {
+		await statesTx('readwrite', async (store) => {
+			store.put(rec);
+			const keys = await reqValue(store.index('key').getAll(rec.key));
+			keys.sort((a, b) => b.at - a.at);
+			for (const old of keys.slice(STATES_PER_GAME))
+				store.delete(old.id);
+		});
+	}
+
+	async function refreshStates() {
+		const key = savestates.key;
+		if (!key) {
+			savestates.list = [];
+			renderStates();
+			return;
+		}
+		try {
+			const list = await readStates(key);
+			if (key === savestates.key)
+				savestates.list = list;
+		} catch (err) {
+			pageLog(`Could not read the save states: ${errorText(err)}`, 'warn');
+			savestates.list = [];
+		}
+		renderStates();
+	}
+
+	// The running game's key: its serial once known; the console's menus have their own.
+	function stateKeyNow() {
+		if (page.vmState !== STATE.RUNNING && page.vmState !== STATE.STARTING)
+			return '';
+		if (devElf.bytes || disc.trayEmpty || disc.swapping)
+			return '';
+		if (!disc.runIsDisc)
+			return STATE_BIOS_KEY;
+		return disc.runSerial || '';
+	}
+
+	function statesGameChanged() {
+		const key = stateKeyNow();
+		if (key === savestates.key)
+			return;
+		savestates.key = key;
+		savestates.list = [];
+		if (savestates.view === 'more')
+			setStateView('list');
+		refreshStates();
+	}
+
+	// ---- thumbnails: the picture at the moment Save state was pressed
+
+	function stateThumbFrom(source) {
+		const resolve = savestates.thumbWait;
+		savestates.thumbWait = null;
+		if (!resolve)
+			return;
+		try {
+			const c = new OffscreenCanvas(STATE_THUMB_W, STATE_THUMB_H);
+			c.getContext('2d', { alpha: false }).drawImage(source, 0, 0, STATE_THUMB_W, STATE_THUMB_H);
+			c.convertToBlob({ type: 'image/jpeg', quality: 0.82 }).then(resolve, () => resolve(null));
+		} catch {
+			resolve(null);
+		}
+	}
+
+	function grabStateThumb() {
+		return new Promise((resolve) => {
+			if (display.kind === '2d' || typeof OffscreenCanvas === 'undefined') {
+				savestates.thumbWait = resolve;
+				stateThumbFrom(els.canvas);
+				return;
+			}
+			savestates.thumbWait = resolve;
+			setTimeout(() => {
+				if (savestates.thumbWait === resolve)
+					stateThumbFrom(els.canvas); // no frame came (a paused picture): whatever the canvas shows
+			}, STATE_THUMB_WAIT_MS);
+		});
+	}
+
+	// ---- the emulator's side
+
+	// Runs pcsx2web_save_state() or pcsx2web_load_state() on path; resolves to true or false.
+	function runStateOp(save, path) {
+		const M = window.Module;
+		return new Promise((resolve) => {
+			if (!M || typeof M._pcsx2web_state_result !== 'function') {
+				resolve(false);
+				return;
+			}
+			const before = M._pcsx2web_state_result() >>> 0;
+			if (M.ccall(save ? 'pcsx2web_save_state' : 'pcsx2web_load_state', 'number', ['string'], [path]) !== 0) {
+				resolve(false);
+				return;
+			}
+			const started = performance.now();
+			const check = () => {
+				const result = M._pcsx2web_state_result() >>> 0;
+				if (result !== before)
+					resolve((result & 1) === 1);
+				else if (performance.now() - started > STATE_TIMEOUT_MS)
+					resolve(false);
+				else
+					setTimeout(check, 50);
+			};
+			setTimeout(check, 50);
+		});
+	}
+
+	const stateBusy = () => !!savestates.busy || !!devState.busy;
+
+	function unlinkStateFile(path) {
+		try {
+			window.Module.FS.unlink(path);
+		} catch {
+			// not there
+		}
+	}
+
+	function stateError(text) {
+		stEls.error.textContent = text || '';
+		stEls.error.hidden = !text;
+		if (text && stateMenuOpen())
+			announce(text);
+	}
+
+	// Saves a state of the running game and keeps it first in its list. Resolves to '' or an error line.
+	async function savePlayerState() {
+		const key = savestates.key;
+		if (stateBusy() || page.vmState !== STATE.RUNNING || !key)
+			return '';
+		savestates.busy = 'save';
+		stateError('');
+		renderStates();
+		const thumb = grabStateThumb();
+		const path = `${STATE_DIR}/player.p2s`;
+		const FS = window.Module.FS;
+		if (!FS.analyzePath(STATE_DIR).exists)
+			FS.mkdir(STATE_DIR);
+		const ok = await runStateOp(true, path);
+		let problem = '';
+		if (!ok) {
+			pageLog('Saving the state failed (see the log above).', 'warn');
+			problem = STATE_COPY.saveFailed;
+		} else {
+			const bytes = FS.readFile(path);
+			unlinkStateFile(path);
+			const rec = { id: newStateId(), key, title: key === STATE_BIOS_KEY ? '' : (disc.runTitle || ''), at: Date.now(),
+				size: bytes.length, thumb: await thumb, bytes: new Blob([bytes], { type: 'application/octet-stream' }) };
+			try {
+				askPersistentStorage();
+				await putState(rec);
+				pageLog(`State saved for ${key} (${bytes.length.toLocaleString('en-US')} bytes).`);
+				announce(STATE_COPY.saved);
+				subtitle(STATE_COPY.saved);
+			} catch (err) {
+				pageLog(`Could not keep the state: ${errorText(err)}`, 'warn');
+				problem = err && err.name === 'QuotaExceededError' ? STATE_COPY.noRoom : STATE_COPY.saveFailed;
+			}
+		}
+		savestates.thumbWait = null;
+		savestates.busy = null;
+		await refreshStates();
+		stateRender();
+		return problem;
+	}
+
+	// Loads bytes into the running game. id: the state's id (its row says Loading…) or 'file'.
+	async function loadPlayerState(id, bytes, when) {
+		if (stateBusy() || page.vmState !== STATE.RUNNING)
+			return '';
+		if (cardBusy())
+			return STATE_COPY.cardBusy;
+		savestates.busy = id;
+		stateError('');
+		renderStates();
+		const path = writeStateFile('player-load.p2s', bytes);
+		const ok = await runStateOp(false, path);
+		unlinkStateFile(path);
+		savestates.busy = null;
+		renderStates();
+		stateRender();
+		if (!ok) {
+			pageLog('Loading the state failed (see the log above).', 'warn');
+			return STATE_COPY.loadFailed;
+		}
+		pageLog(`State loaded${when ? `: ${when}` : ''}.`);
+		const line = STATE_COPY.loaded(when || 'from the file');
+		announce(line);
+		subtitle(line);
+		return '';
+	}
+
+	async function loadStoredState(rec) {
+		let bytes;
+		try {
+			bytes = await readStateBytes(rec.id);
+		} catch (err) {
+			pageLog(`Could not read the state: ${errorText(err)}`, 'warn');
+		}
+		if (!bytes)
+			return STATE_COPY.loadFailed;
+		return loadPlayerState(rec.id, bytes, stateWhen(rec.at));
+	}
+
+	// F1 and F3 (UI-SPEC.md §19).
+	async function stateShortcut(load) {
+		if (page.vmState !== STATE.RUNNING || !savestates.key || stateBusy())
+			return;
+		let problem;
+		if (!load) {
+			problem = await savePlayerState();
+		} else if (!savestates.list.length) {
+			subtitle(STATE_COPY.noneYet);
+			announce(STATE_COPY.noneYet);
+			return;
+		} else {
+			problem = await loadStoredState(savestates.list[0]);
+		}
+		if (problem) {
+			subtitle(problem);
+			announce(problem);
+		}
+	}
+
+	async function stateFileChosenPlayer() {
+		const file = stEls.input.files && stEls.input.files[0];
+		stEls.input.value = '';
+		if (!file || stateBusy() || page.vmState !== STATE.RUNNING || !savestates.key)
+			return;
+		let bytes;
+		try {
+			bytes = new Uint8Array(await file.arrayBuffer());
+		} catch (err) {
+			pageLog(`Could not read the save state ${file.name}: ${errorText(err)}`, 'warn');
+			stateError(STATE_COPY.unreadable);
+			return;
+		}
+		if (bytes.length < 4 || P2S_MAGIC.some((b, i) => bytes[i] !== b)) {
+			stateError(STATE_COPY.notState);
+			return;
+		}
+		pageLog(`Save state chosen: ${file.name} (${bytes.length.toLocaleString('en-US')} bytes).`);
+		const key = savestates.key;
+		const problem = await loadPlayerState('file', bytes, '');
+		if (problem) {
+			stateError(problem);
+			return;
+		}
+		// Kept with this game's states, at the time it was opened, with today's picture.
+		const rec = { id: newStateId(), key, title: disc.runTitle || '', at: Date.now(), size: bytes.length,
+			thumb: await grabStateThumb(), bytes: new Blob([bytes], { type: 'application/octet-stream' }) };
+		try {
+			await putState(rec);
+		} catch (err) {
+			pageLog(`Could not keep the opened state: ${errorText(err)}`, 'warn');
+		}
+		refreshStates();
+	}
+
+	async function copyStateToDisk(rec) {
+		let bytes;
+		try {
+			bytes = await readStateBytes(rec.id);
+		} catch {
+			bytes = null;
+		}
+		if (!bytes) {
+			stateError(STATE_COPY.unreadable);
+			return;
+		}
+		const d = new Date(rec.at);
+		const two = (n) => String(n).padStart(2, '0');
+		const stamp = `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}-${two(d.getMinutes())}`;
+		const name = `${rec.key === STATE_BIOS_KEY ? 'BIOS' : rec.key} ${stamp}.p2s`.replace(/[\\/:*?"<>|]+/g, '-');
+		const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = name;
+		document.body.append(a);
+		a.click();
+		a.remove();
+		setTimeout(() => URL.revokeObjectURL(url), 1000);
+		pageLog(`State saved to disk as ${name}.`);
+	}
+
+	async function deleteState(rec) {
+		try {
+			await statesTx('readwrite', (store) => store.delete(rec.id));
+		} catch (err) {
+			pageLog(`Could not delete the state: ${errorText(err)}`, 'warn');
+			stateError(STATE_COPY.saveFailed);
+			return;
+		}
+		announce(STATE_COPY.deleted);
+		subtitle(STATE_COPY.deleted);
+		setStateView('list');
+		await refreshStates();
+	}
+
+	function newStateId() {
+		const bytes = new Uint8Array(6);
+		crypto.getRandomValues(bytes);
+		return 's' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+	}
+
+	// "Today 19:42", "Yesterday 08:10", "12 Oct 21:03" (and the year when it is not this one).
+	function stateWhen(at) {
+		const d = new Date(at);
+		const now = new Date();
+		const time = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+		const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+		const days = Math.round((day(now) - day(d)) / 86400000);
+		if (days === 0)
+			return `today ${time}`;
+		if (days === 1)
+			return `yesterday ${time}`;
+		const opts = { day: 'numeric', month: 'short' };
+		if (d.getFullYear() !== now.getFullYear())
+			opts.year = 'numeric';
+		return `${d.toLocaleDateString('en-GB', opts)} ${time}`;
+	}
+
+	const capFirst = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+
+	function stateSize(bytes) {
+		return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+	}
+
+	// ---- the menu
+
+	function setStateView(view) {
+		savestates.view = view;
+		for (const v of stEls.views)
+			v.hidden = v.dataset.view !== view;
+		stateError('');
+		renderStates();
+		if (stateMenuOpen())
+			queueMicrotask(() => focusStateMenu());
+	}
+
+	function focusStateMenu() {
+		if (savestates.view === 'more') {
+			stEls.copy.focus({ preventScroll: true });
+			return;
+		}
+		const first = [stEls.save, ...stEls.list.querySelectorAll('.state-pick'), stEls.open].find((b) => !isDisabled(b));
+		(first || stEls.menu).focus({ preventScroll: true });
+	}
+
+	function stateAction(fn) {
+		Promise.resolve(fn()).then((problem) => {
+			if (problem)
+				stateError(problem);
+		});
+	}
+
+	function renderStates() {
+		const running = page.vmState === STATE.RUNNING;
+		const key = savestates.key;
+		const live = running && !!key;
+		const busy = stateBusy();
+		const n = key ? savestates.list.length : 0;
+		setText(stEls.game, !key ? (running || page.vmState === STATE.STARTING ? (disc.runTitle || 'Starting…') : STATE_COPY.noGame) :
+			key === STATE_BIOS_KEY ? STATE_COPY.consoleMenus : (disc.runTitle || key));
+		setText(stEls.saveLabel, savestates.busy === 'save' ? STATE_COPY.saving : 'Save state');
+		setItemDisabled(stEls.save, !live || busy, live ? null : stEls.reason.id);
+		setItemDisabled(stEls.open, !live || busy, live ? null : stEls.reason.id);
+		stEls.none.hidden = !live || n > 0;
+		setText(stEls.reason, !running ? STATE_COPY.startFirst : !key ? STATE_COPY.unknownYet :
+			`${STATE_COPY.kept} ${n >= STATES_PER_GAME ? STATE_COPY.full + ' ' : ''}${STATE_COPY.versions}`);
+		stEls.btn.setAttribute('aria-label', STATE_COPY.btnName(n));
+		renderStateRows(live, busy);
+		if (savestates.view === 'more') {
+			const rec = savestates.list.find((r) => r.id === savestates.target);
+			if (!rec) {
+				savestates.view = 'list';
+				for (const v of stEls.views)
+					v.hidden = v.dataset.view !== 'list';
+			} else {
+				setText(stEls.moreName, capFirst(stateWhen(rec.at)));
+				setText(stEls.moreWhere, `${stateSize(rec.size)} · ${STATE_COPY.kept}`);
+			}
+		}
+	}
+
+	function renderStateRows(live, busy) {
+		const rows = live ? savestates.list : [];
+		const key = JSON.stringify([rows.map((r) => [r.id, r.at]), savestates.busy, busy, new Date().toDateString()]);
+		if (key === savestates.listKey)
+			return;
+		savestates.listKey = key;
+		const a = document.activeElement;
+		const focusRow = a && stEls.list.contains(a) ? a.closest('.state-row') : null;
+		const focusId = focusRow ? focusRow.dataset.id : null;
+		const focusMore = !!(a && a.classList.contains('card-more'));
+		for (const img of stEls.list.querySelectorAll('img'))
+			URL.revokeObjectURL(img.src);
+		stEls.list.textContent = '';
+		rows.forEach((r, i) => {
+			const when = stateWhen(r.at);
+			const row = document.createElement('div');
+			row.className = 'state-row';
+			row.dataset.id = r.id;
+			const pick = document.createElement('button');
+			pick.type = 'button';
+			pick.className = 'menu-item state-pick';
+			if (r.thumb) {
+				const img = document.createElement('img');
+				img.className = 'state-thumb';
+				img.alt = '';
+				img.src = URL.createObjectURL(r.thumb);
+				pick.appendChild(img);
+			} else {
+				pick.appendChild(span('state-thumb', ''));
+			}
+			const text = span('card-pick-text state-pick-text', '');
+			text.appendChild(span('card-pick-name', savestates.busy === r.id ? STATE_COPY.loading : capFirst(when)));
+			text.appendChild(span('card-pick-where', i === 0 ? STATE_COPY.newest : stateSize(r.size)));
+			pick.appendChild(text);
+			if (i === 0)
+				pick.setAttribute('aria-keyshortcuts', 'F3');
+			setItemDisabled(pick, busy, null);
+			pick.addEventListener('click', () => {
+				if (isDisabled(pick))
+					return;
+				stateAction(() => loadStoredState(r));
+			});
+			const more = document.createElement('button');
+			more.type = 'button';
+			more.className = 'btn-icon card-more';
+			more.setAttribute('aria-label', STATE_COPY.moreFor(when));
+			more.appendChild(svgIcon('dots-three', 'icon'));
+			more.addEventListener('click', () => {
+				savestates.target = r.id;
+				setStateView('more');
+			});
+			row.append(pick, more);
+			stEls.list.appendChild(row);
+			if (r.id === focusId)
+				queueMicrotask(() => (focusMore ? more : pick).focus({ preventScroll: true }));
+		});
+	}
+
+	function wireStateUi() {
+		stEls.save.addEventListener('click', () => {
+			if (!isDisabled(stEls.save))
+				stateAction(savePlayerState);
+		});
+		stEls.open.addEventListener('click', () => {
+			if (!isDisabled(stEls.open))
+				stEls.input.click();
+		});
+		stEls.input.addEventListener('change', stateFileChosenPlayer);
+		const target = () => savestates.list.find((r) => r.id === savestates.target);
+		stEls.copy.addEventListener('click', () => {
+			const rec = target();
+			if (rec)
+				copyStateToDisk(rec);
+		});
+		stEls.del.addEventListener('click', () => {
+			const rec = target();
+			if (rec)
+				deleteState(rec);
+		});
+		stEls.back.addEventListener('click', () => setStateView('list'));
+		stEls.menu.addEventListener('beforetoggle', (e) => {
+			if (e.newState === 'open') {
+				savestates.view = 'list';
+				for (const v of stEls.views)
+					v.hidden = v.dataset.view !== 'list';
+				stateError('');
+				statesGameChanged();
+				renderStates();
+				placeStateMenu();
+			}
+		});
+		stEls.menu.addEventListener('toggle', (e) => {
+			const open = e.newState === 'open';
+			stEls.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+			if (open) {
+				focusStateMenu();
+			} else {
+				const a = document.activeElement;
+				if (!a || a === document.body || stEls.menu.contains(a))
+					stEls.btn.focus({ preventScroll: true });
+			}
+			updateChrome();
+		});
+		stEls.menu.addEventListener('focusout', (e) => {
+			const to = e.relatedTarget;
+			if (to && !stEls.menu.contains(to) && to !== stEls.btn)
+				stEls.menu.hidePopover();
+		});
+		stEls.menu.addEventListener('keydown', (e) => {
+			if (e.key === 'Escape' && savestates.view === 'more') {
+				e.preventDefault();
+				e.stopPropagation();
+				setStateView('list');
+			}
+		});
+		for (const type of ['resize', 'fullscreenchange'])
+			(type === 'resize' ? window : document).addEventListener(type, () => {
+				if (stateMenuOpen())
+					placeStateMenu();
+			});
+		renderStates();
+	}
+
 	// ------------------------------------------------------------------ preferences
 
 	function readPref(key) {
@@ -8720,7 +9737,7 @@
 
 	function chromeMayHide() {
 		return pageState() === 'running' && captureActive() && document.hasFocus() &&
-			!page.drawer && !menuOpen() && !discMenuOpen() && !cardMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !eeMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
+			!page.drawer && !menuOpen() && !discMenuOpen() && !cardMenuOpen() && !soundMenuOpen() && !gfxMenuOpen() && !eeMenuOpen() && !stateMenuOpen() && !els.about.open && !subtitleOpen && !page.drag &&
 			!pointerOverChrome && !page.keepChrome && hoverQuery.matches;
 	}
 
@@ -9484,10 +10501,10 @@
 				? [COPY.firstFrame, ' ', { num: s, unit: 's' }]
 				: [{ name: b ? b.name : '' }, { sep: 1 }, { num: s, unit: 's' }];
 			m.meta = true;
-			if (s >= STARTING_LOG_S)
+			if (s >= startingLogSeconds())
 				m.fine = [[COPY.noAnswer, ' ', { logLink: COPY.openLog }]];
 			else if (s >= STARTING_REASSURE_S) {
-				m.fine = [[COPY.reassure]];
+				m.fine = [[gzBoot() ? COPY.reassureGz : COPY.reassure]];
 			}
 			break;
 		}
@@ -9700,13 +10717,22 @@
 	// newer one when both are due at once, as after a hidden tab).
 	function announceStartingNotice() {
 		const s = (performance.now() - page.bootAt) / 1000;
-		if (s >= STARTING_LOG_S && page.startNotice < 2) {
+		if (s >= startingLogSeconds() && page.startNotice < 2) {
 			page.startNotice = 2;
 			announce(COPY.noAnswer);
 		} else if (s >= STARTING_REASSURE_S && page.startNotice < 1) {
 			page.startNotice = 1;
-			announce(COPY.reassure);
+			announce(gzBoot() ? COPY.reassureGz : COPY.reassure);
 		}
+	}
+
+	// A .gz disc: PCSX2 reads the whole image to index it before the game starts (DISC-DESIGN.md 5.4).
+	function gzBoot() {
+		return !!(disc.runIsDisc && disc.current && /\.gz$/i.test(disc.current.name));
+	}
+
+	function startingLogSeconds() {
+		return gzBoot() ? STARTING_GZ_LOG_S : STARTING_LOG_S;
 	}
 
 	// Focus, announcements and timing that belong to entering a state.
@@ -10137,6 +11163,7 @@
 			gpuMode: gpu.mode,
 			latency: latencySummary(),
 			surface: surfaceFeed.width ? `${surfaceFeed.width}x${surfaceFeed.height}@${surfaceFeed.scale}` : null,
+			rumble: page.phase === 'ready' && rumbleWords() ? [0, 1].map((i) => Atomics.load(rumble.words, i)) : null,
 		}),
 		logText: () => logLines.map((l) => l.text).join('\n'),
 		// Tests: the copy asked for with ?capture= of the first frame presented at vsync n or later
@@ -10185,6 +11212,7 @@
 		wireSoundUi();
 		wireGfxUi();
 		wireEeUi();
+		wireStateUi();
 		wirePlayersUi();
 		setPicture(readPicturePref());
 		page.keepChrome = readPref(PREF_KEEP_CHROME) === '1';

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -293,6 +294,12 @@ namespace InputManager
 	/// Intensity is normalized from 0 to 1.
 	void SetUSBVibrationIntensity(u32 port, float large_or_single_motor_intensity, float small_motor_intensity);
 	void SetPadVibrationIntensity(u32 pad_index, float large_or_single_motor_intensity, float small_motor_intensity);
+
+#ifdef __EMSCRIPTEN__
+	/// The browser build: no input source drives the motors; the page reads each port's motors here, one word per
+	/// port (large motor << 8 | small motor, 0-255 each), and plays them on that player's gamepads.
+	const std::atomic<u32>* GetWebPadVibration();
+#endif
 
 	/// Zeros all vibration intensities. Call when pausing.
 	/// The pad vibration state will internally remain, so that when emulation is unpaused, the effect resumes.

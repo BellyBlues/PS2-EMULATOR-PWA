@@ -630,7 +630,7 @@ namespace VU1Jit
 		source.known = &Known;
 		source.jump_targets = &JumpTargets;
 		source.ctx = this;
-		const bool have_code = CompileModule(pc, sig, source, &cm);
+		const bool have_code = CompileModule(1, pc, sig, source, &cm);
 		if (!have_code)
 			cm.blocks.push_back(CompiledModule::Block{pc, sig, 1, 0, true}); // a marker: the interpreter runs its instruction
 		// An entry merged before (whose merged module was dropped since) keeps its count: merges stay bounded.
@@ -812,7 +812,7 @@ namespace VU1Jit
 				source.roots.push_back(root);
 		}
 		old->generation = MAX_MERGES;
-		if (!CompileModule(pc, sig, source, &cm))
+		if (!CompileModule(1, pc, sig, source, &cm))
 			return;
 		const Program* entry = Install(cm, true, generation);
 		m_merges++;

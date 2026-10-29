@@ -37,7 +37,7 @@ Emscripten 6.0.12 (emsdk), CMake, Ninja and Python 3:
 source ~/emsdk/emsdk_env.sh
 tools/wasm/build-dependencies-wasm.sh deps-wasm      # once
 emcmake cmake -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_QT_UI=OFF -DENABLE_TESTS=OFF \
+  -DENABLE_TESTS=OFF \
   -DCMAKE_PREFIX_PATH="$PWD/deps-wasm" -DCMAKE_FIND_ROOT_PATH="$PWD/deps-wasm" \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ninja -C build-wasm pcsx2-wasm pcsx2-headless
@@ -59,7 +59,10 @@ Every change must be verified, not assumed.
   `source ~/emsdk/emsdk_env.sh`): Node 22's V8 copies the function table into every module the JITs
   generate, and a game then exhausts the heap within minutes.
 - Performance: measure with the crowd benchmark (`tools/wasm/bench/README.md`); `?threads=1` on the
-  page shows which emulator thread limits a game.
+  page shows which emulator thread limits a game. First check that the CPU runs at full power: on the
+  owner's laptop TLP capped it even on mains until 2026-10-26, and every 7840U number before then is too
+  low (`docs/web-port/PERFORMANCE.md`, top). `scaling_max_freq` must equal `cpuinfo_max_freq` in
+  `/sys/devices/system/cpu/cpu0/cpufreq/`.
 - Browser: `python3 tools/wasm/serve.py [--port N] [--bios-dir DIR] [web root]`, then open
   `index.html` (or `index.html?bios=dev-bios/<file>` with `--bios-dir`). Test UI changes in a
   real browser at desktop and phone widths, with the keyboard.
@@ -105,15 +108,18 @@ These notes come from PCSX2's own agent guidelines, kept word for word in
 - `3rdparty/` holds vendored dependencies. Avoid modifying them unless a task requires patching
   one.
 - PCSX2's layout: `pcsx2/` is the emulator core (EE, IOP, VUs, GS, SPU2, input, storage,
-  networking and devices), `pcsx2-qt/` the Qt desktop frontend, `common/` shared utilities and
-  platform abstraction, `pcsx2-gsrunner/` the GS dump runner used for graphics testing,
-  `tests/ctest/` unit tests, `cmake/` build configuration, `bin/` runtime resources, and `tools/`
-  and `updater/` auxiliary programs.
-- Desktop builds follow the [PCSX2 build guide](https://pcsx2.net/docs/advanced/building/). On
-  Linux, dependencies come from `.github/workflows/scripts/linux/build-dependencies-qt.sh deps`.
+  networking and devices), `common/` shared utilities and platform abstraction,
+  `pcsx2-gsrunner/` the GS dump runner used for graphics testing, `tests/ctest/` unit tests,
+  `cmake/` build configuration, `bin/` runtime resources, and `tools/` auxiliary programs.
+- PCSX2's desktop-only parts are removed from `wasm`: the Qt frontend (`pcsx2-qt/`), the Windows
+  updater (`updater/`), the Visual Studio solution and projects (`*.slnx`, `*.vcxproj*`,
+  `*.props`, `common/vsprops/`), PCSX2's CI scripts and GitHub templates, and its Crowdin and
+  Codacy configuration. Desktop builds of the core use CMake; for them, see the
+  [PCSX2 build guide](https://pcsx2.net/docs/advanced/building/) and upstream's own scripts.
 
 Their contribution and communication rules apply to anything proposed to PCSX2 itself (see Git
-and GitHub below). After merging a newer upstream `master`, keep this file on merge conflicts,
+and GitHub below). After merging a newer upstream `master`, resolve modify/delete conflicts on the
+removed desktop-only parts above by keeping them deleted (`git rm`), keep this file on merge conflicts,
 refresh the copy with `git show upstream/master:AGENTS.md > docs/upstream/PCSX2-AGENTS.md`, and
 bring any new engineering guidance over here.
 

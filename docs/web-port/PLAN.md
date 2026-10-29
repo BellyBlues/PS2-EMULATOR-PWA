@@ -7,7 +7,8 @@
 > "first pixels" exit is met in the browser; the remaining items below still apply.
 
 > **Status update (2026-10-16): speed.** The emulated CPU is the limit, not drawing: the
-> BIOS intro is EE-interpreter-bound. Under Node on the 7840U, 450 frames of the
+> BIOS intro is EE-interpreter-bound. Under Node on the 7840U (its CPU capped by TLP, see
+> `PERFORMANCE.md`; absolute times too slow), 450 frames of the
 > SCPH-39001 intro (7.5 s in real time) took 35.5 s with `-renderer null` and about 37 s
 > with `-renderer sw`. Three interpreter changes taken from the recompilers, wasm-only
 > (`ARCH_WASM`) and checked on the BIOS only (the EE event test runs only once an event is
@@ -29,7 +30,7 @@
 
 With these, a Release wasm32 build (`build-wasm/bin/pcsx2-headless.wasm`, 9.9 MB) boots SCPH-39001 and SCPH-70004 to the OSDSYS menu under Node. It runs interpreters only, with the SW renderer, a new `GSDeviceNull`, and a screenshot at the end.
 
-Measured in `build-wasm/boot-rel.log` (Release, SW renderer, default 2 SW threads, Ryzen 7 PRO 7840U, limiter target speed 1, `:122`):
+Measured in `build-wasm/boot-rel.log` (Release, SW renderer, default 2 SW threads, Ryzen 7 PRO 7840U with its CPU capped by TLP, see `PERFORMANCE.md`, limiter target speed 1, `:122`):
 - **BIOS logo intro (a light 3D load, frames 6–449):** median 20.1 % of real time over 63 samples, interquartile range 19.8–20.4 %, full range 14.7–60.6 %.
 - **Static OSDSYS menu (frames 489–579):** 100 %. That is the frame limiter's ceiling, so the real headroom is unknown.
 - The run does not separate CPU cost from SW-renderer cost. `boot-70004.log` ends at 71–75 %. A later split (2026-10-16, status update at the top) shows the EE interpreter is the limit: with `-renderer null` the intro takes under 10 % less time.
@@ -473,13 +474,13 @@ Done: `ARCH_WASM`/`SIMD_SSE` (`common/Pcsx2Defs.h`, `cmake/BuildParameters.cmake
 
 ## 9. Week-1 starter checklist
 
-Builds on the existing worktree. Run from `/home/nassim/Desktop/Startups/pcsx2-web-wasm`. Another session owns uncommitted work there (`pcsx2-wasm/`, `tools/wasm/serve.py`, `GSDeviceNull`, root `CMakeLists.txt`): coordinate before editing, and stage only your own files.
+Builds on the existing worktree. Run from the repository root (`/home/nassim/Desktop/Startups/tabstationtoo` on the owner's machine). Another session owns uncommitted work there (`pcsx2-wasm/`, `tools/wasm/serve.py`, `GSDeviceNull`, root `CMakeLists.txt`): coordinate before editing, and stage only your own files.
 
 **Day 1: reproduce the toolchain, the Node boot and the browser build.**
 ```bash
 cd ~/emsdk && ./emsdk install 6.0.12 && ./emsdk activate 6.0.12
 source ~/emsdk/emsdk_env.sh && emcc --version          # expect 6.0.12
-cd /home/nassim/Desktop/Startups/pcsx2-web-wasm
+cd /home/nassim/Desktop/Startups/tabstationtoo
 tools/wasm/build-dependencies-wasm.sh deps-wasm        # static, -pthread, -sSUPPORT_LONGJMP=wasm
 emcmake cmake -S . -B build-wasm -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \

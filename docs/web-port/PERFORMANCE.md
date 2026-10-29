@@ -6,6 +6,15 @@ Update it with every optimization (newest entries at the bottom of each list). N
 Apple M1 Max unless noted; "speed" is the emulator's speed in percent of a real PS2, with the frame
 limiter off when it is above 100 %.
 
+**Numbers from the Ryzen 7 PRO 7840U before 2026-10-26 were taken with its CPU capped.** On that laptop
+TLP (Linux power management) held the CPU back on mains power as well as on battery; fixed on 2026-10-26
+(`CPU_SCALING_MAX_FREQ_ON_AC=5132000`, energy preference `performance`). Their absolute speeds are too low.
+Comparisons made there stay valid (both sides ran interleaved under the same cap), and so do the shares of
+a thread's time, which are ratios. The SVR 2011 numbers below are the ones most affected: with the cap
+removed the owner reports that the game runs smoothly (not measured again yet). Before measuring on Linux,
+check that `/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq` equals `cpuinfo_max_freq` and that
+`tlp-stat -p` (or `powerprofilesctl`) shows no power-saving profile on mains.
+
 ## How speed is measured
 
 - **Crowd benchmark** (`tools/wasm/bench/`): a PS2 program with no menu that draws 1, 100, 200 and
@@ -16,7 +25,9 @@ limiter off when it is above 100 %.
   Guitar Hero into a song and Naruto Shippuden Ultimate Ninja 5's menus and intro, driven by
   scripted button presses; GTA San Andreas (PAL) on foot in Grove Street, from a savestate taken
   after the intro, 2400 vsyncs with a scripted walk, speed counted from vsync 600 (the JITs compile
-  from cold after a savestate). Game data never enters the repository.
+  from cold after a savestate); Tekken Tag Tournament (NTSC-U, SLUS-20001), a fight on the grass stage
+  from the owner's savestate, 1500 vsyncs, speed counted from vsync 600. Game data never enters the
+  repository.
 - **The page**, while playing:
   - `?threads=1` adds how busy the EE, GS and VU1 threads are to the speed readout. The thread
     near 100 % is the one holding a game back.
@@ -73,7 +84,9 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | The same generator runs VU0 micro programs, now on by default (`EnableVU0`). GTA San Andreas ran VU0 programs on the interpreter for about 13 % of the EE thread. Checked with `-vu0jit-lockstep` on GTA gameplay (600 vsyncs, 1,008,250 programs, 0 differences), the fuzzer on VU0 (about 17,000 programs each with Liftoff only, TurboFan only and default tiering, 0 differences), GTA state hashes (VU0 registers included, 1000 vsyncs) and software-renderer screenshots. | `pcsx2-wasm/Main.cpp`, `pcsx2-headless/Main.cpp` | GTA SA gameplay (headless): 46.2 → 50.2 VPS | `6c4a3d41f` |
 | VU0 blocks stop where the EE's slice ends. The EE runs VU0 in slices of its own cycles, mostly under 16; a block that did not fit a slice whole was not entered, and the interpreter stepped it instead: 23.7 M of the 77.5 M VU0 instructions in 1800 vsyncs of GTA San Andreas, about 6 % of the EE thread. Generated code now leaves before the first instruction that would start past the slice, with the state the interpreter has there; before a run of delay slots (a branch's, an E bit's, an E bit in an E bit's delay slot) it leaves before the instruction that sets them, so the interpreter stops among them as it would. Checked with VU0 lockstep on GTA (1,008,250 runs, 0 differences); the fuzzer, whose VU0 mode now runs a third of its programs in 1-32 cycle slices (Liftoff only, TurboFan only and default tiering, 2 rounds of 20,000 and 40,000 programs, 0 differences; VU1 0 differences); EE/IOP state hashes identical to the build before on GTA, the BIOS and the benchmark. `-vu0jit-slices 0` turns it off. | `pcsx2/wasm/VU0Jit.cpp`, `VU1JitEmit.cpp`, `VU1JitEmit.h`, `VU1JitFuzz.cpp` | GTA SA: VU0 interpreter steps 23.7 M -> 12,800 per 1800 vsyncs; instructions retired 1,045 G -> 995 G per 2400 vsyncs (-4.8 %, the whole process), cycles -4 %; speed from vsync 600 (noisy machine): 86.8 and 97.2 % off, 103.4 and 101.4 % on; re-measured on a quiet machine, medians of 3 interleaved: 93.4 → 96.3 %, instructions 1,042-1,045 G → 995 G | `b67ed7c8b` |
 | OPMULA and OPMSUB (the outer product, a cross product in two instructions) are generated natively. They were the last upper ops on op bodies: each call stored and reloaded every register and flag the module keeps in locals. WWE SmackDown vs. Raw 2011 uses them in its lighting; a 6-man Hell in a Cell fight ran 15,800 VU1 programs a vsync with VU1 at 100 %. x, y and z of fs.yzx * ft.zxy (from ACC for OPMSUB) whatever the dest field, MAC's w bits kept from the pending flags, status from all four lanes. Checked with the fuzzer (Liftoff and TurboFan, 27,000 programs at the usual weights and 40,000 with the two ops weighted 40, 0 differences) and 400 vsyncs of the SVR fight with `-mtvu-sync` and the software renderer: VU, EE, IOP, SPU2 and GS memories and the screenshots byte-identical to the build before. | `pcsx2/wasm/VU1JitEmit.cpp` | SVR 2011 fight (headless, null renderer, Ryzen 7 7840U, 3 interleaved runs): 86.6-87.4 → 91.9-92.3 %; in Chromium on the 780M (WebGPU): 88 → 93 % | `9cf1444b2` |
-| MAC and status flags kept lazily. A flag-setting op records only its raw result (1.0 in the lanes outside dest, which sets no flag) and the explicit bits (MAC's bits above 16, FSSET's and DIV's status bits, OPMULA/OPMSUB's w bits); a write-back folds the entry into four lane accumulators (minimum and maximum exponent, the signs, the minimum \|x\| - 1) for the sticky bits. MAC and status are computed only where something observes them: FMAND/FMEQ/FMOR, FSAND/FSEQ/FSOR, op bodies and the exits. Before, every FMAC op computed them in full (about 35 wasm ops) and every write-back updated VI[STATUS] (about 12), and the sticky chain kept all of it live through TurboFan. Checked with the fuzzer (VU1 and VU0 modes, Liftoff and TurboFan, 76,000 programs, 0 differences; a planted error in the sticky bits shows up in 730 of 2,569 programs). | `pcsx2/wasm/VU1JitEmit.cpp` | SVR 2011 fight, paused (VU1-bound), headless on a busy machine: VU1 time 19.0 → 17.4 ms per vsync, 83.4 → 86.0 % (medians of 2 interleaved); live action is EE-bound and unchanged | `ccb406594` |
+| MAC and status flags kept lazily. A flag-setting op records only its raw result (1.0 in the lanes outside dest, which sets no flag) and the explicit bits (MAC's bits above 16, FSSET's and DIV's status bits, OPMULA/OPMSUB's w bits); a write-back folds the entry into four lane accumulators (minimum and maximum exponent, the signs, the minimum \|x\| - 1) for the sticky bits. MAC and status are computed only where something observes them: FMAND/FMEQ/FMOR, FSAND/FSEQ/FSOR, op bodies and the exits. Before, every FMAC op computed them in full (about 35 wasm ops) and every write-back updated VI[STATUS] (about 12), and the sticky chain kept all of it live through TurboFan. Checked with the fuzzer (VU1 and VU0 modes, Liftoff and TurboFan, 76,000 programs, 0 differences; a planted error in the sticky bits shows up in 730 of 2,569 programs). | `pcsx2/wasm/VU1JitEmit.cpp` | SVR 2011 fight, paused (VU1-bound), headless, quiet machine, 2 interleaved runs each: 91.5-93.0 → 97.1-97.4 % (87.0 % before the OPMULA commit too); live action is EE-bound and stays at 60-61 %, with VU1 72 → 61 % busy | `ccb406594` |
+| VU0 runs modules of blocks, and its memory ops natively. VU0 compiled one block per module, so every branch inside a program went back to the C++ dispatcher, and it called the interpreter's op body for every LQ/SQ/ILW/ISW (and the I/D forms), around which generated code stores and reloads all its registers and flags (computing the lazy flags). Tekken Tag Tournament skins every vertex of its fighters on VU0: 17,000 programs a vsync of about 61 instructions and 4 blocks, VU0 43 % of the EE thread, of which about 15 % the C++ around each entry. `CompileModule()` now takes the VU: a VU0 module holds every block reachable from its entry (no `known`; at most 64 blocks and 1024 instructions, as random code otherwise makes modules TurboFan runs out of memory on), no block entered in a delay slot and no edge after an M bit; an edge tests the slice as the dispatcher would (`first_need`). Memory ops address VU0's 4 KB natively; one whose address has bit 14 set (VU0's mapping of VU1's registers) leaves before the instruction for the interpreter; in a branch's or an E bit's delay slot (where VU0 makes no exits) they keep the op body. The modules alone gave nothing (entries 69 M → 30 M per 600 vsyncs, but the generated code grew as much as the dispatcher shrank); with the native memory ops, +28 %. Checked: VU0 fuzzer (7 seeds of 20,000 or 40,000 programs; default tiering, Liftoff only, TurboFan only), 0 differences; VU1 fuzzer 0 differences; `-vu0jit-lockstep` on Tekken (20.2 M runs, 0 differences); EE/IOP/VU0 state hashes over 400 Tekken vsyncs (`-mtvu-sync`) identical to the build before. | `pcsx2/wasm/VU0Jit.cpp`, `VU1JitEmit.cpp`, `VU1Jit.cpp` | Tekken Tag Tournament fight, headless, 3 interleaved pairs: 49-51 → 64-65 % | `81f76df15` |
+| An interlocked QMFC2 or CFC2 runs VU0 to its end in one Execute. `vu0Sync()` ran VU0 up to the EE's cycle (stopping at a slice in the middle of a block), then `_vu0FinishMicro()` ran it to its end: two Executes per program for a game that reads every result back with QMFC2.I. Both end on the same VU0 state; what differs is `_vu0FinishMicro()`'s own work (its cycle update, the EE's catch-up, VU1's ExecuteBlock), which it skips when the sync already ended the program. The VU0 JIT tells whether it would have (`VU0Jit::BeginWindow`/`EndWindow`: the last instruction started before the sync's cycle and no M bit stopped it before; `BlockExit::last_cyc` gives that start), and the rest follows in its order. Only with the cycle rate at 0 (it scales each Execute), VU0's D/T interrupts off, and VU0 on the JIT's dispatcher. Guarded for wasm (`pcsx2/VU0.cpp`). A first version that ran the finish whatever the sync would have done was not exact (it added cycles when the sync had ended the program) and was not kept. Checked: EE/IOP/VU0 state hashes identical to the build before over Tekken (600 vsyncs, `-mtvu-sync`), GTA (600) and FFXII gameplay (600). | `pcsx2/VU0.cpp`, `pcsx2/wasm/VU0Jit.cpp` | Tekken: VU0 Executes 30.3 M → 21.8 M per 600 vsyncs; with the idle loop rows below, 74-80 → 84-88 % (headless, interleaved, busy machine) | `8bd1fa3fb` |
 
 ### EE and IOP JITs (game code)
 
@@ -90,6 +103,9 @@ noted. Changes inside PCSX2's own code are guarded for WebAssembly (`ARCH_WASM` 
 | Idle loops skipped up to the next event. GTA San Andreas waits for a DMA interrupt by polling two counters (a 10-instruction loop at `0x34dfd8`, run 250 M times per 1200 vsyncs): a third of the EE thread. At a taken backward branch whose loop has only register ALU ops, loads, branches and jumps, one iteration runs on the interpreter, checked step by step; if it changed no register, the iterations whose last branch test comes before the next event only add cycles (memory changes only in event tests), so they are skipped. The site remembers the registers and the values loaded, so the same state skips without running the iteration again. Exact: `-eejit-trace` replays every skipped branch test with its state, and the hashes over 1000 GTA vsyncs (906 M branch tests, 210 M of them skipped) are the same with the skip on, off (`-eejit-spin 0`) and in the build before it; the end state of 1000 non-traced vsyncs is the same on and off. | `pcsx2/wasm/EEJit.cpp` | GTA SA gameplay (headless): 34.7 → 46.2 VPS | `0b9ac18f0`, `582755a74`, `ef46ac2fc` |
 | PEXEH, PEXEW, PREVH, PROT3W as byte shuffles, and DIV.S, generated natively: GTA's interpreter calls 21.4 M → 13.6 M per 1200 vsyncs | `pcsx2/wasm/EEJit.cpp` | within noise | `ef46ac2fc`, `035e32569` |
 | One function per module (its unit): a module's blocks run in one loop, jump to each other directly, and keep the guest registers in locals from one block to the next. Exact: state hashes identical to the build before over GTA gameplay (600 vsyncs), the BIOS and the benchmark. On its own it does not change the speed: GTA's blocks are 4-5 instructions, and the time goes into the bookkeeping at each taken branch (PC, branch flag, cycles, the branch end call, the next block's checks: about 30 memory operations), which the units make it possible to keep in locals next. | `pcsx2/wasm/EEJit.cpp`, `RegCache.h`, `WasmEmitter.h` | GTA SA headless: 98.6 → 97.8 % (within noise); in the owner's page recordings from one save state, no gain (98.5 against 98.7 %), with 48 % more compile time (1.19 against 0.81 s per 2400 vsyncs headless) and 27 % more generated code, which slowed the first seconds after a load. **Reverted** | `7f41a4f0a`, reverted in the next commit |
+| A block's code compare out of line. Each block compared the words it was compiled from inline in its entry checks, 64 bits at a time against constants, and ran that only when its page's generation had changed (once a vsync, `NoteAll()`, or after a write to the page); it made every block much larger. It now calls one C++ function, `CompareCode()`, with a descriptor of the block (host address, length, its words), kept by the module. Exact: end states of SVR 2011's live fight (600 vsyncs, `-mtvu-sync`) and of the crowd benchmark (1200 vsyncs) identical to the build before, apart from GS.bin, which differs between any two runs (the BIOS run differs between any two runs too: the clock). Measured first: keeping the generation check but no compare at all gave 59.6 → 63.3 % on SVR, removing every code check 65.5 %; the mapping check costs nothing measurable; checking pages against their blocks at vsync instead of the per-frame reset (`NoteAll()`) gave nothing, with or without this (61.5 against 61.8 %). | `pcsx2/wasm/EEJit.cpp` | SVR 2011 live fight, headless, 4 interleaved runs each: 59.5-60.7 → 60.0-62.3 % (means 59.9 → 61.6 %) | `718ecb92c` |
+| An idle loop site that keeps failing waits without a call. Generated code counts the site's wait down itself (`s_spin_wait`) and calls `SpinTry()` only at 0; before, every taken branch at the site called into C++, which compared the loop's code before it looked at the wait. Tekken's vsync wait (below) made 133,000 such calls a vsync, 5.7 % of the EE thread. Only when a skip starts changes, which changes nothing but the time. | `pcsx2/wasm/EEJit.cpp` | Tekken fight, headless, 2 interleaved pairs: 64.5 → 66 % | `b39f50062` |
+| Idle loops that call functions and store, skipped in closed form. Tekken Tag Tournament waits for the vsync in a loop that turns its random number generator (`jal 0x35c678`: seed = seed * 5 + 1, stored back), 133,000 iterations a vsync and about 16 % of the EE thread; the skip refused it (a call and a store). The tried iteration may now leave the loop's words through J, JAL, JR and JALR (that code is part of the memo) and store to aligned main RAM or scratchpad. A loop without stores is skipped as before; one with stores is analysed over the tried iteration's path (`SpinStoreLoop()`): every branch, jump target and address the same whatever the stored words hold, no register depending on them at the end, each stored word an affine function of its own old value (32-bit adds, subtracts, left shifts, moves), no other load touching them. Then n iterations add the same cycles and apply that map n times: one write per word, by powers (`SpinPower()`). With `-eejit-trace` the n iterations run on the interpreter instead and must end on the same words. Checked: state hashes identical to the build before over Tekken (600 vsyncs, 374.6 M branch tests, 513,006 store loop skips each replayed and matched), GTA (600), FFXII gameplay (600) and the BIOS (900); Tekken's end state after 600 untraced vsyncs identical with the skip on and off (every savestate part). | `pcsx2/wasm/EEJit.cpp` | Tekken fight, headless, 3 interleaved pairs: 48-50 → 74-80 % (198.8 M of 200 M iterations skipped per 1500 vsyncs); GTA unchanged (142-146 → 147 %, PAL) | `e75e9a5ca` |
 
 ### GPU pipelines (stutter when something new appears)
 
@@ -154,6 +170,8 @@ simpler distant figures), so each row compares one version with itself.
 | Naruto intro video, Chrome | 82-84 % (measured by the owner before the EE register work) | not yet measured in the page; headless it runs about 24 % faster |
 | GTA San Andreas on foot, headless (median of 3, from vsync 600 of 2400) | 34.7 VPS (69 %) | 50.8 VPS (101.5 %); the owner's page recording before this was 78 % on average (57-92 %), EE-bound. In one build with the features switched (a busier machine, medians of 3 interleaved): 31.1 VPS with both off, 43.8 with the idle loop skip, 47.8 with the VU0 JIT too |
 | GTA San Andreas on foot, in the page (the owner's recording, after the idle loop skip and the VU0 JIT, before the limiter change) | 78 % average | 94.8 % average in gameplay, 59 % of the time at 99 % or more; dips to 76-85 % where the EE is busy |
+| Tekken Tag Tournament, a fight on the grass stage (owner's state), headless, interleaved | 45-51 % | 84-88 % (EE-bound) |
+| Tekken Tag Tournament, the same fight in Chrome (headless Chrome on the M1 Max, WebGPU, a fresh profile: no pipeline list, `?codelist=0`), limiter on, from vsync 600 | 50-51 % (mean 50.7) | 85-89 % (mean 87.3); EE thread 100 % busy, GS about 25 %, VU1 about 20 % |
 
 ## In progress
 
@@ -239,6 +257,41 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   a write-back equal to the last one. Exact (fuzzer, Liftoff and TurboFan and VU0 mode, 60,000 programs, 0
   differences), but SVR 2011's fight stayed at 92.2 % against 91.0-92.5 % without it: TurboFan already drops the
   flag work nothing observes once the flags live in locals. Patch kept in the owner's scratch folder, not merged.
+- **Regions for SVR 2011** (2026-10-23, measured, not built; the plan is `EE-JIT-REGIONS.md` on `Yousri-v2`).
+  Phase 1 with synthetic ELFs (one loop of N ALU ops plus a counter load/add/store and a taken branch, Ryzen 7
+  7840U): 14.3 / 15.2 / 17.9 / 41.2 ns per iteration at N = 1 / 4 / 16 / 64, so about 12 ns of bookkeeping per taken
+  branch and 0.25-0.5 ns per ALU op; per op of 16 in a loop, loads and stores 0.5 ns, LQC2/SQC2 1.1-1.3, ADD.S/MUL.S
+  2.7-3.4, VMUL/VMADD (VU0 macro) 6-7. SVR's live fight takes 170,000 branches a vsync (46,000 backward within
+  1 KB, 70,000 forward, 21,000 JAL, 30,000 JR/JALR): about 2 ms of bookkeeping in the EE thread's 28 ms, of which
+  loops are a quarter, so loop regions would give it about 2 %, under the plan's 10 % bar. With `perf` (V8's
+  `--perf-prof`), JIT code is 40 % of the EE thread and almost all TurboFan; V8's tiering budget is about 7 %
+  (60.5 → 64.6 % with `--wasm-tiering-budget=100000`, steady state; a page cannot set it).
+- **Cycle skip for SVR 2011** (2026-10-23, built and taken out before it was pushed; patches in the owner's scratch
+  folder). PCSX2's EE cycle skipping from the page, per game. The speed readout of the live fight went from 54-62 %
+  to 92-105 % at level 2 (Chromium on the 780M: 46 → 88-97 %), but the game's own frame rate fell (27-29 to 22-26
+  frames a second, `PerformanceMetrics::GetInternalFPS()`): it draws fewer frames per vsync, and the owner saw it
+  just as laggy. SVR runs at 60 frames a second, so only a faster EE thread helps it; check the internal frame rate,
+  not only the speed, before calling a speedhack a gain.
+- **V8's tiers in SVR 2011, and compilation hints** (2026-10-23). `perf` with V8's `--perf-prof` over the live
+  fight (40 s from the save state, EE thread): generated code in Liftoff, V8's baseline tier, is 19-30 % of the
+  thread in the first 15 s and still 16 % after 35 s (TurboFan 41 %), because V8 tiers a function up after about
+  13 MB of its code has run and a block is one small function. Liftoff code is about 20 % slower than TurboFan in
+  a block-like test. The WebAssembly compilation-hints proposal (`metadata.code.compilation_priority`, optimization
+  priority 127) made no difference in Chromium 156, by default or with `--experimental-wasm-compilation-hints`
+  (test page in the owner's scratch folder), so a page cannot ask for TurboFan today.
+- **More EE ideas on SVR 2011's live fight** (2026-10-23, each measured in interleaved headless runs, none kept):
+  registers written through to `cpuRegs` as they are set, so that no write-back is ever emitted (61.4 against
+  61.9 %); the idle loop skip backing off up to 65,536 calls at sites that never skipped, checked before the code
+  compare (60.6 against 59.9 %: the 2 % `SpinTry` shows in profiles is the call itself); the units of `7f41a4f0a`
+  built again with their parent (54.2 against 56.5 %); ThinLTO for the whole build (57.9 against 60.2 %); a larger
+  minimum IOP slice in `_cpuEventTest_Shared()` (48 → 256: same, 1,024: slower). V8 tier-up tests in Chromium 156:
+  a block that leaves by `return_call` is charged its budget like one that returns, and dead code skipped by a
+  branch does not count, so neither can make blocks tier up sooner.
+  After the out-of-line compare (`718ecb92c`) the code checks still cost about 10 % there (61.3 → 67.5 % with none;
+  65.5 % with the generation check but no compare): the compare calls, about 9,000 a vsync, nearly all after
+  `NoteAll()`. Returning to the dispatcher to compare instead of calling (no call left in any block) was slower
+  (58.3 against 61.4 %: each changed generation breaks the chain of linked blocks), and with all blocks checked at
+  vsync too (59.8 against 61.6 %), since that compares every live block, most of which do not run in the frame.
 
 ## Known to be left
 
@@ -308,7 +361,8 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   - flag computation costs about 10 instructions per flag;
   - a few rare delay-slot cases still go to the interpreter.
 - **WWE SmackDown vs. Raw 2011** (NTSC-U, SLUS-21939; a 6-man Hell in a Cell fight from the owner's save
-  state, which sits on the pause menu with the whole scene still drawn; Ryzen 7 7840U). 92 % headless with the
+  state, which sits on the pause menu with the whole scene still drawn; Ryzen 7 7840U, under the TLP CPU cap
+  noted at the top: the percentages are too low, the shares stand). 92 % headless with the
   null renderer, 93 % in Chromium on the 780M (WebGPU): the GPU is not the limit. VU1 is at 100 %: 15,800
   programs and 2.6 M instructions a vsync, 3.6 MB of PATH1 packets. Share of the VU thread (after `9cf1444b2`):
 
@@ -328,12 +382,23 @@ Measured, exact or not, and not kept because the gain was too small for the chan
   6 %, `VIF1transfer` 4 %, `vu1ExecMicro` 3 %). A state taken in live action, not on the pause menu, is still to be
   measured.
 - **SVR 2011 in live action** (the same fight unpaused with a scripted Cross, then a state saved 1,800 vsyncs
-  later; the owner's page recording of a match agrees: 50-60 % with the EE at 100 % and VU1 at 55-65 %). About 50 %
-  headless with the null renderer: the EE needs about twice its speed. Share of the EE thread: generated EE, IOP
+  later; the owner's page recording of a match agrees: 50-60 % with the EE at 100 % and VU1 at 55-65 %). All of
+  this was under the TLP CPU cap noted at the top: with the cap removed (2026-10-26) the owner reports the game
+  running smoothly, so the "1.65 times" below overstates what the EE lacks; measure again before planning on it. About 61 %
+  headless with the null renderer on a quiet machine (50 % while the browser ran too): the EE needs about 1.65 times
+  its speed. Share of the EE thread: generated EE, IOP
   and VU0 code 56 % (thin: no block above 1.2 %), VIF 10 % (`vifCode_Unpack` 5.6 %), `intExecute` 6 %, GIF and
   MTGS 4 %, SPU2 2.5 %, the IOP's C++ 3 %. Underclock does not help (EE cycle rate 0, -1, -2, -3: 48-55 % each).
   The idle loop skip finds 473 sites and skips none: the hottest (`0x1b51b0`, about 3,600 entries a vsync) polls
   bit 8 of a DMA channel's CHCR with a timeout counter in s1, which changes every iteration, so the skip refuses it;
   it is only some 15,000 instructions a vsync. Interpreter calls are about 10,000 a vsync (CACHE 3,900, COP2 2,300).
-  So this game is the case for the faster EE compiler (`EE-JIT-REGIONS.md` on `Yousri-v2`).
+  So this game was the case for the faster EE compiler (`EE-JIT-REGIONS.md` on `Yousri-v2`), on a capped CPU.
 - **SPU2 mixing**: 5-10 % of the EE thread. It processes all 48 voices every sample by design.
+- **Tekken Tag Tournament** (the grass stage fight, after `8bd1fa3fb`): EE-bound at 85-89 % in Chrome. Share of the
+  EE thread, headless: VU0 33 % (generated code about 20 %; the C++ around each of the 36,000 Executes a vsync about
+  13 %: `Dispatch`, `NormalizeRings`, `ApplyExit`, `DeriveSignature`, `vu0ExecMicro`, `Find`), event tests 23 %
+  (the IOP 9 %, VIF 6.6 %, GIF 3 %, SPU2 2.5 %), VIF1 unpacks into the MTVU ring 5 %, code checks 2-3 %. Each skinned
+  vertex costs two VU0 Executes: `VCALLMS` runs the program's first 16 cycles (InterpVU0's start), `QMFC2.I` the
+  rest. Running the start later, with the rest, would change where the program ends against the EE's cycles (event
+  tests run VU0 too, without the EE's catch-up), so it is not exact; not done. 34 M COP2 interpreter calls per 1500
+  vsyncs remain (VCALLMS, and the moves while VU0 runs, which generated code leaves to the interpreter).

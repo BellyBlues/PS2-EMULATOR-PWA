@@ -2,12 +2,15 @@
 
 TabStationToo is a browser frontend for the WebAssembly build of PCSX2 (the `pcsx2-wasm`
 target). It is built on PCSX2 (GPL-3.0) and is not affiliated with Sony or the PCSX2 project.
-You pick your own PS2 BIOS and, if you like, a disc image of one of your games, press Boot, and the
-game (or the BIOS menu) renders in a `<canvas>`, driven from the keyboard. Where the browser offers
-WebGPU, the GS draws with PCSX2's hardware renderer on the GPU and posts each frame to the page as an
-`ImageBitmap` (the WebGPU device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise it uses the software
-renderer and its output is copied to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio worklet.
-Memory cards plug into both slots from a library of named cards kept in the browser or in `.ps2` files on disk. There are no save states yet.
+You pick your own PS2 BIOS and a folder of disc images of your own games, put a disc into the PS2
+in the disc library, and the game (or the BIOS menu) renders in a `<canvas>`, driven from the
+keyboard or a gamepad. The EE, IOP, VU0 and VU1 run on WebAssembly JITs that compile the PS2's
+code at run time (`../pcsx2/wasm/`). Where the browser offers WebGPU, the GS draws with PCSX2's
+hardware renderer on the GPU and posts each frame to the page as an `ImageBitmap` (the WebGPU
+device, `docs/web-port/WEBGPU-DESIGN.md`); otherwise it uses the software renderer and its output
+is copied to the page as plain RGBA pixels and drawn on a 2D canvas. Sound plays through a Web Audio
+worklet. Memory cards plug into both slots from a library of named cards kept in the browser or in
+`.ps2` files on disk. Save states (STATE on the remote, F1 and F3) are kept per game in the browser.
 
 - `Main.cpp`: the frontend (Host callbacks, settings, CPU thread loop, `pcsx2web_*` exports)
 - `web/`: the page (`index.html`, `app.js`, `disc-worker.js`, `audio-tap.js`, `style.css`,
@@ -30,7 +33,7 @@ tools/wasm/build-dependencies-wasm.sh deps-wasm        # once; output in deps-wa
 
 emcmake cmake -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$PWD/deps-wasm" \
-  -DENABLE_QT_UI=OFF -DENABLE_GSRUNNER=OFF -DENABLE_TESTS=OFF
+  -DENABLE_GSRUNNER=OFF -DENABLE_TESTS=OFF
 ninja -C build-wasm pcsx2-wasm
 ```
 
@@ -62,19 +65,31 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
 
 ## Use
 
-1. Open the URL. The emulator (about 14 MB) starts downloading at once; the screen asks for your
-   BIOS. Press **Choose BIOS file…** or drop the file on the page (usually a 4 MB `.bin`, for
-   example `SCPH-39001.bin`). On touch-only devices the download waits until you pick a BIOS.
-2. To play a game, press **Choose a disc…** on the BIOS's title card, or drop the image on the page:
-   an uncompressed `.iso`, `.bin` or `.img` made from a disc you own. The page checks that the file
-   holds an ISO 9660 volume where PCSX2 looks for one and refuses anything else (compressed
-   `.chd`/`.cso`/`.zso`/`.gz` and `.dump` images get their own message). The file is not copied or
+1. Open the URL. The emulator (about 14 MB) starts downloading at once and the disc library opens
+   ([Disc library](#disc-library)). Its BIOS tile asks for your BIOS: press **Choose file** or drop
+   the file on the page (usually a 4 MB `.bin`, for example `SCPH-39001.bin`). Its Games tile then
+   takes a folder of disc images, and putting a disc into the PS2 boots it. On touch-only devices
+   the download waits until you pick a BIOS.
+2. Without the library (close it with Esc), the slate under it offers **Choose a disc…**; a disc image
+   dropped on the page works too:
+   an `.iso`, `.bin` or `.img`, or a compressed `.chd`, `.cso`, `.zso` or `.gz`, made from a disc you own.
+   The page checks that a flat file holds an ISO 9660 volume where PCSX2 looks for one, and that a
+   compressed file starts with its format's header, and refuses anything else (`.dump` block dumps get
+   their own message). PCSX2's own readers decompress them, through `WebDisc::OpenCFile()` (a `FILE*`
+   over the disc worker with a cache of 128 KiB windows). A `.gz` is scanned whole at every boot to
+   build its index, so it starts slowly; CHD and CSO start at once. The file is not copied or
    uploaded: the disc worker reads the parts the game asks for, while it runs. In Chrome and Edge
    the picker (or a drop) also gives the page a handle to the file, kept in IndexedDB: after a
    reload the title card offers **Open it again**, which asks the browser for permission and opens
    the disc with one press. Other browsers need the file picked again. The disc menu under the
-   screen (the disc's title) has **Choose another disc…** and **Remove the disc**; neither works
-   while the PS2 runs, because there is no disc swap yet.
+   screen (the disc's title) has **Choose another disc…** and **Remove the disc**. While the PS2 runs
+   they swap or eject the disc without stopping it, for games on several discs: the page asks the
+   emulator to eject (`pcsx2web_change_disc("")`, PCSX2's `ChangeDisc` to no disc), opens the new file
+   in the disc worker, then inserts it (`pcsx2web_change_disc("/disc/<name>")`). Ejecting first means
+   nothing reads the old disc once the worker has replaced it; if the new file can't be opened, the
+   worker still serves the old one and it goes back in. A disc dropped on the page while a game runs,
+   and the console's empty tray, swap the same way. `window.PCSX2WebDisc.load(url)` and `.remove()` do
+   it from automated runs.
 3. Press **Boot** (or Enter while the screen has focus). If the emulator is still downloading, the
    boot is queued; press again to cancel. With a disc, PCSX2 fast-boots it as its desktop version
    does (the BIOS intro is skipped) and the game's title, from PCSX2's game database, appears in the
@@ -97,7 +112,7 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    the letters of your layout. **Escape** releases the keyboard (it never reaches the PS2); click
    the screen, or press Enter on "Click the screen to play", to take it back. Tab (which moves to
    that button and never reaches the PS2), opening the BIOS menu or About, leaving the window or
-   hiding the tab also release it. Clicking Stop, Crisp, Keys, Log or Fullscreen keeps the keyboard
+   hiding the tab also release it. Clicking Reset or the remote's buttons keeps the keyboard
    on the PS2. Browser shortcuts (Ctrl/Cmd/Alt combinations, F5, F11, F12) keep working. The controls fade after 2.5 s without
    pointer activity; **Keep controls visible** in the Keys drawer turns that off.
    **Gamepads** play too: a gamepad with the browser's standard layout (Xbox, DualShock, DualSense,
@@ -109,13 +124,17 @@ reason the page loads nothing from other origins: no CDN, and same-origin, self-
    gamepads can be swapped. The choices are remembered in this browser. A gamepad that the browser
    does not lay out in the standard way (an 8BitDo in D mode on a Mac, for one) shows **Map controls**
    in that tab: press each control when asked and the mapping is kept in this browser.
-5. Under the screen: **Stop** shuts the VM down (then **Boot again**); the BIOS menu shows where the
-   BIOS is stored and has **Choose another file…** and **Forget this BIOS**; **Sound** opens the
-   volume slider and **Mute** (M mutes and unmutes from the screen too; both are remembered in this
-   browser); **Crisp** switches
-   between sharp and smooth scaling; **Keys** (`?`) and **Log** (`` ` ``, ² on AZERTY) open the
-   drawers; **Fullscreen** (Alt+Enter, or a double-click on the picture) fills the display. The
-   single-key shortcuts only work while focus is on the screen or the controls under it.
+5. Under the screen, the console's front (UI-SPEC.md §16): **Reset** stops the VM (then **Boot
+   again**); **Eject** opens the disc library; the tray opens the disc menu and the plate beside
+   the memory card slots the BIOS menu (where the BIOS is stored, **Choose another file…** and
+   **Forget this BIOS**); the memory card slots open their cards' menus, and the controller ports
+   plug and unplug Player 1 and Player 2. The remote beside it has **VOL** − and + and **MUTE**
+   (M mutes and unmutes from the screen too; both are remembered in this browser), **WIDE**
+   (Fullscreen; Alt+Enter, or a double-click on the picture), **PICTURE** (Smooth, Crisp or CRT),
+   **MENU** (Graphics: renderer and resolution), **CLOCK** (Underclock, per game), **INFO** (the
+   Log, `` ` ``, ² on AZERTY) and, with `?threads=1`, **REC** (the Recorder). `?` opens the Keys
+   drawer. Under the console, the two controllers show what plays each control; click one to change
+   it. The single-key shortcuts only work while focus is on the screen or the controls under it.
 
 Use only a BIOS dumped from a console you own. The file never leaves the browser: it is written
 into the emulator's in-memory file system (`/bios/<name>`) and remembered in the site's IndexedDB
@@ -369,6 +388,17 @@ compile a block once it has run 128 times, within 4 ms of compiling per vsync (`
 `-eejit-hot N[,M[,B]]`, `-iopjit-hot N[,M[,B]]` and `-jit-budget US` change that, and
 `-jit-compile-stats VSYNCS` prints their compile time, total and worst vsync, every VSYNCS vsyncs.
 
+### Save states
+
+STATE on the remote (UI-SPEC.md §19) saves and loads PCSX2 save states (`.p2s`) of the running game, with
+F1 (save) and F3 (load the newest) while the screen or its controls have focus. They are kept per game serial
+(the console's menus have their own key) in IndexedDB, `pcsx2-web-states`, at most 10 per game, each with a
+128 × 96 JPEG of the picture at that moment (the next WebGPU frame, or the 2D canvas). The emulator writes and
+reads them in `/states` through `pcsx2web_save_state()` and `pcsx2web_load_state()`, the calls the Recorder's
+developer states use; the two share one busy lock. PCSX2 refuses to load while a memory card was written in
+the last few seconds, so the page checks the cards first and says so. "Open a state file…" loads a `.p2s`
+into the running game and keeps it with that game's states (a file does not say which game it is from).
+
 ### Disc library
 
 The page's home is a dialog with a shelf of the discs in a folder and a PS2 to put them in
@@ -556,6 +586,7 @@ It calls exports that never block (atomics and a lock-free key queue only):
 | `pcsx2web_frame()` | address of the frame descriptor: `seq, width, height, pixels, vsync` (u32) |
 | `pcsx2web_surface_size(w, h, scale)` | the display canvas's backing size and device pixel ratio (WebGPU presents at it) |
 | `pcsx2web_set_crisp(on)` | nearest (1) or bilinear (0) presentation, applied at the next vsync |
+| `pcsx2web_pad_vibration()` | address of two `u32` words, one per pad port: the game's motors as `large << 8 \| small` (0-255 each), updated on every pad poll (`InputManager::SetPadVibrationIntensity`) and zeroed on pause. The page plays them on that player's gamepads (`rumbleFrame()`); `PCSX2Web.stats().rumble` shows them |
 | `pcsx2web_set_upscale(n)` | the internal resolution (`EmuCore/GS/upscale_multiplier`): 1 (native, the default) or 2 (twice the PS2's lines), applied at the next vsync or boot; other values are ignored. The hardware renderer only (the software renderer ignores it); the GS clamps it to the adapter's largest texture. The page's Graphics menu offers Native and 2× |
 | `pcsx2web_set_tv_shader(n)` | PCSX2's TV shader (`EmuCore/GS/TVShader`: 0 none, 1 scanlines, 2 diagonal, 3 triangular, 4 wave, 5 Lottes CRT, 6 4xRGSS, 7 NxAGSS), applied at the next vsync; the WebGPU device only (the 2D path's device has none). The page's CRT picture mode is 5 |
 | `pcsx2web_set_ee_cycle_rate(rate)` | the Underclock (PCSX2's EE cycle rate): 0, or -1 to -3 for the EE at 75, 60 or 50 %, applied at the next vsync or boot; other values are ignored |
@@ -639,16 +670,19 @@ The audio block (`pcsx2web_audio()`, little-endian u32, read with `Atomics.load`
 
 ## Current limitations
 
-- No save states, rumble or touch controls yet; fixed key and gamepad layouts (no remapping). Two pads (ports 1 and 2, no multitap). Two memory card slots of 8 MB `.ps2` cards (no multitap, PS1 or folder cards).
+- No touch controls yet. Rumble only where the browser can vibrate a gamepad (Chromium, not Firefox). Two pads (ports 1 and 2, no multitap). Two memory card slots of 8 MB `.ps2` cards (no multitap, PS1 or folder cards).
 - Sound: stereo only (no surround), no output device choice; below about 20 % speed it plays
   continuous but smeared (time-stretched), and when the machine is overloaded it can still break up.
   Safari is untested.
-- Discs: uncompressed single-file images only (no CHD, CSO/ZSO, GZ, blockdump or multi-file
-  BIN/CUE), and no disc swap or eject while a game runs.
-- Interpreters only, so most content runs below full speed: game menus mostly run at 60–100 %,
-  3D battles at 10–20 %.
+- Discs: single-file images only (no CHD with a parent, blockdump or multi-file BIN/CUE). The disc
+  library is for booting: while a game runs, discs change through the disc menu. In the disc library, CHD, ZSO and GZ discs are named after
+  their file (no serial, so no cover from ps2-covers); ISO and CSO discs are read for their serial.
+- Not every scene runs at full speed on every machine: the EE (main CPU) thread is the usual limit. Guitar
+  Hero, GTA San Andreas and Final Fantasy XII's cutscenes run at or near 100 % in Chrome, and a WWE SmackDown
+  vs. Raw 2011 match runs smoothly on a Ryzen 7 7840U at full power. A power manager capping the CPU (TLP on
+  Linux, even on mains) costs a lot: under such a cap that match read 50-60 % (`docs/web-port/PERFORMANCE.md`).
 - The hardware renderer on WebGPU needs dual-source blending (not in Safari) and does not have
-  upscaling, PrimID DATE, AA1, CAS or FXAA yet (`docs/web-port/WEBGPU-DESIGN.md`, step 3).
+  upscaling beyond 2×, PrimID DATE, AA1, CAS or FXAA yet (`docs/web-port/WEBGPU-DESIGN.md`, step 3).
 - Only the main BIOS file is loaded (no separate ROM1/ROM2/NVM/MEC files).
 - Needs a recent desktop browser with cross-origin isolation (Chrome, Edge or Firefox; Safari is
   untested). WebGPU presentation also needs JSPI (Chrome 137+, Firefox 157 has it); without it,

@@ -67,6 +67,8 @@ if (host && dialog && root) {
 	for (const b of consoleOpeners) {
 		b?.addEventListener('click', () => {
 			const view = host.status().view;
+			if (b.id === 'tray-library' && host.insertWhileRunning())
+				return;
 			if (host.canOpen())
 				open();
 			else if (view === 'running' || view === 'starting')

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the third-party libraries PCSX2 needs for an Emscripten (wasm32) build.
-# Versions and hashes follow .github/workflows/scripts/linux/build-dependencies-qt.sh.
+# Versions and hashes started from PCSX2's .github/workflows/scripts/linux/build-dependencies-qt.sh
+# (removed from this repository; see upstream PCSX2).
 # Everything is static and compiled with -pthread: linking a shared-memory wasm
 # module fails if any object was built without atomics/bulk-memory. libpng,
 # libjpeg and FreeType use setjmp, so they also need -sSUPPORT_LONGJMP=wasm to

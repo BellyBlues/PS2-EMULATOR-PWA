@@ -9,7 +9,10 @@
 #include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
 
+#include <algorithm>
 #include <climits>
+#include <cstring>
+#include <memory>
 
 // The worker writes these words with Atomics on an Int32Array; std::atomic of the same size, lock-free
 // and sequentially consistent, compiles to the same wasm atomics. Waits and wakes go through
@@ -237,4 +240,147 @@ const char* WebDisc::ResultName(s32 result)
 		default:
 			return (result >= 0) ? "ok" : "unknown error";
 	}
+}
+
+namespace WebDisc
+{
+	// OpenCFile(): the cookie behind the FILE*. Windows are aligned to WINDOW_SIZE; a read that misses fills
+	// the least recently used one with one request to the worker. Reads of a window or more skip the cache.
+	static constexpr u32 WINDOW_SIZE = 128 * 1024;
+	static constexpr u32 WINDOWS = 4;
+
+	struct CFileCookie
+	{
+		u32 generation = 0;
+		u64 size = 0;
+		u64 pos = 0;
+		u64 use = 0;
+		struct Window
+		{
+			u64 start = UINT64_MAX;
+			u32 length = 0;
+			u64 used = 0;
+			std::unique_ptr<u8[]> data;
+		} window[WINDOWS];
+	};
+
+	static ssize_t CFileRead(void* opaque, char* buf, size_t len)
+	{
+		CFileCookie* c = static_cast<CFileCookie*>(opaque);
+		size_t done = 0;
+		while (done < len && c->pos < c->size)
+		{
+			const u64 want = std::min<u64>(len - done, c->size - c->pos);
+			if (want >= WINDOW_SIZE)
+			{
+				const u32 length = static_cast<u32>(std::min<u64>(want, MAX_REQUEST));
+				const s32 got = Read(c->generation, buf + done, c->pos, length);
+				if (got <= 0)
+					return done ? static_cast<ssize_t>(done) : -1;
+				done += static_cast<u32>(got);
+				c->pos += static_cast<u32>(got);
+				continue;
+			}
+
+			const u64 start = c->pos - (c->pos % WINDOW_SIZE);
+			CFileCookie::Window* w = nullptr;
+			for (CFileCookie::Window& x : c->window)
+			{
+				if (x.start == start)
+					w = &x;
+			}
+			if (!w)
+			{
+				w = &c->window[0];
+				for (CFileCookie::Window& x : c->window)
+				{
+					if (x.used < w->used)
+						w = &x;
+				}
+				if (!w->data)
+					w->data = std::make_unique<u8[]>(WINDOW_SIZE);
+				const u32 length = static_cast<u32>(std::min<u64>(WINDOW_SIZE, c->size - start));
+				w->start = UINT64_MAX;
+				const s32 got = Read(c->generation, w->data.get(), start, length);
+				if (got <= 0)
+					return done ? static_cast<ssize_t>(done) : -1;
+				w->start = start;
+				w->length = static_cast<u32>(got);
+			}
+			w->used = ++c->use;
+			const u32 at = static_cast<u32>(c->pos - start);
+			if (at >= w->length)
+				break;
+			const u32 n = static_cast<u32>(std::min<u64>(want, w->length - at));
+			std::memcpy(buf + done, w->data.get() + at, n);
+			done += n;
+			c->pos += n;
+		}
+		return static_cast<ssize_t>(done);
+	}
+
+	static int CFileSeek(void* opaque, off_t* offset, int whence)
+	{
+		CFileCookie* c = static_cast<CFileCookie*>(opaque);
+		s64 base;
+		switch (whence)
+		{
+			case SEEK_SET:
+				base = 0;
+				break;
+			case SEEK_CUR:
+				base = static_cast<s64>(c->pos);
+				break;
+			case SEEK_END:
+				base = static_cast<s64>(c->size);
+				break;
+			default:
+				return -1;
+		}
+		const s64 to = base + static_cast<s64>(*offset);
+		if (to < 0)
+			return -1;
+		c->pos = static_cast<u64>(to);
+		*offset = static_cast<off_t>(to);
+		return 0;
+	}
+
+	static int CFileClose(void* opaque)
+	{
+		delete static_cast<CFileCookie*>(opaque);
+		return 0;
+	}
+} // namespace WebDisc
+
+std::FILE* WebDisc::OpenCFile(const char* path, Error* error)
+{
+	if (!path || !IsDiscPath(path))
+	{
+		Error::SetStringView(error, "Not a disc path.");
+		return nullptr;
+	}
+
+	Info info;
+	if (!Query(&info, error))
+		return nullptr;
+
+	CFileCookie* cookie = new CFileCookie();
+	cookie->generation = info.generation;
+	cookie->size = info.size;
+	cookie_io_functions_t io = {};
+	io.read = CFileRead;
+	io.seek = CFileSeek;
+	io.close = CFileClose;
+	std::FILE* fp = fopencookie(cookie, "rb", io);
+	if (!fp)
+	{
+		delete cookie;
+		Error::SetStringView(error, "Could not open the disc as a file.");
+		return nullptr;
+	}
+
+	// Unbuffered: with a buffer, musl splits every fread into two callbacks (DISC-DESIGN.md 5.1); the windows
+	// above are the buffer.
+	std::setvbuf(fp, nullptr, _IONBF, 0);
+	return fp;
 }

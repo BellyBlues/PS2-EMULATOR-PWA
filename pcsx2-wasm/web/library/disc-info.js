@@ -88,7 +88,103 @@ export function parseSystemCnf(text) {
 }
 
 // { media, volumeId, platform, serial } for a disc image, or null when it holds no ISO 9660 volume.
-export async function readDiscInfo(blob) {
+// Compressed images, by extension, with the header that must start them. Only a CSO can be read here (each
+// 2048-byte block is raw deflate, which DecompressionStream inflates); the others go on the shelf named after
+// their file, without a serial.
+const COMPRESSED_MAGIC = [
+	[/\.chd$/i, [0x4d, 0x43, 0x6f, 0x6d, 0x70, 0x72, 0x48, 0x44]], // "MComprHD"
+	[/\.cso$/i, [0x43, 0x49, 0x53, 0x4f]], // "CISO"
+	[/\.zso$/i, [0x5a, 0x49, 0x53, 0x4f]], // "ZISO"
+	[/\.gz$/i, [0x1f, 0x8b]],
+];
+
+// Inflates one block. A CSO pads blocks to its alignment, and DecompressionStream fails on bytes after the end
+// of the deflate stream: once the block's `expected` bytes are out, that error is the padding's.
+async function inflateRaw(bytes, expected) {
+	const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
+	const out = new Uint8Array(expected);
+	let got = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done)
+				break;
+			out.set(value.subarray(0, Math.max(0, expected - got)), got);
+			got += value.length;
+		}
+	} catch (err) {
+		if (got < expected)
+			throw err;
+	}
+	if (got < expected)
+		throw new Error('short block');
+	return out;
+}
+
+// A Blob-like view of a CSO's uncompressed bytes (what readSectors needs: size and slice().arrayBuffer()).
+// CSO: "CISO", header size, total bytes (u64), block size, version, index shift; then one u32 per block plus
+// one, the block's offset >> shift, with the top bit set when the block is stored uncompressed.
+async function csoView(blob) {
+	const head = new Uint8Array(await blob.slice(0, 24).arrayBuffer());
+	const total = u32(head, 8) + u32(head, 12) * 2 ** 32;
+	const blockSize = u32(head, 16);
+	const shift = head[21];
+	if (blockSize !== 2048 || total < MIN_SIZE)
+		return null;
+	const blocks = Math.ceil(total / blockSize);
+	const indexAt = 24;
+	const readIndex = async (first, count) => {
+		const b = new Uint8Array(await blob.slice(indexAt + first * 4, indexAt + (first + count + 1) * 4).arrayBuffer());
+		return Array.from({ length: count + 1 }, (_, i) => u32(b, i * 4));
+	};
+	const view = {
+		size: total,
+		slice(from, to) {
+			return { arrayBuffer: async () => {
+				const first = Math.floor(from / blockSize);
+				const last = Math.min(blocks, Math.ceil(to / blockSize));
+				const index = await readIndex(first, last - first);
+				const out = new Uint8Array((last - first) * blockSize);
+				for (let i = 0; i < last - first; i++) {
+					const plain = (index[i] & 0x80000000) !== 0;
+					const at = (index[i] & 0x7fffffff) * 2 ** shift;
+					const end = (index[i + 1] & 0x7fffffff) * 2 ** shift;
+					const raw = new Uint8Array(await blob.slice(at, end).arrayBuffer());
+					const data = plain ? raw : await inflateRaw(raw, blockSize);
+					out.set(data.subarray(0, blockSize), i * blockSize);
+				}
+				const start = from - first * blockSize;
+				return out.slice(start, start + (to - from)).buffer;
+			} };
+		},
+	};
+	return view;
+}
+
+// A compressed image: null unless its header matches its extension; a CSO is read like a flat image.
+async function readCompressedInfo(blob, name) {
+	const entry = COMPRESSED_MAGIC.find(([re]) => re.test(name));
+	const head = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
+	if (!entry || !entry[1].every((b, i) => head[i] === b))
+		return null;
+	if (/\.cso$/i.test(name) && typeof DecompressionStream === 'function') {
+		try {
+			const view = await csoView(blob);
+			const info = view && await readDiscInfo(view, '');
+			if (info) {
+				info.media = view.size > CD_MAX_BYTES ? 'DVD' : 'CD';
+				return info;
+			}
+		} catch {
+			// unreadable here; PCSX2 may still read it
+		}
+	}
+	return { media: null, volumeId: '', platform: null, serial: null };
+}
+
+export async function readDiscInfo(blob, name = blob.name || '') {
+	if (COMPRESSED_RE.test(name))
+		return readCompressedInfo(blob, name);
 	if (blob.size < MIN_SIZE)
 		return null;
 	const head = new Uint8Array(await blob.slice(0, Math.min(blob.size, HEADER_BYTES)).arrayBuffer());
