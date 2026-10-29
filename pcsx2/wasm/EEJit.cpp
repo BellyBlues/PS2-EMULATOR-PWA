@@ -400,6 +400,15 @@ namespace
 	// aligned loads of main RAM or the scratchpad only. If it changed nothing, the site remembers the registers it
 	// started from and the values it loaded: the same registers and the same values make the same iteration, so the
 	// next time it skips without running it.
+	//
+	// Loops that store (SpinStoreLoop()): the iteration may also call code outside the loop's words (J, JAL, JR, JALR)
+	// and store to aligned main RAM or scratchpad. Some games turn a random number generator while they wait for the
+	// vsync (Tekken Tag Tournament: seed = seed * 5 + 1, 133,000 times a vsync). If every branch, jump target and
+	// address in the iteration is the same whatever the stored words hold, no register depends on them at its end, and
+	// each stored word is an affine function of its own old value (32-bit adds, subtracts and left shifts), then every
+	// iteration takes the same path and leaves the same registers, and n of them only add cycles and apply that affine
+	// map n times to each word: one write per word (by powers, SpinPower()). With -eejit-trace the n iterations run on
+	// the interpreter instead and must end on the same words.
 
 	struct SpinWord
 	{
@@ -452,6 +461,21 @@ namespace
 		u64 value;
 	};
 
+	// A word a store loop writes: n iterations make it mul^n * w + add * (mul^(n-1) + ... + 1).
+	struct SpinUpdate32
+	{
+		u32 addr;
+		u32 mul;
+		u32 add;
+	};
+
+	// An instruction of the tried iteration outside the loop's words, for the memo.
+	struct SpinOutside
+	{
+		u32 pc;
+		u32 code;
+	};
+
 	struct SpinSite
 	{
 		u32 target = 0;
@@ -466,12 +490,24 @@ namespace
 		SpinSnap start;
 		std::vector<SpinTest> tests;
 		std::vector<SpinSnap> snaps;
-		std::vector<SpinLoad> loads;
+		std::vector<SpinLoad> loads; // of words the iteration does not store
+		std::vector<SpinOutside> outside;
+		bool stores = false; // a store loop (SpinStoreLoop())
+		std::vector<SpinUpdate32> updates;
 		// For each value of cpuBlockCycles (below 8) at the loop's start: the cycles one iteration adds, and
 		// cpuBlockCycles after it.
 		u32 delta[8];
 		u8 next_bc[8];
 		u64 calls = 0, tries = 0, skips = 0, iters = 0; // -eejit-stats
+	};
+
+	// An instruction of the tried iteration and the GPRs (low 64 bits) before it (SpinStoreLoop()).
+	struct SpinStep
+	{
+		u32 pc;
+		u32 code;
+		Kind kind;
+		u64 regs[32];
 	};
 
 	constexpr size_t kMaxSpinSites = 1u << 16;
@@ -487,13 +523,15 @@ namespace
 	std::mutex s_spin_mutex; // AddSpinSite() on the EE and code generation threads
 	std::unordered_map<u32, u32> s_spin_index; // branch PC -> s_spin_sites index
 	bool s_spin_off = false;
-	u64 s_spin_tries = 0, s_spin_hits = 0, s_spin_skips = 0, s_spin_iters = 0, s_spin_cycles = 0, s_spin_why[7] = {};
+	u64 s_spin_tries = 0, s_spin_hits = 0, s_spin_skips = 0, s_spin_iters = 0, s_spin_cycles = 0, s_spin_why[8] = {};
+	u64 s_spin_store_skips = 0;
 
 	enum class SpinClass : u8
 	{
 		Other,
 		Alu,
 		Load,
+		Store,
 		Branch, // conditional, no link
 		Jump,
 	};
@@ -513,6 +551,11 @@ namespace
 				return SpinClass::Alu;
 			case Kind::LB: case Kind::LBU: case Kind::LH: case Kind::LHU: case Kind::LW: case Kind::LWU: case Kind::LD:
 				return SpinClass::Load;
+			case Kind::SB:
+			case Kind::SH:
+			case Kind::SW:
+			case Kind::SD:
+				return SpinClass::Store;
 			case Kind::BEQ: case Kind::BNE: case Kind::BLEZ: case Kind::BGTZ: case Kind::BEQL: case Kind::BNEL:
 			case Kind::BLEZL: case Kind::BGTZL: case Kind::BLTZ: case Kind::BGEZ: case Kind::BLTZL: case Kind::BGEZL:
 				return SpinClass::Branch;
@@ -539,9 +582,21 @@ namespace
 		load->addr = cpuRegs.GPR.r[(w.code >> 21) & 31].UL[0] + static_cast<s16>(w.code & 0xffff);
 		switch (w.kind)
 		{
-			case Kind::LB: case Kind::LBU: load->size = 1; break;
-			case Kind::LH: case Kind::LHU: load->size = 2; break;
-			case Kind::LW: case Kind::LWU: load->size = 4; break;
+			case Kind::LB:
+			case Kind::LBU:
+			case Kind::SB:
+				load->size = 1;
+				break;
+			case Kind::LH:
+			case Kind::LHU:
+			case Kind::SH:
+				load->size = 2;
+				break;
+			case Kind::LW:
+			case Kind::LWU:
+			case Kind::SW:
+				load->size = 4;
+				break;
 			default: load->size = 8; break;
 		}
 		if (load->addr & (load->size - 1))
@@ -622,6 +677,311 @@ namespace
 		}
 	}
 
+	// The value of a register or of a stored word in a store loop's iteration (SpinStoreLoop()): the same in every
+	// iteration (Const), sext32(a * w + b) where w is the 32-bit word the iteration stores at index sym of its
+	// stores, as the iteration started (Aff), or anything else (Opaque).
+	struct SpinVal
+	{
+		enum : u8
+		{
+			Const,
+			Aff,
+			Opaque
+		} tag = Const;
+		u32 sym = 0;
+		u32 a = 0;
+		u32 b = 0;
+	};
+
+	// After a tried iteration that stored (path: its instructions, with the registers before each): whether every
+	// iteration from the same registers is the same but for the words it stores, each of which is then an affine
+	// function of its own old value (site.updates); see the comment above SpinWord. Const values are those of the
+	// tried iteration.
+	bool SpinStoreLoop(SpinSite& site, const std::vector<SpinStep>& path)
+	{
+		const auto size_of = [](Kind k) -> u32 {
+			switch (k)
+			{
+				case Kind::LB:
+				case Kind::LBU:
+				case Kind::SB:
+					return 1;
+				case Kind::LH:
+				case Kind::LHU:
+				case Kind::SH:
+					return 2;
+				case Kind::LW:
+				case Kind::LWU:
+				case Kind::SW:
+					return 4;
+				default:
+					return 8;
+			}
+		};
+		const auto addr_of = [](const SpinStep& st) {
+			return static_cast<u32>(st.regs[(st.code >> 21) & 31]) + static_cast<u32>(static_cast<s16>(st.code & 0xffff));
+		};
+
+		// The words it stores: each address with one size (SpinRead() checked alignment and memory).
+		struct Word
+		{
+			u32 addr;
+			u32 size;
+		};
+		std::vector<Word> words;
+		const auto overlap = [&](u32 addr, u32 size) -> int {
+			for (size_t k = 0; k < words.size(); k++)
+			{
+				if (addr < words[k].addr + words[k].size && words[k].addr < addr + size)
+					return static_cast<int>(k);
+			}
+			return -1;
+		};
+		for (const SpinStep& st : path)
+		{
+			if (SpinClassOf(st.kind) != SpinClass::Store)
+				continue;
+			const u32 addr = addr_of(st), size = size_of(st.kind);
+			const int k = overlap(addr, size);
+			if (k < 0)
+				words.push_back({addr, size});
+			else if (words[k].addr != addr || words[k].size != size)
+				return false;
+		}
+		// No store may change the iteration's own code.
+		for (const SpinStep& st : path)
+		{
+			if (overlap(st.pc, 4) >= 0)
+				return false;
+		}
+
+		SpinVal reg[32] = {};
+		std::vector<SpinVal> mem(words.size());
+		std::vector<u8> stored(words.size(), 0);
+		const auto opaque = [] { SpinVal v; v.tag = SpinVal::Opaque; return v; };
+		const auto aff = [](u32 sym, u32 a, u32 b) { SpinVal v; v.tag = SpinVal::Aff; v.sym = sym; v.a = a; v.b = b; return v; };
+		const auto set = [&](u32 r, const SpinVal& v) {
+			if (r)
+				reg[r] = v;
+		};
+		// x + y (sub: x - y) on 32 bits, sign-extended, as ADDU and SUBU: cx, cy are the operands' values if Const.
+		const auto add32 = [&](const SpinVal& x, u64 cx, const SpinVal& y, u64 cy, bool sub) {
+			const u32 sign = sub ? ~0u : 1u;
+			if (x.tag == SpinVal::Opaque || y.tag == SpinVal::Opaque)
+				return opaque();
+			if (x.tag == SpinVal::Const && y.tag == SpinVal::Const)
+				return SpinVal{};
+			if (x.tag == SpinVal::Aff && y.tag == SpinVal::Aff)
+			{
+				if (x.sym != y.sym)
+					return opaque();
+				return aff(x.sym, x.a + sign * y.a, x.b + sign * y.b);
+			}
+			if (x.tag == SpinVal::Aff)
+				return aff(x.sym, x.a, x.b + sign * static_cast<u32>(cy));
+			return aff(y.sym, sign * y.a, static_cast<u32>(cx) + sign * y.b);
+		};
+		// rd = x op y where op is DADDU, OR or XOR: a Const 0 operand leaves the other one as it is.
+		const auto with_zero = [&](const SpinVal& x, u64 cx, const SpinVal& y, u64 cy) {
+			if (x.tag == SpinVal::Const && y.tag == SpinVal::Const)
+				return SpinVal{};
+			if (y.tag == SpinVal::Const && cy == 0)
+				return x;
+			if (x.tag == SpinVal::Const && cx == 0)
+				return y;
+			return opaque();
+		};
+
+		for (const SpinStep& st : path)
+		{
+			const u32 code = st.code;
+			const u32 rs = (code >> 21) & 31, rt = (code >> 16) & 31, rd = (code >> 11) & 31, sa = (code >> 6) & 31;
+			const SpinVal vs = rs ? reg[rs] : SpinVal{}, vt = rt ? reg[rt] : SpinVal{};
+			const u64 cs = st.regs[rs], ct = st.regs[rt];
+			const bool cs_const = vs.tag == SpinVal::Const, ct_const = vt.tag == SpinVal::Const;
+			switch (st.kind)
+			{
+				case Kind::Nop:
+					break;
+				case Kind::SLL:
+					if (vt.tag == SpinVal::Aff)
+						set(rd, aff(vt.sym, vt.a << sa, vt.b << sa));
+					else
+						set(rd, vt);
+					break;
+				case Kind::ADDU:
+				case Kind::SUBU:
+					set(rd, add32(vs, cs, vt, ct, st.kind == Kind::SUBU));
+					break;
+				case Kind::ADDIU:
+					if (vs.tag == SpinVal::Aff)
+						set(rt, aff(vs.sym, vs.a, vs.b + static_cast<u32>(static_cast<s16>(code & 0xffff))));
+					else
+						set(rt, vs);
+					break;
+				case Kind::DADDU:
+				case Kind::OR:
+				case Kind::XOR:
+					set(rd, with_zero(vs, cs, vt, ct));
+					break;
+				case Kind::DADDIU:
+				case Kind::ORI:
+				case Kind::XORI:
+					set(rt, (code & 0xffff) == 0 ? vs : (cs_const ? SpinVal{} : opaque()));
+					break;
+				case Kind::MOVZ:
+				case Kind::MOVN:
+					if (!ct_const)
+						set(rd, opaque());
+					else if ((st.kind == Kind::MOVZ) == (ct == 0))
+						set(rd, vs);
+					break;
+				case Kind::LUI:
+				case Kind::MFHI:
+				case Kind::MFLO:
+					set(st.kind == Kind::LUI ? rt : rd, SpinVal{}); // HI and LO: no op that writes them is allowed
+					break;
+				// Shifts by sa read rt; by register, rs and rt; the immediate forms rs.
+				case Kind::SRL:
+				case Kind::SRA:
+				case Kind::DSLL:
+				case Kind::DSRL:
+				case Kind::DSRA:
+				case Kind::DSLL32:
+				case Kind::DSRL32:
+				case Kind::DSRA32:
+					set(rd, ct_const ? SpinVal{} : opaque());
+					break;
+				case Kind::SLLV:
+				case Kind::SRLV:
+				case Kind::SRAV:
+				case Kind::DSLLV:
+				case Kind::DSRLV:
+				case Kind::DSRAV:
+				case Kind::DSUBU:
+				case Kind::AND:
+				case Kind::NOR:
+				case Kind::SLT:
+				case Kind::SLTU:
+					set(rd, cs_const && ct_const ? SpinVal{} : opaque());
+					break;
+				case Kind::SLTI:
+				case Kind::SLTIU:
+				case Kind::ANDI:
+					set(rt, cs_const ? SpinVal{} : opaque());
+					break;
+				case Kind::LB:
+				case Kind::LBU:
+				case Kind::LH:
+				case Kind::LHU:
+				case Kind::LW:
+				case Kind::LWU:
+				case Kind::LD:
+				{
+					if (!cs_const)
+						return false;
+					const u32 addr = addr_of(st), size = size_of(st.kind);
+					const int k = overlap(addr, size);
+					if (k < 0)
+						set(rt, SpinVal{}); // memory only events change
+					else if (st.kind == Kind::LW && words[k].addr == addr && words[k].size == 4)
+						set(rt, stored[k] ? mem[k] : aff(static_cast<u32>(k), 1, 0));
+					else if (stored[k] && mem[k].tag == SpinVal::Const && words[k].addr == addr && words[k].size == size)
+						set(rt, SpinVal{});
+					else
+						return false;
+					break;
+				}
+				case Kind::SB:
+				case Kind::SH:
+				case Kind::SW:
+				case Kind::SD:
+				{
+					if (!cs_const)
+						return false;
+					const int k = overlap(addr_of(st), size_of(st.kind));
+					if (vt.tag == SpinVal::Opaque || (vt.tag == SpinVal::Aff && st.kind != Kind::SW))
+						return false;
+					mem[k] = vt;
+					stored[k] = 1;
+					break;
+				}
+				case Kind::BEQ:
+				case Kind::BNE:
+				case Kind::BEQL:
+				case Kind::BNEL:
+					if (!cs_const || !ct_const)
+						return false;
+					break;
+				case Kind::BLEZ:
+				case Kind::BGTZ:
+				case Kind::BLEZL:
+				case Kind::BGTZL:
+				case Kind::BLTZ:
+				case Kind::BGEZ:
+				case Kind::BLTZL:
+				case Kind::BGEZL:
+				case Kind::JR:
+					if (!cs_const)
+						return false;
+					break;
+				case Kind::JALR:
+					if (!cs_const)
+						return false;
+					set(rd, SpinVal{});
+					break;
+				case Kind::JAL:
+					set(31, SpinVal{});
+					break;
+				case Kind::J:
+					break;
+				default:
+					return false; // not a SpinClass the try runs
+			}
+		}
+		// Every register the same after each iteration (the tried one checked that they end as they started).
+		for (u32 r = 1; r < 32; r++)
+		{
+			if (reg[r].tag != SpinVal::Const)
+				return false;
+		}
+		// A word stored a Const holds it after every iteration (the tried one wrote it); the others change.
+		site.updates.clear();
+		for (size_t k = 0; k < words.size(); k++)
+		{
+			if (mem[k].tag == SpinVal::Const)
+				continue;
+			if (mem[k].sym != k)
+				return false;
+			site.updates.push_back({words[k].addr, mem[k].a, mem[k].b});
+		}
+		if (site.updates.size() > 8) // SpinSkip()'s room
+			return false;
+		// The memo compares the other loads only.
+		site.loads.erase(std::remove_if(site.loads.begin(), site.loads.end(),
+							 [&](const SpinLoad& l) { return overlap(l.addr, l.size) >= 0; }),
+			site.loads.end());
+		return true;
+	}
+
+	// w -> mul * w + add applied n times, on 32 bits.
+	u32 SpinPower(const SpinUpdate32& u, u32 w, u64 n)
+	{
+		u32 mul = 1, add = 0; // the map so far
+		u32 pm = u.mul, pa = u.add; // the map applied 2^k times
+		for (; n; n >>= 1)
+		{
+			if (n & 1)
+			{
+				add = pm * add + pa;
+				mul = pm * mul;
+			}
+			pa = pm * pa + pa;
+			pm = pm * pm;
+		}
+		return mul * w + add;
+	}
+
 	// From the loop's start with the site's memo state: skips the iterations whose last branch test comes before the
 	// next event (a test with an earlier cycle cannot be due when the last one is not).
 	void SpinSkip(SpinSite& site)
@@ -674,6 +1034,53 @@ namespace
 		}
 		if (!n)
 			return;
+
+		if (site.stores)
+		{
+			// The words after n iterations; with -eejit-trace, the iterations on the interpreter (each test traced),
+			// which must end there.
+			const auto word = [](u32 addr) {
+				const VTLBVirtual vmv = vtlbdata.vmap[addr >> VTLB_PAGE_BITS];
+				return *reinterpret_cast<const u32*>(vmv.assumePtr(addr));
+			};
+			u32 after[8];
+			pxAssert(site.updates.size() <= std::size(after));
+			for (size_t k = 0; k < site.updates.size(); k++)
+				after[k] = SpinPower(site.updates[k], word(site.updates[k].addr), n);
+			if (EEJit::g_trace)
+			{
+				for (u64 k = 0; k < n;)
+				{
+					intJitExecOne();
+					if (cpuRegs.pc == site.target && cpuRegs.branch == 0)
+						k++;
+				}
+				bool same = cpuRegs.cycle == cycle && *bcp == bc && SpinSameRegs(site.start);
+				for (size_t k = 0; k < site.updates.size(); k++)
+					same &= word(site.updates[k].addr) == after[k];
+				if (!same)
+				{
+					Console.Error("EE JIT: idle loop at %08x: %llu iterations of a store loop do not end where the skip does, "
+								  "idle loops off.",
+						site.target, static_cast<unsigned long long>(n));
+					s_spin_off = true;
+				}
+			}
+			else
+			{
+				for (size_t k = 0; k < site.updates.size(); k++)
+					memWrite32(site.updates[k].addr, after[k]);
+				cpuRegs.cycle = cycle;
+				*bcp = bc;
+			}
+			s_spin_skips++;
+			s_spin_store_skips++;
+			s_spin_iters += n;
+			s_spin_cycles += cycle - cycle0;
+			site.skips++;
+			site.iters += n;
+			return;
+		}
 
 		if (EEJit::g_trace)
 		{
@@ -745,10 +1152,15 @@ namespace
 				return;
 		}
 
-		// The remembered iteration: same registers, same loaded values.
+		// The remembered iteration: same registers, same loaded values, the same code where it left the loop's words.
+		const auto same_outside = [](const SpinOutside& o) {
+			const u32* word = SpinWordPtr(o.pc);
+			return word && *word == o.code;
+		};
 		if (site.memo && site.wait_loop == EmuConfig.Speedhacks.WaitLoop &&
 			site.cycle_rate == EmuConfig.Speedhacks.EECycleRate && SpinSameRegs(site.start) &&
-			std::all_of(site.loads.begin(), site.loads.end(), SpinSame))
+			std::all_of(site.loads.begin(), site.loads.end(), SpinSame) &&
+			std::all_of(site.outside.begin(), site.outside.end(), same_outside))
 		{
 			s_spin_hits++;
 			SpinSkip(site);
@@ -773,56 +1185,104 @@ namespace
 		site.tests.clear();
 		site.snaps.clear();
 		site.loads.clear();
+		site.outside.clear();
+		site.updates.clear();
+		site.stores = false;
+
+		// The instruction at pc: the loop's words, or (a function it calls) memory, recorded for the memo.
+		const auto fetch = [&](u32 pc, SpinWord* w) {
+			const u32 i = (pc - L) >> 2;
+			if (i < site.words.size())
+			{
+				*w = site.words[i];
+				return true;
+			}
+			const u32* word = SpinWordPtr(pc);
+			if (!word)
+				return false;
+			const Decoded d = Decode(*word);
+			*w = {*word, d.kind, d.op->cycles};
+			site.outside.push_back({pc, *word});
+			return true;
+		};
+		// Each instruction with the registers before it, for SpinStoreLoop().
+		static std::vector<SpinStep> path;
+		path.clear();
+		const auto record = [&](u32 pc, const SpinWord& w) {
+			SpinStep& st = path.emplace_back();
+			st.pc = pc;
+			st.code = w.code;
+			st.kind = w.kind;
+			for (u32 r = 0; r < 32; r++)
+				st.regs[r] = cpuRegs.GPR.r[r].UD[0];
+		};
 
 		// One iteration, for real, on the interpreter.
 		for (u32 steps = 0;; steps++)
 		{
 			const u32 pc = cpuRegs.pc;
-			const u32 i = (pc - L) >> 2;
-			if (steps >= 64 || (pc & 3) || i >= site.words.size())
+			SpinWord w;
+			if (steps >= 64 || (pc & 3) || !fetch(pc, &w))
 				return fail(0);
-			const SpinWord& w = site.words[i];
 			const SpinClass cls = SpinClassOf(w.kind);
-			if (cls == SpinClass::Alu || cls == SpinClass::Load)
+			if (cls == SpinClass::Alu || cls == SpinClass::Load || cls == SpinClass::Store)
 			{
-				if (cls == SpinClass::Load)
+				if (cls != SpinClass::Alu)
 				{
 					SpinLoad l;
 					if (!SpinRead(w, &l))
 						return fail(1);
-					site.loads.push_back(l);
+					if (cls == SpinClass::Load)
+						site.loads.push_back(l);
+					site.stores |= cls == SpinClass::Store;
 				}
+				record(pc, w);
 				bc += w.cycles * factor;
 				add += w.cycles * factor;
 				intJitExecOne();
 				continue;
 			}
-			if (cls != SpinClass::Branch)
+			if (cls != SpinClass::Branch && cls != SpinClass::Jump)
 				return fail(2);
 
 			const bool likely = w.kind == Kind::BEQL || w.kind == Kind::BNEL || w.kind == Kind::BLEZL ||
 								w.kind == Kind::BGTZL || w.kind == Kind::BLTZL || w.kind == Kind::BGEZL;
-			const bool taken = SpinCond(w.kind, w.code);
-			const u32 target = pc + 4 + (static_cast<s16>(w.code & 0xffff) << 2);
+			const bool taken = cls == SpinClass::Jump || SpinCond(w.kind, w.code);
+			u32 target;
+			if (w.kind == Kind::J || w.kind == Kind::JAL)
+				target = ((w.code & 0x03ffffff) << 2) | ((pc + 4) & 0xf0000000);
+			else if (w.kind == Kind::JR || w.kind == Kind::JALR)
+				target = cpuRegs.GPR.r[(w.code >> 21) & 31].UL[0];
+			else
+				target = pc + 4 + (static_cast<s16>(w.code & 0xffff) << 2);
+			if (target & 3)
+				return fail(2); // an address error
+			record(pc, w);
 			SpinTest t = {};
 			bc += w.cycles * factor;
 			add += w.cycles * factor;
 			if (taken)
 			{
-				// The delay slot runs inside the branch's step: check it now (the branch changes no register).
-				if (i + 1 >= site.words.size())
+				// The delay slot runs inside the branch's step: check it now. Of the branches, only JAL and JALR change
+				// a register (the link, pc + 8), which the delay slot sees.
+				SpinWord ds;
+				if (!fetch(pc + 4, &ds))
 					return fail(3);
-				const SpinWord& ds = site.words[i + 1];
 				const SpinClass dcls = SpinClassOf(ds.kind);
-				if (dcls == SpinClass::Load)
+				if (dcls == SpinClass::Load || dcls == SpinClass::Store)
 				{
 					SpinLoad l;
 					if (!SpinRead(ds, &l))
 						return fail(3);
-					site.loads.push_back(l);
+					if (dcls == SpinClass::Load)
+						site.loads.push_back(l);
+					site.stores |= dcls == SpinClass::Store;
 				}
 				else if (dcls != SpinClass::Alu)
 					return fail(3);
+				record(pc + 4, ds);
+				if (w.kind == Kind::JAL || w.kind == Kind::JALR)
+					path.back().regs[w.kind == Kind::JAL ? 31 : (w.code >> 11) & 31] = pc + 8;
 				bc += ds.cycles * factor;
 				add += ds.cycles * factor;
 				t.end = true;
@@ -883,6 +1343,8 @@ namespace
 		if (!SpinEqual(site.start.data(), &cpuRegs, kSpinSnap) || cpuRegs.branch != 0 ||
 			*intJitLastBranchTo() != L)
 			return fail(4);
+		if (site.stores && !SpinStoreLoop(site, path))
+			return fail(7);
 		site.fails = 0;
 		for (u32 b = 0; b < 8; b++)
 		{
@@ -4568,9 +5030,10 @@ void EEJit::PrintStats()
 		Console.WriteLn("EE JIT: code list of %zu blocks: %llu modules compiled ahead in %.1f ms; log of %u blocks",
 			s_list.size(), static_cast<unsigned long long>(s_ahead_compiles),
 			s_ahead_ns / 1e6, s_code_log.count.load(std::memory_order_relaxed));
-	Console.WriteLn("EE JIT: idle loops: %zu sites, %llu tries, %llu remembered, %llu skips of %llu iterations (%llu cycles)%s",
+	Console.WriteLn("EE JIT: idle loops: %zu sites, %llu tries, %llu remembered, %llu skips (%llu of loops that store) of %llu "
+					"iterations (%llu cycles)%s",
 		s_spin_sites.size(), static_cast<unsigned long long>(s_spin_tries), static_cast<unsigned long long>(s_spin_hits),
-		static_cast<unsigned long long>(s_spin_skips),
+		static_cast<unsigned long long>(s_spin_skips), static_cast<unsigned long long>(s_spin_store_skips),
 		static_cast<unsigned long long>(s_spin_iters), static_cast<unsigned long long>(s_spin_cycles),
 		g_spin ? (s_spin_off ? ", turned off" : "") : ", off");
 	if (!g_stats)
@@ -4578,11 +5041,12 @@ void EEJit::PrintStats()
 	Console.WriteLn("EE JIT: %llu blocks called by the dispatcher", static_cast<unsigned long long>(s_dispatches));
 	Console.WriteLn("EE JIT: compile split: %.1f ms generating, %.1f ms engine compile+instantiate; worst vsync %.1f ms; %.1f ms interpreting (timed per step)",
 		s_gen_ns / 1e6, s_engine_ns / 1e6, s_max_frame_compile_ns / 1e6, s_interp_ns / 1e6);
-	Console.WriteLn("EE JIT: idle loop fails: %llu left, %llu load, %llu op, %llu delay slot, %llu changed, %llu wait loops; %llu events due",
+	Console.WriteLn("EE JIT: idle loop fails: %llu left, %llu load, %llu op, %llu delay slot, %llu changed, %llu wait loops, "
+					"%llu stores; %llu events due",
 		static_cast<unsigned long long>(s_spin_why[0]), static_cast<unsigned long long>(s_spin_why[1]),
 		static_cast<unsigned long long>(s_spin_why[2]), static_cast<unsigned long long>(s_spin_why[3]),
 		static_cast<unsigned long long>(s_spin_why[4]), static_cast<unsigned long long>(s_spin_why[5]),
-		static_cast<unsigned long long>(s_spin_why[6]));
+		static_cast<unsigned long long>(s_spin_why[7]), static_cast<unsigned long long>(s_spin_why[6]));
 	{
 		std::vector<std::pair<u64, u32>> sv;
 		for (const auto& [pc, index] : s_spin_index)
